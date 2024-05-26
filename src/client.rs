@@ -29,10 +29,10 @@
 //! The synchronous calls use a default timeout
 
 use crate::{
-    async_client::AsyncClient, connect_options::ConnectOptions, create_options::CreateOptions,
-    disconnect_options::DisconnectOptions, errors::Result, message::Message,
-    properties::Properties, server_response::ServerResponse, subscribe_options::SubscribeOptions,
-    Event, QoS, SyncReceiver,
+    AsyncClient, ConnectOptions, CreateOptions,
+    DisconnectOptions, FfiCreateOptions, Result, Message,
+    Properties, ServerResponse, SubscribeOptions,
+    QoS, Receiver,
 };
 use std::time::Duration;
 
@@ -54,7 +54,7 @@ impl Client {
     /// Creates a new MQTT client which can connect to an MQTT broker.
     pub fn new<T>(opts: T) -> Result<Client>
     where
-        T: Into<CreateOptions>,
+        T: Into<FfiCreateOptions>,
     {
         let async_cli = AsyncClient::new(opts)?;
 

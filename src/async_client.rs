@@ -47,7 +47,7 @@
 use crate::{
     client_persistence::UserPersistence,
     connect_options::ConnectOptions,
-    create_options::{CreateOptions, PersistenceType},
+    create_options::{FfiCreateOptions, PersistenceType},
     disconnect_options::{DisconnectOptions, DisconnectOptionsBuilder},
     errors::{self, Error, Result},
     ffi,
@@ -153,7 +153,7 @@ impl AsyncClient {
     ///
     pub fn new<T>(opts: T) -> Result<AsyncClient>
     where
-        T: Into<CreateOptions>,
+        T: Into<FfiCreateOptions>,
     {
         // Do any initialization of the C lib
         C_LIB_INIT.call_once(|| {

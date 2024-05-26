@@ -4,7 +4,7 @@
 //
 
 /*******************************************************************************
- * Copyright (c) 2017-2018 Frank Pagliughi <fpagliughi@mindspring.com>
+ * Copyright (c) 2017-2024 Frank Pagliughi <fpagliughi@mindspring.com>
  *
  * All rights reserved. This program and the accompanying materials
  * are made available under the terms of the Eclipse Public License v2.0
@@ -37,7 +37,7 @@ pub const PERSISTENCE_SUCCESS: c_int = ffi::MQTTASYNC_SUCCESS as c_int;
 pub const PERSISTENCE_ERROR: c_int = ffi::MQTTCLIENT_PERSISTENCE_ERROR;
 
 /// Trait to implement custom persistence in the client.
-pub trait ClientPersistence {
+pub trait ClientPersistence : Send {
     /// Open and initialize the persistent store.
     /// * `client_id` The unique client identifier.
     /// * `server_uri` The address of the server to which the client is
@@ -73,7 +73,7 @@ pub trait ClientPersistence {
 }
 
 /// The type for a client persistence object.
-pub type ClientPersistenceType = Box<Box<dyn ClientPersistence + Send>>;
+pub type ClientPersistenceType = Box<Box<dyn ClientPersistence>>;
 
 /////////////////////////////////////////////////////////////////////////////
 
@@ -96,7 +96,7 @@ pub struct UserPersistence {
 impl UserPersistence {
     /// Creates a new user persistence object.
     pub fn new(mut persistence: ClientPersistenceType) -> UserPersistence {
-        let context = &mut *persistence as *mut Box<dyn ClientPersistence + Send> as _;
+        let context = &mut *persistence as *mut Box<dyn ClientPersistence> as _;
 
         UserPersistence {
             copts: ffi::MQTTClient_persistence {
