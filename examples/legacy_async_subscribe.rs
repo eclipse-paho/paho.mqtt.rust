@@ -81,8 +81,7 @@ fn main() {
 
     // Create the client. Use an ID for a persistent session.
     // A real system should try harder to use a unique ID.
-    // It explicitly creates a client that can only be used for MQTT v3.x.
-    let create_opts = mqtt::CreateOptionsBuilder::new_v3()
+    let create_opts = mqtt::CreateOptionsBuilder::new()
         .server_uri(host)
         .client_id("rust_async_subscribe")
         .finalize();

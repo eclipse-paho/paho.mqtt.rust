@@ -36,8 +36,13 @@ pub const PERSISTENCE_SUCCESS: c_int = ffi::MQTTASYNC_SUCCESS as c_int;
 /// Return value for a failed persistence operation
 pub const PERSISTENCE_ERROR: c_int = ffi::MQTTCLIENT_PERSISTENCE_ERROR;
 
+/// A boxed Client Persistence
+pub type ClientPersistenceBox = Box<dyn ClientPersistence>;
+
+/////////////////////////////////////////////////////////////////////////////
+
 /// Trait to implement custom persistence in the client.
-pub trait ClientPersistence : Send {
+pub trait ClientPersistence: Send {
     /// Open and initialize the persistent store.
     /// * `client_id` The unique client identifier.
     /// * `server_uri` The address of the server to which the client is
@@ -72,9 +77,6 @@ pub trait ClientPersistence : Send {
     fn contains_key(&mut self, key: &str) -> bool;
 }
 
-/// The type for a client persistence object.
-pub type ClientPersistenceType = Box<Box<dyn ClientPersistence>>;
-
 /////////////////////////////////////////////////////////////////////////////
 
 /// A struct to wrap the user-defined client persistence objects for the
@@ -86,31 +88,29 @@ pub type ClientPersistenceType = Box<Box<dyn ClientPersistence>>;
 /// Note that the C library _does not_ keep a copy of the
 /// MQTTClient_persistence object, so the client must keep one and keep it
 /// at a consistent address. Thus it should be kept in a box on the heap.
-pub struct UserPersistence {
-    /// The underlying struct for the C library
-    pub(crate) copts: ffi::MQTTClient_persistence,
-    /// The user-supplied persistence object
-    _persistence: ClientPersistenceType,
-}
+pub struct UserPersistence(Box<ClientPersistenceBox>);
 
 impl UserPersistence {
     /// Creates a new user persistence object.
-    pub fn new(mut persistence: ClientPersistenceType) -> UserPersistence {
-        let context = &mut *persistence as *mut Box<dyn ClientPersistence> as _;
+    pub fn new(persistence: ClientPersistenceBox) -> Self {
+        Self::from(persistence)
+    }
 
-        UserPersistence {
-            copts: ffi::MQTTClient_persistence {
-                context,
-                popen: Some(UserPersistence::on_open),
-                pclose: Some(UserPersistence::on_close),
-                pput: Some(UserPersistence::on_put),
-                pget: Some(UserPersistence::on_get),
-                premove: Some(UserPersistence::on_remove),
-                pkeys: Some(UserPersistence::on_keys),
-                pclear: Some(UserPersistence::on_clear),
-                pcontainskey: Some(UserPersistence::on_contains_key),
-            },
-            _persistence: persistence,
+    /// Gets the FFI C structure for this object.
+    /// TODO: Figure out how to mark this with a lifetime matched to self
+    pub(crate) fn c_struct(&self) -> ffi::MQTTClient_persistence {
+        let context = &*self.0 as *const ClientPersistenceBox as *mut ClientPersistenceBox as _;
+
+        ffi::MQTTClient_persistence {
+            context,
+            popen: Some(Self::on_open),
+            pclose: Some(Self::on_close),
+            pput: Some(Self::on_put),
+            pget: Some(Self::on_get),
+            premove: Some(Self::on_remove),
+            pkeys: Some(Self::on_keys),
+            pclear: Some(Self::on_clear),
+            pcontainskey: Some(Self::on_contains_key),
         }
     }
 
@@ -124,7 +124,7 @@ impl UserPersistence {
     /// This is a callback directly from the C library. All parameters
     /// parameters must be checked for validity (NULL pointers, etc)
     ///
-    pub unsafe extern "C" fn on_open(
+    pub(crate) unsafe extern "C" fn on_open(
         handle: *mut *mut c_void,
         client_id: *const c_char,
         server_uri: *const c_char,
@@ -136,7 +136,7 @@ impl UserPersistence {
             let client_id = CStr::from_ptr(client_id).to_str().unwrap();
             let server_uri = CStr::from_ptr(server_uri).to_str().unwrap();
 
-            let persist = &mut *(context as *mut Box<dyn ClientPersistence>);
+            let persist = &mut *(context as *mut ClientPersistenceBox);
 
             if persist.open(client_id, server_uri).is_ok() {
                 *handle = context;
@@ -153,13 +153,13 @@ impl UserPersistence {
     /// This is a callback directly from the C library. All parameters
     /// parameters must be checked for validity (NULL pointers, etc)
     ///
-    pub unsafe extern "C" fn on_close(handle: *mut c_void) -> c_int {
+    pub(crate) unsafe extern "C" fn on_close(handle: *mut c_void) -> c_int {
         trace!("UserPersistence::on_close");
         if handle.is_null() {
             return PERSISTENCE_ERROR;
         }
 
-        let persist = &mut *(handle as *mut Box<dyn ClientPersistence>);
+        let persist = &mut *(handle as *mut ClientPersistenceBox);
 
         match persist.close() {
             Ok(_) => PERSISTENCE_SUCCESS,
@@ -174,7 +174,7 @@ impl UserPersistence {
     /// This is a callback directly from the C library. All parameters
     /// parameters must be checked for validity (NULL pointers, etc)
     ///
-    pub unsafe extern "C" fn on_put(
+    pub(crate) unsafe extern "C" fn on_put(
         handle: *mut c_void,
         key: *mut c_char,
         bufcount: c_int,
@@ -188,7 +188,7 @@ impl UserPersistence {
         if bufcount == 0 {
             return PERSISTENCE_SUCCESS;
         }
-        let persist = &mut *(handle as *mut Box<dyn ClientPersistence>);
+        let persist = &mut *(handle as *mut ClientPersistenceBox);
         let key = CStr::from_ptr(key).to_str().unwrap();
 
         let mut bufs: Vec<&[u8]> = Vec::new();
@@ -214,7 +214,7 @@ impl UserPersistence {
     /// This is a callback directly from the C library. All parameters
     /// parameters must be checked for validity (NULL pointers, etc)
     ///
-    pub unsafe extern "C" fn on_get(
+    pub(crate) unsafe extern "C" fn on_get(
         handle: *mut c_void,
         key: *mut c_char,
         buffer: *mut *mut c_char,
@@ -224,7 +224,7 @@ impl UserPersistence {
         if handle.is_null() || key.is_null() || buffer.is_null() || buflen.is_null() {
             return PERSISTENCE_ERROR;
         }
-        let persist = &mut *(handle as *mut Box<dyn ClientPersistence>);
+        let persist = &mut *(handle as *mut ClientPersistenceBox);
         let key = CStr::from_ptr(key).to_str().unwrap();
 
         match persist.get(key) {
@@ -249,12 +249,12 @@ impl UserPersistence {
     /// This is a callback directly from the C library. All parameters
     /// parameters must be checked for validity (NULL pointers, etc)
     ///
-    pub unsafe extern "C" fn on_remove(handle: *mut c_void, key: *mut c_char) -> c_int {
+    pub(crate) unsafe extern "C" fn on_remove(handle: *mut c_void, key: *mut c_char) -> c_int {
         trace!("UserPersistence::on_remove");
         if handle.is_null() || key.is_null() {
             return PERSISTENCE_ERROR;
         }
-        let persist = &mut *(handle as *mut Box<dyn ClientPersistence>);
+        let persist = &mut *(handle as *mut ClientPersistenceBox);
         let key = CStr::from_ptr(key).to_str().unwrap();
 
         match persist.remove(key) {
@@ -271,7 +271,7 @@ impl UserPersistence {
     /// This is a callback directly from the C library. All parameters
     /// parameters must be checked for validity (NULL pointers, etc)
     ///
-    pub unsafe extern "C" fn on_keys(
+    pub(crate) unsafe extern "C" fn on_keys(
         handle: *mut c_void,
         keys: *mut *mut *mut c_char,
         nkeys: *mut c_int,
@@ -281,7 +281,7 @@ impl UserPersistence {
             return PERSISTENCE_ERROR;
         }
 
-        let persist = &mut *(handle as *mut Box<dyn ClientPersistence>);
+        let persist = &mut *(handle as *mut ClientPersistenceBox);
 
         *keys = ptr::null_mut();
         *nkeys = 0;
@@ -319,12 +319,12 @@ impl UserPersistence {
     /// This is a callback directly from the C library. All parameters
     /// parameters must be checked for validity (NULL pointers, etc)
     ///
-    pub unsafe extern "C" fn on_clear(handle: *mut c_void) -> c_int {
+    pub(crate) unsafe extern "C" fn on_clear(handle: *mut c_void) -> c_int {
         trace!("UserPersistence::on_clear");
         if handle.is_null() {
             return PERSISTENCE_ERROR;
         }
-        let persist = &mut *(handle as *mut Box<dyn ClientPersistence>);
+        let persist = &mut *(handle as *mut ClientPersistenceBox);
 
         match persist.clear() {
             Ok(_) => PERSISTENCE_SUCCESS,
@@ -340,15 +340,28 @@ impl UserPersistence {
     /// This is a callback directly from the C library. All parameters
     /// must be checked for validity (NULL pointers, etc)
     ///
-    pub unsafe extern "C" fn on_contains_key(handle: *mut c_void, key: *mut c_char) -> c_int {
+    pub(crate) unsafe extern "C" fn on_contains_key(
+        handle: *mut c_void,
+        key: *mut c_char,
+    ) -> c_int {
         trace!("UserPersistence::on_contains_key");
         if handle.is_null() || key.is_null() {
             return PERSISTENCE_ERROR;
         }
-        let persist = &mut *(handle as *mut Box<dyn ClientPersistence>);
-        let key = CStr::from_ptr(key).to_str().unwrap();
 
-        to_c_bool(persist.contains_key(key))
+        match CStr::from_ptr(key).to_str() {
+            Ok(key) => {
+                let persist = &mut *(handle as *mut ClientPersistenceBox);
+                to_c_bool(persist.contains_key(key))
+            }
+            Err(_) => PERSISTENCE_ERROR,
+        }
+    }
+}
+
+impl From<Box<dyn ClientPersistence>> for UserPersistence {
+    fn from(persistence: ClientPersistenceBox) -> Self {
+        Self(Box::new(persistence))
     }
 }
 

@@ -29,10 +29,8 @@
 //! The synchronous calls use a default timeout
 
 use crate::{
-    AsyncClient, ConnectOptions, CreateOptions,
-    DisconnectOptions, FfiCreateOptions, Result, Message,
-    Properties, ServerResponse, SubscribeOptions,
-    QoS, Receiver,
+    AsyncClient, ConnectOptions, CreateOptions, DisconnectOptions, Message, Properties, QoS,
+    Receiver, Result, ServerResponse, SubscribeOptions,
 };
 use std::time::Duration;
 
@@ -54,7 +52,7 @@ impl Client {
     /// Creates a new MQTT client which can connect to an MQTT broker.
     pub fn new<T>(opts: T) -> Result<Client>
     where
-        T: Into<FfiCreateOptions>,
+        T: Into<CreateOptions>,
     {
         let async_cli = AsyncClient::new(opts)?;
 
@@ -343,7 +341,7 @@ impl Client {
     ///
     /// Client ID is returned as a rust String as set in a
     /// CreateOptionsBuilder for symmetry
-    pub fn client_id(&self) -> String {
+    pub fn client_id(&self) -> &str {
         self.cli.client_id()
     }
 }
@@ -394,12 +392,10 @@ mod tests {
     fn test_get_client_id() {
         let c_id = "test_client_id_can_be_retrieved";
         let options = CreateOptionsBuilder::new().client_id(c_id).finalize();
-        let client = Client::new(options);
-        assert!(
-            client.is_ok(),
-            "Error in creating sync client with client_id"
-        );
-        let retrieved = client.unwrap().client_id();
-        assert_eq!(retrieved, c_id.to_string());
+        let cli = Client::new(options);
+        assert!(cli.is_ok(), "Error in creating sync client with client_id");
+        let cli = cli.unwrap();
+        let retrieved = cli.client_id();
+        assert_eq!(retrieved, c_id);
     }
 }

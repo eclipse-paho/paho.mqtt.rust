@@ -90,7 +90,7 @@ fn main() -> mqtt::Result<()> {
             .server_uri(&host)
             .client_id("ssl_publish_rs")
             .max_buffered_messages(100)
-            .create_client()?;
+            .create_async_client()?;
 
         let ssl_opts = mqtt::SslOptionsBuilder::new()
             .trust_store(trust_store)?

@@ -45,22 +45,14 @@
 //! ```
 
 use crate::{
-    client_persistence::UserPersistence,
-    connect_options::ConnectOptions,
-    create_options::{FfiCreateOptions, PersistenceType},
-    disconnect_options::{DisconnectOptions, DisconnectOptionsBuilder},
     errors::{self, Error, Result},
     ffi,
-    message::Message,
-    properties::Properties,
-    reason_code::ReasonCode,
-    response_options::{ResponseOptions, ResponseOptionsBuilder},
-    server_response::ServerRequest,
     string_collection::StringCollection,
-    subscribe_options::SubscribeOptions,
-    token::{ConnectToken, DeliveryToken, SubscribeManyToken, SubscribeToken, Token},
     types::*,
-    AsyncReceiver, Event, SyncReceiver, UserData,
+    AsyncReceiver, ConnectOptions, ConnectToken, CreateOptions, DeliveryToken, DisconnectOptions,
+    DisconnectOptionsBuilder, Message, PersistenceType, Properties, ReasonCode, Receiver,
+    ResponseOptions, ResponseOptionsBuilder, ServerRequest, SubscribeManyToken, SubscribeOptions,
+    SubscribeToken, Token, UserData,
 };
 use crossbeam_channel as sync_channel;
 use std::{
@@ -92,18 +84,12 @@ pub(crate) struct InnerAsyncClient {
     handle: ffi::MQTTAsync,
     // The MQTT version of the connection
     mqtt_version: AtomicU32,
+    /// The options used to create the client (URL, ClientID, persistence, etc)
+    opts: CreateOptions,
     // The options for connecting to the broker
-    opts: Mutex<ConnectOptions>,
+    conn_opts: Mutex<ConnectOptions>,
     // The context to give to the C callbacks
     callback_context: Mutex<CallbackContext>,
-    // The server URI
-    server_uri: CString,
-    // The MQTT client ID name
-    client_id: CString,
-    // The user persistence (if any)
-    user_persistence: Option<Box<UserPersistence>>,
-    // Arbitrary, user-supplied data
-    user_data: Option<UserData>,
 }
 
 // The client is safe to send or share between threads.
@@ -153,7 +139,7 @@ impl AsyncClient {
     ///
     pub fn new<T>(opts: T) -> Result<AsyncClient>
     where
-        T: Into<FfiCreateOptions>,
+        T: Into<CreateOptions>,
     {
         // Do any initialization of the C lib
         C_LIB_INIT.call_once(|| {
@@ -167,24 +153,22 @@ impl AsyncClient {
         });
 
         // Create the client
-        let mut opts = opts.into();
+        let opts = opts.into();
         debug!("Create options: {:?}", opts);
 
         let mut cli = InnerAsyncClient {
             handle: ptr::null_mut(),
             mqtt_version: AtomicU32::new(opts.mqtt_version_raw()),
-            opts: Mutex::new(ConnectOptions::new()),
+            opts,
+            conn_opts: Mutex::new(ConnectOptions::new()),
             callback_context: Mutex::new(CallbackContext::default()),
-            server_uri: CString::new(opts.server_uri)?,
-            client_id: CString::new(opts.client_id)?,
-            user_persistence: None,
-            user_data: opts.user_data,
         };
 
         // We might need this for file persistence path
         let file_path;
+        let mut persist_copts;
 
-        let (ptype, pptr) = match opts.persistence {
+        let (ptype, pptr) = match &cli.opts.persistence {
             PersistenceType::None => (ffi::MQTTCLIENT_PERSISTENCE_NONE, ptr::null_mut()),
             PersistenceType::File => (ffi::MQTTCLIENT_PERSISTENCE_DEFAULT, ptr::null_mut()),
             PersistenceType::FilePath(path) => {
@@ -193,24 +177,27 @@ impl AsyncClient {
                 let pptr = file_path.as_ptr() as *mut c_void;
                 (ffi::MQTTCLIENT_PERSISTENCE_DEFAULT, pptr)
             }
-            PersistenceType::User(cli_persist) => {
-                let mut user_persistence = Box::new(UserPersistence::new(cli_persist));
-                let pptr = &mut user_persistence.copts as *mut _ as *mut c_void;
-                cli.user_persistence = Some(user_persistence);
+            PersistenceType::User(user_persist) => {
+                persist_copts = user_persist.c_struct();
+                let pptr = &mut persist_copts as *mut _ as *mut c_void;
                 (ffi::MQTTCLIENT_PERSISTENCE_USER, pptr)
             }
         };
 
         debug!("Creating client with persistence: {}", ptype);
 
+        let server_uri = CString::new(cli.opts.server_uri.clone())?;
+        let client_id = CString::new(cli.opts.client_id.clone())?;
+        let mut copts = cli.opts.c_struct();
+
         let rc = unsafe {
             ffi::MQTTAsync_createWithOptions(
                 &mut cli.handle as *mut *mut c_void,
-                cli.server_uri.as_ptr(),
-                cli.client_id.as_ptr(),
+                server_uri.as_ptr(),
+                client_id.as_ptr(),
                 ptype as c_int,
                 pptr,
-                &mut opts.copts,
+                &mut copts,
             ) as i32
         };
 
@@ -430,7 +417,7 @@ impl AsyncClient {
     /// Note that it's up to the application to ensure that it doesn't
     /// deadlock the callback thread when accessing the user data.
     pub fn user_data(&self) -> Option<&UserData> {
-        self.inner.user_data.as_ref()
+        self.inner.opts.user_data.as_ref()
     }
 
     /// Gets a copy of the options used in the last connection attempt.
@@ -467,7 +454,7 @@ impl AsyncClient {
         opts.set_token(tok.clone());
 
         debug!("Connect options: {:?}", opts);
-        let mut lkopts = self.inner.opts.lock().unwrap();
+        let mut lkopts = self.inner.conn_opts.lock().unwrap();
         *lkopts = opts;
 
         let rc = unsafe { ffi::MQTTAsync_connect(self.inner.handle, &lkopts.copts) };
@@ -520,7 +507,7 @@ impl AsyncClient {
         let tok = Token::from_client(self, ServerRequest::Connect, success_cb, failure_cb);
         opts.set_token(tok.clone());
 
-        let mut lkopts = self.inner.opts.lock().unwrap();
+        let mut lkopts = self.inner.conn_opts.lock().unwrap();
         *lkopts = opts;
 
         let rc = unsafe { ffi::MQTTAsync_connect(self.inner.handle, &lkopts.copts) };
@@ -538,7 +525,7 @@ impl AsyncClient {
     /// attempted. It will retry with the same connect options.
     ///
     pub fn reconnect(&self) -> ConnectToken {
-        let connopts = self.inner.opts.lock().unwrap().clone();
+        let connopts = self.inner.conn_opts.lock().unwrap().clone();
         self.connect(connopts)
     }
 
@@ -557,7 +544,7 @@ impl AsyncClient {
         FS: Fn(&AsyncClient, u16) + Send + 'static,
         FF: Fn(&AsyncClient, u16, i32) + Send + 'static,
     {
-        let connopts = self.inner.opts.lock().unwrap().clone();
+        let connopts = self.inner.conn_opts.lock().unwrap().clone();
         self.connect_with_callbacks(connopts, success_cb, failure_cb)
     }
 
@@ -1356,16 +1343,16 @@ impl AsyncClient {
     ///
     /// Client ID is returned as a rust String as set in a
     /// CreateOptionsBuilder for symmetry
-    pub fn client_id(&self) -> String {
-        self.inner.client_id.clone().into_string().unwrap()
+    pub fn client_id(&self) -> &str {
+        &self.inner.opts.client_id
     }
 
     /// Returns server URI used for connection
     ///
     /// Server URI is returned as a rust String as set in a
     /// CreateOptionsBuilder for symmetry
-    pub fn server_uri(&self) -> String {
-        self.inner.server_uri.clone().into_string().unwrap()
+    pub fn server_uri(&self) -> &str {
+        &self.inner.opts.server_uri
     }
 }
 
@@ -1468,7 +1455,7 @@ mod tests {
         let cli = CreateOptionsBuilder::new()
             .server_uri("tcp://localhost:1883")
             .user_data(Box::new(DATA_STR))
-            .create_client()
+            .create_async_client()
             .unwrap();
 
         let data = cli.user_data();
@@ -1486,7 +1473,7 @@ mod tests {
         let cli = CreateOptionsBuilder::new()
             .server_uri("tcp://localhost:1883")
             .user_data(data)
-            .create_client()
+            .create_async_client()
             .unwrap();
 
         let data = cli.user_data();
@@ -1512,7 +1499,7 @@ mod tests {
         let cli = CreateOptionsBuilder::new()
             .server_uri("tcp://localhost:1883")
             .user_data(data)
-            .create_client()
+            .create_async_client()
             .unwrap();
 
         let data = cli.user_data();
@@ -1571,29 +1558,28 @@ mod tests {
 
     #[test]
     fn test_get_client_id() {
-        let c_id = "test_client_id_can_be_retrieved";
+        let c_id = "test_client_id";
         let options = CreateOptionsBuilder::new().client_id(c_id).finalize();
-        let client = AsyncClient::new(options);
-        assert!(
-            client.is_ok(),
-            "Error in creating async client with client_id"
-        );
-        let retrieved = client.unwrap().client_id();
-        assert_eq!(retrieved, c_id.to_string());
+        let cli = AsyncClient::new(options);
+        assert!(cli.is_ok(), "Error in creating async client with client_id");
+        let cli = cli.unwrap();
+        let retrieved = cli.client_id();
+        assert_eq!(retrieved, c_id);
     }
 
     #[test]
     fn test_get_server_uri() {
         let server_uri = "tcp://localhost:1883";
-        let client = CreateOptionsBuilder::new()
+        let cli = CreateOptionsBuilder::new()
             .server_uri(server_uri)
-            .create_client();
+            .create_async_client();
         assert!(
-            client.is_ok(),
+            cli.is_ok(),
             "Error in creating async client with server_uri"
         );
-        let retrieved = client.unwrap().server_uri();
-        assert_eq!(retrieved, server_uri.to_string());
+        let cli = cli.unwrap();
+        let retrieved = cli.server_uri();
+        assert_eq!(retrieved, server_uri);
     }
 
     // See: <https://github.com/eclipse-paho/paho.mqtt.rust/pull/257>
