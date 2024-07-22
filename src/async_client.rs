@@ -574,10 +574,11 @@ impl AsyncClient {
         let tok = Token::new();
         opts.set_token(tok.clone());
 
-        let rc = unsafe { ffi::MQTTAsync_disconnect(self.inner.handle, &opts.copts) };
+        let copts = opts.c_struct();
+        let rc = unsafe { ffi::MQTTAsync_disconnect(self.inner.handle, &copts) };
 
         if rc != 0 {
-            mem::drop(unsafe { Token::from_raw(opts.copts.context) });
+            mem::drop(unsafe { Token::from_raw(copts.context) });
             return Token::from_error(rc);
         }
 

@@ -25,7 +25,7 @@
 //! This contains the structures to define the options for disconnecting from
 //! the MQTT broker/server.
 
-use std::time::Duration;
+use std::{fmt, os::raw::{c_int, c_void}, ptr, time::Duration};
 
 use crate::{
     ffi,
@@ -35,11 +35,15 @@ use crate::{
 };
 
 /// The collection of options for disconnecting from the client.
-#[derive(Debug)]
 pub struct DisconnectOptions {
-    /// The underlying C disconnect options
-    pub(crate) copts: ffi::MQTTAsync_disconnectOptions,
-    props: Properties,
+    /// A delay to disconnect to allow any in-flight messages to complete.
+    pub timeout: Duration,
+    /// MQTT v5 disconnect properties
+    pub props: Properties,
+    /// MQTT v5 reason code for disconnect
+    pub reason_code: ReasonCode,
+    /// The token to complete on disconnect
+    context: *mut c_void,
 }
 
 impl DisconnectOptions {
@@ -48,10 +52,15 @@ impl DisconnectOptions {
         Self::default()
     }
 
-    // Ensures that the underlying C struct points to cached values
-    fn from_data(mut copts: ffi::MQTTAsync_disconnectOptions, props: Properties) -> Self {
-        copts.properties = props.cprops;
-        Self { copts, props }
+    /// Gets an FFI C struct for the disconnect options
+    pub(crate) fn c_struct(&self) -> ffi::MQTTAsync_disconnectOptions {
+        ffi::MQTTAsync_disconnectOptions {
+            timeout: self.timeout.as_secs() as c_int,
+            onSuccess: Some(TokenInner::on_success),
+            onFailure: Some(TokenInner::on_failure),
+            context: self.context,
+            ..ffi::MQTTAsync_disconnectOptions::default()
+        }
     }
 
     /// Sets the token to ber used for connect completion callbacks.
@@ -59,14 +68,12 @@ impl DisconnectOptions {
     /// done with it, we must recover and drop it (i.e. in the completion
     /// callback).
     pub fn set_token(&mut self, tok: Token) {
-        self.copts.onSuccess = Some(TokenInner::on_success);
-        self.copts.onFailure = Some(TokenInner::on_failure);
-        self.copts.context = tok.into_raw();
+        self.context = tok.into_raw();
     }
 
     /// Gets the reason code in the options.
     pub fn reason_code(&self) -> ReasonCode {
-        ReasonCode::from(self.copts.reasonCode)
+        self.reason_code
     }
 
     /// Gets the properties in the message
@@ -77,16 +84,23 @@ impl DisconnectOptions {
 
 impl Default for DisconnectOptions {
     fn default() -> Self {
-        Self::from_data(
-            ffi::MQTTAsync_disconnectOptions::default(),
-            Properties::default(),
-        )
+        Self {
+            timeout: Duration::from_secs(1),
+            props: Properties::default(),
+            reason_code: ReasonCode::Success,
+            context: ptr::null_mut(),
+        }
     }
 }
 
-impl Clone for DisconnectOptions {
-    fn clone(&self) -> Self {
-        Self::from_data(self.copts, self.props.clone())
+impl fmt::Debug for DisconnectOptions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DisconnectOptions")
+            .field("timeout", &self.timeout)
+            .field("props", &self.props)
+            .field("reason_code", &self.reason_code)
+            // TODO: tok
+            .finish()
     }
 }
 
@@ -99,9 +113,13 @@ unsafe impl Sync for DisconnectOptions {}
 
 /// Builder to create the options for disconnecting from an MQTT server.
 #[derive(Debug, Default)]
-pub struct DisconnectOptionsBuilder {
-    copts: ffi::MQTTAsync_disconnectOptions,
-    props: Properties,
+pub struct DisconnectOptionsBuilder{
+    /// A delay to disconnect to allow any in-flight messages to complete.
+    pub timeout: Duration,
+    /// MQTT v5 disconnect properties
+    pub props: Properties,
+    /// MQTT v5 reason code for disconnect
+    reason_code: ReasonCode,
 }
 
 impl DisconnectOptionsBuilder {
@@ -118,8 +136,7 @@ impl DisconnectOptionsBuilder {
     /// * `timeout` The time interval to allow the disconnect to
     ///   complete. This has a resolution of milliseconds.
     pub fn timeout(&mut self, timeout: Duration) -> &mut Self {
-        let millis = timeout.as_millis();
-        self.copts.timeout = if millis == 0 { 1 } else { millis as i32 };
+        self.timeout = timeout;
         self
     }
 
@@ -128,7 +145,7 @@ impl DisconnectOptionsBuilder {
     /// The valid disconnect reasons are listed here in the spec:
     /// <https://docs.oasis-open.org/mqtt/mqtt/v5.0/os/mqtt-v5.0-os.html#_Toc3901208>
     pub fn reason_code(&mut self, reason_code: ReasonCode) -> &mut Self {
-        self.copts.reasonCode = reason_code as ffi::MQTTReasonCodes;
+        self.reason_code = reason_code;
         self
     }
 
@@ -137,7 +154,8 @@ impl DisconnectOptionsBuilder {
     /// This sets the reason code in the options to 0x04:
     ///   "Disconnect with Will Message"
     pub fn publish_will_message(&mut self) -> &mut Self {
-        self.reason_code(ReasonCode::DisconnectWithWillMessage)
+        self.reason_code = ReasonCode::DisconnectWithWillMessage;
+        self
     }
 
     /// Sets the collection of properties for the disconnect.
@@ -153,7 +171,12 @@ impl DisconnectOptionsBuilder {
 
     /// Finalize the builder to create the disconnect options.
     pub fn finalize(&self) -> DisconnectOptions {
-        DisconnectOptions::from_data(self.copts, self.props.clone())
+        DisconnectOptions {
+            timeout: self.timeout,
+            props: self.props.clone(),
+            reason_code: self.reason_code,
+            context: ptr::null_mut(),
+        }
     }
 }
 
@@ -180,9 +203,10 @@ mod tests {
     #[test]
     fn test_new() {
         let opts = DisconnectOptions::new();
+        let copts = opts.c_struct();
 
-        assert_eq!(STRUCT_ID, opts.copts.struct_id);
-        assert_eq!(STRUCT_VERSION, opts.copts.struct_version);
+        assert_eq!(STRUCT_ID, copts.struct_id);
+        assert_eq!(STRUCT_VERSION, copts.struct_version);
     }
 
     #[test]
@@ -190,8 +214,9 @@ mod tests {
         let opts = DisconnectOptions::new();
 
         let thr = thread::spawn(move || {
-            assert_eq!(STRUCT_ID, opts.copts.struct_id);
-            assert_eq!(STRUCT_VERSION, opts.copts.struct_version);
+            let copts = opts.c_struct();
+            assert_eq!(STRUCT_ID, copts.struct_id);
+            assert_eq!(STRUCT_VERSION, copts.struct_version);
         });
         thr.join().unwrap();
     }
@@ -231,6 +256,7 @@ mod tests {
             .unwrap();
 
         let opts = DisconnectOptionsBuilder::new().properties(props).finalize();
+        let copts = opts.c_struct();
 
         let props = opts.properties();
 
@@ -248,7 +274,7 @@ mod tests {
 
         assert_eq!(props.get_int(PropertyCode::ContentType), None);
 
-        let props = Properties::from_c_struct(&opts.copts.properties);
+        let props = Properties::from_c_struct(&copts.properties);
         assert_eq!(props.len(), 2);
 
         assert_eq!(
