@@ -52,7 +52,7 @@ use crate::{
     AsyncReceiver, ConnectOptions, ConnectToken, CreateOptions, DeliveryToken,
     DisconnectOptions, DisconnectOptionsBuilder, Message, PersistenceType, Properties,
     ReasonCode, Receiver, ResponseOptions, ResponseOptionsBuilder, ServerRequest,
-    SubscribeManyToken, SubscribeOptions, SubscribeToken, Token, UserData,
+    SubscribeManyToken, SubscribeOptions, SubscribeToken, Token, TokenInner, UserData,
 };
 use crossbeam_channel as sync_channel;
 use std::{
@@ -508,7 +508,12 @@ impl AsyncClient {
 
         self.set_mqtt_version(opts.mqtt_version());
 
-        let tok = Token::from_client(self, ServerRequest::Connect, success_cb, failure_cb);
+        let tok = Token::with_client_callbacks(
+            self,
+            ServerRequest::Connect,
+            success_cb,
+            failure_cb,
+        );
         opts.set_token(tok.clone());
 
         let mut lkopts = self.inner.conn_opts.lock().unwrap();
@@ -560,21 +565,31 @@ impl AsyncClient {
     ///
     /// # Arguments
     ///
-    /// * `opt_opts` Optional disconnect options. Specifying `None` will use
-    ///   default of immediate (zero timeout) disconnect.
+    /// `opts` Optional disconnect options. Specifying `None` will use
+    ///        default of immediate (zero timeout) disconnect.
     ///
-    pub fn disconnect<T>(&self, opt_opts: T) -> Token
+    pub fn disconnect<T>(&self, opts: T) -> Token
     where
         T: Into<Option<DisconnectOptions>>,
     {
-        let mut opts = opt_opts.into().unwrap_or_default();
-        debug!("Disconnecting.  Handle: {:?}", self.inner.handle);
+        debug!("Disconnecting client: {:?}", self.inner.handle);
+
+        let opts = opts.into().unwrap_or_default();
+        let mut copts = opts.c_struct();
         trace!("Disconnect options: {:?}", opts);
 
-        let tok = Token::new();
-        opts.set_token(tok.clone());
+        let tok = Token::with_client(self, ServerRequest::Disconnect);
+        copts.context = tok.clone().into_raw();
 
-        let copts = opts.c_struct();
+        if self.mqtt_version() < MqttVersion::V5 {
+            copts.onSuccess = Some(TokenInner::on_success);
+            copts.onFailure = Some(TokenInner::on_failure);
+        }
+        else {
+            copts.onSuccess5 = Some(TokenInner::on_success5);
+            copts.onFailure5 = Some(TokenInner::on_failure5);
+        }
+
         let rc = unsafe { ffi::MQTTAsync_disconnect(self.inner.handle, &copts) };
 
         if rc != 0 {

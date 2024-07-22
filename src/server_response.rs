@@ -55,6 +55,8 @@ pub enum ServerRequest {
     Unsubscribe,
     /// An unsubscribe request for multiple topics
     UnsubscribeMany(usize),
+    /// Disconnecting from the server
+    Disconnect,
 }
 
 /////////////////////////////////////////////////////////////////////////////
@@ -150,6 +152,7 @@ impl ServerResponse {
                 debug!("Subscribed to {} topics w/ QoS: {:?}", qosv.len(), qosv);
                 RequestResponse::SubscribeMany(qosv)
             }
+            // TODO: Anything for Disconnect?
             _ => RequestResponse::None,
         };
         Self {

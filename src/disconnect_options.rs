@@ -25,16 +25,11 @@
 //! This contains the structures to define the options for disconnecting from
 //! the MQTT broker/server.
 
-use std::{fmt, os::raw::{c_int, c_void}, ptr, time::Duration};
-
-use crate::{
-    ffi,
-    properties::Properties,
-    reason_code::ReasonCode,
-    token::{Token, TokenInner},
-};
+use crate::{ffi, properties::Properties, reason_code::ReasonCode};
+use std::{os::raw::c_int, time::Duration};
 
 /// The collection of options for disconnecting from the client.
+#[derive(Debug, Default, Clone)]
 pub struct DisconnectOptions {
     /// A delay to disconnect to allow any in-flight messages to complete.
     pub timeout: Duration,
@@ -42,85 +37,45 @@ pub struct DisconnectOptions {
     pub props: Properties,
     /// MQTT v5 reason code for disconnect
     pub reason_code: ReasonCode,
-    /// The token to complete on disconnect
-    context: *mut c_void,
 }
 
 impl DisconnectOptions {
-    /// Create a new `DisconnectOptions`
+    /// Create disconnect options
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Create disconnect options with the specified timeout.
+    pub fn with_timeout(timeout: Duration) -> Self {
+        Self {
+            timeout,
+            ..Self::default()
+        }
     }
 
     /// Gets an FFI C struct for the disconnect options
     pub(crate) fn c_struct(&self) -> ffi::MQTTAsync_disconnectOptions {
         ffi::MQTTAsync_disconnectOptions {
             timeout: self.timeout.as_secs() as c_int,
-            onSuccess: Some(TokenInner::on_success),
-            onFailure: Some(TokenInner::on_failure),
-            context: self.context,
+            properties: self.props.cprops,
+            reasonCode: self.reason_code as ffi::MQTTReasonCodes,
             ..ffi::MQTTAsync_disconnectOptions::default()
         }
     }
 
-    /// Sets the token to ber used for connect completion callbacks.
-    /// Note that we leak the token to give to the C lib. When we're
-    /// done with it, we must recover and drop it (i.e. in the completion
-    /// callback).
-    pub fn set_token(&mut self, tok: Token) {
-        self.context = tok.into_raw();
-    }
-
-    /// Gets the reason code in the options.
-    pub fn reason_code(&self) -> ReasonCode {
-        self.reason_code
-    }
-
-    /// Gets the properties in the message
+    /// Gets the properties used o disconnect
     pub fn properties(&self) -> &Properties {
         &self.props
     }
 }
-
-impl Default for DisconnectOptions {
-    fn default() -> Self {
-        Self {
-            timeout: Duration::from_secs(1),
-            props: Properties::default(),
-            reason_code: ReasonCode::Success,
-            context: ptr::null_mut(),
-        }
-    }
-}
-
-impl fmt::Debug for DisconnectOptions {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("DisconnectOptions")
-            .field("timeout", &self.timeout)
-            .field("props", &self.props)
-            .field("reason_code", &self.reason_code)
-            // TODO: tok
-            .finish()
-    }
-}
-
-unsafe impl Send for DisconnectOptions {}
-unsafe impl Sync for DisconnectOptions {}
 
 /////////////////////////////////////////////////////////////////////////////
 //                              Builder
 /////////////////////////////////////////////////////////////////////////////
 
 /// Builder to create the options for disconnecting from an MQTT server.
-#[derive(Debug, Default)]
-pub struct DisconnectOptionsBuilder{
-    /// A delay to disconnect to allow any in-flight messages to complete.
-    pub timeout: Duration,
-    /// MQTT v5 disconnect properties
-    pub props: Properties,
-    /// MQTT v5 reason code for disconnect
-    reason_code: ReasonCode,
-}
+#[derive(Debug, Default, Clone)]
+pub struct DisconnectOptionsBuilder(DisconnectOptions);
 
 impl DisconnectOptionsBuilder {
     /// Create a new `DisconnectOptionsBuilder`
@@ -136,7 +91,7 @@ impl DisconnectOptionsBuilder {
     /// * `timeout` The time interval to allow the disconnect to
     ///   complete. This has a resolution of milliseconds.
     pub fn timeout(&mut self, timeout: Duration) -> &mut Self {
-        self.timeout = timeout;
+        self.0.timeout = timeout;
         self
     }
 
@@ -145,7 +100,7 @@ impl DisconnectOptionsBuilder {
     /// The valid disconnect reasons are listed here in the spec:
     /// <https://docs.oasis-open.org/mqtt/mqtt/v5.0/os/mqtt-v5.0-os.html#_Toc3901208>
     pub fn reason_code(&mut self, reason_code: ReasonCode) -> &mut Self {
-        self.reason_code = reason_code;
+        self.0.reason_code = reason_code;
         self
     }
 
@@ -154,7 +109,7 @@ impl DisconnectOptionsBuilder {
     /// This sets the reason code in the options to 0x04:
     ///   "Disconnect with Will Message"
     pub fn publish_will_message(&mut self) -> &mut Self {
-        self.reason_code = ReasonCode::DisconnectWithWillMessage;
+        self.0.reason_code = ReasonCode::DisconnectWithWillMessage;
         self
     }
 
@@ -165,18 +120,13 @@ impl DisconnectOptionsBuilder {
     /// * `props` The collection of properties to include with the
     ///   disconnect message.
     pub fn properties(&mut self, props: Properties) -> &mut Self {
-        self.props = props;
+        self.0.props = props;
         self
     }
 
     /// Finalize the builder to create the disconnect options.
     pub fn finalize(&self) -> DisconnectOptions {
-        DisconnectOptions {
-            timeout: self.timeout,
-            props: self.props.clone(),
-            reason_code: self.reason_code,
-            context: ptr::null_mut(),
-        }
+        self.0.clone()
     }
 }
 
@@ -224,17 +174,17 @@ mod tests {
     #[test]
     fn test_reason_code() {
         let opts = DisconnectOptionsBuilder::new().finalize();
-        assert_eq!(opts.reason_code(), ReasonCode::NormalDisconnection);
+        assert_eq!(opts.reason_code, ReasonCode::NormalDisconnection);
 
         let opts = DisconnectOptionsBuilder::new()
             .reason_code(ReasonCode::DisconnectWithWillMessage)
             .finalize();
-        assert_eq!(opts.reason_code(), ReasonCode::DisconnectWithWillMessage);
+        assert_eq!(opts.reason_code, ReasonCode::DisconnectWithWillMessage);
 
         let opts = DisconnectOptionsBuilder::new()
             .publish_will_message()
             .finalize();
-        assert_eq!(opts.reason_code(), ReasonCode::DisconnectWithWillMessage);
+        assert_eq!(opts.reason_code, ReasonCode::DisconnectWithWillMessage);
     }
 
     #[test]

@@ -149,6 +149,35 @@ impl TokenInner {
         Arc::new(Self::default())
     }
 
+    /// Creates a new, un-signaled Token.
+    pub fn with_client(cli: &AsyncClient, req: ServerRequest) -> Arc<Self> {
+        Arc::new(Self {
+            cli: Some(cli.clone()),
+            req,
+            ..Self::default()
+        })
+    }
+
+    /// Creates a new, un-signaled Token with callbacks.
+    pub fn with_client_callbacks<FS, FF>(
+        cli: &AsyncClient,
+        req: ServerRequest,
+        success_cb: FS,
+        failure_cb: FF,
+    ) -> Arc<Self>
+    where
+        FS: Fn(&AsyncClient, u16) + 'static,
+        FF: Fn(&AsyncClient, u16, i32) + 'static,
+    {
+        Arc::new(Self {
+            cli: Some(cli.clone()),
+            req,
+            on_success: Some(Box::new(success_cb)),
+            on_failure: Some(Box::new(failure_cb)),
+            ..Self::default()
+        })
+    }
+
     /// Creates a token for a specific request type
     pub fn from_request<'a, C>(cli: C, req: ServerRequest) -> Arc<Self>
     where
@@ -171,6 +200,7 @@ impl TokenInner {
         })
     }
 
+    // TODO: Get rid of this one
     /// Creates a new, un-signaled Token with callbacks.
     pub fn from_client<FS, FF>(
         cli: &AsyncClient,
@@ -182,13 +212,7 @@ impl TokenInner {
         FS: Fn(&AsyncClient, u16) + 'static,
         FF: Fn(&AsyncClient, u16, i32) + 'static,
     {
-        Arc::new(Self {
-            cli: Some(cli.clone()),
-            req,
-            on_success: Some(Box::new(success_cb)),
-            on_failure: Some(Box::new(failure_cb)),
-            ..Self::default()
-        })
+        Self::with_client_callbacks(cli, req, success_cb, failure_cb)
     }
 
     /// Creates a new Token signaled with a return code.
@@ -505,6 +529,29 @@ impl Token {
     pub fn new() -> Self {
         Self {
             inner: TokenInner::new(),
+        }
+    }
+
+    /// Creates a new, un-signaled Token with callbacks.
+    pub fn with_client(cli: &AsyncClient, req: ServerRequest) -> Self {
+        Self {
+            inner: TokenInner::with_client(cli, req),
+        }
+    }
+
+    /// Creates a new, un-signaled Token with callbacks.
+    pub fn with_client_callbacks<FS, FF>(
+        cli: &AsyncClient,
+        req: ServerRequest,
+        success_cb: FS,
+        failure_cb: FF,
+    ) -> Self
+    where
+        FS: Fn(&AsyncClient, u16) + 'static,
+        FF: Fn(&AsyncClient, u16, i32) + 'static,
+    {
+        Self {
+            inner: TokenInner::from_client(cli, req, success_cb, failure_cb),
         }
     }
 
