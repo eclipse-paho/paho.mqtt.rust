@@ -3,8 +3,9 @@
 # Code format definitions for Eclipse Paho MQTT Rust library.
 #
 
-edition = "2018"
+edition = "2021"
+max_width = 92
 
-# As of 2021-04-23, this is still unstable, requiring +nightly
+# As of 2024-07-21, this is still unstable, requiring +nightly
 control_brace_style = "ClosingNextLine"
 

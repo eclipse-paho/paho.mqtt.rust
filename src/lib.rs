@@ -116,6 +116,7 @@ pub use crate::errors::*;
 pub use crate::event::Event;
 pub use crate::message::*; //{Message, MessageBuilder};
 pub use crate::name_value::*; //{NameValueCollection};
+pub use crate::persistence::*;
 pub use crate::properties::*; //{Property, Properties};
 pub use crate::reason_code::*; //{ReasonCode}
 pub use crate::response_options::*; //{ResponseOptions};
@@ -178,8 +179,8 @@ pub mod reason_code;
 /// Miscelaneous types
 pub mod types;
 
-/// Definitions for creating user-defined persistence.
-pub mod client_persistence;
+/// Message persistence for the client.
+pub mod persistence;
 
 /// The MQTT errors
 pub mod errors;

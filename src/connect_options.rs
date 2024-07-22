@@ -134,7 +134,10 @@ impl ConnectOptions {
     // Creates a set of options from a C struct and cached values.
     // Fixes up the underlying C struct to point to the cached values,
     // then returns a new options object with them combined.
-    fn from_data(mut copts: ffi::MQTTAsync_connectOptions, data: ConnectOptionsData) -> Self {
+    fn from_data(
+        mut copts: ffi::MQTTAsync_connectOptions,
+        data: ConnectOptionsData,
+    ) -> Self {
         let mut data = Box::pin(data);
 
         copts.will = match data.will {

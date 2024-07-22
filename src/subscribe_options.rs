@@ -305,7 +305,8 @@ mod tests {
         assert!(opts.retain_as_published());
         assert_eq!(opts.retain_handling(), RetainHandling::default());
 
-        let opts = SubscribeOptions::with_retain_handling(RetainHandling::SendRetainedOnNew);
+        let opts =
+            SubscribeOptions::with_retain_handling(RetainHandling::SendRetainedOnNew);
 
         assert!(!opts.no_local());
         assert!(!opts.retain_as_published());

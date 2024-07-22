@@ -99,7 +99,10 @@ impl ResponseOptions {
     // Creates a set of options from a C struct and cached values.
     // Fixes up the underlying C struct to point to the cached values,
     // then returns a new options object with them combined.
-    fn from_data(mut copts: ffi::MQTTAsync_responseOptions, data: ResponseOptionsData) -> Self {
+    fn from_data(
+        mut copts: ffi::MQTTAsync_responseOptions,
+        data: ResponseOptionsData,
+    ) -> Self {
         let mut data = Box::pin(data);
 
         copts.properties = data.props.cprops;
@@ -281,7 +284,8 @@ mod tests {
         assert!(!opts.copts.subscribeOptionsList.is_null());
 
         unsafe {
-            let sub_opts_list = std::slice::from_raw_parts(opts.copts.subscribeOptionsList, 4);
+            let sub_opts_list =
+                std::slice::from_raw_parts(opts.copts.subscribeOptionsList, 4);
             assert!(sub_opts_list[0].noLocal != 0);
             assert!(sub_opts_list[1].noLocal != 0);
             assert!(sub_opts_list[2].noLocal != 0);

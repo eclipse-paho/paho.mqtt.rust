@@ -33,7 +33,10 @@ const PAHO_C_LOG_TARGET: &str = "paho_mqtt_c";
 // the C library, which has more levels than the Rust logger.
 // This should be installed by the client once when the first one is
 // created.
-pub(crate) unsafe extern "C" fn on_c_trace(lvl: ffi::MQTTASYNC_TRACE_LEVELS, msg: *mut c_char) {
+pub(crate) unsafe extern "C" fn on_c_trace(
+    lvl: ffi::MQTTASYNC_TRACE_LEVELS,
+    msg: *mut c_char,
+) {
     if msg.is_null() {
         return;
     }

@@ -235,7 +235,11 @@ impl<'a> Topic<'a> {
     /// See [`publish_with_alias()`](Self::publish_with_alias) for more information.
     ///
     /// Returns a Publish Error containing the complete message on failure.
-    pub fn try_publish_with_alias<V>(&mut self, alias: u16, payload: V) -> Result<DeliveryToken>
+    pub fn try_publish_with_alias<V>(
+        &mut self,
+        alias: u16,
+        payload: V,
+    ) -> Result<DeliveryToken>
     where
         V: Into<Vec<u8>>,
     {

@@ -20,15 +20,11 @@
  *    Frank Pagliughi - initial implementation and documentation
  *******************************************************************************/
 
-use std::{
-    cmp, fmt,
-    os::raw::c_int,
-    path::{Path, PathBuf},
-};
-
 use crate::{
-    ffi, AsyncClient, Client, ClientPersistence, MqttVersion, Result, UserData, UserPersistence,
+    ffi, AsyncClient, Client, ClientPersistence, MqttVersion, PersistenceType, Result,
+    UserData, UserPersistence,
 };
+use std::{cmp, os::raw::c_int};
 
 /*
     Remember the C constants (c_uint)
@@ -36,82 +32,6 @@ use crate::{
         MQTTCLIENT_PERSISTENCE_NONE    = 1
         MQTTCLIENT_PERSISTENCE_USER    = 2
 */
-
-/// The type of persistence for the client.
-///
-/// There is a built-in mechanism for using the file system to persist
-/// messages and data. The `File` selection will use that in the current
-/// working directory (CWD). A path can also be specified, with `FilePath`
-/// and then the persistence store will be created under that directory.
-/// Each client will create a directory under that using the MQTT client
-/// ID and server URL to name the directory. Therefore, a client ID is
-/// required by the library when using persistence.
-///
-/// The persistence type can be created from any string or path to indicate
-/// file persistence to that directory. If a directory with that name can't
-/// be found or created by the library, then a persistence error is returned
-/// when attempting to create the MQTT client object.
-#[derive(Default)]
-pub enum PersistenceType {
-    /// Messages are persisted to files in a local directory (default).
-    File,
-    /// Messages are persisted to files under the specified directory.
-    FilePath(PathBuf),
-    /// No persistence is used.
-    #[default]
-    None,
-    /// A user-defined persistence provided by the application.
-    User(UserPersistence),
-}
-
-impl fmt::Debug for PersistenceType {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        use PersistenceType::*;
-        match *self {
-            File => write!(f, "File"),
-            FilePath(_) => write!(f, "File with Path"),
-            None => write!(f, "None"),
-            User(_) => write!(f, "User"),
-        }
-    }
-}
-
-impl From<&str> for PersistenceType {
-    /// A string slice can be used to create a file path persistence.
-    fn from(path: &str) -> Self {
-        PersistenceType::FilePath(PathBuf::from(path))
-    }
-}
-
-impl From<String> for PersistenceType {
-    /// A string can be used to create a file path persistence.
-    fn from(path: String) -> Self {
-        PersistenceType::FilePath(PathBuf::from(path))
-    }
-}
-
-impl From<&Path> for PersistenceType {
-    /// A path can be used to create a file path persistence.
-    fn from(path: &Path) -> Self {
-        PersistenceType::FilePath(path.into())
-    }
-}
-
-impl From<PathBuf> for PersistenceType {
-    /// A path buffer can be used to create a file path persistence.
-    fn from(path: PathBuf) -> Self {
-        PersistenceType::FilePath(path)
-    }
-}
-
-impl From<Option<PersistenceType>> for PersistenceType {
-    fn from(opt: Option<PersistenceType>) -> Self {
-        match opt {
-            Some(typ) => typ,
-            None => PersistenceType::None,
-        }
-    }
-}
 
 /////////////////////////////////////////////////////////////////////////////
 //                            Create Options

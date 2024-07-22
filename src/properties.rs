@@ -831,7 +831,11 @@ impl Drop for Property {
                         self.cprop.value.__bindgen_anon_1.data.data
                     );
                     let n = self.cprop.value.__bindgen_anon_1.data.len as usize;
-                    let _ = Vec::from_raw_parts(self.cprop.value.__bindgen_anon_1.data.data, n, n);
+                    let _ = Vec::from_raw_parts(
+                        self.cprop.value.__bindgen_anon_1.data.data,
+                        n,
+                        n,
+                    );
                 }
                 PropertyType::Utf8EncodedString => {
                     trace!(
@@ -867,7 +871,8 @@ impl Clone for Property {
                 PropertyType::BinaryData => {
                     // TODO: Can we just do a low-level mem copy?
                     let n = cprop.value.__bindgen_anon_1.data.len as usize;
-                    let v = Vec::from_raw_parts(cprop.value.__bindgen_anon_1.data.data, n, n);
+                    let v =
+                        Vec::from_raw_parts(cprop.value.__bindgen_anon_1.data.data, n, n);
                     let mut vc = v.clone();
                     let p = vc.as_mut_ptr() as *mut c_char;
                     cprop.value.__bindgen_anon_1.data.data = p;
@@ -1000,7 +1005,12 @@ impl Properties {
     }
 
     /// Adds a string pair property to the collection
-    pub fn push_string_pair(&mut self, code: PropertyCode, key: &str, val: &str) -> Result<()> {
+    pub fn push_string_pair(
+        &mut self,
+        code: PropertyCode,
+        key: &str,
+        val: &str,
+    ) -> Result<()> {
         self.push(Property::new_string_pair(code, key, val)?)
     }
 
@@ -1086,7 +1096,11 @@ impl Properties {
     }
 
     /// Gets a string pair for a specific property when there may be more than one.
-    pub fn get_string_pair_at(&self, code: PropertyCode, idx: usize) -> Option<(String, String)> {
+    pub fn get_string_pair_at(
+        &self,
+        code: PropertyCode,
+        idx: usize,
+    ) -> Option<(String, String)> {
         self.get_at(code, idx)
             .and_then(|prop| prop.get_string_pair())
     }
@@ -1193,11 +1207,15 @@ mod tests {
     #[test]
     fn test_property_code_new() {
         assert_eq!(
-            PropertyCode::new(ffi::MQTTPropertyCodes_MQTTPROPERTY_CODE_PAYLOAD_FORMAT_INDICATOR),
+            PropertyCode::new(
+                ffi::MQTTPropertyCodes_MQTTPROPERTY_CODE_PAYLOAD_FORMAT_INDICATOR
+            ),
             Some(PropertyCode::PayloadFormatIndicator)
         );
         assert_eq!(
-            PropertyCode::new(ffi::MQTTPropertyCodes_MQTTPROPERTY_CODE_AUTHENTICATION_METHOD),
+            PropertyCode::new(
+                ffi::MQTTPropertyCodes_MQTTPROPERTY_CODE_AUTHENTICATION_METHOD
+            ),
             Some(PropertyCode::AuthenticationMethod)
         );
         assert_eq!(

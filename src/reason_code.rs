@@ -277,7 +277,9 @@ mod tests {
 
         assert_eq!(
             ReasonCode::DisconnectWithWillMessage,
-            ReasonCode::from(ffi::MQTTReasonCodes_MQTTREASONCODE_DISCONNECT_WITH_WILL_MESSAGE)
+            ReasonCode::from(
+                ffi::MQTTReasonCodes_MQTTREASONCODE_DISCONNECT_WITH_WILL_MESSAGE
+            )
         );
 
         assert_eq!(

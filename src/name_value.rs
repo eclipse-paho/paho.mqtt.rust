@@ -206,7 +206,8 @@ mod tests {
 
     #[test]
     fn test_new_from_vec_strings() {
-        let v = vec_of_string_pairs![("name0", "val0"), ("name1", "val1"), ("name2", "val2")];
+        let v =
+            vec_of_string_pairs![("name0", "val0"), ("name1", "val1"), ("name2", "val2")];
         let n = v.len();
 
         let sc = NameValueCollection::new(&v);

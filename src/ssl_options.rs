@@ -294,7 +294,8 @@ impl SslOptionsBuilder {
     where
         S: Into<String>,
     {
-        self.data.enabled_cipher_suites = CString::new(enabled_cipher_suites.into()).unwrap();
+        self.data.enabled_cipher_suites =
+            CString::new(enabled_cipher_suites.into()).unwrap();
         self
     }
 
@@ -441,8 +442,8 @@ mod tests {
         let protos = &["spdy/1", "http/1.1"];
 
         let v: Vec<c_uchar> = vec![
-            6, b's', b'p', b'd', b'y', b'/', b'1', 8, b'h', b't', b't', b'p', b'/', b'1', b'.',
-            b'1',
+            6, b's', b'p', b'd', b'y', b'/', b'1', 8, b'h', b't', b't', b'p', b'/', b'1',
+            b'.', b'1',
         ];
 
         assert_eq!(v, SslOptions::proto_vec(protos));

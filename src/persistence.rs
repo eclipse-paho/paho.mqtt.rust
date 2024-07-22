@@ -1,4 +1,4 @@
-// client_persistence.rs
+// persistence.rs
 //
 // This file is part of the Eclipse Paho MQTT Rust Client library.
 //
@@ -19,10 +19,20 @@
  *    Frank Pagliughi - initial implementation and documentation
  *******************************************************************************/
 
+//! MQTT client persistence options.
+//!
+//! The Paho MQTT client can use persistence to store in-flight messages out
+//! of process to be recovered in the event of an application crash or
+//! restart. The client has built-in support for storing messages in the
+//! local file system, but also allows the user to define their own strategy.
+//! This can be done with anything that can be used as a key/value store.
+//!
+
 use std::{
     ffi::{CStr, CString},
-    mem,
+    fmt, mem,
     os::raw::{c_char, c_int, c_void},
+    path::{Path, PathBuf},
     ptr, slice,
 };
 
@@ -39,6 +49,88 @@ pub const PERSISTENCE_ERROR: c_int = ffi::MQTTCLIENT_PERSISTENCE_ERROR;
 /// A boxed Client Persistence
 pub type ClientPersistenceBox = Box<dyn ClientPersistence>;
 
+/////////////////////////////////////////////////////////////////////////////
+//                          PersistenceType
+/////////////////////////////////////////////////////////////////////////////
+
+/// The type of persistence for the client.
+///
+/// There is a built-in mechanism for using the file system to persist
+/// messages and data. The `File` selection will use that in the current
+/// working directory (CWD). A path can also be specified, with `FilePath`
+/// and then the persistence store will be created under that directory.
+/// Each client will create a directory under that using the MQTT client
+/// ID and server URL to name the directory. Therefore, a client ID is
+/// required by the library when using persistence.
+///
+/// The persistence type can be created from any string or path to indicate
+/// file persistence to that directory. If a directory with that name can't
+/// be found or created by the library, then a persistence error is returned
+/// when attempting to create the MQTT client object.
+#[derive(Default)]
+pub enum PersistenceType {
+    /// Messages are persisted to files in a local directory (default).
+    File,
+    /// Messages are persisted to files under the specified directory.
+    FilePath(PathBuf),
+    /// No persistence is used.
+    #[default]
+    None,
+    /// A user-defined persistence provided by the application.
+    User(UserPersistence),
+}
+
+impl fmt::Debug for PersistenceType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        use PersistenceType::*;
+        match *self {
+            File => write!(f, "File"),
+            FilePath(_) => write!(f, "File with Path"),
+            None => write!(f, "None"),
+            User(_) => write!(f, "User"),
+        }
+    }
+}
+
+impl From<&str> for PersistenceType {
+    /// A string slice can be used to create a file path persistence.
+    fn from(path: &str) -> Self {
+        PersistenceType::FilePath(PathBuf::from(path))
+    }
+}
+
+impl From<String> for PersistenceType {
+    /// A string can be used to create a file path persistence.
+    fn from(path: String) -> Self {
+        PersistenceType::FilePath(PathBuf::from(path))
+    }
+}
+
+impl From<&Path> for PersistenceType {
+    /// A path can be used to create a file path persistence.
+    fn from(path: &Path) -> Self {
+        PersistenceType::FilePath(path.into())
+    }
+}
+
+impl From<PathBuf> for PersistenceType {
+    /// A path buffer can be used to create a file path persistence.
+    fn from(path: PathBuf) -> Self {
+        PersistenceType::FilePath(path)
+    }
+}
+
+impl From<Option<PersistenceType>> for PersistenceType {
+    fn from(opt: Option<PersistenceType>) -> Self {
+        match opt {
+            Some(typ) => typ,
+            None => PersistenceType::None,
+        }
+    }
+}
+
+/////////////////////////////////////////////////////////////////////////////
+//                       ClientPersistence trait
 /////////////////////////////////////////////////////////////////////////////
 
 /// Trait to implement custom persistence in the client.
@@ -78,6 +170,8 @@ pub trait ClientPersistence: Send {
 }
 
 /////////////////////////////////////////////////////////////////////////////
+//                          UserPersistence
+/////////////////////////////////////////////////////////////////////////////
 
 /// A struct to wrap the user-defined client persistence objects for the
 /// C library, including the callback funtions from the C library.
@@ -99,7 +193,8 @@ impl UserPersistence {
     /// Gets the FFI C structure for this object.
     /// TODO: Figure out how to mark this with a lifetime matched to self
     pub(crate) fn c_struct(&self) -> ffi::MQTTClient_persistence {
-        let context = &*self.0 as *const ClientPersistenceBox as *mut ClientPersistenceBox as _;
+        let context =
+            &*self.0 as *const ClientPersistenceBox as *mut ClientPersistenceBox as _;
 
         ffi::MQTTClient_persistence {
             context,
@@ -131,7 +226,10 @@ impl UserPersistence {
         context: *mut c_void,
     ) -> c_int {
         trace!("UserPersistence::on_open");
-        if !handle.is_null() && !client_id.is_null() && !server_uri.is_null() && !context.is_null()
+        if !handle.is_null()
+            && !client_id.is_null()
+            && !server_uri.is_null()
+            && !context.is_null()
         {
             let client_id = CStr::from_ptr(client_id).to_str().unwrap();
             let server_uri = CStr::from_ptr(server_uri).to_str().unwrap();
@@ -249,7 +347,10 @@ impl UserPersistence {
     /// This is a callback directly from the C library. All parameters
     /// parameters must be checked for validity (NULL pointers, etc)
     ///
-    pub(crate) unsafe extern "C" fn on_remove(handle: *mut c_void, key: *mut c_char) -> c_int {
+    pub(crate) unsafe extern "C" fn on_remove(
+        handle: *mut c_void,
+        key: *mut c_char,
+    ) -> c_int {
         trace!("UserPersistence::on_remove");
         if handle.is_null() || key.is_null() {
             return PERSISTENCE_ERROR;
@@ -292,7 +393,8 @@ impl UserPersistence {
                 let n = k.len();
                 if n != 0 {
                     // TODO OPTIMIZE: This does a lot of copying
-                    let ckeys = libc::malloc(n * mem::size_of::<usize>()) as *mut *mut c_char;
+                    let ckeys =
+                        libc::malloc(n * mem::size_of::<usize>()) as *mut *mut c_char;
                     for (i, s) in k.into_iter().enumerate() {
                         let s = CString::new(s).unwrap();
                         let sb = s.as_bytes_with_nul();

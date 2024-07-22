@@ -119,7 +119,10 @@ impl ServerResponse {
     /// successful action. It directly accesses the pointers and unions
     /// in the C `MQTTAsync_successData` struct.
     ///
-    pub unsafe fn from_success(req: ServerRequest, rsp: &ffi::MQTTAsync_successData) -> Self {
+    pub unsafe fn from_success(
+        req: ServerRequest,
+        rsp: &ffi::MQTTAsync_successData,
+    ) -> Self {
         use ServerRequest::*;
 
         let rsp = match req {
@@ -165,7 +168,10 @@ impl ServerResponse {
     /// successful v5 action. It directly accesses the pointers and unions
     /// in the C `MQTTAsync_successData5` struct.
     ///
-    pub unsafe fn from_success5(req: ServerRequest, rsp: &ffi::MQTTAsync_successData5) -> Self {
+    pub unsafe fn from_success5(
+        req: ServerRequest,
+        rsp: &ffi::MQTTAsync_successData5,
+    ) -> Self {
         use ServerRequest::*;
 
         let props = Properties::from_c_struct(&rsp.properties);
