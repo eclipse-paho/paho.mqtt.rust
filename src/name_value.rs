@@ -10,7 +10,7 @@
 //
 
 /*******************************************************************************
- * Copyright (c) 2020-2022 Frank Pagliughi <fpagliughi@mindspring.com>
+ * Copyright (c) 2020-2024 Frank Pagliughi <fpagliughi@mindspring.com>
  *
  * All rights reserved. This program and the accompanying materials
  * are made available under the terms of the Eclipse Public License v2.0
@@ -148,6 +148,16 @@ impl Clone for NameValueCollection {
 
 impl From<HashMap<&str, &str>> for NameValueCollection {
     fn from(hmap: HashMap<&str, &str>) -> Self {
+        let v: Vec<(CString, CString)> = hmap
+            .into_iter()
+            .map(|(n, v)| (CString::new(n).unwrap(), CString::new(v).unwrap()))
+            .collect();
+        Self::from_data(NameValueData { coll: v })
+    }
+}
+
+impl From<HashMap<String, String>> for NameValueCollection {
+    fn from(hmap: HashMap<String, String>) -> Self {
         let v: Vec<(CString, CString)> = hmap
             .into_iter()
             .map(|(n, v)| (CString::new(n).unwrap(), CString::new(v).unwrap()))

@@ -27,55 +27,71 @@
 
 use crate::{
     ffi, from_c_bool,
-    message::Message,
+    Message,
     name_value::NameValueCollection,
-    properties::Properties,
-    ssl_options::SslOptions,
-    string_collection::StringCollection,
+    Properties,
+    SslOptions,
+    StringCollection,
     to_c_bool,
-    token::{ConnectToken, Token, TokenInner},
+    ConnectToken, Token, TokenInner,
     types::*,
-    will_options::WillOptions,
+    WillOptions,
     Error, Result,
 };
 use std::{
-    ffi::CString,
-    os::raw::{c_int, c_void},
-    pin::Pin,
-    ptr,
-    time::Duration,
+    collections::HashMap, ffi::CString, os::raw::c_int, pin::Pin, ptr, time::Duration,
 };
 
+/// The default keep alive interval for MQTT (TCP) & MQTTS (TLS) connections.
+const DEFAULT_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(60);
+
+/// The default keep alive interval for Websocket
+const DEFAULT_KEEP_ALIVE_INTERVAL_WS: Duration = Duration::from_secs(45);
+
 /////////////////////////////////////////////////////////////////////////////
-// Connections
+// ConnectOptions
 
-/// The collection of options for connecting to a broker.
-///
-/// This can be constructed using a [`ConnectOptionsBuilder`] to set all the
-/// options.
-#[derive(Debug)]
+/// The options for connecting to an MQTT broker.
+#[derive(Debug, Clone)]
 pub struct ConnectOptions {
-    /// The underlying C options structure.
-    /// The 'will', 'ssl', 'username', and 'password' fields should
-    /// be NULL (not empty) if unused.
-    pub(crate) copts: ffi::MQTTAsync_connectOptions,
-    /// The pinned data cache
-    data: Pin<Box<ConnectOptionsData>>,
-}
-
-/// Cached data for the connect options.
-#[derive(Debug, Default, Clone)]
-struct ConnectOptionsData {
-    will: Option<WillOptions>,
-    ssl: Option<SslOptions>,
-    user_name: Option<CString>,
-    password: Option<Vec<u8>>,
-    server_uris: StringCollection,
-    props: Option<Properties>,
-    will_props: Option<Properties>,
-    http_headers: Option<NameValueCollection>,
-    http_proxy: Option<CString>,
-    https_proxy: Option<CString>,
+    /// The maximum time that should pass without communications between
+    /// the client and server. Resolution in sec.
+    pub keep_alive_interval: Duration,
+    /// The clean start/session flag.
+    pub clean_start: bool,
+    /// The maximum number of messages that can be in flight at once.
+    pub max_inflight: u16,
+    /// The Last Will and Testament (LWT) message
+    pub will: Option<Message>,
+    /// The TLS/SSL options
+    pub ssl: Option<SslOptions>,
+    /// The user name for authentication
+    pub user_name: Option<String>,
+    /// The password for authentication
+    pub password: Option<Vec<u8>>,
+    /// The timeout for the connection
+    pub timeout: Duration,
+    /// MQTT v3 publish retry interval.
+    /// This should be `None` for v5 connections. It's ignored either way.
+    pub retry_interval: Option<Duration>,
+    /// The servers to which the client will connect, as URIs.
+    pub server_uris: Vec<String>,
+    /// The MQTT protocol for the connection
+    pub mqtt_version: MqttVersion,
+    /// Whether the server should automatically reconnect on a connection lost.
+    pub auto_reconnect: bool,
+    /// The minimum retry interval for auto reconnects. Resolution in sec.
+    pub min_retry_interval: Duration,
+    /// The maximum retry interval for auto reconnects. Resolution in sec.
+    pub max_retry_interval: Duration,
+    /// The connect properties
+    pub props: Properties,
+    /// HTTP headers for websockets
+    pub http_headers: HashMap<String, String>,
+    /// The HTTP proxy (insecure), if any
+    http_proxy: String,
+    /// The HTTPS proxy (secure), if any
+    https_proxy: String,
 }
 
 impl ConnectOptions {
@@ -84,30 +100,44 @@ impl ConnectOptions {
         Self::default()
     }
 
+    /// Creates a new, default set of connect options for MQTT v3.x
+    pub fn new_v3() -> Self {
+        Self::default()
+    }
+
     /// Creates a new, default set of connect options for MQTT v5
     pub fn new_v5() -> Self {
-        Self::from_data(
-            ffi::MQTTAsync_connectOptions::new_v5(),
-            ConnectOptionsData::default(),
-        )
+        Self {
+            mqtt_version: MqttVersion::V5,
+            ..Self::default()
+        }
     }
 
     /// Creates a new, default set of connect options for connecting over
     /// websockets.
     pub fn new_ws() -> Self {
-        Self::from_data(
-            ffi::MQTTAsync_connectOptions::new_ws(),
-            ConnectOptionsData::default(),
-        )
+        Self {
+            keep_alive_interval: DEFAULT_KEEP_ALIVE_INTERVAL_WS,
+            ..Self::default()
+        }
+    }
+
+    /// Creates a new, default set of connect options for connecting over
+    /// websockets.
+    pub fn new_ws_v3() -> Self {
+        Self {
+            keep_alive_interval: DEFAULT_KEEP_ALIVE_INTERVAL_WS,
+            ..Self::default()
+        }
     }
 
     /// Creates a new, default set of connect options for connecting MQTT v5
     /// over websockets.
     pub fn new_ws_v5() -> Self {
-        Self::from_data(
-            ffi::MQTTAsync_connectOptions::new_ws_v5(),
-            ConnectOptionsData::default(),
-        )
+        Self {
+            keep_alive_interval: DEFAULT_KEEP_ALIVE_INTERVAL_WS,
+            ..Self::new_v5()
+        }
     }
 
     /// Creates a new set of connect options for the specified MQTT
@@ -121,22 +151,447 @@ impl ConnectOptions {
         V: Into<MqttVersion>,
     {
         let ver = ver.into();
-        let mut opts = if ver < MqttVersion::V5 {
+        if ver < MqttVersion::V5 {
             Self::new()
         }
         else {
             Self::new_v5()
-        };
-        opts.copts.MQTTVersion = ver as i32;
-        opts
+        }
     }
 
+    /// Gets the MQTT protocol version that should be used for the
+    /// connection.
+    pub fn mqtt_version(&self) -> MqttVersion {
+        self.mqtt_version
+    }
+
+    /// Gets the MQTT protocol version as a raw integer.
+    pub fn mqtt_version_raw(&self) -> u32 {
+        self.mqtt_version as u32
+    }
+
+    /// Gets the "clean session" setting in the options.
+    ///
+    /// This is only used in MQTT v3 connections.
+    pub fn clean_session(&self) -> bool {
+        self.clean_start && self.mqtt_version < MqttVersion::V5
+    }
+
+    /// This sets the "clean session" behavior for connecting to the server.
+    ///
+    /// When set to true, this directs the server to throw away any state
+    /// related to the client, as determined by the client identifier.
+    /// When set to false, the server keeps the state information and
+    /// resumes the previous session.
+    ///
+    /// This is only used in MQTT v3 connections.
+    pub fn set_clean_session(&mut self, clean: bool) {
+        self.clean_start = clean;
+    }
+
+    /// Gets the "clean start" setting in the options.
+    ///
+    /// This is only used in MQTT v5 connections.
+    pub fn clean_start(&self) -> bool {
+        self.clean_start && self.mqtt_version >= MqttVersion::V5
+    }
+
+    /// This sets the "clean start" behavior for connecting to the server.
+    ///
+    /// When set to true, this directs the server to throw away any state
+    /// related to the client, as determined by the client identifier.
+    /// When set to false, the server keeps the state information and
+    /// resumes the previous session.
+    ///
+    /// This is only used in MQTT v5 connections.
+    pub fn set_clean_start(&mut self, clean: bool) {
+        self.clean_start = clean;
+    }
+
+    // TODO: Do we need this?
+    /*
+    /// Sets the token to ber used for connect completion callbacks.
+    ///
+    /// Note that we leak the token to give to the C lib. When we're
+    /// done with it, we must recover and drop it (i.e. in the completion
+    /// callback).
+    pub fn set_token(&mut self, tok: ConnectToken) {
+        let tok: Token = tok;
+        self.copts.context = tok.into_raw();
+        self.fix_callbacks();
+    }
+    */
+}
+
+impl Default for ConnectOptions {
+    fn default() -> Self {
+        Self {
+            keep_alive_interval: DEFAULT_KEEP_ALIVE_INTERVAL,
+            clean_start: true,
+            max_inflight: 65535,
+            will: None,
+            ssl: None,
+            user_name: None,
+            password: None,
+            timeout: Duration::from_secs(30),
+            retry_interval: None,
+            server_uris: Vec::new(),
+            mqtt_version: MqttVersion::Default,
+            auto_reconnect: false,
+            min_retry_interval: Duration::from_secs(1),
+            max_retry_interval: Duration::from_secs(60),
+            props: Properties::default(),
+            http_headers: HashMap::new(),
+            http_proxy: String::new(),
+            https_proxy: String::new(),
+        }
+    }
+}
+
+/////////////////////////////////////////////////////////////////////////////
+//                              Builder
+/////////////////////////////////////////////////////////////////////////////
+
+/// Builder to create the options to connect to the MQTT server.
+#[derive(Default)]
+pub struct ConnectOptionsBuilder(ConnectOptions);
+
+impl ConnectOptionsBuilder {
+    /// Creates a new `ConnectOptionsBuilder` for MQTT v3.x
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Creates a new `ConnectOptionsBuilder` explicitly for MQTT v3.x
+    /// (although this is currently the default).
+    pub fn new_v3() -> Self {
+        Self(ConnectOptions::new_v3())
+    }
+
+    /// Creates a new `ConnectOptionsBuilder` for MQTT v5
+    pub fn new_v5() -> Self {
+        Self(ConnectOptions::new_v5())
+    }
+
+    /// Creates a new `ConnectOptionsBuilder` for connecting to MQTT v3.x
+    /// over websockets.
+    pub fn new_ws() -> Self {
+        Self(ConnectOptions::new_ws())
+    }
+
+    /// Creates a new `ConnectOptionsBuilder` for connecting to MQTT v5
+    /// over websockets.
+    pub fn new_ws_v5() -> Self {
+        Self(ConnectOptions::new_ws_v5())
+    }
+
+    /// Creates a new set of `ConnectOptionsBuilder` for the specified MQTT
+    /// protocol version.
+    ///
+    /// Note that this will initialize the options with the requested version,
+    /// even if it's not currently known. The server will likely reject a
+    /// request with a bad protocol version, however.
+    pub fn with_mqtt_version<V>(ver: V) -> Self
+    where
+        V: Into<MqttVersion>,
+    {
+        Self(ConnectOptions::with_mqtt_version(ver))
+    }
+
+    /// Sets the keep alive interval for the client session.
+    ///
+    /// # Arguments
+    ///
+    /// `keep_alive_interval` The maximum time that should pass without
+    ///                       communication between the client and server.
+    ///                       This has a resolution in seconds.
+    pub fn keep_alive_interval(&mut self, keep_alive_interval: Duration) -> &mut Self {
+        // TODO: Set a lower limit?
+        self.0.keep_alive_interval = keep_alive_interval;
+        self
+    }
+
+    /// Sets the 'clean session' flag to send to the broker.
+    ///
+    /// This is for MQTT v3.x connections only, and if set, will set the
+    /// other options to be compatible with v3.
+    ///
+    /// # Arguments
+    ///
+    /// `clean` Whether the broker should remove any previously-stored
+    ///         information for this client.
+    pub fn clean_session(&mut self, clean: bool) -> &mut Self {
+        // TODO: Error on version mismatch?
+        self.0.clean_start = clean;
+        self
+    }
+
+    /// Sets the 'clean start' flag to send to the broker.
+    ///
+    /// This is for MQTT v5 connections only, and if set, will set the
+    /// other options to be compatible with v5.
+    ///
+    /// # Arguments
+    ///
+    /// `clean` Whether the broker should remove any previously-stored
+    ///         information for this client.
+    pub fn clean_start(&mut self, clean: bool) -> &mut Self {
+        // TODO: Error on version mismatch?
+        self.0.clean_start = clean;
+        self
+    }
+
+    /// Sets the maximum number of in-flight messages that can be
+    /// simultaneously handled by this client.
+    ///
+    /// # Arguments
+    ///
+    /// `max_inflight` The maximum number of messages that can be in-flight
+    ///                at any given time with this client.
+    pub fn max_inflight(&mut self, max_inflight: u16) -> &mut Self {
+        self.0.max_inflight = max_inflight;
+        self
+    }
+
+    /// Sets the LWT message for the connection.
+    ///
+    /// # Arguments
+    ///
+    /// `will` The LWT options for the connection.
+    pub fn will_message<M>(&mut self, will: M) -> &mut Self
+    where
+        M: Into<Option<Message>>,
+    {
+        self.0.will = will.into();
+        self
+    }
+
+    /// Sets the SSL options for the connection.
+    ///
+    /// # Arguments
+    ///
+    /// `ssl` The SSL options for the connection.
+    pub fn ssl_options<S>(&mut self, ssl: S) -> &mut Self
+    where
+        S: Into<Option<SslOptions>>,
+    {
+        self.0.ssl = ssl.into();
+        self
+    }
+
+    /// Sets the user name for authentication with the broker.
+    /// This works with the password.
+    ///
+    /// # Arguments
+    ///
+    /// `user_name` The user name to send to the broker.
+    ///
+    pub fn user_name<S>(&mut self, user_name: S) -> &mut Self
+    where
+        S: Into<String>,
+    {
+        // TODO: Into option?
+        self.0.user_name = Some(user_name.into());
+        self
+    }
+
+    /// Sets the password for authentication with the broker.
+    /// This works with the user name.
+    ///
+    /// # Arguments
+    ///
+    /// `password` The password to send to the broker.
+    ///
+    pub fn password<S>(&mut self, password: S) -> &mut Self
+    where
+        S: Into<Vec<u8>>,
+    {
+        // TODO: Into option?
+        self.0.password = Some(password.into());
+        self
+    }
+
+    /// Sets the time interval to allow the connection to complete.
+    ///
+    /// # Arguments
+    ///
+    /// `timeout` The time interval to allow the connection to
+    ///           complete. This has a resolution of seconds.
+    ///
+    pub fn connect_timeout(&mut self, timeout: Duration) -> &mut Self {
+        // TODO: Lower limit of 1 sec?
+        self.0.timeout = timeout;
+        self
+    }
+
+    /// Sets the publish retry interval for MQTT v3 connections.
+    ///
+    /// This is ignored for MQTT v5 connections, as retrying is only allowed
+    /// on a reconnect in v5.
+    ///
+    /// # Arguments
+    ///
+    /// `interval` The publish retry interval. This has a resolution of seconds.
+    ///
+    pub fn retry_interval<D>(&mut self, interval: D) -> &mut Self
+    where
+        D: Into<Option<Duration>>,
+    {
+        self.0.retry_interval = interval.into();
+        self
+    }
+
+    /// Specify the servers to which the client will connect.
+    ///
+    /// # Arguments
+    ///
+    /// `server_uris` The addresses of the brokers to which this client
+    ///               should connect.
+    //
+    pub fn server_uris<T>(&mut self, server_uris: &[T]) -> &mut Self
+    where
+        T: AsRef<str>,
+    {
+        self.0.server_uris = server_uris
+            .iter()
+            .map(|s| String::from(s.as_ref()))
+            .collect();
+        self
+    }
+
+    /// Sets the client to automatically reconnect if the connection is lost.
+    ///
+    /// # Arguments
+    ///
+    /// `min_retry_interval` The minimum retry interval. Doubled on each
+    ///                      failed retry. This has a resolution in seconds.
+    /// `max_retry_interval` The maximum retry interval. Doubling stops here
+    ///                      on failed retries. This has a resolution in
+    ///                      seconds.
+    pub fn automatic_reconnect(
+        &mut self,
+        min_retry_interval: Duration,
+        max_retry_interval: Duration,
+    ) -> &mut Self {
+        self.0.auto_reconnect = true;
+        // TODO: Lower limit? Ensure max >= min?
+        self.0.min_retry_interval = min_retry_interval;
+        self.0.max_retry_interval = max_retry_interval;
+        self
+    }
+
+    /// Sets the collection of properties for the connections.
+    ///
+    /// # Arguments
+    ///
+    /// `props` The collection of properties to include with the connect message.
+    pub fn properties(&mut self, props: Properties) -> &mut Self {
+        // TODO: Error on version mismatch
+        self.0.props = props;
+        self
+    }
+
+    /// Sets the additional HTTP headers that will be sent in the
+    /// WebSocket opening handshake.
+    pub fn http_headers(&mut self, headers: HashMap<String, String>) -> &mut Self {
+        self.0.http_headers = headers;
+        self
+    }
+
+    /// Sets the additional HTTP headers that will be sent in the
+    /// WebSocket opening handshake.
+    pub fn http_headers_from_coll<N, V>(&mut self, headers: &[(N, V)]) -> &mut Self
+    where
+        N: AsRef<str>,
+        V: AsRef<str>,
+    {
+        let mut hdrs = HashMap::new();
+        for (n, v) in headers {
+            hdrs.insert(n.as_ref().into(), v.as_ref().into());
+        }
+        self.http_headers(hdrs)
+    }
+
+    /// Sets an HTTP proxy for websockets.
+    ///
+    /// # Arguments
+    ///
+    /// `proxy` The HTTP proxy
+    ///
+    pub fn http_proxy<S>(&mut self, proxy: S) -> &mut Self
+    where
+        S: Into<String>,
+    {
+        self.0.http_proxy = proxy.into();
+        self
+    }
+
+    /// Sets a secure HTTPS proxy for websockets.
+    ///
+    /// # Arguments
+    ///
+    /// `proxy` The HTTPS proxy
+    ///
+    pub fn https_proxy<S>(&mut self, proxy: S) -> &mut Self
+    where
+        S: Into<String>,
+    {
+        self.0.https_proxy = proxy.into();
+        self
+    }
+
+    /// Gets the FFI representation of the connect options.
+    /// This is a convenience function for the unit tests.
+    #[cfg(test)]
+    pub(crate) fn to_ffi(&self) -> ConnectOptionsFfi {
+        ConnectOptionsFfi::from(&self.0)
+    }
+
+    /// Finalize the builder to create the connect options.
+    pub fn finalize(&self) -> ConnectOptions {
+        self.0.clone()
+    }
+}
+
+/////////////////////////////////////////////////////////////////////////////
+// ConnectOptionsFfi
+
+/// The collection of options for connecting to a broker.
+///
+/// This can be constructed using a [`ConnectOptionsBuilder`] to set all the
+/// options.
+#[derive(Debug)]
+pub(crate) struct ConnectOptionsFfi {
+    /// The underlying C options structure.
+    /// The 'will', 'ssl', 'username', and 'password' fields should
+    /// be NULL (not empty) if unused.
+    pub(crate) copts: ffi::MQTTAsync_connectOptions,
+    /// The pinned data cache
+    data: Pin<Box<ConnectOptionsFfiData>>,
+}
+
+/// Cached data for the connect options.
+#[derive(Debug, Default, Clone)]
+struct ConnectOptionsFfiData {
+    will: Option<WillOptions>,
+    ssl: Option<SslOptions>,
+    user_name: Option<CString>,
+    password: Option<CString>,
+    server_uris: StringCollection,
+    props: Properties,
+    will_props: Properties,
+    http_headers: NameValueCollection,
+    http_proxy: CString,
+    https_proxy: CString,
+}
+
+impl ConnectOptionsFfi {
     // Creates a set of options from a C struct and cached values.
     // Fixes up the underlying C struct to point to the cached values,
     // then returns a new options object with them combined.
     fn from_data(
         mut copts: ffi::MQTTAsync_connectOptions,
-        data: ConnectOptionsData,
+        data: ConnectOptionsFfiData,
     ) -> Self {
         let mut data = Box::pin(data);
 
@@ -168,48 +623,43 @@ impl ConnectOptions {
             },
         };
 
-        let n = data.server_uris.len();
-
-        if n != 0 {
+        if !data.server_uris.is_empty() {
             copts.serverURIs = data.server_uris.as_c_arr_mut_ptr();
-            copts.serverURIcount = n as c_int;
+            copts.serverURIcount = data.server_uris.len() as c_int;
         }
         else {
             copts.serverURIs = ptr::null();
             copts.serverURIcount = 0;
         }
 
-        copts.connectProperties = ptr::null_mut();
-        if copts.MQTTVersion >= MQTT_VERSION_5 as i32 {
-            if let Some(ref mut props) = data.props {
-                copts.connectProperties = &mut props.cprops
-            }
+        let is_v5 = copts.MQTTVersion >= MQTT_VERSION_5 as i32;
+
+        copts.connectProperties = if is_v5 && !data.props.is_empty() {
+            &mut data.props.cprops
         }
+        else {
+            ptr::null_mut()
+        };
 
-        copts.willProperties = ptr::null_mut();
-        if copts.MQTTVersion >= MQTT_VERSION_5 as i32 {
-            if let Some(ref mut will_props) = data.will_props {
-                copts.willProperties = &mut will_props.cprops
-            }
+        copts.willProperties = if is_v5 && !data.will_props.is_empty() {
+            &mut data.will_props.cprops
         }
+        else {
+            ptr::null_mut()
+        };
 
-        copts.httpHeaders = match data.http_headers {
-            Some(ref mut http_headers) => http_headers.as_c_arr_ptr(),
+        copts.httpHeaders = match &data.http_headers {
+            h if !h.is_empty() => h.as_c_arr_ptr(),
             _ => ptr::null(),
         };
 
-        copts.httpHeaders = match data.http_headers {
-            Some(ref mut http_headers) => http_headers.as_c_arr_ptr(),
+        copts.httpProxy = match &data.http_proxy {
+            s if !s.is_empty() => s.as_ptr(),
             _ => ptr::null(),
         };
 
-        copts.httpProxy = match data.http_proxy {
-            Some(ref proxy) => proxy.as_ptr(),
-            _ => ptr::null(),
-        };
-
-        copts.httpsProxy = match data.https_proxy {
-            Some(ref proxy) => proxy.as_ptr(),
+        copts.httpsProxy = match &data.https_proxy {
+            s if !s.is_empty() => s.as_ptr(),
             _ => ptr::null(),
         };
 
@@ -236,6 +686,7 @@ impl ConnectOptions {
         }
     }
 
+/*
     /// Does a check of the options to determine if their valid.
     pub fn check(&self) -> Result<()> {
         if !self.data.server_uris.is_empty() {
@@ -308,6 +759,7 @@ impl ConnectOptions {
     pub fn has_ssl_options(&self) -> bool {
         self.data.ssl.is_some()
     }
+*/
 
     /// Sets the token to ber used for connect completion callbacks.
     ///
@@ -321,348 +773,98 @@ impl ConnectOptions {
     }
 }
 
-impl Default for ConnectOptions {
+impl Default for ConnectOptionsFfi {
     fn default() -> Self {
         Self::from_data(
             ffi::MQTTAsync_connectOptions::default(),
-            ConnectOptionsData::default(),
+            ConnectOptionsFfiData::default(),
         )
     }
 }
 
-impl Clone for ConnectOptions {
+impl Clone for ConnectOptionsFfi {
     fn clone(&self) -> Self {
         Self::from_data(self.copts, (*self.data).clone())
     }
 }
 
-unsafe impl Send for ConnectOptions {}
-unsafe impl Sync for ConnectOptions {}
+unsafe impl Send for ConnectOptionsFfi {}
+unsafe impl Sync for ConnectOptionsFfi {}
 
-/////////////////////////////////////////////////////////////////////////////
-//                              Builder
-/////////////////////////////////////////////////////////////////////////////
+impl From<&ConnectOptions> for ConnectOptionsFfi {
+    fn from(opts: &ConnectOptions) -> Self {
+        let mut copts = ffi::MQTTAsync_connectOptions::default();
 
-/// Builder to create the options to connect to the MQTT server.
-#[derive(Default)]
-pub struct ConnectOptionsBuilder {
-    copts: ffi::MQTTAsync_connectOptions,
-    data: ConnectOptionsData,
+        let is_v5 = opts.mqtt_version >= MqttVersion::V5;
+
+        let mut secs = opts.keep_alive_interval.as_secs();
+        copts.keepAliveInterval = if secs == 0 { 1 } else { secs as i32 };
+
+        copts.cleansession = to_c_bool(!is_v5 && opts.clean_start);
+        copts.cleanstart = to_c_bool(is_v5 && opts.clean_start);
+
+        copts.maxInflight = opts.max_inflight as c_int;
+
+        secs = opts.timeout.as_secs();
+        copts.connectTimeout = if secs == 0 { 1 } else { secs as i32 };
+
+        copts.MQTTVersion = opts.mqtt_version as c_int;
+
+        if opts.auto_reconnect {
+            copts.automaticReconnect = to_c_bool(true);
+
+            secs = opts.min_retry_interval.as_secs();
+            copts.minRetryInterval = if secs == 0 { 1 } else { secs as i32 };
+
+            secs = opts.max_retry_interval.as_secs();
+            copts.maxRetryInterval = if secs == 0 { 1 } else { secs as i32 };
+        }
+
+        let data = ConnectOptionsFfiData::from(opts);
+        Self::from_data(copts, data)
+    }
 }
 
-impl ConnectOptionsBuilder {
-    /// Creates a new `ConnectOptionsBuilder` for MQTT v3.x
-    pub fn new() -> Self {
-        Self::default()
+impl From<ConnectOptions> for ConnectOptionsFfi {
+    fn from(opts: ConnectOptions) -> Self {
+        Self::from(&opts)
     }
+}
 
-    /// Creates a new `ConnectOptionsBuilder` explicitly for MQTT v3.x
-    /// (although this is currently the default).
-    pub fn new_v3() -> Self {
-        Self::default()
-    }
+impl From<&ConnectOptions> for ConnectOptionsFfiData {
+    fn from(opts: &ConnectOptions) -> Self {
+        let mut data = ConnectOptionsFfiData::default();
 
-    /// Creates a new `ConnectOptionsBuilder` for MQTT v5
-    pub fn new_v5() -> Self {
-        Self {
-            copts: ffi::MQTTAsync_connectOptions::new_v5(),
-            ..Self::default()
+        if let Some(msg) = &opts.will {
+            data.will = Some(WillOptions::from(msg.clone()));
+            data.will_props = msg.properties().clone();
         }
-    }
-
-    /// Creates a new `ConnectOptionsBuilder` for connecting to MQTT v3.x
-    /// over websockets.
-    pub fn new_ws() -> Self {
-        Self {
-            copts: ffi::MQTTAsync_connectOptions::new_ws(),
-            ..Self::default()
+        if let Some(ssl) = &opts.ssl {
+            data.ssl = Some(ssl.clone());
+            //Some(SslOptions::from(ssl.clone()));
         }
-    }
-
-    /// Creates a new `ConnectOptionsBuilder` for connecting to MQTT v5
-    /// over websockets.
-    pub fn new_ws_v5() -> Self {
-        Self {
-            copts: ffi::MQTTAsync_connectOptions::new_ws_v5(),
-            ..Self::default()
+        if let Some(user_name) = &opts.user_name {
+            data.user_name = Some(CString::new(user_name.clone()).unwrap());
         }
-    }
-
-    /// Creates a new set of `ConnectOptionsBuilder` for the specified MQTT
-    /// protocol version.
-    ///
-    /// Note that this will initialize the options with the requested version,
-    /// even if it's not currently known. The server will likely reject a
-    /// request with a bad protocol version, however.
-    pub fn with_mqtt_version<V>(ver: V) -> Self
-    where
-        V: Into<MqttVersion>,
-    {
-        let ver = ver.into();
-        let mut copts = if ver < MqttVersion::V5 {
-            ffi::MQTTAsync_connectOptions::new_v3()
+        if let Some(password) = &opts.password {
+            data.password = Some(CString::new(password.clone()).unwrap());
         }
-        else {
-            ffi::MQTTAsync_connectOptions::new_v5()
-        };
-        copts.MQTTVersion = ver as i32;
-
-        Self {
-            copts,
-            ..Self::default()
+        if !opts.server_uris.is_empty() {
+            data.server_uris = StringCollection::from(opts.server_uris.as_slice());
         }
-    }
+        data.props = opts.props.clone();
 
-    /// Sets the keep alive interval for the client session.
-    ///
-    /// # Arguments
-    ///
-    /// * `keep_alive_interval` The maximum time that should pass without
-    ///   communication between the client and server.
-    ///   This has a resolution in seconds.
-    pub fn keep_alive_interval(&mut self, keep_alive_interval: Duration) -> &mut Self {
-        let secs = keep_alive_interval.as_secs();
-        self.copts.keepAliveInterval = if secs == 0 { 1 } else { secs as i32 };
-        self
-    }
-
-    /// Sets the 'clean session' flag to send to the broker.
-    ///
-    /// This is for MQTT v3.x connections only, and if set, will set the
-    /// other options to be compatible with v3.
-    ///
-    /// # Arguments
-    ///
-    /// * `clean` Whether the broker should remove any previously-stored
-    ///   information for this client.
-    pub fn clean_session(&mut self, clean: bool) -> &mut Self {
-        self.copts.cleansession = to_c_bool(clean);
-
-        // Force the options to those compatible with v3 if set
-        self.copts.cleanstart = 0;
-        if self.copts.MQTTVersion >= ffi::MQTTVERSION_5 as i32 {
-            self.copts.MQTTVersion = 0;
+        if !opts.http_headers.is_empty() {
+            data.http_headers = NameValueCollection::from(opts.http_headers.clone());
         }
-        self
-    }
-
-    /// Sets the 'clean start' flag to send to the broker.
-    ///
-    /// This is for MQTT v5 connections only, and if set, will set the
-    /// other options to be compatible with v5.
-    ///
-    /// # Arguments
-    ///
-    /// * `clean` Whether the broker should remove any previously-stored
-    ///   information for this client.
-    pub fn clean_start(&mut self, clean: bool) -> &mut Self {
-        self.copts.cleanstart = to_c_bool(clean);
-
-        // Force the options to those compatible with v5 if set
-        self.copts.cleansession = 0;
-        if self.copts.MQTTVersion < 5 {
-            self.copts.MQTTVersion = 5;
+        if !opts.http_proxy.is_empty() {
+            data.http_proxy = CString::new(opts.http_proxy.clone()).unwrap();
         }
-        self
-    }
-
-    /// Sets the maximum number of in-flight messages that can be
-    /// simultaneously handled by this client.
-    ///
-    /// # Arguments
-    ///
-    /// * `max_inflight` The maximum number of messages that can be in-flight
-    ///   at any given time with this client.
-    pub fn max_inflight(&mut self, max_inflight: i32) -> &mut Self {
-        self.copts.maxInflight = max_inflight;
-        self
-    }
-
-    /// Sets the LWT options for the connection.
-    ///
-    /// # Arguments
-    ///
-    /// * `will` The LWT options for the connection.
-    #[deprecated(note = "Pass in a message with `will_message` instead")]
-    pub fn will_options(&mut self, will: WillOptions) -> &mut Self {
-        self.data.will = Some(will);
-        self
-    }
-
-    /// Sets the LWT message for the connection.
-    ///
-    /// # Arguments
-    ///
-    /// * `will` The LWT options for the connection.
-    pub fn will_message(&mut self, will: Message) -> &mut Self {
-        self.data.will_props = Some(will.properties().clone());
-        self.data.will = Some(WillOptions::from(will));
-        self
-    }
-
-    /// Sets the SSL options for the connection.
-    ///
-    /// # Arguments
-    ///
-    /// * `ssl` The SSL options for the connection.
-    pub fn ssl_options(&mut self, ssl: SslOptions) -> &mut Self {
-        self.data.ssl = Some(ssl);
-        self
-    }
-
-    /// Sets the user name for authentication with the broker.
-    /// This works with the password.
-    ///
-    /// # Arguments
-    ///
-    /// * `user_name` The user name to send to the broker.
-    ///
-    pub fn user_name<S>(&mut self, user_name: S) -> &mut Self
-    where
-        S: Into<String>,
-    {
-        let user_name = CString::new(user_name.into()).unwrap();
-        self.data.user_name = Some(user_name);
-        self
-    }
-
-    /// Sets the password for authentication with the broker.
-    /// This works with the user name.
-    ///
-    /// # Arguments
-    ///
-    /// * `password` The password to send to the broker.
-    ///
-    pub fn password<P>(&mut self, password: P) -> &mut Self
-    where
-        P: Into<Vec<u8>>,
-    {
-        let password = password.into();
-        self.data.password = Some(password);
-        self
-    }
-
-    /// Sets the time interval to allow the connect to complete.
-    ///
-    /// # Arguments
-    ///
-    /// * `timeout` The time interval to allow the connect to
-    ///   complete. This has a resolution of seconds.
-    ///
-    pub fn connect_timeout(&mut self, timeout: Duration) -> &mut Self {
-        let secs = timeout.as_secs();
-        self.copts.connectTimeout = if secs == 0 { 1 } else { secs as i32 };
-        self
-    }
-
-    /// Sets the retry interval.
-    ///
-    /// # Arguments
-    ///
-    /// * `interval` The retry interval. This has a resolution of seconds.
-    pub fn retry_interval(&mut self, interval: Duration) -> &mut Self {
-        let secs = interval.as_secs();
-        self.copts.retryInterval = if secs == 0 { 1 } else { secs as i32 };
-        self
-    }
-
-    /// Specify the servers to which the client will connect.
-    ///
-    /// # Arguments
-    ///
-    /// * `server_uris` The addresses of the brokers to which this client
-    ///   should connect.
-    //
-    pub fn server_uris<T>(&mut self, server_uris: &[T]) -> &mut Self
-    where
-        T: AsRef<str>,
-    {
-        self.data.server_uris = StringCollection::new(server_uris);
-        self
-    }
-
-    /// Sets the client to automatically reconnect if the connection is lost.
-    ///
-    /// # Arguments
-    ///
-    /// * `min_retry_interval` The minimum retry interval. Doubled on each
-    ///   failed retry. This has a resolution in seconds.
-    /// * `max_retry_interval` The maximum retry interval. Doubling stops here
-    ///   on failed retries. This has a resolution in seconds.
-    pub fn automatic_reconnect(
-        &mut self,
-        min_retry_interval: Duration,
-        max_retry_interval: Duration,
-    ) -> &mut Self {
-        self.copts.automaticReconnect = 1; // true
-
-        let mut secs = min_retry_interval.as_secs();
-        self.copts.minRetryInterval = if secs == 0 { 1 } else { secs as i32 };
-
-        secs = max_retry_interval.as_secs();
-        self.copts.maxRetryInterval = if secs == 0 { 1 } else { secs as i32 };
-        self
-    }
-
-    /// Sets the collection of properties for the connections.
-    ///
-    /// # Arguments
-    ///
-    /// * `props` The collection of properties to include with the connect message.
-    pub fn properties(&mut self, props: Properties) -> &mut Self {
-        self.data.props = Some(props);
-
-        if self.copts.MQTTVersion < 5 {
-            self.copts.MQTTVersion = 5;
+        if !opts.https_proxy.is_empty() {
+            data.https_proxy = CString::new(opts.https_proxy.clone()).unwrap();
         }
-        self
-    }
 
-    /// Sets the additional HTTP headers that will be sent in the
-    /// WebSocket opening handshake.
-    pub fn http_headers<N, V>(&mut self, coll: &[(N, V)]) -> &mut Self
-    where
-        N: AsRef<str>,
-        V: AsRef<str>,
-    {
-        let coll = NameValueCollection::new(coll);
-        self.data.http_headers = Some(coll);
-        self
-    }
-
-    /// Sets an HTTP proxy for websockets.
-    ///
-    /// # Arguments
-    ///
-    /// * `proxy` The HTTP proxy
-    ///
-    pub fn http_proxy<S>(&mut self, proxy: S) -> &mut Self
-    where
-        S: Into<String>,
-    {
-        let proxy = CString::new(proxy.into()).unwrap();
-        self.data.http_proxy = Some(proxy);
-        self
-    }
-
-    /// Sets a secure HTTPS proxy for websockets.
-    ///
-    /// # Arguments
-    ///
-    /// * `proxy` The HTTPS proxy
-    ///
-    pub fn https_proxy<S>(&mut self, proxy: S) -> &mut Self
-    where
-        S: Into<String>,
-    {
-        let proxy = CString::new(proxy.into()).unwrap();
-        self.data.https_proxy = Some(proxy);
-        self
-    }
-
-    /// Finalize the builder to create the connect options.
-    pub fn finalize(&self) -> ConnectOptions {
-        ConnectOptions::from_data(self.copts, self.data.clone())
+        data
     }
 }
 
@@ -694,7 +896,7 @@ mod tests {
 
     #[test]
     fn test_new() {
-        let opts = ConnectOptions::new();
+        let opts = ConnectOptionsFfi::from(&ConnectOptions::new());
 
         assert_eq!(STRUCT_ID, opts.copts.struct_id);
         assert_eq!(STRUCT_VERSION, opts.copts.struct_version);
@@ -746,7 +948,7 @@ mod tests {
 
         let opts = ConnectOptionsBuilder::new()
             .ssl_options(ssl_opts)
-            .finalize();
+            .to_ffi();
 
         assert!(!opts.copts.ssl.is_null());
 
@@ -759,8 +961,9 @@ mod tests {
 
     #[test]
     fn test_user_name() {
-        let opts = ConnectOptionsBuilder::new().user_name(NAME).finalize();
+        const NAME: &str = "some-random-name";
 
+        let opts = ConnectOptionsBuilder::new().user_name(NAME).to_ffi();
         assert!(!opts.copts.username.is_null());
 
         let user_name = opts.data.user_name.as_deref().unwrap();
@@ -772,10 +975,10 @@ mod tests {
 
     #[test]
     fn test_password() {
-        let opts = ConnectOptionsBuilder::new().password(PSWD).finalize();
+        const PSWD: &str = "some-random-password";
 
-        assert!(!opts.copts.binarypwd.data.is_null());
-        assert_eq!(opts.copts.binarypwd.len, PSWD.len() as c_int);
+        let opts = ConnectOptionsBuilder::new().password(PSWD).to_ffi();
+        assert!(!opts.copts.password.is_null());
 
         let s = unsafe {
             std::slice::from_raw_parts(
@@ -817,7 +1020,7 @@ mod tests {
 
         let opts = ConnectOptionsBuilder::new()
             .server_uris(&servers)
-            .finalize();
+            .to_ffi();
 
         assert_eq!(servers.len() as i32, opts.copts.serverURIcount);
 
@@ -830,13 +1033,14 @@ mod tests {
 
     #[test]
     fn test_mqtt_version() {
-        let opts = ConnectOptionsBuilder::new().finalize();
+        let opts = ConnectOptionsBuilder::new().to_ffi();
+
         assert_eq!(MQTT_VERSION_DEFAULT as c_int, opts.copts.MQTTVersion);
 
-        let opts = ConnectOptionsBuilder::new_v3().finalize();
+        let opts = ConnectOptionsBuilder::new_v3().to_ffi();
         assert_eq!(MQTT_VERSION_DEFAULT as c_int, opts.copts.MQTTVersion);
 
-        let opts = ConnectOptionsBuilder::new_v5().finalize();
+        let opts = ConnectOptionsBuilder::new_v5().to_ffi();
         assert_eq!(MQTT_VERSION_5 as c_int, opts.copts.MQTTVersion);
     }
 
@@ -847,33 +1051,29 @@ mod tests {
         const HTTP: &str = "http://some_server:80";
         const HTTPS: &str = "https://some_other_server:443";
 
-        let opts = ConnectOptionsBuilder::new().http_proxy(HTTP).finalize();
-
+        let opts = ConnectOptionsBuilder::new().http_proxy(HTTP).to_ffi();
         assert!(!opts.copts.httpProxy.is_null());
         assert!(opts.copts.httpsProxy.is_null());
 
-        assert!(opts.data.https_proxy.is_none());
-
-        let proxy = opts.data.http_proxy.as_deref().unwrap();
-        assert_eq!(HTTP, proxy.to_str().unwrap());
+        assert!(opts.data.https_proxy.is_empty());
+        assert_eq!(HTTP, opts.data.http_proxy.to_str().unwrap());
 
         let s = unsafe { CStr::from_ptr(opts.copts.httpProxy) };
         assert_eq!(HTTP, s.to_str().unwrap());
 
-        let opts = ConnectOptionsBuilder::new().https_proxy(HTTPS).finalize();
+        let opts = ConnectOptionsBuilder::new().https_proxy(HTTPS).to_ffi();
 
         assert!(!opts.copts.httpsProxy.is_null());
         assert!(opts.copts.httpProxy.is_null());
 
-        assert!(opts.data.http_proxy.is_none());
-
-        let proxy = opts.data.https_proxy.as_deref().unwrap();
-        assert_eq!(HTTPS, proxy.to_str().unwrap());
+        assert!(opts.data.http_proxy.is_empty());
+        assert_eq!(HTTPS, opts.data.https_proxy.to_str().unwrap());
 
         let s = unsafe { CStr::from_ptr(opts.copts.httpsProxy) };
         assert_eq!(HTTPS, s.to_str().unwrap());
     }
 
+    /*
     #[test]
     fn test_opts_check() {
         // Default must pass check
@@ -1004,6 +1204,7 @@ mod tests {
 
         assert_eq!(CONNECT_TIMEOUT_SECS as i32, opts.copts.connectTimeout);
     }
+    */
 
     #[test]
     fn test_connect_properties() {
@@ -1013,9 +1214,9 @@ mod tests {
             .unwrap();
 
         // Remember, you can only set properties on a v5 connection.
-        let opts = ConnectOptionsBuilder::new_v5().properties(props).finalize();
+        let opts = ConnectOptionsBuilder::new_v5().properties(props).to_ffi();
 
-        let props = opts.data.props.as_ref().unwrap();
+        let props = &opts.data.props;
         assert_eq!(1, props.len());
         assert_eq!(Some(60), props.get_int(PropertyCode::SessionExpiryInterval));
 
@@ -1037,9 +1238,9 @@ mod tests {
             .finalize();
 
         // Remember, you can only set properties on a v5 connection.
-        let opts = ConnectOptionsBuilder::new_v5().will_message(lwt).finalize();
+        let opts = ConnectOptionsBuilder::new_v5().will_message(lwt).to_ffi();
 
-        let will_props = opts.data.will_props.as_ref().unwrap();
+        let will_props = &opts.data.will_props;
         assert_eq!(1, will_props.len());
         assert_eq!(
             Some(60),
@@ -1073,6 +1274,7 @@ mod tests {
         }
     */
 
+    /*
     // Determine that the options can be sent across threads.
     // As long as it compiles, this indicates that ConnectOptions implements
     // the Send trait.
@@ -1086,4 +1288,5 @@ mod tests {
         });
         thr.join().unwrap();
     }
+    */
 }

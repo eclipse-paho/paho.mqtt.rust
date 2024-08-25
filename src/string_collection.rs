@@ -172,6 +172,20 @@ impl TryFrom<&StringCollection> for Vec<String> {
     }
 }
 
+// TODO: Optimize these?
+
+impl From<&[&str]> for StringCollection {
+    fn from(coll: &[&str]) -> Self {
+        Self::new(coll)
+    }
+}
+
+impl From<&[String]> for StringCollection {
+    fn from(coll: &[String]) -> Self {
+        Self::new(coll)
+    }
+}
+
 /////////////////////////////////////////////////////////////////////////////
 //                              Unit Tests
 /////////////////////////////////////////////////////////////////////////////

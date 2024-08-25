@@ -49,10 +49,11 @@ use crate::{
     ffi,
     string_collection::StringCollection,
     types::*,
-    AsyncReceiver, ConnectOptions, ConnectToken, CreateOptions, DeliveryToken,
-    DisconnectOptions, DisconnectOptionsBuilder, Message, PersistenceType, Properties,
-    ReasonCode, Receiver, ResponseOptions, ResponseOptionsBuilder, ServerRequest,
-    SubscribeManyToken, SubscribeOptions, SubscribeToken, Token, TokenInner, UserData,
+    AsyncReceiver, ConnectOptions, ConnectOptionsFfi, ConnectToken, CreateOptions,
+    DeliveryToken, DisconnectOptions, DisconnectOptionsBuilder, Message, PersistenceType,
+    Properties, ReasonCode, Receiver, ResponseOptions, ResponseOptionsBuilder,
+    ServerRequest, SubscribeManyToken, SubscribeOptions, SubscribeToken, Token, TokenInner,
+    UserData,
 };
 use crossbeam_channel as sync_channel;
 use std::{
@@ -440,7 +441,11 @@ impl AsyncClient {
     where
         T: Into<Option<ConnectOptions>>,
     {
-        debug!("Connecting. Handle: {:?}", self.inner.handle);
+        let opts = opts.into().unwrap_or_default();
+        debug!(
+            "Connecting. Handle: {:?}, opts: {:?}",
+            self.inner.handle, opts
+        );
 
         let mut opts = opts.into().unwrap_or_default();
 
@@ -455,16 +460,16 @@ impl AsyncClient {
         self.set_mqtt_version(opts.mqtt_version());
 
         let tok = Token::from_request(self, ServerRequest::Connect);
-        opts.set_token(tok.clone());
 
-        debug!("Connect options: {:?}", opts);
-        let mut lkopts = self.inner.conn_opts.lock().unwrap();
-        *lkopts = opts;
+        let mut ffi_opts = ConnectOptionsFfi::from(&opts);
+        ffi_opts.set_token(tok.clone());
 
-        let rc = unsafe { ffi::MQTTAsync_connect(self.inner.handle, &lkopts.copts) };
+        *self.inner.conn_opts.lock().unwrap() = opts;
+
+        let rc = unsafe { ffi::MQTTAsync_connect(self.inner.handle, &ffi_opts.copts) };
 
         if rc != 0 {
-            mem::drop(unsafe { Token::from_raw(lkopts.copts.context) });
+            mem::drop(unsafe { Token::from_raw(ffi_opts.copts.context) });
             return ConnectToken::from_error(rc);
         }
 
@@ -480,7 +485,7 @@ impl AsyncClient {
     /// * `failure_cb` The callback for a failed connection attempt.
     pub fn connect_with_callbacks<FS, FF>(
         &self,
-        mut opts: ConnectOptions,
+        opts: ConnectOptions,
         success_cb: FS,
         failure_cb: FF,
     ) -> ConnectToken
@@ -492,11 +497,6 @@ impl AsyncClient {
             "Connecting with callbacks. Handle: {:?}, opts: {:?}",
             self.inner.handle, opts
         );
-        unsafe {
-            if !opts.copts.will.is_null() {
-                debug!("Will: {:?}", *(opts.copts.will));
-            }
-        }
 
         if crate::is_secure_uri(&self.server_uri()) && !opts.has_ssl_options() {
             return ConnectToken::from(Error::MissingSslOptions);
@@ -514,15 +514,16 @@ impl AsyncClient {
             success_cb,
             failure_cb,
         );
-        opts.set_token(tok.clone());
 
-        let mut lkopts = self.inner.conn_opts.lock().unwrap();
-        *lkopts = opts;
+        let mut ffi_opts = ConnectOptionsFfi::from(&opts);
+        ffi_opts.set_token(tok.clone());
 
-        let rc = unsafe { ffi::MQTTAsync_connect(self.inner.handle, &lkopts.copts) };
+        *self.inner.conn_opts.lock().unwrap() = opts;
+
+        let rc = unsafe { ffi::MQTTAsync_connect(self.inner.handle, &ffi_opts.copts) };
 
         if rc != 0 {
-            mem::drop(unsafe { Token::from_raw(lkopts.copts.context) });
+            mem::drop(unsafe { Token::from_raw(ffi_opts.copts.context) });
             return ConnectToken::from_error(rc);
         }
 
