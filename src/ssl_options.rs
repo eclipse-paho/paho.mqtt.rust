@@ -22,56 +22,30 @@
 use std::{
     ffi::CString,
     io,
-    os::raw::{c_char, c_uchar, c_uint},
+    os::raw::{c_char, c_int, c_uchar, c_uint},
     path::{Path, PathBuf},
     pin::Pin,
     ptr,
 };
 
-use crate::{errors::Result, ffi, from_c_bool, to_c_bool};
+use crate::{ffi, to_c_bool, Error, Result};
 
-// Implementation note:
-// The C library seems to require the SSL Options struct to provide valid
-// strings for all the entries. Empty entries require a zero-length string
-// and should not be left as NULL. Therefore, out ffi::MQTTAsync_SSLOptions
-// struct needs to be fixed up to always point to the cached CString
-// values.
-// Caching the CStrings in the struct with the fixed-up pointers in the
-// underlying C struct.
-//
-
-/// The options for SSL socket connections to the broker.
-#[derive(Debug)]
-pub struct SslOptions {
-    /// The underlying C struct to pass to the library
-    pub(crate) copts: ffi::MQTTAsync_SSLOptions,
-    /// Cache of Rust values tied to the C struct
-    data: Pin<Box<SslOptionsData>>,
-}
-
-#[derive(Debug, Default, Clone)]
-struct SslOptionsData {
-    // File name of the trust store.
-    trust_store: CString,
-    // File name of the clien't public key store.
-    key_store: CString,
-    // File name for the private key, if not in key store.
-    private_key: CString,
-    // Password for the private key, if any.
-    private_key_password: CString,
-    // The list of cipher quites that the client presents to the server.
-    enabled_cipher_suites: CString,
-    // The path to the CA certificates, if specified.
-    ca_path: CString,
-    // The list of ALPN protocols available to be negotiated.
-    protos: Vec<c_uchar>,
+/// Convert a path name to a CString
+pub fn path_to_cstring<P: AsRef<Path>>(path: P) -> Result<CString> {
+    let s = CString::new(
+        path.as_ref()
+            .to_str()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "Path string error"))?,
+    )?;
+    Ok(s)
 }
 
 /// The SSL/TLS versions that can be requested.
 #[repr(u32)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum SslVersion {
     /// The default library SSL/TLS version
+    #[default]
     Default = ffi::MQTT_SSL_VERSION_DEFAULT,
     /// TLS version 1.0
     Tls_1_0 = ffi::MQTT_SSL_VERSION_TLS_1_0,
@@ -81,131 +55,46 @@ pub enum SslVersion {
     Tls_1_2 = ffi::MQTT_SSL_VERSION_TLS_1_2,
 }
 
+/////////////////////////////////////////////////////////////////////////////
+
+/// The options for SSL socket connections to the broker.
+#[derive(Debug, Default, Clone)]
+pub struct SslOptions {
+    /// File name of the trust store.
+    trust_store: PathBuf,
+    /// File name of the clien't public key store.
+    key_store: PathBuf,
+    /// File name for the private key, if not in key store.
+    private_key: PathBuf,
+    /// Password for the private key, if any.
+    private_key_password: String,
+    /// The list of cipher quites that the client presents to the server.
+    enabled_cipher_suites: String,
+    /// Whether to enable verification of the server certificate **/
+    enable_server_cert_auth: bool,
+    /// The SSL/TLS version to use.
+    ssl_version: SslVersion,
+    /// Whether to carry out post-connect checks, including that a certificate
+    /// matches the given host name.
+    verify: bool,
+    /// The path to the CA certificates, if specified.
+    ca_path: PathBuf,
+
+    // TODO: Error callback and context
+    // TODO: PSK callback and context
+    /// Don't load default SSL CA. Should be used together with PSK to make
+    /// sure regular servers with certificate in place is not accepted.
+    disable_default_trust_store: bool,
+    /// The list of ALPN protocols available to be negotiated.
+    protos: Vec<String>,
+}
+
 impl SslOptions {
-    /// Creates a new set of default SSL options
+    /// Creates a new, default, set of SSL/TLS options.
     pub fn new() -> Self {
         Self::default()
     }
-
-    // The C library expects unset values in the SSL options struct to be
-    // NULL rather than empty string.
-    fn c_str(str: &CString) -> *const c_char {
-        if str.to_bytes().is_empty() {
-            ptr::null()
-        }
-        else {
-            str.as_ptr()
-        }
-    }
-
-    // Converts the list of ALPN protocol strings into the wire format for
-    // openssl.
-    //
-    // The wire format is a single array of non-empty byte string, with a
-    // length byte prefix for each. It's described here:
-    // https://www.openssl.org/docs/man1.1.0/man3/SSL_CTX_set_alpn_protos.html
-    fn proto_vec(protos: &[&str]) -> Vec<c_uchar> {
-        let protos: Vec<c_uchar> = protos
-            .iter()
-            .flat_map(|p| {
-                let mut p: Vec<c_uchar> = p.bytes().map(|c| c as c_uchar).collect();
-                p.insert(0, p.len() as c_uchar);
-                p
-            })
-            .collect();
-        protos
-    }
-
-    // Updates the underlying C structure to match the cached data.
-    fn from_data(mut copts: ffi::MQTTAsync_SSLOptions, data: SslOptionsData) -> Self {
-        let data = Box::pin(data);
-
-        copts.trustStore = Self::c_str(&data.trust_store);
-        copts.keyStore = Self::c_str(&data.key_store);
-        copts.privateKey = Self::c_str(&data.private_key);
-        copts.privateKeyPassword = Self::c_str(&data.private_key_password);
-        copts.enabledCipherSuites = Self::c_str(&data.enabled_cipher_suites);
-        copts.CApath = Self::c_str(&data.ca_path);
-
-        copts.protos = if data.protos.is_empty() {
-            ptr::null()
-        }
-        else {
-            data.protos.as_ptr()
-        };
-        copts.protos_len = data.protos.len() as c_uint;
-
-        Self { copts, data }
-    }
-
-    /// Set the name of the PEM file containing the public
-    /// digital certificates trusted by the client.
-    pub fn trust_store(&self) -> PathBuf {
-        PathBuf::from(&self.data.trust_store.to_str().unwrap())
-    }
-
-    /// Get the name of the PEM file containing the public
-    /// certificate chain of the client.
-    pub fn key_store(&self) -> PathBuf {
-        PathBuf::from(&self.data.key_store.to_str().unwrap())
-    }
-
-    /// The PEM file containing the client's private key, if not included
-    /// in the Key Store.
-    pub fn private_key(&self) -> PathBuf {
-        PathBuf::from(&self.data.private_key.to_str().unwrap())
-    }
-
-    /// Gets the list of cipher suites that the client will present to
-    /// the server during the SSL handshake.
-    pub fn enabled_cipher_suites(&self) -> String {
-        self.data
-            .enabled_cipher_suites
-            .to_str()
-            .unwrap()
-            .to_string()
-    }
-
-    /// Determine if the client will verify the server certificate.
-    pub fn enable_server_cert_auth(&self) -> bool {
-        from_c_bool(self.copts.enableServerCertAuth)
-    }
-
-    /// Gets the directory containing CA certificates in PEM format,
-    /// if set.
-    pub fn ca_path(&self) -> PathBuf {
-        PathBuf::from(&self.data.ca_path.to_str().unwrap())
-    }
-
-    /// Determines if the default trust store should not be loaded.
-    pub fn is_default_trust_store_disabled(&self) -> bool {
-        self.copts.disableDefaultTrustStore != 0
-    }
-
-    /// Gets the list of ALPN protocols available to be negotiated.
-    /// This is in the wire format of the data.
-    pub fn alpn_proto_vec(&self) -> &[c_uchar] {
-        &self.data.protos
-    }
 }
-
-impl Default for SslOptions {
-    fn default() -> Self {
-        Self::from_data(
-            ffi::MQTTAsync_SSLOptions::default(),
-            SslOptionsData::default(),
-        )
-    }
-}
-
-impl Clone for SslOptions {
-    fn clone(&self) -> Self {
-        Self::from_data(self.copts, (*self.data).clone())
-    }
-}
-
-unsafe impl Send for SslOptions {}
-unsafe impl Sync for SslOptions {}
 
 /////////////////////////////////////////////////////////////////////////////
 //                              Builder
@@ -213,10 +102,7 @@ unsafe impl Sync for SslOptions {}
 
 /// Builder to create SSL Options.
 #[derive(Default)]
-pub struct SslOptionsBuilder {
-    copts: ffi::MQTTAsync_SSLOptions,
-    data: SslOptionsData,
-}
+pub struct SslOptionsBuilder(SslOptions);
 
 impl SslOptionsBuilder {
     /// Creates a new builder with default options.
@@ -226,49 +112,34 @@ impl SslOptionsBuilder {
 
     /// Set the name of the file in PEM format containing the public
     /// digital certificates trusted by the client.
-    pub fn trust_store<P>(&mut self, trust_store: P) -> Result<&mut Self>
+    pub fn trust_store<P>(&mut self, trust_store: P) -> &mut Self
     where
         P: AsRef<Path>,
     {
-        self.data.trust_store = CString::new(
-            trust_store
-                .as_ref()
-                .to_str()
-                .ok_or_else(|| io::Error::other("Path string error"))?,
-        )?;
-        Ok(self)
+        self.0.trust_store = trust_store.as_ref().into();
+        self
     }
 
     /// Set the name of the file in PEM format containing the public
     /// certificate chain of the client.
     ///
     /// It may also include the client's private key.
-    pub fn key_store<P>(&mut self, key_store: P) -> Result<&mut Self>
+    pub fn key_store<P>(&mut self, key_store: P) -> &mut Self
     where
         P: AsRef<Path>,
     {
-        self.data.key_store = CString::new(
-            key_store
-                .as_ref()
-                .to_str()
-                .ok_or_else(|| io::Error::other("Path string error"))?,
-        )?;
-        Ok(self)
+        self.0.key_store = key_store.as_ref().into();
+        self
     }
 
     /// If not included in the Key Store, this setting points to the file
     /// in PEM format containing the client's private key.
-    pub fn private_key<P>(&mut self, private_key: P) -> Result<&mut Self>
+    pub fn private_key<P>(&mut self, private_key: P) -> &mut Self
     where
         P: AsRef<Path>,
     {
-        self.data.private_key = CString::new(
-            private_key
-                .as_ref()
-                .to_str()
-                .ok_or_else(|| io::Error::other("Path string error"))?,
-        )?;
-        Ok(self)
+        self.0.private_key = private_key.as_ref().into();
+        self
     }
 
     /// The password to load the client's privateKey if it's encrypted.
@@ -276,7 +147,7 @@ impl SslOptionsBuilder {
     where
         S: Into<String>,
     {
-        self.data.private_key_password = CString::new(private_key_password.into()).unwrap();
+        self.0.private_key_password = private_key_password.into();
         self
     }
 
@@ -294,43 +165,37 @@ impl SslOptionsBuilder {
     where
         S: Into<String>,
     {
-        self.data.enabled_cipher_suites =
-            CString::new(enabled_cipher_suites.into()).unwrap();
+        self.0.enabled_cipher_suites = enabled_cipher_suites.into();
         self
     }
 
     /// Enable or disable verification of the server certificate
     pub fn enable_server_cert_auth(&mut self, on: bool) -> &mut Self {
-        self.copts.enableServerCertAuth = to_c_bool(on);
+        self.0.enable_server_cert_auth = on;
         self
     }
 
     /// The SSL/TLS version to use.
     pub fn ssl_version(&mut self, ver: SslVersion) -> &mut Self {
-        self.copts.sslVersion = ver as i32;
+        self.0.ssl_version = ver;
         self
     }
 
     /// Whether to carry out post-connect checks, including that a
     /// certificate matches the given host name.
     pub fn verify(&mut self, on: bool) -> &mut Self {
-        self.copts.verify = to_c_bool(on);
+        self.0.verify = on;
         self
     }
 
     /// If set, this points to a directory containing CA certificates
     /// in PEM format.
-    pub fn ca_path<P>(&mut self, ca_path: P) -> Result<&mut Self>
+    pub fn ca_path<P>(&mut self, ca_path: P) -> &mut Self
     where
         P: AsRef<Path>,
     {
-        self.data.ca_path = CString::new(
-            ca_path
-                .as_ref()
-                .to_str()
-                .ok_or_else(|| io::Error::other("Path string error"))?,
-        )?;
-        Ok(self)
+        self.0.ca_path = ca_path.as_ref().into();
+        self
     }
 
     /// Don't load the default SSL CA.
@@ -338,19 +203,179 @@ impl SslOptionsBuilder {
     /// This should be used together with PSK to make sure
     /// regular servers with certificate in place is not accepted.
     pub fn disable_default_trust_store(&mut self, disable: bool) -> &mut Self {
-        self.copts.disableDefaultTrustStore = to_c_bool(disable);
+        self.0.disable_default_trust_store = disable;
         self
     }
 
     /// If set, only these protocols are used during negotiation.
     pub fn alpn_protos(&mut self, protos: &[&str]) -> &mut Self {
-        self.data.protos = SslOptions::proto_vec(protos);
+        self.0.protos = protos.iter().map(|s| String::from(*s)).collect();
         self
+    }
+
+    /// Gets the FFI representation of the SSL/TLS options.
+    /// This is a convenience function for the unit tests.
+    #[cfg(test)]
+    pub(crate) fn to_ffi(&self) -> Result<SslOptionsFfi> {
+        SslOptionsFfi::try_from(&self.0)
     }
 
     /// Create the SSL options from the builder.
     pub fn finalize(&self) -> SslOptions {
-        SslOptions::from_data(self.copts, self.data.clone())
+        self.0.clone()
+    }
+}
+
+/////////////////////////////////////////////////////////////////////////////
+
+// Implementation note:
+// The C library seems to require the SSL Options struct to provide valid
+// strings for all the entries. Empty entries require a zero-length string
+// and should not be left as NULL. Therefore, out ffi::MQTTAsync_SSLOptions
+// struct needs to be fixed up to always point to the cached CString
+// values.
+// Caching the CStrings in the struct with the fixed-up pointers in the
+// underlying C struct.
+//
+
+/// The options for SSL socket connections to the broker.
+#[derive(Debug)]
+pub(crate) struct SslOptionsFfi {
+    /// The underlying C struct to pass to the library
+    pub(crate) copts: ffi::MQTTAsync_SSLOptions,
+    /// Cache of Rust values tied to the C struct
+    #[allow(dead_code)]
+    data: Pin<Box<SslOptionsFfiData>>,
+}
+
+#[derive(Debug, Default, Clone)]
+struct SslOptionsFfiData {
+    // File name of the trust store.
+    trust_store: CString,
+    // File name of the clien't public key store.
+    key_store: CString,
+    // File name for the private key, if not in key store.
+    private_key: CString,
+    // Password for the private key, if any.
+    private_key_password: CString,
+    // The list of cipher quites that the client presents to the server.
+    enabled_cipher_suites: CString,
+    // The path to the CA certificates, if specified.
+    ca_path: CString,
+    // The list of ALPN protocols available to be negotiated.
+    protos: Vec<c_uchar>,
+}
+
+impl SslOptionsFfi {
+    // The C library expects unset values in the SSL options struct to be
+    // NULL rather than empty string.
+    #[inline]
+    fn c_str(s: &CString) -> *const c_char {
+        match &s {
+            s if !s.to_bytes().is_empty() => s.as_ptr(),
+            _ => ptr::null(),
+        }
+    }
+
+    // Updates the underlying C structure to match the cached data.
+    fn from_data(mut copts: ffi::MQTTAsync_SSLOptions, data: SslOptionsFfiData) -> Self {
+        let data = Box::pin(data);
+
+        copts.trustStore = Self::c_str(&data.trust_store);
+        copts.keyStore = Self::c_str(&data.key_store);
+        copts.privateKey = Self::c_str(&data.private_key);
+        copts.privateKeyPassword = Self::c_str(&data.private_key_password);
+        copts.enabledCipherSuites = Self::c_str(&data.enabled_cipher_suites);
+        copts.CApath = Self::c_str(&data.ca_path);
+
+        copts.protos = match &data.protos {
+            protos if !protos.is_empty() => protos.as_ptr(),
+            _ => ptr::null(),
+        };
+        copts.protos_len = data.protos.len() as c_uint;
+
+        Self { copts, data }
+    }
+
+    /// Gets the list of ALPN protocols available to be negotiated.
+    /// This is in the wire format of the data.
+    #[cfg(test)]
+    pub fn alpn_proto_vec(&self) -> &[c_uchar] {
+        &self.data.protos
+    }
+}
+
+impl Default for SslOptionsFfi {
+    fn default() -> Self {
+        Self::from_data(
+            ffi::MQTTAsync_SSLOptions::default(),
+            SslOptionsFfiData::default(),
+        )
+    }
+}
+
+unsafe impl Send for SslOptionsFfi {}
+unsafe impl Sync for SslOptionsFfi {}
+
+impl TryFrom<&SslOptions> for SslOptionsFfi {
+    type Error = Error;
+
+    fn try_from(opts: &SslOptions) -> Result<Self> {
+        let data = SslOptionsFfiData::try_from(opts)?;
+
+        let copts = ffi::MQTTAsync_SSLOptions {
+            sslVersion: opts.ssl_version as c_int,
+            verify: to_c_bool(opts.verify),
+            disableDefaultTrustStore: to_c_bool(opts.disable_default_trust_store),
+            ..ffi::MQTTAsync_SSLOptions::default()
+        };
+
+        Ok(Self::from_data(copts, data))
+    }
+}
+
+impl TryFrom<SslOptions> for SslOptionsFfi {
+    type Error = crate::Error;
+
+    fn try_from(opts: SslOptions) -> Result<Self> {
+        SslOptionsFfi::try_from(&opts)
+    }
+}
+
+impl SslOptionsFfiData {
+    // Converts the list of ALPN protocol strings into the wire format for
+    // openssl.
+    //
+    // The wire format is a single array of non-empty byte string, with a
+    // length byte prefix for each. It's described here:
+    // https://www.openssl.org/docs/man1.1.0/man3/SSL_CTX_set_alpn_protos.html
+    fn proto_vec<S: AsRef<str>>(protos: &[S]) -> Vec<c_uchar> {
+        let protos: Vec<c_uchar> = protos
+            .iter()
+            .flat_map(|s| {
+                let mut p: Vec<c_uchar> =
+                    s.as_ref().bytes().map(|c| c as c_uchar).collect();
+                p.insert(0, p.len() as c_uchar);
+                p
+            })
+            .collect();
+        protos
+    }
+}
+
+impl TryFrom<&SslOptions> for SslOptionsFfiData {
+    type Error = Error;
+
+    fn try_from(opts: &SslOptions) -> Result<Self> {
+        Ok(SslOptionsFfiData {
+            trust_store: path_to_cstring(&opts.trust_store)?,
+            key_store: path_to_cstring(&opts.key_store)?,
+            private_key: path_to_cstring(&opts.private_key)?,
+            private_key_password: CString::new(opts.private_key_password.clone())?,
+            enabled_cipher_suites: CString::new(opts.enabled_cipher_suites.clone())?,
+            ca_path: path_to_cstring(&opts.ca_path)?,
+            protos: SslOptionsFfiData::proto_vec(opts.protos.as_slice()),
+        })
     }
 }
 
@@ -361,6 +386,7 @@ impl SslOptionsBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::from_c_bool;
     use std::ffi::CStr;
 
     // Identifier for the C SSL options structure
@@ -376,7 +402,7 @@ mod tests {
 
     #[test]
     fn test_new() {
-        let opts = SslOptions::new();
+        let opts = SslOptionsFfi::try_from(SslOptions::new()).unwrap();
         //let copts = ffi::MQTTAsync_SSLOptions::default();
 
         assert_eq!(STRUCT_ID, opts.copts.struct_id);
@@ -387,7 +413,7 @@ mod tests {
 
     #[test]
     fn test_builder_dflt() {
-        let opts = SslOptionsBuilder::new().finalize();
+        let opts = SslOptionsBuilder::new().to_ffi().unwrap();
 
         assert_eq!(STRUCT_ID, opts.copts.struct_id);
         assert_eq!(STRUCT_VERSION, opts.copts.struct_version);
@@ -400,8 +426,8 @@ mod tests {
         const TRUST_STORE: &str = "some_file.crt";
         let opts = SslOptionsBuilder::new()
             .trust_store(TRUST_STORE)
-            .unwrap()
-            .finalize();
+            .to_ffi()
+            .unwrap();
 
         assert_eq!(TRUST_STORE, opts.data.trust_store.to_str().unwrap());
 
@@ -414,8 +440,8 @@ mod tests {
         const KEY_STORE: &str = "some_file.crt";
         let opts = SslOptionsBuilder::new()
             .key_store(KEY_STORE)
-            .unwrap()
-            .finalize();
+            .to_ffi()
+            .unwrap();
 
         assert_eq!(KEY_STORE, opts.data.key_store.to_str().unwrap());
 
@@ -425,7 +451,7 @@ mod tests {
 
     #[test]
     fn test_verify() {
-        let opts = SslOptionsBuilder::new().verify(true).finalize();
+        let opts = SslOptionsBuilder::new().verify(true).to_ffi().unwrap();
         assert!(from_c_bool(opts.copts.verify));
     }
 
@@ -433,7 +459,8 @@ mod tests {
     fn test_disable_default_trust_store() {
         let opts = SslOptionsBuilder::new()
             .disable_default_trust_store(true)
-            .finalize();
+            .to_ffi()
+            .unwrap();
         assert!(from_c_bool(opts.copts.disableDefaultTrustStore));
     }
 
@@ -446,48 +473,50 @@ mod tests {
             b'.', b'1',
         ];
 
-        assert_eq!(v, SslOptions::proto_vec(protos));
+        assert_eq!(v, SslOptionsFfiData::proto_vec(protos));
 
-        let opts = SslOptionsBuilder::new().alpn_protos(protos).finalize();
+        let opts = SslOptionsBuilder::new()
+            .alpn_protos(protos)
+            .to_ffi()
+            .unwrap();
 
         assert_eq!(v, opts.alpn_proto_vec());
     }
 
     // TODO: Test the other builder initializers
-
-    #[test]
-    fn test_move() {
-        const TRUST_STORE: &str = "some_file.crt";
-        let org_opts = SslOptionsBuilder::new()
-            .trust_store(TRUST_STORE)
-            .unwrap()
-            .finalize();
-
-        let opts = org_opts;
-
-        assert_eq!(TRUST_STORE, opts.data.trust_store.to_str().unwrap());
-
-        let s = unsafe { CStr::from_ptr(opts.copts.trustStore) };
-        assert_eq!(TRUST_STORE, s.to_str().unwrap());
-    }
-
-    #[test]
-    fn test_clone() {
-        const TRUST_STORE: &str = "some_file.crt";
-        // Make sure the original goes out of scope
-        // before testing the clone.
-        let opts = {
+    /*
+        #[test]
+        fn test_move() {
+            const TRUST_STORE: &str = "some_file.crt";
             let org_opts = SslOptionsBuilder::new()
                 .trust_store(TRUST_STORE)
-                .unwrap()
                 .finalize();
 
-            org_opts.clone()
-        };
+            let opts = org_opts;
 
-        assert_eq!(TRUST_STORE, opts.data.trust_store.to_str().unwrap());
+            assert_eq!(TRUST_STORE, opts.data.trust_store.to_str().unwrap());
 
-        let s = unsafe { CStr::from_ptr(opts.copts.trustStore) };
-        assert_eq!(TRUST_STORE, s.to_str().unwrap());
-    }
+            let s = unsafe { CStr::from_ptr(opts.copts.trustStore) };
+            assert_eq!(TRUST_STORE, s.to_str().unwrap());
+        }
+
+        #[test]
+        fn test_clone() {
+            const TRUST_STORE: &str = "some_file.crt";
+            // Make sure the original goes out of scope
+            // before testing the clone.
+            let opts = {
+                let org_opts = SslOptionsBuilder::new()
+                    .trust_store(TRUST_STORE)
+                    .finalize();
+
+                org_opts.clone()
+            };
+
+            assert_eq!(TRUST_STORE, opts.data.trust_store.to_str().unwrap());
+
+            let s = unsafe { CStr::from_ptr(opts.copts.trustStore) };
+            assert_eq!(TRUST_STORE, s.to_str().unwrap());
+        }
+    */
 }

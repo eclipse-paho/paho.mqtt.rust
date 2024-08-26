@@ -93,8 +93,8 @@ fn main() -> mqtt::Result<()> {
             .create_async_client()?;
 
         let ssl_opts = mqtt::SslOptionsBuilder::new()
-            .trust_store(trust_store)?
-            .key_store(key_store)?
+            .trust_store(trust_store)
+            .key_store(key_store)
             .finalize();
 
         let conn_opts = mqtt::ConnectOptionsBuilder::new()

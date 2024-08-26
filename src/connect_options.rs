@@ -37,6 +37,9 @@ use crate::{
     types::*,
     WillOptions,
     Error, Result,
+    ffi, name_value::NameValueCollection, ssl_options::SslOptionsFfi,
+    string_collection::StringCollection, to_c_bool, types::*, ConnectToken, Message,
+    Properties, SslOptions, Token, TokenInner, WillOptions,
 };
 use std::{
     collections::HashMap, ffi::CString, os::raw::c_int, pin::Pin, ptr, time::Duration,
@@ -567,14 +570,15 @@ pub(crate) struct ConnectOptionsFfi {
     /// be NULL (not empty) if unused.
     pub(crate) copts: ffi::MQTTAsync_connectOptions,
     /// The pinned data cache
+    #[allow(dead_code)]
     data: Pin<Box<ConnectOptionsFfiData>>,
 }
 
 /// Cached data for the connect options.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default)]
 struct ConnectOptionsFfiData {
     will: Option<WillOptions>,
-    ssl: Option<SslOptions>,
+    ssl: Option<SslOptionsFfi>,
     user_name: Option<CString>,
     password: Option<CString>,
     server_uris: StringCollection,
@@ -654,12 +658,12 @@ impl ConnectOptionsFfi {
         };
 
         copts.httpProxy = match &data.http_proxy {
-            s if !s.is_empty() => s.as_ptr(),
+            s if !s.to_bytes().is_empty() => s.as_ptr(),
             _ => ptr::null(),
         };
 
         copts.httpsProxy = match &data.https_proxy {
-            s if !s.is_empty() => s.as_ptr(),
+            s if !s.to_bytes().is_empty() => s.as_ptr(),
             _ => ptr::null(),
         };
 
@@ -782,12 +786,6 @@ impl Default for ConnectOptionsFfi {
     }
 }
 
-impl Clone for ConnectOptionsFfi {
-    fn clone(&self) -> Self {
-        Self::from_data(self.copts, (*self.data).clone())
-    }
-}
-
 unsafe impl Send for ConnectOptionsFfi {}
 unsafe impl Sync for ConnectOptionsFfi {}
 
@@ -840,8 +838,9 @@ impl From<&ConnectOptions> for ConnectOptionsFfiData {
             data.will_props = msg.properties().clone();
         }
         if let Some(ssl) = &opts.ssl {
-            data.ssl = Some(ssl.clone());
-            //Some(SslOptions::from(ssl.clone()));
+            // TODO: Return the error
+            let ssl_ffi = SslOptionsFfi::try_from(ssl).unwrap();
+            data.ssl = Some(ssl_ffi);
         }
         if let Some(user_name) = &opts.user_name {
             data.user_name = Some(CString::new(user_name.clone()).unwrap());
@@ -876,7 +875,7 @@ impl From<&ConnectOptions> for ConnectOptionsFfiData {
 mod tests {
     use super::*;
     use crate::{message::MessageBuilder, properties::*, ssl_options::SslOptionsBuilder};
-    use std::{ffi::CStr, os::raw::c_char, thread};
+    use std::{ffi::CStr, os::raw::c_char};
 
     const NAME: &str = "some-random-name";
     const PSWD: &str = "some-random-password";
@@ -941,14 +940,13 @@ mod tests {
 
     #[test]
     fn test_ssl() {
+
         let ssl_opts = SslOptionsBuilder::new()
             .trust_store(TRUST_STORE)
             .unwrap()
             .finalize();
 
-        let opts = ConnectOptionsBuilder::new()
-            .ssl_options(ssl_opts)
-            .to_ffi();
+        let opts = ConnectOptionsBuilder::new().ssl_options(ssl_opts).to_ffi();
 
         assert!(!opts.copts.ssl.is_null());
 
@@ -1018,9 +1016,7 @@ mod tests {
     fn test_server_uris() {
         let servers = ["tcp://server1:1883", "ssl://server2:1885"];
 
-        let opts = ConnectOptionsBuilder::new()
-            .server_uris(&servers)
-            .to_ffi();
+        let opts = ConnectOptionsBuilder::new().server_uris(&servers).to_ffi();
 
         assert_eq!(servers.len() as i32, opts.copts.serverURIcount);
 
