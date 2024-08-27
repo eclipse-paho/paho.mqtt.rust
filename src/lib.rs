@@ -119,7 +119,6 @@ pub use crate::name_value::*; //{NameValueCollection};
 pub use crate::persistence::*;
 pub use crate::properties::*; //{Property, Properties};
 pub use crate::reason_code::*; //{ReasonCode}
-pub use crate::response_options::*; //{ResponseOptions};
 pub use crate::server_response::*; //{ServerResponse, CommandResponse};
 pub use crate::ssl_options::*; //{SslOptions, SslOptionsBuilder};
 pub use crate::subscribe_options::*; //{SubscribeOptions};
@@ -151,8 +150,9 @@ pub mod disconnect_options;
 /// Options for subscribing to topics
 pub mod subscribe_options;
 
-/// Options for responses coming back from the C lib.
-pub mod response_options;
+/// Options for call and response options for the C lib.
+use crate::call_options::*; //{CallOptionsFfi};
+mod call_options;
 
 /// Responses coming back from the server.
 pub mod server_response;

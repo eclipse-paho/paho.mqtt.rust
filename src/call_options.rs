@@ -1,11 +1,11 @@
-// response_options.rs
+// call_options.rs
 //
-// The set of options for responses coming back to an MQTT client.
+// The set of options for calls and responses to the MQTT C library.
 // This file is part of the Eclipse Paho MQTT Rust Client library.
 //
 
 /*******************************************************************************
- * Copyright (c) 2019-2020 Frank Pagliughi <fpagliughi@mindspring.com>
+ * Copyright (c) 2019-2024 Frank Pagliughi <fpagliughi@mindspring.com>
  *
  * All rights reserved. This program and the accompanying materials
  * are made available under the terms of the Eclipse Public License v2.0
@@ -20,13 +20,15 @@
  *    Frank Pagliughi - initial implementation and documentation
  *******************************************************************************/
 
-//! Response options for the Paho MQTT Rust client library.
+//! FFI call options for the Paho MQTT Rust client library.
 //!
-//! Originally this presented a way for the application to specify callbacks
-//! to the C library to receive responses to various requests. With MQTT v5,
-//! the C lib extended this struct as a way to specify v5 options (like
-//! properties, etc) in the requests. So this is now sometimes referred to
-//! as the "call options".
+//! Originally with the MQTT v3 C library, these were called "response"
+//! options and presented a way for the application to specify callbacks
+//! to the C library to receive responses to various requests.
+//!
+//! With MQTT v5, the C lib extended this struct as a way to specify v5
+//! options (like properties, etc) in the requests. So the library aliased
+//! the name to "call options", which now seems more appropriate.
 //!
 
 use std::{os::raw::c_int, pin::Pin, ptr};
@@ -34,23 +36,24 @@ use std::{os::raw::c_int, pin::Pin, ptr};
 use crate::{
     ffi,
     properties::Properties,
-    subscribe_options::SubscribeOptions,
+    subscribe_options::{SubscribeOptions, SubscribeOptionsFfi},
     token::{Token, TokenInner},
     types::*,
 };
 
 /// The collection of options for responses coming back to the client.
 #[derive(Debug)]
-pub struct ResponseOptions {
+pub(crate) struct CallOptionsFfi {
     /// The underlying C options struct
     pub(crate) copts: ffi::MQTTAsync_responseOptions,
     /// The cached Rust data for the struct
-    data: Pin<Box<ResponseOptionsData>>,
+    #[allow(dead_code)]
+    data: Pin<Box<CallOptionsFfiData>>,
 }
 
 /// Cached data for the response options
 #[derive(Debug, Default, Clone)]
-struct ResponseOptionsData {
+struct CallOptionsFfiData {
     /// The MQTT v5 properties
     props: Properties,
     /// The collection of MQTT v5 subscription options
@@ -58,8 +61,8 @@ struct ResponseOptionsData {
     sub_opts: Option<Vec<ffi::MQTTSubscribe_options>>,
 }
 
-impl ResponseOptions {
-    /// Creates a `ResponseOptions` intance for the provided token.
+impl CallOptionsFfi {
+    /// Creates a `CallOptionsFfi` intance for the provided token.
     /// The option's `copts` can be passed to one of the C library's
     /// asynchronous functions to set the callbacks to complete the token.
     ///
@@ -75,7 +78,7 @@ impl ResponseOptions {
         let mut copts = Self::c_options(ver.into());
         copts.context = tok.into().into_raw();
 
-        Self::from_data(copts, ResponseOptionsData::default())
+        Self::from_data(copts, CallOptionsFfiData::default())
     }
 
     // Creates a C response options struct for the specified MQTT version
@@ -101,7 +104,7 @@ impl ResponseOptions {
     // then returns a new options object with them combined.
     fn from_data(
         mut copts: ffi::MQTTAsync_responseOptions,
-        data: ResponseOptionsData,
+        data: CallOptionsFfiData,
     ) -> Self {
         let mut data = Box::pin(data);
 
@@ -117,18 +120,13 @@ impl ResponseOptions {
 
         Self { copts, data }
     }
-
-    /// Gets the MQTT v5 properties in the response, if any.
-    pub fn properties(&self) -> &Properties {
-        &self.data.props
-    }
 }
 
-impl Default for ResponseOptions {
+impl Default for CallOptionsFfi {
     fn default() -> Self {
         Self::from_data(
             ffi::MQTTAsync_responseOptions::default(),
-            ResponseOptionsData::default(),
+            CallOptionsFfiData::default(),
         )
     }
 }
@@ -137,19 +135,19 @@ impl Default for ResponseOptions {
 
 /// Builder to create MQTT v5 response options.
 #[derive(Default)]
-pub struct ResponseOptionsBuilder {
+pub(crate) struct CallOptionsFfiBuilder {
     /// The underlying C options struct
     copts: ffi::MQTTAsync_responseOptions,
     /// The cached Rust data for the struct
-    data: ResponseOptionsData,
+    data: CallOptionsFfiData,
 }
 
-impl ResponseOptionsBuilder {
+impl CallOptionsFfiBuilder {
     /// Creates a new builder starting with default options.
     pub fn new() -> Self {
         Self {
-            copts: ResponseOptions::c_options(MqttVersion::V5),
-            data: ResponseOptionsData::default(),
+            copts: CallOptionsFfi::c_options(MqttVersion::V5),
+            data: CallOptionsFfiData::default(),
         }
     }
 
@@ -170,6 +168,7 @@ impl ResponseOptionsBuilder {
 
     /// Sets a single set of subscribe options - for a call to subscribe()
     pub fn subscribe_options(&mut self, opts: SubscribeOptions) -> &mut Self {
+        let opts = SubscribeOptionsFfi::from(opts);
         self.copts.subscribeOptions = opts.copts;
         self
     }
@@ -178,16 +177,23 @@ impl ResponseOptionsBuilder {
     pub fn subscribe_many_options(&mut self, opts: &[SubscribeOptions]) -> &mut Self {
         match opts {
             [] => {}
-            // This is necessary, as the `MQTTAsync_subscribeMany` paho.mqtt.c function uses `opts` over `optlist` when `count <= 1`
-            [opts] => self.copts.subscribeOptions = opts.copts,
-            _ => self.data.sub_opts = Some(opts.iter().map(|opt| opt.copts).collect()),
+            // This is necessary, as the `MQTTAsync_subscribeMany` paho.mqtt.c
+            // function uses `opts` over `optlist` when `count <= 1`
+            [opts] => self.copts.subscribeOptions = SubscribeOptionsFfi::from(*opts).copts,
+            _ => {
+                self.data.sub_opts = Some(
+                    opts.iter()
+                        .map(|opt| SubscribeOptionsFfi::from(*opt).copts)
+                        .collect(),
+                )
+            }
         }
         self
     }
 
     /// Create the response options from the builder.
-    pub fn finalize(&self) -> ResponseOptions {
-        ResponseOptions::from_data(self.copts, self.data.clone())
+    pub fn finalize(&self) -> CallOptionsFfi {
+        CallOptionsFfi::from_data(self.copts, self.data.clone())
     }
 }
 
@@ -206,7 +212,7 @@ mod tests {
     #[test]
     fn test_new_v3() {
         let tok = Token::new();
-        let opts = ResponseOptions::new(MQTT_VERSION_3_1_1, tok.clone());
+        let opts = CallOptionsFfi::new(MQTT_VERSION_3_1_1, tok.clone());
 
         let inner = Token::into_raw(tok);
 
@@ -223,7 +229,7 @@ mod tests {
     #[test]
     fn test_new_v5() {
         let tok = Token::new();
-        let opts = ResponseOptions::new(MQTT_VERSION_5, tok.clone());
+        let opts = CallOptionsFfi::new(MQTT_VERSION_5, tok.clone());
 
         let inner = Token::into_raw(tok);
 
@@ -241,7 +247,7 @@ mod tests {
     fn test_sub_opts() {
         let tok = Token::new();
         let sub_opts = SubscribeOptions::with_no_local();
-        let opts = ResponseOptionsBuilder::new()
+        let opts = CallOptionsFfiBuilder::new()
             .token(tok.clone())
             .subscribe_options(sub_opts)
             .finalize();
@@ -264,7 +270,7 @@ mod tests {
     fn test_sub_many_opts() {
         let tok = Token::new();
         let sub_opts = vec![SubscribeOptions::with_no_local(); 4];
-        let opts = ResponseOptionsBuilder::new()
+        let opts = CallOptionsFfiBuilder::new()
             .token(tok.clone())
             .subscribe_many_options(&sub_opts)
             .finalize();

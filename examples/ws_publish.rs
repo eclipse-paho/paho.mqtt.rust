@@ -6,10 +6,15 @@
 //! This sample demonstrates:
 //!   - Connecting to an MQTT broker using websockets.
 //!   - Publishing a message asynchronously
+//!
+//! Usage:
+//! ```text
+//! $ ws_publish [server_uri [proxy]]
+//! ```
 //
 
 /*******************************************************************************
- * Copyright (c) 2017-20123 Frank Pagliughi <fpagliughi@mindspring.com>
+ * Copyright (c) 2017-20124 Frank Pagliughi <fpagliughi@mindspring.com>
  *
  * All rights reserved. This program and the accompanying materials
  * are made available under the terms of the Eclipse Public License v2.0
@@ -36,10 +41,12 @@ fn main() {
     // Command-line option(s)
     let mut args = env::args().skip(1);
 
+    // Get the server URI, if any, or default
     let host = args
         .next()
         .unwrap_or_else(|| "ws://localhost:8080".to_string());
 
+    // Get the proxy, if any, or default
     let proxy = args.next().unwrap_or_default();
 
     // Create the client
@@ -65,7 +72,7 @@ fn main() {
 
     // Create a message and publish it
     println!("Publishing a message on the 'test' topic");
-    let msg = mqtt::Message::new("test", "Hello Rust MQTT world!", 0);
+    let msg = mqtt::Message::new("test", "Hello Rust Websocket MQTT world!", 0);
     let tok = cli.publish(msg);
 
     if let Err(e) = tok.wait() {
