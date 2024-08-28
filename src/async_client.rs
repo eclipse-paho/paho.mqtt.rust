@@ -112,6 +112,7 @@ pub type MessageArrivedCallback = dyn FnMut(&AsyncClient, Option<Message>) + Sen
 
 /// User callback type for an SSL/TLS error
 pub type SslErrorCallback = dyn Fn(&AsyncClient, &str) + Send + 'static;
+//pub type SslErrorCallback = dyn Fn(&AsyncClient, String) + Send + 'static;
 
 // The context provided for the client callbacks.
 //
@@ -395,6 +396,20 @@ impl AsyncClient {
                             .unwrap_or_default();
                         cb(&cli, s);
                     };
+/*
+            if let Some(ref ssl) = cli.inner.conn_opts.lock().unwrap().ssl {
+                if let Some(ref cb) = ssl.on_ssl_error {
+                    let err_str = if err.is_null() || len == 0 {
+                        String::new()
+                    }
+                    else {
+                        let s =
+                            str::from_utf8(slice::from_raw_parts(err as *mut u8, len))
+                        .unwrap_or_default();
+                        s.to_string()
+                    };
+                    cb(&cli, err_str);
+*/
                 }
             }
         }

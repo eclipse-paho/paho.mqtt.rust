@@ -88,6 +88,7 @@ pub struct SslOptions {
     pub on_ssl_error: Option<Arc<SslErrorCallback>>,
 
     // TODO: PSK callback and context
+
     /// Don't load default SSL CA. Should be used together with PSK to make
     /// sure regular servers with certificate in place is not accepted.
     pub disable_default_trust_store: bool,
