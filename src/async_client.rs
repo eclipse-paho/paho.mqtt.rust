@@ -65,7 +65,7 @@ use std::{
     slice, str,
     sync::{
         atomic::{AtomicU32, Ordering},
-        Arc, Mutex, Once,
+        Arc, Mutex, Once, RwLock,
     },
     time::Duration,
 };
@@ -88,7 +88,7 @@ pub(crate) struct InnerAsyncClient {
     /// The options used to create the client (URL, ClientID, persistence, etc)
     opts: CreateOptions,
     // The options for connecting to the broker
-    conn_opts: Mutex<ConnectOptions>,
+    conn_opts: RwLock<ConnectOptions>,
     // The context to give to the C callbacks
     callback_context: Mutex<CallbackContext>,
 }
@@ -109,6 +109,9 @@ pub type DisconnectedCallback =
 
 /// User callback signature for when subscribed messages are received.
 pub type MessageArrivedCallback = dyn FnMut(&AsyncClient, Option<Message>) + Send + 'static;
+
+/// User callback type for an SSL/TLS error
+pub type SslErrorCallback = dyn Fn(&AsyncClient, &str) + Send + 'static;
 
 // The context provided for the client callbacks.
 //
@@ -162,7 +165,7 @@ impl AsyncClient {
             handle: ptr::null_mut(),
             mqtt_version: AtomicU32::new(opts.mqtt_version_raw()),
             opts,
-            conn_opts: Mutex::new(ConnectOptions::new()),
+            conn_opts: RwLock::new(ConnectOptions::new()),
             callback_context: Mutex::new(CallbackContext::default()),
         };
 
@@ -369,6 +372,36 @@ impl AsyncClient {
         1
     }
 
+    // Low-level callback from the C library for an SSL/TLS error.
+    // This should only be called if the connect SSL options have a handler
+    // for an error callback.
+    unsafe extern "C" fn on_ssl_error(
+        err: *const c_char,
+        len: usize,
+        context: *mut c_void,
+    ) -> i32 {
+        debug!("SSL Error for Client: {:?}", context);
+        if context.is_null() {
+            return 0;
+        }
+
+        let cli = AsyncClient::from_raw(context);
+        {
+            if let Some(ref ssl) = cli.inner.conn_opts.read().unwrap().ssl {
+                if let Some(ref cb) = ssl.on_ssl_error {
+                    if !err.is_null() && len != 0 {
+                        let s = str::from_utf8(slice::from_raw_parts(err as *mut u8, len))
+                            .map(str::trim)
+                            .unwrap_or_default();
+                        cb(&cli, s);
+                    };
+                }
+            }
+        }
+        let _ = cli.into_raw();
+        0
+    }
+
     // Set the disconnection callbacks, usually to prepare for creating
     // an input channel/stream of messages.
     fn set_disconnection_callbacks(&self) {
@@ -464,7 +497,15 @@ impl AsyncClient {
         let mut ffi_opts = ConnectOptionsFfi::from(&opts);
         ffi_opts.set_token(tok.clone());
 
-        *self.inner.conn_opts.lock().unwrap() = opts;
+        // Set the SSL error callback, if needed
+        if let Some(ssl) = unsafe { ffi_opts.copts.ssl.as_mut() } {
+            // A pointer to the inner client will serve as the SSL error callback context
+            let inner: &InnerAsyncClient = &self.inner;
+            ssl.ssl_error_cb = Some(AsyncClient::on_ssl_error);
+            ssl.ssl_error_context = inner as *const _ as *mut c_void;
+        }
+
+        *self.inner.conn_opts.write().unwrap() = opts;
 
         let rc = unsafe { ffi::MQTTAsync_connect(self.inner.handle, &ffi_opts.copts) };
 
@@ -518,7 +559,7 @@ impl AsyncClient {
         let mut ffi_opts = ConnectOptionsFfi::from(&opts);
         ffi_opts.set_token(tok.clone());
 
-        *self.inner.conn_opts.lock().unwrap() = opts;
+        *self.inner.conn_opts.write().unwrap() = opts;
 
         let rc = unsafe { ffi::MQTTAsync_connect(self.inner.handle, &ffi_opts.copts) };
 
@@ -535,7 +576,7 @@ impl AsyncClient {
     /// attempted. It will retry with the same connect options.
     ///
     pub fn reconnect(&self) -> ConnectToken {
-        let connopts = self.inner.conn_opts.lock().unwrap().clone();
+        let connopts = self.inner.conn_opts.read().unwrap().clone();
         self.connect(connopts)
     }
 
@@ -558,7 +599,7 @@ impl AsyncClient {
         FS: Fn(&AsyncClient, u16) + Send + 'static,
         FF: Fn(&AsyncClient, u16, i32) + Send + 'static,
     {
-        let connopts = self.inner.conn_opts.lock().unwrap().clone();
+        let connopts = self.inner.conn_opts.read().unwrap().clone();
         self.connect_with_callbacks(connopts, success_cb, failure_cb)
     }
 
@@ -898,6 +939,7 @@ impl AsyncClient {
         debug_assert!(self.mqtt_version() >= MqttVersion::V5);
 
         let tok = Token::from_request(None, ServerRequest::Subscribe);
+
         let mut call_opts = CallOptionsFfiBuilder::new()
             .token(tok.clone())
             .subscribe_options(opts.into())

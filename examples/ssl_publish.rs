@@ -26,7 +26,7 @@
 //!
 
 /*******************************************************************************
- * Copyright (c) 2017-2023 Frank Pagliughi <fpagliughi@mindspring.com>
+ * Copyright (c) 2017-2024 Frank Pagliughi <fpagliughi@mindspring.com>
  *
  * All rights reserved. This program and the accompanying materials
  * are made available under the terms of the Eclipse Public License v2.0
@@ -95,6 +95,9 @@ fn main() -> mqtt::Result<()> {
         let ssl_opts = mqtt::SslOptionsBuilder::new()
             .trust_store(trust_store)
             .key_store(key_store)
+            .error_callback(|_, s| {
+                eprintln!("SSL/TLS error: {}", s);
+            })
             .finalize();
 
         let conn_opts = mqtt::ConnectOptionsBuilder::new()
@@ -107,7 +110,7 @@ fn main() -> mqtt::Result<()> {
 
         let msg = mqtt::MessageBuilder::new()
             .topic("test")
-            .payload("Hello secure world!")
+            .payload("Hello Rust MQTT secure world!")
             .qos(1)
             .finalize();
 

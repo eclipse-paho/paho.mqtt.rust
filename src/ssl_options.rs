@@ -21,14 +21,15 @@
 
 use std::{
     ffi::CString,
-    io,
+    fmt, io,
     os::raw::{c_char, c_int, c_uchar, c_uint},
     path::{Path, PathBuf},
     pin::Pin,
     ptr,
+    sync::Arc,
 };
 
-use crate::{ffi, to_c_bool, Error, Result};
+use crate::{ffi, to_c_bool, AsyncClient, Error, Result, SslErrorCallback};
 
 /// Convert a path name to a CString
 pub fn path_to_cstring<P: AsRef<Path>>(path: P) -> Result<CString> {
@@ -39,6 +40,8 @@ pub fn path_to_cstring<P: AsRef<Path>>(path: P) -> Result<CString> {
     )?;
     Ok(s)
 }
+
+/////////////////////////////////////////////////////////////////////////////
 
 /// The SSL/TLS versions that can be requested.
 #[repr(u32)]
@@ -56,43 +59,53 @@ pub enum SslVersion {
 }
 
 /////////////////////////////////////////////////////////////////////////////
+//                              SslOptions
+/////////////////////////////////////////////////////////////////////////////
 
 /// The options for SSL socket connections to the broker.
-#[derive(Debug, Default, Clone)]
+#[derive(Default, Clone)] //Debug, Default, Clone)]
 pub struct SslOptions {
     /// File name of the trust store.
-    trust_store: PathBuf,
+    pub trust_store: PathBuf,
     /// File name of the clien't public key store.
-    key_store: PathBuf,
+    pub key_store: PathBuf,
     /// File name for the private key, if not in key store.
-    private_key: PathBuf,
+    pub private_key: PathBuf,
     /// Password for the private key, if any.
-    private_key_password: String,
+    pub private_key_password: String,
     /// The list of cipher quites that the client presents to the server.
-    enabled_cipher_suites: String,
+    pub enabled_cipher_suites: String,
     /// Whether to enable verification of the server certificate **/
-    enable_server_cert_auth: bool,
+    pub enable_server_cert_auth: bool,
     /// The SSL/TLS version to use.
-    ssl_version: SslVersion,
+    pub ssl_version: SslVersion,
     /// Whether to carry out post-connect checks, including that a certificate
     /// matches the given host name.
-    verify: bool,
+    pub verify: bool,
     /// The path to the CA certificates, if specified.
-    ca_path: PathBuf,
+    pub ca_path: PathBuf,
+    /// The SSL error callback.
+    pub on_ssl_error: Option<Arc<SslErrorCallback>>,
 
-    // TODO: Error callback and context
     // TODO: PSK callback and context
     /// Don't load default SSL CA. Should be used together with PSK to make
     /// sure regular servers with certificate in place is not accepted.
-    disable_default_trust_store: bool,
+    pub disable_default_trust_store: bool,
     /// The list of ALPN protocols available to be negotiated.
-    protos: Vec<String>,
+    pub protos: Vec<String>,
 }
 
 impl SslOptions {
     /// Creates a new, default, set of SSL/TLS options.
     pub fn new() -> Self {
         Self::default()
+    }
+}
+
+// TODO: Implement this
+impl fmt::Debug for SslOptions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "SslOptions")
     }
 }
 
@@ -198,6 +211,15 @@ impl SslOptionsBuilder {
         self
     }
 
+    /// Sets the SSL/TLS error callback.
+    pub fn error_callback<F>(&mut self, cb: F) -> &mut Self
+    where
+        F: Fn(&AsyncClient, &str) + Send + 'static,
+    {
+        self.0.on_ssl_error = Some(Arc::new(cb));
+        self
+    }
+
     /// Don't load the default SSL CA.
     ///
     /// This should be used together with PSK to make sure
@@ -226,6 +248,8 @@ impl SslOptionsBuilder {
     }
 }
 
+/////////////////////////////////////////////////////////////////////////////
+//                          Crate FFI Options
 /////////////////////////////////////////////////////////////////////////////
 
 // Implementation note:
