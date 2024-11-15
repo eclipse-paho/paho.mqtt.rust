@@ -88,7 +88,6 @@ pub struct SslOptions {
     pub on_ssl_error: Option<Arc<SslErrorCallback>>,
 
     // TODO: PSK callback and context
-
     /// Don't load default SSL CA. Should be used together with PSK to make
     /// sure regular servers with certificate in place is not accepted.
     pub disable_default_trust_store: bool,
@@ -108,18 +107,21 @@ impl SslOptions {
 impl fmt::Debug for SslOptions {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SslOptions")
-        .field("trust_store", &self.trust_store)
-        .field("key_store", &self.key_store)
-        .field("private_key", &self.private_key)
-        .field("private_key_password", &self.private_key_password)
-        .field("enabled_cipher_suites", &self.enabled_cipher_suites)
-        .field("enable_server_cert_auth", &self.enable_server_cert_auth)
-        .field("ssl_version", &self.ssl_version)
-        .field("verify", &self.verify)
-        .field("ca_path", &self.ca_path)
-        .field("disable_default_trust_store", &self.disable_default_trust_store)
-        .field("protos", &self.protos)
-        .finish()
+            .field("trust_store", &self.trust_store)
+            .field("key_store", &self.key_store)
+            .field("private_key", &self.private_key)
+            .field("private_key_password", &self.private_key_password)
+            .field("enabled_cipher_suites", &self.enabled_cipher_suites)
+            .field("enable_server_cert_auth", &self.enable_server_cert_auth)
+            .field("ssl_version", &self.ssl_version)
+            .field("verify", &self.verify)
+            .field("ca_path", &self.ca_path)
+            .field(
+                "disable_default_trust_store",
+                &self.disable_default_trust_store,
+            )
+            .field("protos", &self.protos)
+            .finish()
     }
 }
 
