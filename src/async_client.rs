@@ -314,7 +314,8 @@ impl AsyncClient {
 
                 if let Some(ref mut cb) = cbctx.on_disconnected {
                     let reason_code = ReasonCode::from(reason);
-                    let props = Properties::from_c_struct(&*cprops);
+                    // TODO: Handle error?
+                    let props = Properties::try_from(&*cprops).unwrap_or_default();
                     trace!("Invoking disconnected callback");
                     cb(&cli, props, reason_code);
                 }

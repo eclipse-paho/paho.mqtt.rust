@@ -29,7 +29,11 @@ use std::{
     slice,
 };
 
-use crate::{ffi, properties::Properties, to_c_bool, QoS};
+use crate::{
+    ffi,
+    properties::{Properties, PropertiesFfi},
+    to_c_bool, QoS,
+};
 
 /// A `Message` represents all the information passed in an MQTT PUBLISH
 /// packet.
@@ -45,7 +49,7 @@ pub struct Message {
 pub(crate) struct MessageData {
     pub(crate) topic: CString,
     pub(crate) payload: Vec<u8>,
-    pub(crate) props: Properties,
+    pub(crate) props: PropertiesFfi,
 }
 
 impl MessageData {
@@ -58,7 +62,7 @@ impl MessageData {
         Self {
             topic: CString::new(topic.into()).unwrap(),
             payload: payload.into(),
-            props: Properties::default(),
+            props: PropertiesFfi::default(),
         }
     }
 }
@@ -144,7 +148,7 @@ impl Message {
         let data = MessageData {
             topic,
             payload,
-            props: Properties::from_c_struct(&cmsg.properties),
+            props: PropertiesFfi::from_c_struct(&cmsg.properties),
         };
 
         Self::from_data(*cmsg, data)
@@ -186,7 +190,8 @@ impl Message {
     }
 
     /// Gets the properties in the message
-    pub fn properties(&self) -> &Properties {
+    /// TODO: Make this Properties
+    pub fn properties(&self) -> &PropertiesFfi {
         &self.data.props
     }
 }
@@ -332,7 +337,7 @@ impl MessageBuilder {
         let data = MessageData {
             topic: CString::new(self.topic).unwrap(),
             payload: self.payload,
-            props: self.props,
+            props: self.props.into(),
         };
         Message::from_data(cmsg, data)
     }

@@ -19,6 +19,7 @@ bundled = ["paho-mqtt-sys/bundled"]
 build_bindgen = ["paho-mqtt-sys/build_bindgen"]
 ssl = ["paho-mqtt-sys/ssl"]
 vendored-ssl = ["paho-mqtt-sys/vendored-ssl"]
+serde = ["dep:serde"]
 
 [dependencies]
 paho-mqtt-sys = { version = "0.11", path = "paho-mqtt-sys", default-features=false }
@@ -30,11 +31,13 @@ crossbeam-channel = "0.5"
 log = "0.4"
 thiserror = "2.0"
 tokio = { version = "1.49", features = ["full"], optional = true }
+serde = { version = "1.0", features = ["derive"], optional = true }
 
 [dev-dependencies]
 env_logger = "0.11"
 toml = "0.9"
 serde = "1.0"
+#serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 lazy_static = "1.4"
 futures-util = "0.3"

@@ -25,14 +25,24 @@
 
 use std::{
     any::{Any, TypeId},
+    collections::HashMap,
     convert::TryFrom,
     ffi::CString,
-    mem,
+    fmt, mem,
     os::raw::{c_char, c_int},
     ptr,
+    slice::{Iter, IterMut},
 };
 
-use crate::{errors::Result, ffi};
+use crate::{ffi, Error, Result};
+
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize, Serializer};
+
+/// Property
+//pub type Property = PropertyFfi;
+/// Properties
+//pub type Properties = PropertiesFfi;
 
 /// Error code for property mismatches
 const INVALID_PROPERTY_ID: i32 = ffi::MQTT_INVALID_PROPERTY_ID;
@@ -49,6 +59,7 @@ type LenString = ffi::MQTTLenString;
 /// The underlying data type for a specific property
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum PropertyType {
     /// A property containing a single byte
     Byte = 0,
@@ -110,13 +121,20 @@ impl TryFrom<ffi::MQTTPropertyTypes> for PropertyType {
     }
 }
 
+impl fmt::Display for PropertyType {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{:?}", self)
+    }
+}
+
 /// The enumerated codes for the MQTT v5 properties.
 ///
 /// The property code defines both the meaning of the value in the property
 /// (Correlation Data, Server Keep Alive) and the data type held by the
 /// property.
-#[repr(u32)]
+#[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[allow(missing_docs)]
 pub enum PropertyCode {
     /// \[Byte, u8\] Indicates whether the payload is unspecified, possibly
@@ -202,7 +220,7 @@ type Code = ffi::MQTTPropertyCodes;
 impl PropertyCode {
     /// Tries to create a `PropertyCode` from the integer value.
     pub fn new(code: ffi::MQTTPropertyCodes) -> Option<Self> {
-        Self::try_from(code).ok()
+        Self::try_from(code as u8).ok()
     }
 
     /// Get the property type from the code identifier.
@@ -217,12 +235,12 @@ impl PropertyCode {
     }
 }
 
-impl TryFrom<ffi::MQTTPropertyCodes> for PropertyCode {
+impl TryFrom<u8> for PropertyCode {
     type Error = crate::Error;
 
     /// Try to convert from an integer property type to and enumeration
     /// value.
-    fn try_from(code: ffi::MQTTPropertyCodes) -> Result<Self> {
+    fn try_from(code: u8) -> Result<Self> {
         use PropertyCode::*;
         match code {
             1 => Ok(PayloadFormatIndicator),
@@ -257,7 +275,283 @@ impl TryFrom<ffi::MQTTPropertyCodes> for PropertyCode {
     }
 }
 
+impl fmt::Display for PropertyCode {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{:?}", self)
+    }
+}
+
 /////////////////////////////////////////////////////////////////////////////
+
+/// Type for a variable byte integer.
+pub type VbiU32 = u32;
+
+/// A single MQTT v5 property.
+///
+/// An MQTT v5 property consists of both a property "code"  and a value. The
+/// code indicates what the property contains (Response Topic, Will Delay
+/// Interval, etc), and also the data type for the value. Each copde
+/// corresponds to a single, specific data type as described in the v5
+/// spec, here:
+/// <https://docs.oasis-open.org/mqtt/mqtt/v5.0/os/mqtt-v5.0-os.html#_Toc3901027>
+///
+/// There are only a limited number of data types that are possible for
+/// properties:
+///   "Byte"  - `u8`
+///   "Two Byte Integer"  - `u16`
+///   "Four Byte Integer"  - `u32`
+///   "Binary Data"  - `Vec<u8>`
+///   "UTF-8 Encoded String"  - `String`
+///   "UTF-8 String Pair"  - `(String,String)`
+///
+#[derive(Debug, Clone)]
+#[repr(u8)]
+#[allow(missing_docs)]
+pub enum Property {
+    PayloadFormatIndicator(u8) = 1,
+    MessageExpiraryInterval(u32) = 2,
+    ContentType(String) = 3,
+    ResponseTopic(String) = 8,
+    CorrelationData(Vec<u8>) = 9,
+    SubscriptionIdentifier(VbiU32) = 11,
+    SessionExpiryInterval(u32) = 17,
+    AssignedClientIdentifer(String) = 18,
+    ServerKeepAlive(u16) = 19,
+    AuthenticationMethod(String) = 21,
+    AuthenticationData(Vec<u8>) = 22,
+    RequestProblemInformation(u8) = 23,
+    WillDelayInterval(u32) = 24,
+    RequestResponseInformation(u8) = 25,
+    ResponseInformation(String) = 26,
+    ServerReference(String) = 28,
+    ReasonString(String) = 31,
+    ReceiveMaximum(u16) = 33,
+    TopicAliasMaximum(u16) = 34,
+    TopicAlias(u16) = 35,
+    MaximumQos(u8) = 36,
+    RetainAvailable(u8) = 37,
+    User((String, String)) = 38,
+    MaximumPacketSize(u32) = 39,
+    WildcardSubscriptionAvailable(u8) = 40,
+    SubscriptionIdentifiersAvailable(u8) = 41,
+    SharedSubscriptionAvailable(u8) = 42,
+}
+
+impl Property {
+    /// Gets the property code as the raw byte value.
+    fn property_code_raw(&self) -> u8 {
+        unsafe { *(self as *const Self as *const u8) }
+    }
+
+    /// Gets the property code corresponging to the property.
+    pub fn code(&self) -> PropertyCode {
+        PropertyCode::try_from(self.property_code_raw()).unwrap()
+    }
+
+    // TODO: Implement these
+
+    /// Gets the property value as a a u8 byte.
+    pub fn get_byte(&self) -> Option<u8> {
+        Some(0)
+    }
+
+    /// Gets the property value as a 16-bit uint.
+    pub fn get_u16(&self) -> Option<u16> {
+        Some(0)
+    }
+
+    /// Gets the property value as a 32-bit uint.
+    pub fn get_u32(&self) -> Option<u32> {
+        Some(0)
+    }
+
+    /// Gets the property value as an integer.
+    /// This extracts an integer value from the property. It works with any
+    /// of the int types, one, two, or four bytes.
+    /// If the Property contains an integer type it will be returned as
+    /// Some(val), otherwise it will return None.
+    pub fn get_uint(&self) -> Option<u32> {
+        Some(0)
+    }
+
+    /// Gets the property value as a string pair.
+    pub fn get_string(&self) -> Option<String> {
+        Some(String::new())
+    }
+
+    /// Gets the property value as a string pair.
+    pub fn get_binary(&self) -> Option<Binary> {
+        Some(Binary::default())
+    }
+
+    /// Gets the property value as a string pair.
+    pub fn get_string_pair(&self) -> Option<(String, String)> {
+        Some((String::new(), String::new()))
+    }
+}
+
+macro_rules! property_value {
+    ( $props:expr, $variant:path ) => {
+        $props
+            .iter()
+            .filter_map(|val| match *val {
+                $variant(ref data) => Some(data),
+                _ => None,
+            })
+            .next()
+    };
+}
+
+macro_rules! property_values {
+    ( $props:expr, $variant:path ) => {
+        $props.iter().filter_map(|val| match *val {
+            $variant(ref data) => Some(data),
+            _ => None,
+        })
+    };
+}
+
+/*
+impl TryFrom<&ffi::MQTTProperty> for Property {
+    type Error = Error;
+
+    fn try_from(cprop: &ffi::MQTTProperty) -> Result<Self> {
+        // TODO: Implement this
+        Ok(Self::default())
+    }
+}
+*/
+
+/////////////////////////////////////////////////////////////////////////////
+
+/// A collection of property values.
+#[derive(Debug, Default, Clone)]
+pub struct Properties(Vec<Property>);
+
+impl Properties {
+    /// Creates a new, empty collection of properties.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Converts the property collection into a vector of properties.
+    pub fn into_vec(self) -> Vec<Property> {
+        self.0
+    }
+
+    /// Gets the property collection as a slice of properties.
+    pub fn as_slice(&self) -> &[Property] {
+        self.0.as_slice()
+    }
+
+    /// Determines if the collection of properies is empty.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Gets the number of properties in the collection.
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Inserts a property into the collection.
+    pub fn insert(&mut self, idx: usize, prop: Property) {
+        self.0.insert(idx, prop);
+    }
+
+    /// Pushes a property onto the end of the collection
+    pub fn push(&mut self, prop: Property) {
+        self.0.push(prop);
+    }
+
+    /// Adds a property to the collection given the property code and value.
+    pub fn push_val<T>(&mut self, code: PropertyCode, val: T) -> Result<()>
+    where
+        T: Any + 'static,
+    {
+        // TODO: Implement this
+        //self.push(Property::new(code, val)?)
+        Ok(())
+    }
+
+    /// Gets the payload format indicator, if any
+    pub fn payload_format_indicator(&self) -> Option<&u8> {
+        property_value!(self, Property::PayloadFormatIndicator)
+    }
+
+    /// Gets the byte value for the requested property code, if any
+    pub fn get_byte(&self, code: PropertyCode) -> Option<&u8> {
+        use PropertyCode::*;
+        match code {
+            PayloadFormatIndicator => {
+                property_value!(self.0, Property::PayloadFormatIndicator)
+            }
+            _ => None,
+        }
+    }
+
+    /// Gets the string value for the requested property code, if any
+    pub fn get_string(&self, code: PropertyCode) -> Option<&str> {
+        use PropertyCode::*;
+        match code {
+            ContentType => property_value!(self.0, Property::ContentType),
+            ResponseTopic => property_value!(self.0, Property::ResponseTopic),
+            _ => None,
+        }
+        .map(|s| s.as_str())
+    }
+
+    /// Find the user value for the requested user key, if any
+    pub fn find_user(&self, key: &str) -> Option<&str> {
+        property_values!(self.0, Property::User)
+            .filter_map(|(k, v)| {
+                if k == key {
+                    Some(v.as_str())
+                }
+                else {
+                    None
+                }
+            })
+            .next()
+    }
+
+    /// Extract the user values into a vector of string tuples.
+    pub fn user_vec(&self) -> Vec<(&str, &str)> {
+        property_values!(self.0, Property::User)
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect()
+    }
+
+    /// Extract the user values into a map of string kay/value pairs.
+    pub fn user_values(&self) -> HashMap<&str, &str> {
+        property_values!(self.0, Property::User)
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect()
+    }
+
+    /// Create an iterator through the properties.
+    pub fn iter(&self) -> Iter<'_, Property> {
+        self.0.iter()
+    }
+}
+
+impl From<Vec<Property>> for Properties {
+    fn from(v: Vec<Property>) -> Self {
+        Self(v)
+    }
+}
+
+impl TryFrom<&ffi::MQTTProperties> for Properties {
+    type Error = Error;
+
+    fn try_from(cprop: &ffi::MQTTProperties) -> Result<Self> {
+        // TODO: Implement this
+        Ok(Self::default())
+    }
+}
+
+/////////////////////////////////////////////////////////////////////////////
+// FFI
 
 /// A single MQTT v5 property.
 ///
@@ -278,16 +572,16 @@ impl TryFrom<ffi::MQTTPropertyCodes> for PropertyCode {
 ///   "UTF-8 String Pair"  - `(String,String)`
 ///
 #[derive(Debug)]
-pub struct Property {
+pub struct PropertyFfi {
     pub(crate) cprop: ffi::MQTTProperty,
 }
 
-impl Property {
+impl PropertyFfi {
     /// Creates a new property for a given code and value.
     ///
     /// The type for the value must match the type expected for the given
     /// property code exactly, otherwise it will be rejected and return None.
-    pub fn new<T>(code: PropertyCode, val: T) -> Result<Property>
+    pub fn new<T>(code: PropertyCode, val: T) -> Result<Self>
     where
         T: Any + 'static,
     {
@@ -453,7 +747,7 @@ impl Property {
     }
 
     /// Creates a single-byte property
-    pub fn new_byte(code: PropertyCode, val: u8) -> Result<Property> {
+    pub fn new_byte(code: PropertyCode, val: u8) -> Result<Self> {
         match code.property_type() {
             PropertyType::Byte => Self::new_int(code, val as i32),
             _ => Err(INVALID_PROPERTY_ID.into()),
@@ -461,7 +755,7 @@ impl Property {
     }
 
     /// Creates a 2-byte integer property
-    pub fn new_u16(code: PropertyCode, val: u16) -> Result<Property> {
+    pub fn new_u16(code: PropertyCode, val: u16) -> Result<Self> {
         match code.property_type() {
             PropertyType::TwoByteInteger => Self::new_int(code, val as i32),
             _ => Err(INVALID_PROPERTY_ID.into()),
@@ -469,7 +763,7 @@ impl Property {
     }
 
     /// Creates a 4-byte integer property
-    pub fn new_u32(code: PropertyCode, val: u32) -> Result<Property> {
+    pub fn new_u32(code: PropertyCode, val: u32) -> Result<Self> {
         match code.property_type() {
             PropertyType::FourByteInteger => Self::new_int(code, val as i32),
             _ => Err(INVALID_PROPERTY_ID.into()),
@@ -479,7 +773,7 @@ impl Property {
     /// Creates a new integer property.
     ///
     /// This works for any sized integer type, from byte on up.
-    pub fn new_int(code: PropertyCode, val: i32) -> Result<Property> {
+    pub fn new_int(code: PropertyCode, val: i32) -> Result<Self> {
         let value = match code.property_type() {
             PropertyType::Byte => {
                 if val & !0xFF != 0 {
@@ -501,7 +795,7 @@ impl Property {
             _ => return Err(INVALID_PROPERTY_ID.into()),
         };
 
-        Ok(Property {
+        Ok(Self {
             cprop: ffi::MQTTProperty {
                 identifier: code as Code,
                 value,
@@ -510,7 +804,7 @@ impl Property {
     }
 
     /// Creates a new binary property.
-    pub fn new_binary<V>(code: PropertyCode, bin: V) -> Result<Property>
+    pub fn new_binary<V>(code: PropertyCode, bin: V) -> Result<Self>
     where
         V: Into<Binary>,
     {
@@ -525,11 +819,11 @@ impl Property {
         let p = v.as_mut_ptr() as *mut c_char;
         mem::forget(v);
 
-        Ok(Property::new_string_binary(code, p, n, ptr::null_mut(), 0))
+        Ok(Self::new_string_binary(code, p, n, ptr::null_mut(), 0))
     }
 
     /// Creates a new string property.
-    pub fn new_string(code: PropertyCode, s: &str) -> Result<Property> {
+    pub fn new_string(code: PropertyCode, s: &str) -> Result<Self> {
         if code.property_type() != PropertyType::Utf8EncodedString {
             return Err(INVALID_PROPERTY_ID.into());
         }
@@ -537,11 +831,11 @@ impl Property {
         let n = s.len();
         let p = CString::new(s).unwrap().into_raw();
 
-        Ok(Property::new_string_binary(code, p, n, ptr::null_mut(), 0))
+        Ok(Self::new_string_binary(code, p, n, ptr::null_mut(), 0))
     }
 
     /// Creates a new string pair property.
-    pub fn new_string_pair(code: PropertyCode, key: &str, val: &str) -> Result<Property> {
+    pub fn new_string_pair(code: PropertyCode, key: &str, val: &str) -> Result<Self> {
         if code.property_type() != PropertyType::Utf8StringPair {
             return Err(INVALID_PROPERTY_ID.into());
         }
@@ -552,11 +846,11 @@ impl Property {
         let nval = val.len();
         let pval = CString::new(val).unwrap().into_raw();
 
-        Ok(Property::new_string_binary(code, pkey, nkey, pval, nval))
+        Ok(Self::new_string_binary(code, pkey, nkey, pval, nval))
     }
 
     /// Creates a property from a C lib MQTTProperty struct.
-    fn from_c_property(cprop: &ffi::MQTTProperty) -> Result<Property> {
+    fn from_c_property(cprop: &ffi::MQTTProperty) -> Result<Self> {
         use PropertyType::*;
 
         let mut cprop = *cprop;
@@ -621,7 +915,7 @@ impl Property {
             // Lengths are the same as the originals
             cprop.value.__bindgen_anon_1.data.data = pdata;
         }
-        Ok(Property { cprop })
+        Ok(Self { cprop })
     }
 
     /// Creates a new string, string pair, or binary property given the raw
@@ -635,8 +929,8 @@ impl Property {
         ndata: usize,
         pval: *mut c_char,
         nval: usize,
-    ) -> Property {
-        Property {
+    ) -> Self {
+        Self {
             cprop: ffi::MQTTProperty {
                 identifier: code as Code,
                 value: Value {
@@ -739,7 +1033,7 @@ impl Property {
         }
     }
 
-    /// Gets the property value as a u16.
+    /// Gets the property value as a u32.
     pub fn get_u32(&self) -> Option<u32> {
         match self.property_type() {
             PropertyType::FourByteInteger => Some(unsafe { self.cprop.value.integer4 }),
@@ -819,7 +1113,7 @@ impl Property {
     }
 }
 
-impl Drop for Property {
+impl Drop for PropertyFfi {
     /// Drops the property.
     /// For string any binary types, the heap memory will be freed.
     fn drop(&mut self) {
@@ -859,7 +1153,7 @@ impl Drop for Property {
     }
 }
 
-impl Clone for Property {
+impl Clone for PropertyFfi {
     /// Creates a clone of the property.
     /// For string any binary properties, this also clones the heap memory
     /// so that each property is managing separate allocations.
@@ -899,7 +1193,7 @@ impl Clone for Property {
                 _ => (),
             }
         }
-        Property { cprop }
+        Self { cprop }
     }
 }
 
@@ -911,14 +1205,14 @@ impl Clone for Property {
 /// This is a collection of properties that can be added to outgoing packets
 /// or retrieved from incoming packets.
 #[derive(Debug, Default)]
-pub struct Properties {
+pub struct PropertiesFfi {
     pub(crate) cprops: ffi::MQTTProperties,
 }
 
-impl Properties {
+impl PropertiesFfi {
     /// Creates a new, empty collection of properties.
     pub fn new() -> Self {
-        Properties::default()
+        Self::default()
     }
 
     /// Creates a set of properties from an underlying C struct.
@@ -927,7 +1221,7 @@ impl Properties {
     /// the copy.
     pub fn from_c_struct(cprops: &ffi::MQTTProperties) -> Self {
         let cprops = unsafe { ffi::MQTTProperties_copy(cprops) };
-        Properties { cprops }
+        Self { cprops }
     }
 
     /// Determines if the property list has no items in it.
@@ -954,7 +1248,7 @@ impl Properties {
     }
 
     /// Adds a property to the colletion.
-    pub fn push(&mut self, prop: Property) -> Result<()> {
+    pub fn push(&mut self, prop: PropertyFfi) -> Result<()> {
         match unsafe { ffi::MQTTProperties_add(&mut self.cprops, &prop.cprop) } {
             0 => Ok(()),
             rc => Err(rc.into()),
@@ -966,29 +1260,29 @@ impl Properties {
     where
         T: Any + 'static,
     {
-        self.push(Property::new(code, val)?)
+        self.push(PropertyFfi::new(code, val)?)
     }
 
     /// Adds an single-byte property to the collection.
     pub fn push_byte(&mut self, code: PropertyCode, val: u8) -> Result<()> {
-        self.push(Property::new_byte(code, val)?)
+        self.push(PropertyFfi::new_byte(code, val)?)
     }
 
     /// Adds an two-byte integer property to the collection.
     pub fn push_u16(&mut self, code: PropertyCode, val: u16) -> Result<()> {
-        self.push(Property::new_u16(code, val)?)
+        self.push(PropertyFfi::new_u16(code, val)?)
     }
 
     /// Adds a four-byte integer property to the collection.
     pub fn push_u32(&mut self, code: PropertyCode, val: u32) -> Result<()> {
-        self.push(Property::new_u32(code, val)?)
+        self.push(PropertyFfi::new_u32(code, val)?)
     }
 
     /// Adds an integer property to the collection.
     ///
     /// This works for any integer type.
     pub fn push_int(&mut self, code: PropertyCode, val: i32) -> Result<()> {
-        self.push(Property::new_int(code, val)?)
+        self.push(PropertyFfi::new_int(code, val)?)
     }
 
     /// Adds a binary property to the collection
@@ -996,12 +1290,12 @@ impl Properties {
     where
         V: Into<Binary>,
     {
-        self.push(Property::new_binary(code, bin)?)
+        self.push(PropertyFfi::new_binary(code, bin)?)
     }
 
     /// Adds a string property to the collection
     pub fn push_string(&mut self, code: PropertyCode, s: &str) -> Result<()> {
-        self.push(Property::new_string(code, s)?)
+        self.push(PropertyFfi::new_string(code, s)?)
     }
 
     /// Adds a string pair property to the collection
@@ -1011,21 +1305,21 @@ impl Properties {
         key: &str,
         val: &str,
     ) -> Result<()> {
-        self.push(Property::new_string_pair(code, key, val)?)
+        self.push(PropertyFfi::new_string_pair(code, key, val)?)
     }
 
     /// Gets a property instance
-    pub fn get(&self, code: PropertyCode) -> Option<Property> {
+    pub fn get(&self, code: PropertyCode) -> Option<PropertyFfi> {
         self.get_at(code, 0)
     }
 
     /// Gets a property instance when there are possibly multiple values.
-    pub fn get_at(&self, code: PropertyCode, idx: usize) -> Option<Property> {
-        let ps = &self.cprops as *const ffi::MQTTProperties;
+    pub fn get_at(&self, code: PropertyCode, idx: usize) -> Option<PropertyFfi> {
+        let ps = &self.cprops as *const _ as *mut ffi::MQTTProperties;
         unsafe {
             let p = ffi::MQTTProperties_getPropertyAt(ps, code as Code, idx as c_int);
             if !p.is_null() {
-                Property::from_c_property(&*p).ok()
+                PropertyFfi::from_c_property(&*p).ok()
             }
             else {
                 None
@@ -1129,18 +1423,18 @@ impl Properties {
 unsafe impl Send for Properties {}
 unsafe impl Sync for Properties {}
 
-impl Clone for Properties {
+impl Clone for PropertiesFfi {
     /// Creates a clone of the property.
     /// For string any binary properties, this also clones the heap memory
     /// so that each property is managing separate allocations.
     fn clone(&self) -> Self {
         // This does a deep copy in the C lib
         let cprops = unsafe { ffi::MQTTProperties_copy(&self.cprops) };
-        Properties { cprops }
+        Self { cprops }
     }
 }
 
-impl Drop for Properties {
+impl Drop for PropertiesFfi {
     fn drop(&mut self) {
         // This deletes the collection and all the elements in it.
         unsafe { ffi::MQTTProperties_free(&mut self.cprops) };
@@ -1149,13 +1443,13 @@ impl Drop for Properties {
 
 /// Iterator over the values for a speciifc property
 pub struct PropertyIterator<'a> {
-    props: &'a Properties,
+    props: &'a PropertiesFfi,
     code: PropertyCode,
     idx: usize,
 }
 
 impl<'a> Iterator for PropertyIterator<'a> {
-    type Item = Property;
+    type Item = PropertyFfi;
 
     fn next(&mut self) -> Option<Self::Item> {
         let prop = self.props.get_at(self.code, self.idx);
@@ -1166,7 +1460,7 @@ impl<'a> Iterator for PropertyIterator<'a> {
 
 /// Iterator over the values for a speciifc property
 pub struct StringPairIterator<'a> {
-    props: &'a Properties,
+    props: &'a PropertiesFfi,
     code: PropertyCode,
     idx: usize,
 }
@@ -1178,6 +1472,44 @@ impl<'a> Iterator for StringPairIterator<'a> {
         let pair = self.props.get_string_pair_at(self.code, self.idx);
         self.idx += 1;
         pair
+    }
+}
+
+#[cfg(feature = "serde")]
+impl Serialize for PropertiesFfi {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut state = serializer.serialize_struct("Properties", self.len())?;
+        for prop in self.iter() {
+            match prop.property_type() {
+                PropertyType::Byte
+                | PropertyType::TwoByteInteger
+                | PropertyType::FourByteInteger
+                | PropertyType::VariableByteInteger => {
+                    let name = prop.property_code().to_string();
+                    state.serialize_field(&name, prop.get_int())?;
+                }
+                _ => {
+                    state.serialize_field("xxx", 0)?;
+                }
+            }
+        }
+        state.end()
+    }
+}
+
+impl From<&Properties> for PropertiesFfi {
+    // TODO: Implement this
+    fn from(props: &Properties) -> Self {
+        Self::default()
+    }
+}
+
+impl From<Properties> for PropertiesFfi {
+    fn from(props: Properties) -> Self {
+        Self::from(&props)
     }
 }
 

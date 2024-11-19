@@ -39,7 +39,7 @@ use crate::{
     Error, Result,
     ffi, name_value::NameValueCollection, ssl_options::SslOptionsFfi,
     string_collection::StringCollection, to_c_bool, types::*, ConnectToken, Message,
-    Properties, SslOptions, Token, TokenInner, WillOptions,
+    Properties, PropertiesFfi, SslOptions, Token, TokenInner, WillOptions,
 };
 use std::{
     collections::HashMap, ffi::CString, os::raw::c_int, pin::Pin, ptr, time::Duration,
@@ -582,8 +582,8 @@ struct ConnectOptionsFfiData {
     user_name: Option<CString>,
     password: Option<CString>,
     server_uris: StringCollection,
-    props: Properties,
-    will_props: Properties,
+    props: PropertiesFfi,
+    will_props: PropertiesFfi,
     http_headers: NameValueCollection,
     http_proxy: CString,
     https_proxy: CString,
@@ -835,7 +835,7 @@ impl From<&ConnectOptions> for ConnectOptionsFfiData {
 
         if let Some(msg) = &opts.will {
             data.will = Some(WillOptions::from(msg.clone()));
-            data.will_props = msg.properties().clone();
+            data.will_props = msg.properties().clone(); //PropertiesFfi::from(msg.properties());
         }
         if let Some(ssl) = &opts.ssl {
             // TODO: Return the error
@@ -851,7 +851,7 @@ impl From<&ConnectOptions> for ConnectOptionsFfiData {
         if !opts.server_uris.is_empty() {
             data.server_uris = StringCollection::from(opts.server_uris.as_slice());
         }
-        data.props = opts.props.clone();
+        data.props = PropertiesFfi::from(&opts.props);
 
         if !opts.http_headers.is_empty() {
             data.http_headers = NameValueCollection::from(opts.http_headers.clone());

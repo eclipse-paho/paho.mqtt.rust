@@ -35,7 +35,7 @@ use std::{os::raw::c_int, pin::Pin, ptr};
 
 use crate::{
     ffi,
-    properties::Properties,
+    properties::{Properties, PropertiesFfi},
     subscribe_options::{SubscribeOptions, SubscribeOptionsFfi},
     token::{Token, TokenInner},
     types::*,
@@ -108,7 +108,8 @@ impl CallOptionsFfi {
     ) -> Self {
         let mut data = Box::pin(data);
 
-        copts.properties = data.props.cprops;
+        let props = PropertiesFfi::from(&data.props);
+        copts.properties = props.cprops;
 
         let (p, n) = match data.sub_opts {
             Some(ref mut sub_opts) => (sub_opts.as_mut_ptr(), sub_opts.len() as c_int),

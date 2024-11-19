@@ -31,7 +31,11 @@
 //! combined with any other Rust futures.
 //!
 
-use crate::{ffi, from_c_bool, properties::Properties, reason_code::ReasonCode};
+use crate::{
+    ffi, from_c_bool,
+    properties::{Properties, PropertiesFfi},
+    reason_code::ReasonCode,
+};
 use std::ffi::CStr;
 
 /////////////////////////////////////////////////////////////////////////////
@@ -177,7 +181,7 @@ impl ServerResponse {
     ) -> Self {
         use ServerRequest::*;
 
-        let props = Properties::from_c_struct(&rsp.properties);
+        let props = Properties::try_from(&rsp.properties).unwrap_or_default();
         //debug!("Properties: {:?}", props);
         let reason_code = ReasonCode::from(rsp.reasonCode);
 
@@ -235,6 +239,23 @@ impl ServerResponse {
             rsp,
             props,
             reason_code,
+        }
+    }
+
+    /// Creates the response object from the v5 "failure" data structure
+    /// sent by the C lib on completion of the operation.
+    ///
+    /// # Safety
+    ///
+    /// This function runs in the context of a C callback indicating a
+    /// failed v5 action. It directly accesses the pointers and unions
+    /// in the C `MQTTAsync_failureData5` struct.
+    ///
+    pub unsafe fn from_failure5(rsp: &ffi::MQTTAsync_failureData5) -> Self {
+        Self {
+            rsp: RequestResponse::default(),
+            props: Properties::try_from(&rsp.properties).unwrap_or_default(),
+            reason_code: rsp.reasonCode.into(),
         }
     }
 

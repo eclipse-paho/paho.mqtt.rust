@@ -25,7 +25,11 @@
 //! This contains the structures to define the options for disconnecting from
 //! the MQTT broker/server.
 
-use crate::{ffi, properties::Properties, reason_code::ReasonCode};
+use crate::{
+    ffi,
+    properties::{Properties, PropertiesFfi},
+    reason_code::ReasonCode,
+};
 use std::{os::raw::c_int, time::Duration};
 
 /// The collection of options for disconnecting from the client.
@@ -55,9 +59,11 @@ impl DisconnectOptions {
 
     /// Gets an FFI C struct for the disconnect options
     pub(crate) fn c_struct(&self) -> ffi::MQTTAsync_disconnectOptions {
+        let props = PropertiesFfi::from(&self.props);
+
         ffi::MQTTAsync_disconnectOptions {
             timeout: self.timeout.as_secs() as c_int,
-            properties: self.props.cprops,
+            properties: props.cprops,
             reasonCode: self.reason_code as ffi::MQTTReasonCodes,
             ..ffi::MQTTAsync_disconnectOptions::default()
         }
