@@ -240,7 +240,26 @@ mod build {
     // but it only seems to set a variable for the path to the include files.
     // We assume the directory above that one is the SSL root.
     fn openssl_root_dir() -> Option<String> {
-        env::var("DEP_OPENSSL_INCLUDE").ok().and_then(|path| {
+        use std::ffi::OsString;
+
+        fn env_inner(name: &str) -> Option<OsString> {
+            let var = env::var_os(name);
+            println!("cargo:rerun-if-env-changed={}", name);
+
+            match var {
+                Some(ref v) => println!("{} = {}", name, v.to_string_lossy()),
+                None => println!("{} unset", name),
+            }
+
+            var
+        }
+        fn env(name: &str) -> Option<OsString> {
+            let prefix = env::var("TARGET").unwrap().to_uppercase().replace('-', "_");
+            let prefixed = format!("{}_{}", prefix, name);
+            env_inner(&prefixed).or_else(|| env_inner(name))
+        }
+
+        env("OPENSSL_INCLUDE_DIR").and_then(|path| {
             Path::new(&path)
                 .parent()
                 .map(|path| path.display().to_string())
@@ -308,37 +327,6 @@ mod build {
         println!("debug:Using Paho C headers at: {}", inc_dir.display());
 
         bindings::place_bindings(&inc_dir);
-
-        // Link in the SSL libraries if configured for it.
-        if cfg!(feature = "ssl") {
-            if let Some(openssl_root_dir) = openssl_root_dir() {
-                println!("cargo:rustc-link-search={}/lib", openssl_root_dir);
-            }
-
-            // See if static SSL linkage was requested
-            let linkage = match env::var("OPENSSL_STATIC")
-                .as_ref()
-                .map(|s| s.as_str())
-            {
-                Ok("0") => "",
-                Ok(_) => "=static",
-                Err(_) => ""
-            };
-
-            let prefix = if is_msvc() { "lib" } else { "" };
-
-            println!("cargo:rustc-link-lib{}={}ssl", linkage, prefix);
-            println!("cargo:rustc-link-lib{}={}crypto", linkage, prefix);
-
-            if is_windows() {
-                if !is_msvc() {
-                    // required for mingw builds
-                    println!("cargo:rustc-link-lib{}=crypt32", linkage);
-                    println!("cargo:rustc-link-lib{}=rpcrt4", linkage);
-                }
-                println!("cargo:rustc-link-lib=User32");
-            }
-        }
 
         // we add the folder where all the libraries are built to the path search
         println!("cargo:rustc-link-search=native={}", lib_path.display());
