@@ -34,10 +34,10 @@
 use {
     crate::{
         async_client::AsyncClient,
-        errors::{Error, Result},
         ffi,
         message::Message,
         server_response::{ServerRequest, ServerResponse},
+        Error, Result,
     },
     futures::{
         executor::block_on,
@@ -83,28 +83,37 @@ pub(crate) struct TokenData {
 
 impl TokenData {
     /// Creates token data for a specific message
-    pub fn from_message_id(msg_id: i16) -> TokenData {
-        TokenData {
+    pub fn from_message_id(msg_id: i16) -> Self {
+        Self {
             msg_id,
-            ..TokenData::default()
+            ..Self::default()
         }
     }
 
     /// Creates a new token that is already signaled with an error.
-    pub fn from_error(rc: i32) -> TokenData {
-        TokenData {
+    pub fn from_error(rc: i32) -> Self {
+        Self {
             res: Some(Err(Error::from(rc))),
-            ..TokenData::default()
+            ..Self::default()
         }
     }
 
     /// Creates a new token that is already signaled with an error.
     // TODO: Use this!
     #[allow(dead_code)]
-    pub fn from_error_descr(rc: i32, descr: &str) -> TokenData {
-        TokenData {
+    pub fn from_error_descr(rc: i32, descr: &str) -> Self {
+        Self {
             res: Some(Err(Error::from((rc, descr)))),
-            ..TokenData::default()
+            ..Self::default()
+        }
+    }
+}
+
+impl From<Error> for TokenData {
+    fn from(err: Error) -> Self {
+        Self {
+            res: Some(Err(err)),
+            ..Self::default()
         }
     }
 }
@@ -473,6 +482,15 @@ impl Default for TokenInner {
     }
 }
 
+impl From<Error> for TokenInner {
+    fn from(err: Error) -> Self {
+        Self {
+            lock: Mutex::new(TokenData::from(err)),
+            ..Self::default()
+        }
+    }
+}
+
 unsafe impl Send for TokenInner {}
 unsafe impl Sync for TokenInner {}
 
@@ -584,6 +602,15 @@ impl Token {
 impl Default for Token {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl From<Error> for Token {
+    /// Creates a new token that is already signaled with an error.
+    fn from(err: Error) -> Self {
+        Self {
+            inner: Arc::new(TokenInner::from(err)),
+        }
     }
 }
 

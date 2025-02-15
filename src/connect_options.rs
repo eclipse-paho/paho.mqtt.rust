@@ -5,7 +5,7 @@
 //
 
 /*******************************************************************************
- * Copyright (c) 2017-2023 Frank Pagliughi <fpagliughi@mindspring.com>
+ * Copyright (c) 2017-2025 Frank Pagliughi <fpagliughi@mindspring.com>
  *
  * All rights reserved. This program and the accompanying materials
  * are made available under the terms of the Eclipse Public License v2.0
@@ -36,6 +36,7 @@ use crate::{
     token::{ConnectToken, Token, TokenInner},
     types::*,
     will_options::WillOptions,
+    Error, Result,
 };
 use std::{ffi::CString, os::raw::c_int, pin::Pin, ptr, time::Duration};
 
@@ -218,6 +219,19 @@ impl ConnectOptions {
         }
     }
 
+    /// Does a check of the options to determine if their valid.
+    pub fn check(&self) -> Result<()> {
+        if !self.data.server_uris.is_empty() {
+            let uris: Vec<String> = (&self.data.server_uris).try_into()?;
+            let any_secure = uris.iter().any(|s| crate::is_secure_uri(s));
+
+            if any_secure && !self.has_ssl_options() {
+                return Err(Error::MissingSslOptions);
+            }
+        }
+        Ok(())
+    }
+
     /// Gets the MQTT protocol version that should be used for the
     /// connection.
     pub fn mqtt_version(&self) -> MqttVersion {
@@ -271,6 +285,11 @@ impl ConnectOptions {
         if clean {
             self.copts.cleansession = 0;
         }
+    }
+
+    /// Whether the options have SSL/TLS options for a secure connection
+    pub fn has_ssl_options(&self) -> bool {
+        self.data.ssl.is_some()
     }
 
     /// Sets the token to ber used for connect completion callbacks.
@@ -641,6 +660,10 @@ mod tests {
     use crate::{message::MessageBuilder, properties::*, ssl_options::SslOptionsBuilder};
     use std::{ffi::CStr, os::raw::c_char, thread};
 
+    const NAME: &str = "some-random-name";
+    const PSWD: &str = "some-random-password";
+    const TRUST_STORE: &str = "some_file.crt";
+
     // Identifier fo a C connect options struct
     const STRUCT_ID: [c_char; 4] = [
         b'M' as c_char,
@@ -697,7 +720,6 @@ mod tests {
 
     #[test]
     fn test_ssl() {
-        const TRUST_STORE: &str = "some_file.crt";
         let ssl_opts = SslOptionsBuilder::new()
             .trust_store(TRUST_STORE)
             .unwrap()
@@ -718,8 +740,6 @@ mod tests {
 
     #[test]
     fn test_user_name() {
-        const NAME: &str = "some-random-name";
-
         let opts = ConnectOptionsBuilder::new().user_name(NAME).finalize();
 
         assert!(!opts.copts.username.is_null());
@@ -733,8 +753,6 @@ mod tests {
 
     #[test]
     fn test_password() {
-        const PSWD: &str = "some-random-password";
-
         let opts = ConnectOptionsBuilder::new().password(PSWD).finalize();
 
         assert!(!opts.copts.password.is_null());
@@ -807,6 +825,47 @@ mod tests {
 
         let s = unsafe { CStr::from_ptr(opts.copts.httpsProxy) };
         assert_eq!(HTTPS, s.to_str().unwrap());
+    }
+
+    #[test]
+    fn test_opts_check() {
+        // Default must pass check
+        let opts = ConnectOptionsBuilder::new().finalize();
+        assert!(opts.check().is_ok());
+
+        // Non-secure connections w/o SSL opts should pass
+        let servers = ["tcp://server1:1883", "mqtt://server2:2883"];
+
+        let opts = ConnectOptionsBuilder::new()
+            .server_uris(&servers)
+            .finalize();
+
+        assert!(opts.check().is_ok());
+
+        // Secure connections w/o SSL opts should fail
+        let servers = ["tcp://server1:1883", "mqtts://server2:8883"];
+
+        let opts = ConnectOptionsBuilder::new()
+            .server_uris(&servers)
+            .finalize();
+
+        println!("{:?}", opts.check());
+        assert!(matches!(opts.check(), Err(Error::MissingSslOptions)));
+
+        // Secure connections with SSL opts should pass
+        let servers = ["tcp://server1:1883", "wss://server2:8883/ws"];
+
+        let ssl_opts = SslOptionsBuilder::new()
+            .trust_store(TRUST_STORE)
+            .unwrap()
+            .finalize();
+
+        let opts = ConnectOptionsBuilder::new()
+            .server_uris(&servers)
+            .ssl_options(ssl_opts)
+            .finalize();
+
+        assert!(opts.check().is_ok());
     }
 
     #[test]

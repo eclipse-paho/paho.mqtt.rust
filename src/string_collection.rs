@@ -10,7 +10,7 @@
 //
 
 /*******************************************************************************
- * Copyright (c) 2017-2020 Frank Pagliughi <fpagliughi@mindspring.com>
+ * Copyright (c) 2017-2025 Frank Pagliughi <fpagliughi@mindspring.com>
  *
  * All rights reserved. This program and the accompanying materials
  * are made available under the terms of the Eclipse Public License v2.0
@@ -149,6 +149,26 @@ impl Default for StringCollection {
 impl Clone for StringCollection {
     fn clone(&self) -> Self {
         Self::from_data((*self.data).clone())
+    }
+}
+
+impl TryFrom<StringCollection> for Vec<String> {
+    type Error = std::ffi::IntoStringError;
+
+    fn try_from(mut coll: StringCollection) -> std::result::Result<Self, Self::Error> {
+        coll.data.coll.drain(..).map(CString::into_string).collect()
+    }
+}
+
+impl TryFrom<&StringCollection> for Vec<String> {
+    type Error = std::ffi::IntoStringError;
+
+    fn try_from(coll: &StringCollection) -> std::result::Result<Self, Self::Error> {
+        coll.data
+            .coll
+            .iter()
+            .map(|s| s.clone().into_string())
+            .collect()
     }
 }
 

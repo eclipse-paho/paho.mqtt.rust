@@ -196,6 +196,9 @@ pub enum Error {
     /// A string NUL error
     #[error("String NUL Error")]
     Nul(#[from] std::ffi::NulError),
+    /// Missing SSL/TLS options
+    #[error("Missing SSL/TLS options")]
+    MissingSslOptions,
     /// Conversion error between types
     #[error("Conversion Error")]
     Conversion,
@@ -270,6 +273,12 @@ impl From<(i32, Option<String>)> for Error {
             Some(msg) => Self::from((rc, msg.as_str())),
             None => Self::from(rc),
         }
+    }
+}
+
+impl From<std::ffi::IntoStringError> for Error {
+    fn from(_: std::ffi::IntoStringError) -> Self {
+        Error::BadUtf8String
     }
 }
 

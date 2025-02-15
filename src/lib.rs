@@ -189,6 +189,16 @@ pub type UserData = Box<dyn Any + 'static + Send + Sync>;
 
 // --------------------------------------------------------------------------
 
+/// Determines if the URI us for a secure connection.
+pub fn is_secure_uri(uri: &str) -> bool {
+    for sch in &["ssl://", "tls://", "mqtts://", "wss://"] {
+        if uri.starts_with(sch) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Convert a Rust bool to a Paho C integer boolean
 pub fn to_c_bool(on: bool) -> c_int {
     c_int::from(on)

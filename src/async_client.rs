@@ -450,6 +450,15 @@ impl AsyncClient {
         debug!("Connecting. Handle: {:?}", self.inner.handle);
 
         let mut opts = opts.into().unwrap_or_default();
+
+        if crate::is_secure_uri(&self.server_uri()) && !opts.has_ssl_options() {
+            return ConnectToken::from(Error::MissingSslOptions);
+        }
+
+        if let Err(err) = opts.check() {
+            return ConnectToken::from(err);
+        }
+
         self.set_mqtt_version(opts.mqtt_version());
 
         let tok = Token::from_request(self, ServerRequest::Connect);
@@ -459,19 +468,7 @@ impl AsyncClient {
         let mut lkopts = self.inner.opts.lock().unwrap();
         *lkopts = opts;
 
-        // This is a small, temporary, hack to get around a possible segfault in the C lib.
-        // See:
-        // <https://github.com/eclipse-paho/paho.mqtt.rust/issues/238>
-        // <https://github.com/eclipse-paho/paho.mqtt.c/issues/1566>
-        let mut ssl_copts = ffi::MQTTAsync_SSLOptions::default();
-        let mut copts = lkopts.copts;
-        if copts.ssl.is_null() {
-            copts.ssl = &mut ssl_copts;
-        }
-
-        let rc = unsafe {
-            ffi::MQTTAsync_connect(self.inner.handle, &copts /*&lkopts.copts*/)
-        };
+        let rc = unsafe { ffi::MQTTAsync_connect(self.inner.handle, &lkopts.copts) };
 
         if rc != 0 {
             mem::drop(unsafe { Token::from_raw(lkopts.copts.context) });
@@ -508,6 +505,14 @@ impl AsyncClient {
             }
         }
 
+        if crate::is_secure_uri(&self.server_uri()) && !opts.has_ssl_options() {
+            return ConnectToken::from(Error::MissingSslOptions);
+        }
+
+        if let Err(err) = opts.check() {
+            return ConnectToken::from(err);
+        }
+
         self.set_mqtt_version(opts.mqtt_version());
 
         let tok = Token::from_client(self, ServerRequest::Connect, success_cb, failure_cb);
@@ -516,15 +521,7 @@ impl AsyncClient {
         let mut lkopts = self.inner.opts.lock().unwrap();
         *lkopts = opts;
 
-        let mut ssl_copts = ffi::MQTTAsync_SSLOptions::default();
-        let mut copts = lkopts.copts;
-        if copts.ssl.is_null() {
-            copts.ssl = &mut ssl_copts;
-        }
-
-        let rc = unsafe {
-            ffi::MQTTAsync_connect(self.inner.handle, &copts /*&lkopts.copts*/)
-        };
+        let rc = unsafe { ffi::MQTTAsync_connect(self.inner.handle, &lkopts.copts) };
 
         if rc != 0 {
             mem::drop(unsafe { Token::from_raw(lkopts.copts.context) });
