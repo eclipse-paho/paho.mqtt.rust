@@ -75,6 +75,7 @@ fn is_msvc() -> bool {
 }
 
 // Get the target pointer width, typically 32 or 64
+#[cfg(not(feature = "build_bindgen"))]
 fn pointer_width() -> u32 {
     env::var("CARGO_CFG_TARGET_POINTER_WIDTH")
         .map(|s| s.parse::<u32>().unwrap())
