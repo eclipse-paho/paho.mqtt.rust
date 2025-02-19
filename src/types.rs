@@ -81,6 +81,12 @@ impl From<c_int> for MqttVersion {
     }
 }
 
+impl fmt::Display for MqttVersion {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", *self as u8)
+    }
+}
+
 /// Supported Quality of Service levels
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(u8)]
@@ -138,5 +144,29 @@ impl From<i32> for QoS {
 impl From<u32> for QoS {
     fn from(qos: u32) -> Self {
         Self::try_from(qos as u8).unwrap_or_default()
+    }
+}
+
+
+/////////////////////////////////////////////////////////////////////////////
+//                              Unit Tests
+/////////////////////////////////////////////////////////////////////////////
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_mqtt_version_display() {
+        assert_eq!(MqttVersion::V3_1.to_string(), "3");
+        assert_eq!(MqttVersion::V3_1_1.to_string(), "4");
+        assert_eq!(MqttVersion::V5.to_string(), "5");
+    }
+
+    #[test]
+    fn test_qos_display() {
+        assert_eq!(QoS::AtMostOnce.to_string(), "0");
+        assert_eq!(QoS::AtLeastOnce.to_string(), "1");
+        assert_eq!(QoS::ExactlyOnce.to_string(), "2");
     }
 }

@@ -5,10 +5,11 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [v0.13.0](https://github.com/eclipse/paho.mqtt.rust/compare/v0.12.5..v0.13.0) - (2025-02-15)
+## [v0.13.1](https://github.com/eclipse/paho.mqtt.rust/compare/v0.13.0..v0.13.1) - (2025-02-19)
 
+- [#240](https://github.com/eclipse-paho/paho.mqtt.rust/issues/240) `Display` trait for `MqttVersion` enumeration.
+- [#241](https://github.com/eclipse-paho/paho.mqtt.rust/issues/241) Restored the ability to turn off the `ssl` feature.
 - Bumped -sys to v0.10.1 to get Paho C v1.3.13
-- 
 
 
 ## [v0.13.0](https://github.com/eclipse/paho.mqtt.rust/compare/v0.12.5..v0.13.0) - (2025-01-21)
