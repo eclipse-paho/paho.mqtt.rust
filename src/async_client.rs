@@ -397,20 +397,20 @@ impl AsyncClient {
                             .unwrap_or_default();
                         cb(&cli, s);
                     };
-/*
-            if let Some(ref ssl) = cli.inner.conn_opts.lock().unwrap().ssl {
-                if let Some(ref cb) = ssl.on_ssl_error {
-                    let err_str = if err.is_null() || len == 0 {
-                        String::new()
-                    }
-                    else {
-                        let s =
-                            str::from_utf8(slice::from_raw_parts(err as *mut u8, len))
-                        .unwrap_or_default();
-                        s.to_string()
-                    };
-                    cb(&cli, err_str);
-*/
+                    /*
+                                if let Some(ref ssl) = cli.inner.conn_opts.lock().unwrap().ssl {
+                                    if let Some(ref cb) = ssl.on_ssl_error {
+                                        let err_str = if err.is_null() || len == 0 {
+                                            String::new()
+                                        }
+                                        else {
+                                            let s =
+                                                str::from_utf8(slice::from_raw_parts(err as *mut u8, len))
+                                            .unwrap_or_default();
+                                            s.to_string()
+                                        };
+                                        cb(&cli, err_str);
+                    */
                 }
             }
         }
@@ -476,7 +476,7 @@ impl AsyncClient {
 
     /// Gets a copy of the options used in the last connection attempt.
     pub fn connect_options(&self) -> ConnectOptions {
-        self.inner.opts.lock().unwrap().clone()
+        self.inner.conn_opts.read().unwrap().clone()
     }
 
     /// Connects to an MQTT broker using the specified connect options.
@@ -488,15 +488,13 @@ impl AsyncClient {
     ///
     pub fn connect<T>(&self, opts: T) -> ConnectToken
     where
-        T: Into<Option<ConnectOptions>>,
+        T: Into<Option<ConnectOptions>>, // + std::convert::From<ConnectOptions>,
     {
         let opts = opts.into().unwrap_or_default();
         debug!(
             "Connecting. Handle: {:?}, opts: {:?}",
             self.inner.handle, opts
         );
-
-        let mut opts = opts.into().unwrap_or_default();
 
         if crate::is_secure_uri(&self.server_uri()) && !opts.has_ssl_options() {
             return ConnectToken::from(Error::MissingSslOptions);

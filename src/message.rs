@@ -135,7 +135,10 @@ impl Message {
     /// # Safety
     ///
     /// Caller must make sure that cmsg is valid
-    pub(crate) unsafe fn from_c_parts(topic: CString, cmsg: &ffi::MQTTAsync_message) -> Self {
+    pub(crate) unsafe fn from_c_parts(
+        topic: CString,
+        cmsg: &ffi::MQTTAsync_message,
+    ) -> Self {
         let len = cmsg.payloadlen as usize;
 
         let payload = if cmsg.payload.is_null() {

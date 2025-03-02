@@ -26,20 +26,9 @@
 //! MQTT broker/server.
 
 use crate::{
-    ffi, from_c_bool,
-    Message,
-    name_value::NameValueCollection,
-    Properties,
-    SslOptions,
-    StringCollection,
-    to_c_bool,
-    ConnectToken, Token, TokenInner,
-    types::*,
-    WillOptions,
-    Error, Result,
-    ffi, name_value::NameValueCollection, ssl_options::SslOptionsFfi,
-    string_collection::StringCollection, to_c_bool, types::*, ConnectToken, Message,
-    Properties, PropertiesFfi, SslOptions, Token, TokenInner, WillOptions,
+    ffi, from_c_bool, name_value::NameValueCollection, string_collection::StringCollection,
+    to_c_bool, types::*, ConnectToken, Error, Message, Properties, PropertiesFfi, Result,
+    SslOptions, SslOptionsFfi, Token, TokenInner, WillOptions,
 };
 use std::{
     collections::HashMap, ffi::CString, os::raw::c_int, pin::Pin, ptr, time::Duration,
@@ -149,17 +138,26 @@ impl ConnectOptions {
     /// Note that this will return the options with the requested version,
     /// even if it's not currently known. The server will likely reject a
     /// request with a bad protocol version, however.
-    pub fn with_mqtt_version<V>(ver: V) -> Self
-    where
-        V: Into<MqttVersion>,
-    {
-        let ver = ver.into();
-        if ver < MqttVersion::V5 {
+    pub fn with_mqtt_version<V: Into<MqttVersion>>(ver: V) -> Self {
+        if ver.into() < MqttVersion::V5 {
             Self::new()
         }
         else {
             Self::new_v5()
         }
+    }
+
+    /// Does a check of the options to determine if their valid.
+    pub fn check(&self) -> Result<()> {
+        if !self.server_uris.is_empty() {
+            let uris = &self.server_uris;
+            let any_secure = uris.iter().any(|s| crate::is_secure_uri(s));
+
+            if any_secure && !self.has_ssl_options() {
+                return Err(Error::MissingSslOptions);
+            }
+        }
+        Ok(())
     }
 
     /// Gets the MQTT protocol version that should be used for the
@@ -209,6 +207,11 @@ impl ConnectOptions {
     /// This is only used in MQTT v5 connections.
     pub fn set_clean_start(&mut self, clean: bool) {
         self.clean_start = clean;
+    }
+
+    /// Whether the options have SSL/TLS options for a secure connection
+    pub fn has_ssl_options(&self) -> bool {
+        self.ssl.is_some()
     }
 
     // TODO: Do we need this?
@@ -690,80 +693,80 @@ impl ConnectOptionsFfi {
         }
     }
 
-/*
-    /// Does a check of the options to determine if their valid.
-    pub fn check(&self) -> Result<()> {
-        if !self.data.server_uris.is_empty() {
-            let uris: Vec<String> = (&self.data.server_uris).try_into()?;
-            let any_secure = uris.iter().any(|s| crate::is_secure_uri(s));
+    /*
+        /// Does a check of the options to determine if their valid.
+        pub fn check(&self) -> Result<()> {
+            if !self.data.server_uris.is_empty() {
+                let uris: Vec<String> = (&self.data.server_uris).try_into()?;
+                let any_secure = uris.iter().any(|s| crate::is_secure_uri(s));
 
-            if any_secure && !self.has_ssl_options() {
-                return Err(Error::MissingSslOptions);
+                if any_secure && !self.has_ssl_options() {
+                    return Err(Error::MissingSslOptions);
+                }
+            }
+            Ok(())
+        }
+
+        /// Gets the MQTT protocol version that should be used for the
+        /// connection.
+        pub fn mqtt_version(&self) -> MqttVersion {
+            MqttVersion::from(self.copts.MQTTVersion)
+        }
+
+        /// Gets the MQTT protocol version as a raw integer.
+        pub fn mqtt_version_raw(&self) -> u32 {
+            self.copts.MQTTVersion as u32
+        }
+
+        /// Gets the "clean session" setting in the options.
+        ///
+        /// This is only used in MQTT v3 connections.
+        pub fn clean_session(&self) -> bool {
+            from_c_bool(self.copts.cleansession)
+        }
+
+        /// This sets the "clean session" behavior for connecting to the server.
+        ///
+        /// When set to true, this directs the server to throw away any state
+        /// related to the client, as determined by the client identifier.
+        /// When set to false, the server keeps the state information and
+        /// resumes the previous session.
+        ///
+        /// This is only used in MQTT v3 connections.
+        pub fn set_clean_session(&mut self, clean: bool) {
+            self.copts.cleansession = to_c_bool(clean);
+            if clean {
+                self.copts.cleanstart = 0;
             }
         }
-        Ok(())
-    }
 
-    /// Gets the MQTT protocol version that should be used for the
-    /// connection.
-    pub fn mqtt_version(&self) -> MqttVersion {
-        MqttVersion::from(self.copts.MQTTVersion)
-    }
-
-    /// Gets the MQTT protocol version as a raw integer.
-    pub fn mqtt_version_raw(&self) -> u32 {
-        self.copts.MQTTVersion as u32
-    }
-
-    /// Gets the "clean session" setting in the options.
-    ///
-    /// This is only used in MQTT v3 connections.
-    pub fn clean_session(&self) -> bool {
-        from_c_bool(self.copts.cleansession)
-    }
-
-    /// This sets the "clean session" behavior for connecting to the server.
-    ///
-    /// When set to true, this directs the server to throw away any state
-    /// related to the client, as determined by the client identifier.
-    /// When set to false, the server keeps the state information and
-    /// resumes the previous session.
-    ///
-    /// This is only used in MQTT v3 connections.
-    pub fn set_clean_session(&mut self, clean: bool) {
-        self.copts.cleansession = to_c_bool(clean);
-        if clean {
-            self.copts.cleanstart = 0;
+        /// Gets the "clean start" setting in the options.
+        ///
+        /// This is only used in MQTT v5 connections.
+        pub fn clean_start(&self) -> bool {
+            from_c_bool(self.copts.cleanstart)
         }
-    }
 
-    /// Gets the "clean start" setting in the options.
-    ///
-    /// This is only used in MQTT v5 connections.
-    pub fn clean_start(&self) -> bool {
-        from_c_bool(self.copts.cleanstart)
-    }
-
-    /// This sets the "clean start" behavior for connecting to the server.
-    ///
-    /// When set to true, this directs the server to throw away any state
-    /// related to the client, as determined by the client identifier.
-    /// When set to false, the server keeps the state information and
-    /// resumes the previous session.
-    ///
-    /// This is only used in MQTT v5 connections.
-    pub fn set_clean_start(&mut self, clean: bool) {
-        self.copts.cleanstart = to_c_bool(clean);
-        if clean {
-            self.copts.cleansession = 0;
+        /// This sets the "clean start" behavior for connecting to the server.
+        ///
+        /// When set to true, this directs the server to throw away any state
+        /// related to the client, as determined by the client identifier.
+        /// When set to false, the server keeps the state information and
+        /// resumes the previous session.
+        ///
+        /// This is only used in MQTT v5 connections.
+        pub fn set_clean_start(&mut self, clean: bool) {
+            self.copts.cleanstart = to_c_bool(clean);
+            if clean {
+                self.copts.cleansession = 0;
+            }
         }
-    }
 
-    /// Whether the options have SSL/TLS options for a secure connection
-    pub fn has_ssl_options(&self) -> bool {
-        self.data.ssl.is_some()
-    }
-*/
+        /// Whether the options have SSL/TLS options for a secure connection
+        pub fn has_ssl_options(&self) -> bool {
+            self.data.ssl.is_some()
+        }
+    */
 
     /// Sets the token to ber used for connect completion callbacks.
     ///
@@ -940,7 +943,6 @@ mod tests {
 
     #[test]
     fn test_ssl() {
-
         let ssl_opts = SslOptionsBuilder::new()
             .trust_store(TRUST_STORE)
             .unwrap()

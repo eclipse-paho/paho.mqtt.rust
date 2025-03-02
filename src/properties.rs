@@ -22,6 +22,9 @@
  *******************************************************************************/
 
 //! MQTT v5 properties.
+//!
+//! This is the collection of metadata that can be added to a packet.
+//!
 
 use std::{
     any::{Any, TypeId},
@@ -348,45 +351,142 @@ impl Property {
         PropertyCode::try_from(self.property_code_raw()).unwrap()
     }
 
-    // TODO: Implement these
-
     /// Gets the property value as a a u8 byte.
     pub fn get_byte(&self) -> Option<u8> {
-        Some(0)
+        use Property::*;
+        match *self {
+            PayloadFormatIndicator(by) => Some(by),
+            RequestProblemInformation(by) => Some(by),
+            RequestResponseInformation(by) => Some(by),
+            MaximumQos(by) => Some(by),
+            RetainAvailable(by) => Some(by),
+            WildcardSubscriptionAvailable(by) => Some(by),
+            SubscriptionIdentifiersAvailable(by) => Some(by),
+            SharedSubscriptionAvailable(by) => Some(by),
+            _ => None,
+        }
     }
 
     /// Gets the property value as a 16-bit uint.
     pub fn get_u16(&self) -> Option<u16> {
-        Some(0)
+        use Property::*;
+        match *self {
+            ServerKeepAlive(val) => Some(val),
+            ReceiveMaximum(val) => Some(val),
+            TopicAliasMaximum(val) => Some(val),
+            TopicAlias(val) => Some(val),
+            _ => None,
+        }
     }
 
     /// Gets the property value as a 32-bit uint.
     pub fn get_u32(&self) -> Option<u32> {
-        Some(0)
+        use Property::*;
+        match *self {
+            MessageExpiraryInterval(val) => Some(val),
+            SubscriptionIdentifier(val) => Some(val),
+            SessionExpiryInterval(val) => Some(val),
+            WillDelayInterval(val) => Some(val),
+            MaximumPacketSize(val) => Some(val),
+            _ => None,
+        }
     }
 
-    /// Gets the property value as an integer.
-    /// This extracts an integer value from the property. It works with any
-    /// of the int types, one, two, or four bytes.
-    /// If the Property contains an integer type it will be returned as
-    /// Some(val), otherwise it will return None.
+    /// Gets the property value as an unsigned integer.
+    /// This extracts an integer value from the property. It works with
+    /// any of the integer types, either one, two, or four bytes.
+    /// Returns None if the Property contains something other than an
+    /// integer.
     pub fn get_uint(&self) -> Option<u32> {
-        Some(0)
+        use Property::*;
+        match *self {
+            PayloadFormatIndicator(val) => Some(val as u32),
+            MessageExpiraryInterval(val) => Some(val),
+            SubscriptionIdentifier(val) => Some(val),
+            SessionExpiryInterval(val) => Some(val),
+            ServerKeepAlive(val) => Some(val as u32),
+            RequestProblemInformation(val) => Some(val as u32),
+            WillDelayInterval(val) => Some(val),
+            RequestResponseInformation(val) => Some(val as u32),
+            ReceiveMaximum(val) => Some(val as u32),
+            TopicAliasMaximum(val) => Some(val as u32),
+            TopicAlias(val) => Some(val as u32),
+            MaximumQos(val) => Some(val as u32),
+            RetainAvailable(val) => Some(val as u32),
+            MaximumPacketSize(val) => Some(val),
+            WildcardSubscriptionAvailable(val) => Some(val as u32),
+            SubscriptionIdentifiersAvailable(val) => Some(val as u32),
+            SharedSubscriptionAvailable(val) => Some(val as u32),
+            _ => None,
+        }
+    }
+
+    /// Gets the property value as a string reference.
+    pub fn get_string(&self) -> Option<&str> {
+        use Property::*;
+        match self {
+            ContentType(s) => Some(s.as_str()),
+            ResponseTopic(s) => Some(s.as_str()),
+            AssignedClientIdentifer(s) => Some(s.as_str()),
+            AuthenticationMethod(s) => Some(s.as_str()),
+            ResponseInformation(s) => Some(s.as_str()),
+            ServerReference(s) => Some(s.as_str()),
+            ReasonString(s) => Some(s.as_str()),
+            _ => None,
+        }
+    }
+
+    /// Converts the property value into a string.
+    pub fn into_string(self) -> Option<String> {
+        use Property::*;
+        match self {
+            ContentType(s) => Some(s),
+            ResponseTopic(s) => Some(s),
+            AssignedClientIdentifer(s) => Some(s),
+            AuthenticationMethod(s) => Some(s),
+            ResponseInformation(s) => Some(s),
+            ServerReference(s) => Some(s),
+            ReasonString(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    /// Gets the property value as a binary blob.
+    pub fn get_binary(&self) -> Option<&[u8]> {
+        use Property::*;
+        match self {
+            CorrelationData(val) => Some(val.as_slice()),
+            AuthenticationData(val) => Some(val.as_slice()),
+            _ => None,
+        }
+    }
+
+    /// Gets the property value as a binary blob.
+    pub fn into_binary(self) -> Option<Binary> {
+        use Property::*;
+        match self {
+            CorrelationData(val) => Some(val),
+            AuthenticationData(val) => Some(val),
+            _ => None,
+        }
     }
 
     /// Gets the property value as a string pair.
-    pub fn get_string(&self) -> Option<String> {
-        Some(String::new())
+    pub fn get_string_pair(&self) -> Option<(&str, &str)> {
+        use Property::*;
+        match self {
+            User((key, val)) => Some((key.as_str(), val.as_str())),
+            _ => None,
+        }
     }
 
-    /// Gets the property value as a string pair.
-    pub fn get_binary(&self) -> Option<Binary> {
-        Some(Binary::default())
-    }
-
-    /// Gets the property value as a string pair.
-    pub fn get_string_pair(&self) -> Option<(String, String)> {
-        Some((String::new(), String::new()))
+    /// Converts the property value into a string pair.
+    pub fn into_string_pair(self) -> Option<(String, String)> {
+        use Property::*;
+        match self {
+            User((key, val)) => Some((key, val)),
+            _ => None,
+        }
     }
 }
 
