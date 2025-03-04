@@ -27,7 +27,7 @@ use crate::{
     client::Client,
     errors::{Error, Result},
     message::{Message, MessageBuilder},
-    properties::{Properties, PropertyCode},
+    properties::{Properties, Property, PropertyCode},
     subscribe_options::SubscribeOptions,
     token::{DeliveryToken, Token},
     QoS, ServerResponse,
@@ -124,7 +124,7 @@ impl<'a> Topic<'a> {
         }
 
         if self.alias != 0 {
-            bld = bld.properties(properties! { PropertyCode::TopicAlias => self.alias });
+            bld = bld.properties(properties! { TopicAlias(self.alias) });
         }
 
         bld.finalize()

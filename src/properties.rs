@@ -42,11 +42,6 @@ use crate::{ffi, Error, Result};
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize, Serializer};
 
-/// Property
-//pub type Property = PropertyFfi;
-/// Properties
-//pub type Properties = PropertiesFfi;
-
 /// Error code for property mismatches
 const INVALID_PROPERTY_ID: i32 = ffi::MQTT_INVALID_PROPERTY_ID;
 
@@ -134,7 +129,8 @@ impl fmt::Display for PropertyType {
 ///
 /// The property code defines both the meaning of the value in the property
 /// (Correlation Data, Server Keep Alive) and the data type held by the
-/// property.
+/// property. The underlying numeric value is what gets serialized on the
+/// wire as the key for each value.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
@@ -285,6 +281,8 @@ impl fmt::Display for PropertyCode {
 }
 
 /////////////////////////////////////////////////////////////////////////////
+//                              Property
+/////////////////////////////////////////////////////////////////////////////
 
 /// Type for a variable byte integer.
 pub type VbiU32 = u32;
@@ -341,14 +339,162 @@ pub enum Property {
 }
 
 impl Property {
+    /// Creates a new property for a given code and value.
+    ///
+    /// The type for the value must match the type expected for the given
+    /// property code exactly, otherwise it will be rejected and return None.
+    pub fn new<T>(code: PropertyCode, val: T) -> Option<Self>
+    where
+        T: Any + 'static,
+    {
+        use PropertyCode::*;
+        let rval: &(dyn Any + 'static) = &val;
+
+        match code {
+            PayloadFormatIndicator => rval
+                .downcast_ref::<u8>()
+                .copied()
+                .map(Self::PayloadFormatIndicator),
+            MessageExpiryInterval => rval
+                .downcast_ref::<u32>()
+                .copied()
+                .map(Self::MessageExpiraryInterval),
+            ContentType => rval
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_string())
+                .or_else(|| rval.downcast_ref::<String>().map(String::clone))
+                .map(Self::ContentType),
+            ResponseTopic => rval
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_string())
+                .or_else(|| rval.downcast_ref::<String>().map(String::clone))
+                .map(Self::ResponseTopic),
+            CorrelationData => rval
+                .downcast_ref::<&[u8]>()
+                .map(|v| (*v).to_vec())
+                .or_else(|| rval.downcast_ref::<Vec<u8>>().map(Vec::clone))
+                .map(Self::CorrelationData),
+            SubscriptionIdentifier => rval
+                .downcast_ref::<u32>()
+                .copied()
+                .map(Self::SubscriptionIdentifier),
+            SessionExpiryInterval => rval
+                .downcast_ref::<u32>()
+                .copied()
+                .map(Self::SessionExpiryInterval),
+            AssignedClientIdentifer => rval
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_string())
+                .or_else(|| rval.downcast_ref::<String>().map(|s| s.into()))
+                .map(Self::AssignedClientIdentifer),
+            ServerKeepAlive => rval
+                .downcast_ref::<u16>()
+                .copied()
+                .map(Self::ServerKeepAlive),
+            AuthenticationMethod => rval
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_string())
+                .or_else(|| rval.downcast_ref::<String>().map(String::clone))
+                .map(Self::AuthenticationMethod),
+            AuthenticationData => rval
+                .downcast_ref::<&[u8]>()
+                .map(|v| (*v).to_vec())
+                .or_else(|| rval.downcast_ref::<Vec<u8>>().map(Vec::clone))
+                .map(Self::AuthenticationData),
+            RequestProblemInformation => rval
+                .downcast_ref::<u8>()
+                .copied()
+                .map(Self::RequestProblemInformation),
+            WillDelayInterval => rval
+                .downcast_ref::<u32>()
+                .copied()
+                .map(Self::WillDelayInterval),
+            RequestResponseInformation => rval
+                .downcast_ref::<u8>()
+                .copied()
+                .map(Self::RequestResponseInformation),
+            ResponseInformation => rval
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_string())
+                .or_else(|| rval.downcast_ref::<String>().map(String::clone))
+                .map(Self::ResponseInformation),
+            ServerReference => rval
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_string())
+                .or_else(|| rval.downcast_ref::<String>().map(String::clone))
+                .map(Self::ServerReference),
+            ReasonString => rval
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_string())
+                .or_else(|| rval.downcast_ref::<String>().map(String::clone))
+                .map(Self::ReasonString),
+            ReceiveMaximum => rval
+                .downcast_ref::<u16>()
+                .copied()
+                .map(Self::ReceiveMaximum),
+            TopicAliasMaximum => rval
+                .downcast_ref::<u16>()
+                .copied()
+                .map(Self::TopicAliasMaximum),
+            TopicAlias => rval.downcast_ref::<u16>().copied().map(Self::TopicAlias),
+            MaximumQos => rval.downcast_ref::<u8>().copied().map(Self::MaximumQos),
+            RetainAvailable => rval
+                .downcast_ref::<u8>()
+                .copied()
+                .map(Self::RetainAvailable),
+            UserProperty => rval
+                .downcast_ref::<(&str, &str)>()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .or_else(|| {
+                    rval.downcast_ref::<(&str, String)>()
+                        .map(|(k, v)| ((*k).to_string(), v.clone()))
+                })
+                .or_else(|| {
+                    rval.downcast_ref::<(String, &str)>()
+                        .map(|(k, v)| (k.clone(), (*v).to_string()))
+                })
+                .or_else(|| {
+                    rval.downcast_ref::<(String, String)>()
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                })
+                .map(Self::User),
+            MaximumPacketSize => rval
+                .downcast_ref::<u32>()
+                .copied()
+                .map(Self::MaximumPacketSize),
+            WildcardSubscriptionAvailable => rval
+                .downcast_ref::<u8>()
+                .copied()
+                .map(Self::WildcardSubscriptionAvailable),
+            SubscriptionIdentifiersAvailable => rval
+                .downcast_ref::<u8>()
+                .copied()
+                .map(Self::SubscriptionIdentifiersAvailable),
+            SharedSubscriptionAvailable => rval
+                .downcast_ref::<u8>()
+                .copied()
+                .map(Self::SharedSubscriptionAvailable),
+        }
+    }
+
     /// Gets the property code as the raw byte value.
     fn property_code_raw(&self) -> u8 {
         unsafe { *(self as *const Self as *const u8) }
     }
 
     /// Gets the property code corresponging to the property.
-    pub fn code(&self) -> PropertyCode {
+    pub fn property_code(&self) -> PropertyCode {
         PropertyCode::try_from(self.property_code_raw()).unwrap()
+    }
+
+    /// Get the property type from the code identifier.
+    pub fn property_type(&self) -> PropertyType {
+        self.property_code().property_type()
+    }
+
+    /// Gets the any::TypeId that corresponds to the property type.
+    pub fn type_of(&self) -> TypeId {
+        self.property_code().property_type().type_of()
     }
 
     /// Gets the property value as a a u8 byte.
@@ -523,6 +669,8 @@ impl TryFrom<&ffi::MQTTProperty> for Property {
 */
 
 /////////////////////////////////////////////////////////////////////////////
+//                              Properties
+/////////////////////////////////////////////////////////////////////////////
 
 /// A collection of property values.
 #[derive(Debug, Default, Clone)]
@@ -564,6 +712,7 @@ impl Properties {
         self.0.push(prop);
     }
 
+    /*
     /// Adds a property to the collection given the property code and value.
     pub fn push_val<T>(&mut self, code: PropertyCode, val: T) -> Result<()>
     where
@@ -573,6 +722,7 @@ impl Properties {
         //self.push(Property::new(code, val)?)
         Ok(())
     }
+    */
 
     /// Gets the payload format indicator, if any
     pub fn payload_format_indicator(&self) -> Option<&u8> {
@@ -1603,6 +1753,9 @@ impl Serialize for PropertiesFfi {
 impl From<&Properties> for PropertiesFfi {
     // TODO: Implement this
     fn from(props: &Properties) -> Self {
+        //let mut ffi_props = FfiProperties::new();
+        //for prop in props {
+
         Self::default()
     }
 }

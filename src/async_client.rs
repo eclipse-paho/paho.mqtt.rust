@@ -51,9 +51,8 @@ use crate::{
     types::*,
     AsyncReceiver, CallOptionsFfi, CallOptionsFfiBuilder, ConnectOptions,
     ConnectOptionsFfi, ConnectToken, CreateOptions, DeliveryToken, DisconnectOptions,
-    DisconnectOptionsBuilder, Message, PersistenceType, Properties, ReasonCode, Receiver,
-    ServerRequest, SubscribeManyToken, SubscribeOptions, SubscribeToken, Token, TokenInner,
-    UserData,
+    Message, PersistenceType, Properties, ReasonCode, Receiver, ServerRequest,
+    SubscribeManyToken, SubscribeOptions, SubscribeToken, Token, TokenInner, UserData,
 };
 use crossbeam_channel as sync_channel;
 use std::{
@@ -192,6 +191,7 @@ impl AsyncClient {
 
         debug!("Creating client with persistence: {}", ptype);
 
+        // Get the FFI values & call the C lib creation
         let server_uri = CString::new(cli.opts.server_uri.clone())?;
         let client_id = CString::new(cli.opts.client_id.clone())?;
         let mut copts = cli.opts.c_struct();
@@ -225,8 +225,8 @@ impl AsyncClient {
     }
 
     /// Constructs a client from a raw pointer to the inner structure.
-    /// This is how the client is normally reconstructed from a context
-    /// pointer coming back from the C lib.
+    /// Internally, this is how the client is normally reconstructed from
+    /// a context pointer coming back from the C lib.
     pub(crate) unsafe fn from_raw(ptr: *mut c_void) -> AsyncClient {
         AsyncClient {
             inner: Arc::from_raw(ptr as *mut InnerAsyncClient),
@@ -247,46 +247,48 @@ impl AsyncClient {
     // Low-level callback from the C library when the client is connected.
     // We just pass the call on to the handler registered with the client, if any.
     unsafe extern "C" fn on_connected(context: *mut c_void, _cause: *mut c_char) {
-        debug!("Connected! Client {:?}", context);
-
-        if !context.is_null() {
-            let cli = AsyncClient::from_raw(context);
-
-            if let Some(ref mut cb) =
-                cli.inner.callback_context.lock().unwrap().on_connected
-            {
-                trace!("Invoking connected callback");
-                cb(&cli);
-            }
-
-            let _ = cli.into_raw();
+        if context.is_null() {
+            warn!("on_connected: null client context.");
+            return;
         }
+
+        debug!("Connected! Client {:?}", context);
+        let cli = AsyncClient::from_raw(context);
+
+        if let Some(ref mut cb) = cli.inner.callback_context.lock().unwrap().on_connected {
+            trace!("Invoking connected callback");
+            cb(&cli);
+        }
+
+        let _ = cli.into_raw();
     }
 
     // Low-level callback from the C library when the connection is lost.
     // We pass the call on to the handler registered with the client, if any.
     unsafe extern "C" fn on_connection_lost(context: *mut c_void, _cause: *mut c_char) {
-        warn!("Connection lost. Client: {:?}", context);
-
-        if !context.is_null() {
-            let cli = AsyncClient::from_raw(context);
-            {
-                let mut cbctx = cli.inner.callback_context.lock().unwrap();
-
-                // Push a None into the message stream to cleanly
-                // shutdown any consumers.
-                if let Some(ref mut cb) = cbctx.on_message_arrived {
-                    trace!("Invoking message callback with None");
-                    cb(&cli, None);
-                }
-
-                if let Some(ref mut cb) = cbctx.on_connection_lost {
-                    trace!("Invoking connection lost callback");
-                    cb(&cli);
-                }
-            }
-            let _ = cli.into_raw();
+        if context.is_null() {
+            warn!("on_connection_lost: null client context");
+            return;
         }
+
+        warn!("Connection lost. Client: {:?}", context);
+        let cli = AsyncClient::from_raw(context);
+        {
+            let mut cbctx = cli.inner.callback_context.lock().unwrap();
+
+            // Push a None into the message stream to cleanly
+            // shutdown any consumers.
+            if let Some(ref mut cb) = cbctx.on_message_arrived {
+                trace!("Invoking message callback with None");
+                cb(&cli, None);
+            }
+
+            if let Some(ref mut cb) = cbctx.on_connection_lost {
+                trace!("Invoking connection lost callback");
+                cb(&cli);
+            }
+        }
+        let _ = cli.into_raw();
     }
 
     // Low-level callback from the C library for when a disconnect packet arrives.
@@ -295,33 +297,35 @@ impl AsyncClient {
         cprops: *mut ffi::MQTTProperties,
         reason: ffi::MQTTReasonCodes,
     ) {
+        if context.is_null() {
+            warn!("on_disconnected: null client context");
+            return;
+        }
         debug!(
             "Disconnected with reason code: {}. Client: {:?}",
             reason, context
         );
 
-        if !context.is_null() {
-            let cli = AsyncClient::from_raw(context);
-            {
-                let mut cbctx = cli.inner.callback_context.lock().unwrap();
+        let cli = AsyncClient::from_raw(context);
+        {
+            let mut cbctx = cli.inner.callback_context.lock().unwrap();
 
-                // Push a None into the message stream to cleanly
-                // shutdown any consumers.
-                if let Some(ref mut cb) = cbctx.on_message_arrived {
-                    trace!("Invoking message callback with None");
-                    cb(&cli, None);
-                }
-
-                if let Some(ref mut cb) = cbctx.on_disconnected {
-                    let reason_code = ReasonCode::from(reason);
-                    // TODO: Handle error?
-                    let props = Properties::try_from(&*cprops).unwrap_or_default();
-                    trace!("Invoking disconnected callback");
-                    cb(&cli, props, reason_code);
-                }
+            // Push a None into the message stream to cleanly
+            // shutdown any consumers.
+            if let Some(ref mut cb) = cbctx.on_message_arrived {
+                trace!("Invoking message callback with None");
+                cb(&cli, None);
             }
-            let _ = cli.into_raw();
+
+            if let Some(ref mut cb) = cbctx.on_disconnected {
+                let reason_code = ReasonCode::from(reason);
+                // TODO: Handle error?
+                let props = Properties::try_from(&*cprops).unwrap_or_default();
+                trace!("Invoking disconnected callback");
+                cb(&cli, props, reason_code);
+            }
         }
+        let _ = cli.into_raw();
     }
 
     // Low-level callback from the C library when a message arrives from the broker.
@@ -332,12 +336,15 @@ impl AsyncClient {
         topic_len: c_int,
         mut cmsg: *mut ffi::MQTTAsync_message,
     ) -> c_int {
-        debug!(
-            "Message arrived. Client: {:?}, topic: {:?} len {:?} cmsg: {:?}: {:?}",
-            context, topic_name, topic_len, cmsg, *cmsg
-        );
+        if context.is_null() {
+            warn!("on_message_arrived: null client context.");
+        }
+        else {
+            debug!(
+                "Message arrived. Client: {:?}, topic: {:?} len {:?} cmsg: {:?}: {:?}",
+                context, topic_name, topic_len, cmsg, *cmsg
+            );
 
-        if !context.is_null() {
             let cli = AsyncClient::from_raw(context);
 
             if let Some(ref mut cb) = cli
@@ -382,11 +389,12 @@ impl AsyncClient {
         len: usize,
         context: *mut c_void,
     ) -> i32 {
-        debug!("SSL Error for Client: {:?}", context);
         if context.is_null() {
+            warn!("on_ssl_error: null client context");
             return 0;
         }
 
+        debug!("SSL Error for Client: {:?}", context);
         let cli = AsyncClient::from_raw(context);
         {
             if let Some(ref ssl) = cli.inner.conn_opts.read().unwrap().ssl {
@@ -519,6 +527,7 @@ impl AsyncClient {
             ssl.ssl_error_context = inner as *const _ as *mut c_void;
         }
 
+        // Cache the connect options
         *self.inner.conn_opts.write().unwrap() = opts;
 
         let rc = unsafe { ffi::MQTTAsync_connect(self.inner.handle, &ffi_opts.copts) };
@@ -631,8 +640,9 @@ impl AsyncClient {
         debug!("Disconnecting client: {:?}", self.inner.handle);
 
         let opts = opts.into().unwrap_or_default();
-        let mut copts = opts.c_struct();
         trace!("Disconnect options: {:?}", opts);
+
+        let mut copts = opts.c_struct();
 
         let tok = Token::with_client(self, ServerRequest::Disconnect);
         copts.context = tok.clone().into_raw();
@@ -680,8 +690,7 @@ impl AsyncClient {
     ///   a resolution in milliseconds.
     ///
     pub fn disconnect_after(&self, timeout: Duration) -> Token {
-        let disconn_opts = DisconnectOptionsBuilder::new().timeout(timeout).finalize();
-        self.disconnect(disconn_opts)
+        self.disconnect(DisconnectOptions::with_timeout(timeout))
     }
 
     /// Determines if this client is currently connected to an MQTT broker.

@@ -33,16 +33,15 @@ macro_rules! bail {
 
 /// Creates a collection of properties
 #[macro_export]
-macro_rules! properties(
-    { $($key:expr => $value:expr),* } => {
+macro_rules! properties {
+    () => (
+        $crate::Properties::new()
+    );
+    ($($x:expr),+ $(,)?) => {
         {
-            #[allow(unused_mut)]
-            let mut p = $crate::properties::Properties::new();
-            $( let _ = p.push_val($key, $value); )*
-            p
+            #[allow(unused_imports)]
+            use $crate::Property::{self, *};
+            $crate::Properties::from(vec![$($x),+])
         }
     };
-    { $($key:expr => $value:expr),+ ,} => {
-        properties![ $( $key => $value ),* ]
-    };
-);
+}

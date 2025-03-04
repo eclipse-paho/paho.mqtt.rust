@@ -42,7 +42,10 @@ use std::{cmp, os::raw::c_int};
 /// [CreateOptionsBuilder](struct.CreateOptionsBuilder.html).
 #[derive(Debug)]
 pub struct CreateOptions {
-    /// The URI of the remote MQTT broker
+    /// The URI of the remote MQTT broker.
+    /// This can be used when there's a single server URI.
+    /// Alternately, for a High Availability setup, a list of server URIs
+    /// can bep specified in the connect options.
     pub server_uri: String,
     /// The client identifier passed to the server when the client connects.
     /// This can be empty, in which case the server will assign a random,
@@ -60,7 +63,7 @@ pub struct CreateOptions {
     /// successful connect.
     pub allow_send_any_time: bool,
     /// When the maximum number of buffered messages is reached, delete the
-    /// oldest rather than the newest.
+    /// oldest rather than discard the newest.
     pub delete_oldest: bool,
     /// Restore messages from persistence on create - or clear it.
     pub restore_msgs: bool,
@@ -74,6 +77,29 @@ pub struct CreateOptions {
 }
 
 impl CreateOptions {
+    /// Create a new set of create options with the specified URL
+    /// and Client ID.
+    pub fn new<U, C>(server_uri: U, client_id: C) -> Self
+    where
+        U: Into<String>,
+        C: Into<String>,
+    {
+        Self {
+            server_uri: server_uri.into(),
+            client_id: client_id.into(),
+            ..Self::default()
+        }
+    }
+
+    /// Creates the FFI create struct to send to the C library.
+    /// Note that despite the String's in the options, those are sent to the
+    /// C lib through a separate path, and the C struct only has POD types.
+    /// So we don't need a separate FFI data struct to cache values.
+    /// This is sufficuent.
+    ///
+    /// We also always tell the C lib that we want to support the v5 proocol.
+    /// The lib will then create a persistence store that supports either v3x
+    /// or v5. So it's universal.
     pub(crate) fn c_struct(&self) -> ffi::MQTTAsync_createOptions {
         ffi::MQTTAsync_createOptions {
             sendWhileDisconnected: self.send_while_disconnected as c_int,
@@ -163,13 +189,12 @@ impl From<CreateOptionsBuilder> for CreateOptions {
 /// use paho_mqtt as mqtt;
 ///
 /// let opts = mqtt::CreateOptionsBuilder::new()
-///     .server_uri("tcp://localhost:1883")
+///     .server_uri("mqtt://my_server:1883")
 ///     .client_id("client1")
 ///     .finalize();
 ///
 /// let cli = mqtt::AsyncClient::new(opts).unwrap();
 /// ```
-
 #[derive(Debug, Default)]
 pub struct CreateOptionsBuilder {
     opts: CreateOptions,
