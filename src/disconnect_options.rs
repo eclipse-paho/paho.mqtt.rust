@@ -4,7 +4,7 @@
 //
 
 /*******************************************************************************
- * Copyright (c) 2017-2020 Frank Pagliughi <fpagliughi@mindspring.com>
+ * Copyright (c) 2017-2025 Frank Pagliughi <fpagliughi@mindspring.com>
  *
  * All rights reserved. This program and the accompanying materials
  * are made available under the terms of the Eclipse Public License v2.0
@@ -19,9 +19,8 @@
  *    Frank Pagliughi - initial implementation and documentation
  *******************************************************************************/
 
-#![deny(missing_docs)]
-
 //! Disconnect options for the Paho MQTT Rust client library.
+//!
 //! This contains the structures to define the options for disconnecting from
 //! the MQTT broker/server.
 
@@ -36,6 +35,7 @@ use std::{os::raw::c_int, time::Duration};
 #[derive(Debug, Default, Clone)]
 pub struct DisconnectOptions {
     /// A delay to disconnect to allow any in-flight messages to complete.
+    /// This has a resolution of milliseconds.
     pub timeout: Duration,
     /// MQTT v5 disconnect properties
     pub props: Properties,
@@ -57,19 +57,19 @@ impl DisconnectOptions {
         }
     }
 
-    /// Gets an FFI C struct for the disconnect options
+    /// Gets an FFI C struct for the disconnect options.
     pub(crate) fn c_struct(&self) -> ffi::MQTTAsync_disconnectOptions {
         let props = PropertiesFfi::from(&self.props);
 
         ffi::MQTTAsync_disconnectOptions {
-            timeout: self.timeout.as_secs() as c_int,
+            timeout: self.timeout.as_millis() as c_int,
             properties: props.cprops,
             reasonCode: self.reason_code as ffi::MQTTReasonCodes,
             ..ffi::MQTTAsync_disconnectOptions::default()
         }
     }
 
-    /// Gets the properties used o disconnect
+    /// Gets the properties used to disconnect.
     pub fn properties(&self) -> &Properties {
         &self.props
     }
@@ -125,8 +125,11 @@ impl DisconnectOptionsBuilder {
     ///
     /// * `props` The collection of properties to include with the
     ///   disconnect message.
-    pub fn properties(&mut self, props: Properties) -> &mut Self {
-        self.0.props = props;
+    pub fn properties<P>(&mut self, props: P) -> &mut Self
+    where
+        P: Into<Option<Properties>>,
+    {
+        self.0.props = props.into().unwrap_or_default();
         self
     }
 

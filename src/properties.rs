@@ -1563,6 +1563,20 @@ impl PropertiesFfi {
         self.get_at(code, 0)
     }
 
+    /// Gets a property instance at the specified index in the collection.
+    pub fn get_idx(&self, idx: usize) -> Option<PropertyFfi> {
+        let ps = &self.cprops as *const _ as *mut ffi::MQTTProperties;
+        unsafe {
+            if idx < (*ps).count as usize {
+                let p = (*ps).array.offset(idx as isize);
+                PropertyFfi::from_c_property(&*p).ok()
+            }
+            else {
+                None
+            }
+        }
+    }
+
     /// Gets a property instance when there are possibly multiple values.
     pub fn get_at(&self, code: PropertyCode, idx: usize) -> Option<PropertyFfi> {
         let ps = &self.cprops as *const _ as *mut ffi::MQTTProperties;
@@ -1577,11 +1591,20 @@ impl PropertiesFfi {
         }
     }
 
-    /// Gets an iterator for a property instance
+    /// Gets an iterator for all the properties
     pub fn iter(&self, code: PropertyCode) -> PropertyIterator<'_> {
         PropertyIterator {
             props: self,
-            code,
+            code: None,
+            idx: 0,
+        }
+    }
+
+    /// Gets an iterator for a property instance
+    pub fn code_iter(&self, code: PropertyCode) -> PropertyIterator {
+        PropertyIterator {
+            props: self,
+            code: Some(code),
             idx: 0,
         }
     }
@@ -1694,7 +1717,7 @@ impl Drop for PropertiesFfi {
 /// Iterator over the values for a speciifc property
 pub struct PropertyIterator<'a> {
     props: &'a PropertiesFfi,
-    code: PropertyCode,
+    code: Option<PropertyCode>,
     idx: usize,
 }
 
@@ -1702,7 +1725,10 @@ impl<'a> Iterator for PropertyIterator<'a> {
     type Item = PropertyFfi;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let prop = self.props.get_at(self.code, self.idx);
+        let prop = match self.code {
+            Some(code) => self.props.get_at(code, self.idx),
+            None => self.props.get_idx(self.idx),
+        };
         self.idx += 1;
         prop
     }
@@ -1731,13 +1757,12 @@ impl Serialize for PropertiesFfi {
     where
         S: Serializer,
     {
+        use PropertyType::*;
+
         let mut state = serializer.serialize_struct("Properties", self.len())?;
         for prop in self.iter() {
             match prop.property_type() {
-                PropertyType::Byte
-                | PropertyType::TwoByteInteger
-                | PropertyType::FourByteInteger
-                | PropertyType::VariableByteInteger => {
+                Byte | TwoByteInteger | FourByteInteger | VariableByteInteger => {
                     let name = prop.property_code().to_string();
                     state.serialize_field(&name, prop.get_int())?;
                 }
@@ -1751,12 +1776,41 @@ impl Serialize for PropertiesFfi {
 }
 
 impl From<&Properties> for PropertiesFfi {
-    // TODO: Implement this
     fn from(props: &Properties) -> Self {
-        //let mut ffi_props = FfiProperties::new();
-        //for prop in props {
+        use PropertyType::*;
 
-        Self::default()
+        let mut ffi_props = Self::new();
+        for prop in props.iter() {
+            let code = prop.property_code();
+
+            match prop.property_type() {
+                Byte => {
+                    let val = prop.get_byte().unwrap();
+                    ffi_props.push_byte(code, val).unwrap();
+                }
+                TwoByteInteger => {
+                    let val = prop.get_u16().unwrap();
+                    ffi_props.push_u16(code, val).unwrap();
+                }
+                FourByteInteger | VariableByteInteger => {
+                    let val = prop.get_u32().unwrap();
+                    ffi_props.push_u32(code, val).unwrap();
+                }
+                BinaryData => {
+                    let val = prop.get_binary().unwrap();
+                    ffi_props.push_binary(code, val).unwrap();
+                }
+                Utf8EncodedString => {
+                    let val = prop.get_string().unwrap();
+                    ffi_props.push_string(code, val).unwrap();
+                }
+                Utf8StringPair => {
+                    let (key, val) = prop.get_string_pair().unwrap();
+                    ffi_props.push_string_pair(code, key, val).unwrap();
+                }
+            }
+        }
+        ffi_props
     }
 }
 

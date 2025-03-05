@@ -26,9 +26,9 @@
 //! MQTT broker/server.
 
 use crate::{
-    ffi, from_c_bool, name_value::NameValueCollection, string_collection::StringCollection,
-    to_c_bool, types::*, ConnectToken, Error, Message, Properties, PropertiesFfi, Result,
-    SslOptions, SslOptionsFfi, Token, TokenInner, WillOptions,
+    ffi, name_value::NameValueCollection, string_collection::StringCollection, to_c_bool,
+    types::*, ConnectToken, Error, Message, Properties, PropertiesFfi, Result, SslOptions,
+    SslOptionsFfi, Token, TokenInner, WillOptions,
 };
 use std::{
     collections::HashMap, ffi::CString, os::raw::c_int, pin::Pin, ptr, time::Duration,
@@ -37,7 +37,7 @@ use std::{
 /// The default keep alive interval for MQTT (TCP) & MQTTS (TLS) connections.
 const DEFAULT_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(60);
 
-/// The default keep alive interval for Websocket
+/// The default keep alive interval for Websocket connections.
 const DEFAULT_KEEP_ALIVE_INTERVAL_WS: Duration = Duration::from_secs(45);
 
 /////////////////////////////////////////////////////////////////////////////
@@ -61,10 +61,9 @@ pub struct ConnectOptions {
     pub user_name: Option<String>,
     /// The password for authentication
     pub password: Option<Vec<u8>>,
-    /// The timeout for the connection
+    /// The timeout for the connection attempt
     pub timeout: Duration,
-    /// MQTT v3 publish retry interval.
-    /// This should be `None` for v5 connections. It's ignored either way.
+    /// MQTT v3 publish retry interval. (Ignored for MQTT v5)
     pub retry_interval: Option<Duration>,
     /// The servers to which the client will connect, as URIs.
     pub server_uris: Vec<String>,
@@ -76,9 +75,9 @@ pub struct ConnectOptions {
     pub min_retry_interval: Duration,
     /// The maximum retry interval for auto reconnects. Resolution in sec.
     pub max_retry_interval: Duration,
-    /// The connect properties
+    /// The connect properties (MQTT v5 only)
     pub props: Properties,
-    /// HTTP headers for websockets
+    /// HTTP headers for websocket connections
     pub http_headers: HashMap<String, String>,
     /// The HTTP proxy (insecure), if any
     http_proxy: String,
@@ -562,10 +561,10 @@ impl ConnectOptionsBuilder {
 /////////////////////////////////////////////////////////////////////////////
 // ConnectOptionsFfi
 
-/// The collection of options for connecting to a broker.
+/// The collection of options for connecting to a broker throught the Paho C
+/// FFI layer.
 ///
-/// This can be constructed using a [`ConnectOptionsBuilder`] to set all the
-/// options.
+/// This is constructed from [`ConnectOptions`] internally in the client.
 #[derive(Debug)]
 pub(crate) struct ConnectOptionsFfi {
     /// The underlying C options structure.
@@ -693,82 +692,7 @@ impl ConnectOptionsFfi {
         }
     }
 
-    /*
-        /// Does a check of the options to determine if their valid.
-        pub fn check(&self) -> Result<()> {
-            if !self.data.server_uris.is_empty() {
-                let uris: Vec<String> = (&self.data.server_uris).try_into()?;
-                let any_secure = uris.iter().any(|s| crate::is_secure_uri(s));
-
-                if any_secure && !self.has_ssl_options() {
-                    return Err(Error::MissingSslOptions);
-                }
-            }
-            Ok(())
-        }
-
-        /// Gets the MQTT protocol version that should be used for the
-        /// connection.
-        pub fn mqtt_version(&self) -> MqttVersion {
-            MqttVersion::from(self.copts.MQTTVersion)
-        }
-
-        /// Gets the MQTT protocol version as a raw integer.
-        pub fn mqtt_version_raw(&self) -> u32 {
-            self.copts.MQTTVersion as u32
-        }
-
-        /// Gets the "clean session" setting in the options.
-        ///
-        /// This is only used in MQTT v3 connections.
-        pub fn clean_session(&self) -> bool {
-            from_c_bool(self.copts.cleansession)
-        }
-
-        /// This sets the "clean session" behavior for connecting to the server.
-        ///
-        /// When set to true, this directs the server to throw away any state
-        /// related to the client, as determined by the client identifier.
-        /// When set to false, the server keeps the state information and
-        /// resumes the previous session.
-        ///
-        /// This is only used in MQTT v3 connections.
-        pub fn set_clean_session(&mut self, clean: bool) {
-            self.copts.cleansession = to_c_bool(clean);
-            if clean {
-                self.copts.cleanstart = 0;
-            }
-        }
-
-        /// Gets the "clean start" setting in the options.
-        ///
-        /// This is only used in MQTT v5 connections.
-        pub fn clean_start(&self) -> bool {
-            from_c_bool(self.copts.cleanstart)
-        }
-
-        /// This sets the "clean start" behavior for connecting to the server.
-        ///
-        /// When set to true, this directs the server to throw away any state
-        /// related to the client, as determined by the client identifier.
-        /// When set to false, the server keeps the state information and
-        /// resumes the previous session.
-        ///
-        /// This is only used in MQTT v5 connections.
-        pub fn set_clean_start(&mut self, clean: bool) {
-            self.copts.cleanstart = to_c_bool(clean);
-            if clean {
-                self.copts.cleansession = 0;
-            }
-        }
-
-        /// Whether the options have SSL/TLS options for a secure connection
-        pub fn has_ssl_options(&self) -> bool {
-            self.data.ssl.is_some()
-        }
-    */
-
-    /// Sets the token to ber used for connect completion callbacks.
+    /// Sets the token to be used for connect completion callbacks.
     ///
     /// Note that we leak the token to give to the C lib. When we're
     /// done with it, we must recover and drop it (i.e. in the completion

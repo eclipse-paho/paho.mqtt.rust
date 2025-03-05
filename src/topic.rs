@@ -23,14 +23,8 @@
 //!
 
 use crate::{
-    async_client::AsyncClient,
-    client::Client,
-    errors::{Error, Result},
-    message::{Message, MessageBuilder},
-    properties::{Properties, Property, PropertyCode},
-    subscribe_options::SubscribeOptions,
-    token::{DeliveryToken, Token},
-    QoS, ServerResponse,
+    AsyncClient, Client, DeliveryToken, Error, Message, MessageBuilder, Properties, QoS,
+    Result, ServerResponse, SubscribeOptions, Token,
 };
 use std::fmt;
 

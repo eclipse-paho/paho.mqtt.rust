@@ -4,7 +4,7 @@
 //
 
 /*******************************************************************************
- * Copyright (c) 2018-2024 Frank Pagliughi <fpagliughi@mindspring.com>
+ * Copyright (c) 2018-2025 Frank Pagliughi <fpagliughi@mindspring.com>
  *
  * All rights reserved. This program and the accompanying materials
  * are made available under the terms of the Eclipse Public License v2.0
@@ -31,11 +31,7 @@
 //! combined with any other Rust futures.
 //!
 
-use crate::{
-    ffi, from_c_bool,
-    properties::{Properties, PropertiesFfi},
-    reason_code::ReasonCode,
-};
+use crate::{ffi, from_c_bool, Properties, ReasonCode};
 use std::ffi::CStr;
 
 /////////////////////////////////////////////////////////////////////////////
