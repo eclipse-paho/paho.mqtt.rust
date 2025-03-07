@@ -4,7 +4,7 @@
 //
 
 /*******************************************************************************
- * Copyright (c) 2017-2023 Frank Pagliughi <fpagliughi@mindspring.com>
+ * Copyright (c) 2017-2025 Frank Pagliughi <fpagliughi@mindspring.com>
  *
  * All rights reserved. This program and the accompanying materials
  * are made available under the terms of the Eclipse Public License v1.0
@@ -139,8 +139,8 @@ where
 
 // Here we're looking for some pre-generated bindings specific for the
 // version of the C lib and the build target.
-// If not found, it settles on the default bindings, given the target
-// word size (32 or 64-bit).
+// If specific target bindings are not found, it settles on the default
+// bindings for the target word size (32 or 64-bit).
 #[cfg(not(feature = "build_bindgen"))]
 mod bindings {
     use super::*;
@@ -148,7 +148,7 @@ mod bindings {
 
     pub fn place_bindings(_inc_dir: &Path) {
         let target = env::var("TARGET").unwrap();
-        println!("debug:Using existing Paho C binding for target: {}", target);
+        println!("debug:Looking for existing Paho C binding for target: {}", target);
 
         let out_dir = env::var("OUT_DIR").unwrap();
         let out_path = Path::new(&out_dir).join("bindings.rs");
@@ -163,7 +163,7 @@ mod bindings {
 
         if !Path::new(&bindings).exists() {
             println!(
-                "No bindings exist for: {}. Using {}-bit default.",
+                "No bindings exist at: {}. Using {}-bit default.",
                 bindings, ptr_wd
             );
             bindings = format!(
@@ -180,8 +180,6 @@ mod bindings {
 // Here we create new bindings using bindgen.
 #[cfg(feature = "build_bindgen")]
 mod bindings {
-    extern crate bindgen;
-
     use super::*;
     use std::{
         env, fs,
@@ -232,11 +230,9 @@ mod bindings {
         );
 
         if !Path::new(&bindings).exists() {
-            if let Err(err) = fs::copy(out_path, &bindings) {
-                println!("debug:Error copying new binding file: {}", err);
-            }
-            else {
-                println!("debug:Created new bindings file {}", bindings)
+            match fs::copy(out_path, &bindings) {
+                Ok(_) => println!("debug:Created new bindings file {}", bindings),
+                Err(err) => println!("debug:Error copying new binding file: {}", err)
             }
         }
     }
@@ -248,14 +244,8 @@ mod bindings {
 // configuration options that are useful for the Rust wrapper.
 #[cfg(feature = "bundled")]
 mod build {
-    extern crate cmake;
-
     use super::*;
-    use std::{
-        //        path::Path,
-        process,
-        process::Command,
-    };
+    use std::process::{self, Command};
 
     // The openssl-sys crate does the hard part of finding the library,
     // but it only seems to set a variable for the path to the include files.
