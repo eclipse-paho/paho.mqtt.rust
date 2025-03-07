@@ -32,9 +32,7 @@
  *    Frank Pagliughi - initial implementation and documentation
  *******************************************************************************/
 
-#[macro_use]
-extern crate paho_mqtt as mqtt;
-
+use paho_mqtt as mqtt;
 use serde_json::json;
 use std::{env, process};
 
@@ -106,8 +104,8 @@ fn main() -> mqtt::Result<()> {
     let corr_id = b"1";
 
     let props = mqtt::properties![
-        mqtt::PropertyCode::ResponseTopic => reply_topic,
-        mqtt::PropertyCode::CorrelationData => corr_id,
+        ResponseTopic(reply_topic),
+        CorrelationData(corr_id.to_vec()),
     ];
 
     // The request topic will be of the form:

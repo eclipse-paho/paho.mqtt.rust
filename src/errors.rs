@@ -200,6 +200,9 @@ pub enum Error {
     /// Missing SSL/TLS options
     #[error("Missing SSL/TLS options")]
     MissingSslOptions,
+    /// Bad property, typically from improper value type for the code
+    #[error("Bad v5 property")]
+    BadProperty,
     /// Conversion error between types
     #[error("Conversion Error")]
     Conversion,

@@ -31,8 +31,7 @@
  *    Frank Pagliughi - initial implementation and documentation
  *******************************************************************************/
 
-#[macro_use]
-extern crate paho_mqtt as mqtt;
+use paho_mqtt as mqtt;
 
 use std::{env, io, process, time::Duration};
 
@@ -65,9 +64,7 @@ fn main() -> mqtt::Result<()> {
     // The LWT is broadcast to the group if our connection is lost
     // But wait 30sec for reconnect before broadcasting it.
 
-    let lwt_props = mqtt::properties! {
-        mqtt::PropertyCode::WillDelayInterval => 10,
-    };
+    let lwt_props = mqtt::properties![WillDelayInterval(10)];
 
     let lwt = mqtt::MessageBuilder::new()
         .topic(&chat_topic)
@@ -89,9 +86,7 @@ fn main() -> mqtt::Result<()> {
     });
 
     // Session will exist for a day (86,400 sec) between connections.
-    let props = mqtt::properties! {
-        mqtt::PropertyCode::SessionExpiryInterval => 86400,
-    };
+    let props = mqtt::properties![SessionExpiryInterval(86400)];
 
     // Connect with a persistent sesstion
 

@@ -71,7 +71,7 @@ fn main() -> mqtt::Result<()> {
 
     match rsp
         .properties()
-        .get_val::<u16>(mqtt::PropertyCode::TopicAliasMaximum)
+        .get_u16(mqtt::PropertyCode::TopicAliasMaximum)
     {
         None | Some(0) => {
             eprintln!("The server doesn't support Topic Aliases.");

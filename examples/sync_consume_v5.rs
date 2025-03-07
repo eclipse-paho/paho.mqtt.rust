@@ -87,10 +87,8 @@ fn try_reconnect(cli: &mqtt::Client) -> bool {
 }
 
 // Create a set of poperties with a single Subscription ID
-fn sub_id(id: i32) -> mqtt::Properties {
-    mqtt::properties![
-        mqtt::PropertyCode::SubscriptionIdentifier => id
-    ]
+fn sub_id(id: u32) -> mqtt::Properties {
+    mqtt::properties![SubscriptionIdentifier(id)]
 }
 
 // --------------------------------------------------------------------------
@@ -129,7 +127,7 @@ fn main() -> mqtt::Result<()> {
     // (3600sec) if the service disconnects or restarts.
     let conn_opts = mqtt::ConnectOptionsBuilder::new_v5()
         .clean_start(false)
-        .properties(mqtt::properties![mqtt::PropertyCode::SessionExpiryInterval => 3600])
+        .properties(mqtt::properties![SessionExpiryInterval(3600)])
         .will_message(lwt)
         .finalize();
 

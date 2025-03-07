@@ -151,7 +151,7 @@ impl Message {
         let data = MessageData {
             topic,
             payload,
-            props: PropertiesFfi::from_c_struct(&cmsg.properties),
+            props: PropertiesFfi::from(&cmsg.properties),
         };
 
         Self::from_data(*cmsg, data)

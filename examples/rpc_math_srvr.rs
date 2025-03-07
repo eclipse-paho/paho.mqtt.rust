@@ -32,9 +32,10 @@
  *    Frank Pagliughi - initial implementation and documentation
  *******************************************************************************/
 
-#[macro_use]
-extern crate lazy_static;
+//#[macro_use]
+//extern crate lazy_static;
 
+use lazy_static::lazy_static;
 use paho_mqtt as mqtt;
 use serde_json::json;
 use std::{
@@ -152,10 +153,7 @@ fn handle_request(cli: &mqtt::AsyncClient, msg: mqtt::Message) -> mqtt::Result<(
 
         // Form a reply message, using the correlation ID
 
-        let mut props = mqtt::Properties::new();
-        props
-            .push_binary(mqtt::PropertyCode::CorrelationData, corr_id)
-            .unwrap();
+        let props = mqtt::properties![CorrelationData(corr_id)];
 
         // Create the reply message and publish it on the response topic
 
@@ -208,7 +206,7 @@ fn main() -> mqtt::Result<()> {
     // session of 60 sec. But we set a clean start
     let mut conn_opts = mqtt::ConnectOptionsBuilder::new_v5()
         .clean_start(true)
-        .properties(mqtt::properties![mqtt::PropertyCode::SessionExpiryInterval => 60])
+        .properties(mqtt::properties![SessionExpiryInterval(60)])
         .finalize();
 
     // Connect and wait for it to complete or fail

@@ -498,42 +498,42 @@ impl Property {
     }
 
     /// Gets the property value as a a u8 byte.
-    pub fn get_byte(&self) -> Option<u8> {
+    pub fn get_byte(&self) -> Option<&u8> {
         use Property::*;
         match *self {
-            PayloadFormatIndicator(by) => Some(by),
-            RequestProblemInformation(by) => Some(by),
-            RequestResponseInformation(by) => Some(by),
-            MaximumQos(by) => Some(by),
-            RetainAvailable(by) => Some(by),
-            WildcardSubscriptionAvailable(by) => Some(by),
-            SubscriptionIdentifiersAvailable(by) => Some(by),
-            SharedSubscriptionAvailable(by) => Some(by),
+            PayloadFormatIndicator(ref by) => Some(by),
+            RequestProblemInformation(ref by) => Some(by),
+            RequestResponseInformation(ref by) => Some(by),
+            MaximumQos(ref by) => Some(by),
+            RetainAvailable(ref by) => Some(by),
+            WildcardSubscriptionAvailable(ref by) => Some(by),
+            SubscriptionIdentifiersAvailable(ref by) => Some(by),
+            SharedSubscriptionAvailable(ref by) => Some(by),
             _ => None,
         }
     }
 
     /// Gets the property value as a 16-bit uint.
-    pub fn get_u16(&self) -> Option<u16> {
+    pub fn get_u16(&self) -> Option<&u16> {
         use Property::*;
         match *self {
-            ServerKeepAlive(val) => Some(val),
-            ReceiveMaximum(val) => Some(val),
-            TopicAliasMaximum(val) => Some(val),
-            TopicAlias(val) => Some(val),
+            ServerKeepAlive(ref val) => Some(val),
+            ReceiveMaximum(ref val) => Some(val),
+            TopicAliasMaximum(ref val) => Some(val),
+            TopicAlias(ref val) => Some(val),
             _ => None,
         }
     }
 
     /// Gets the property value as a 32-bit uint.
-    pub fn get_u32(&self) -> Option<u32> {
+    pub fn get_u32(&self) -> Option<&u32> {
         use Property::*;
         match *self {
-            MessageExpiraryInterval(val) => Some(val),
-            SubscriptionIdentifier(val) => Some(val),
-            SessionExpiryInterval(val) => Some(val),
-            WillDelayInterval(val) => Some(val),
-            MaximumPacketSize(val) => Some(val),
+            MessageExpiraryInterval(ref val) => Some(val),
+            SubscriptionIdentifier(ref val) => Some(val),
+            SessionExpiryInterval(ref val) => Some(val),
+            WillDelayInterval(ref val) => Some(val),
+            MaximumPacketSize(ref val) => Some(val),
             _ => None,
         }
     }
@@ -618,10 +618,10 @@ impl Property {
     }
 
     /// Gets the property value as a string pair.
-    pub fn get_string_pair(&self) -> Option<(&str, &str)> {
+    pub fn get_string_pair(&self) -> Option<&(String, String)> {
         use Property::*;
         match self {
-            User((key, val)) => Some((key.as_str(), val.as_str())),
+            User(ref val) => Some(val),
             _ => None,
         }
     }
@@ -630,7 +630,7 @@ impl Property {
     pub fn into_string_pair(self) -> Option<(String, String)> {
         use Property::*;
         match self {
-            User((key, val)) => Some((key, val)),
+            User(val) => Some(val),
             _ => None,
         }
     }
@@ -682,6 +682,11 @@ impl Properties {
         Self::default()
     }
 
+    /// Creates a new collection with a single property.
+    pub fn with_property(prop: Property) -> Self {
+        Self::from(vec![prop])
+    }
+
     /// Converts the property collection into a vector of properties.
     pub fn into_vec(self) -> Vec<Property> {
         self.0
@@ -712,17 +717,19 @@ impl Properties {
         self.0.push(prop);
     }
 
-    /*
     /// Adds a property to the collection given the property code and value.
     pub fn push_val<T>(&mut self, code: PropertyCode, val: T) -> Result<()>
     where
         T: Any + 'static,
     {
-        // TODO: Implement this
-        //self.push(Property::new(code, val)?)
+        self.push(Property::new(code, val).ok_or(Error::BadProperty)?);
         Ok(())
     }
-    */
+
+    /// Searches for a property with the specified code
+    pub fn get(&self, code: PropertyCode) -> Option<&Property> {
+        self.0.iter().find(|&p| p.property_code() == code)
+    }
 
     /// Gets the payload format indicator, if any
     pub fn payload_format_indicator(&self) -> Option<&u8> {
@@ -731,28 +738,41 @@ impl Properties {
 
     /// Gets the byte value for the requested property code, if any
     pub fn get_byte(&self, code: PropertyCode) -> Option<&u8> {
-        use PropertyCode::*;
-        match code {
-            PayloadFormatIndicator => {
-                property_value!(self.0, Property::PayloadFormatIndicator)
-            }
-            _ => None,
-        }
+        self.get(code).and_then(|p| p.get_byte())
+    }
+
+    /// Gets the byte value for the requested property code, if any
+    pub fn get_u16(&self, code: PropertyCode) -> Option<&u16> {
+        self.get(code).and_then(|p| p.get_u16())
+    }
+
+    /// Gets the byte value for the requested property code, if any
+    pub fn get_u32(&self, code: PropertyCode) -> Option<&u32> {
+        self.get(code).and_then(|p| p.get_u32())
+    }
+
+    /// Gets the byte value for the requested property code, if any
+    pub fn get_uint(&self, code: PropertyCode) -> Option<u32> {
+        self.get(code).and_then(|p| p.get_uint())
     }
 
     /// Gets the string value for the requested property code, if any
     pub fn get_string(&self, code: PropertyCode) -> Option<&str> {
-        use PropertyCode::*;
-        match code {
-            ContentType => property_value!(self.0, Property::ContentType),
-            ResponseTopic => property_value!(self.0, Property::ResponseTopic),
-            _ => None,
-        }
-        .map(|s| s.as_str())
+        self.get(code).and_then(|p| p.get_string())
+    }
+
+    /// Gets the binary value for the requested property code, if any
+    pub fn get_binary(&self, code: PropertyCode) -> Option<&[u8]> {
+        self.get(code).and_then(|p| p.get_binary())
+    }
+
+    /// Gets the string value for the requested property code, if any
+    pub fn get_string_pair(&self, code: PropertyCode) -> Option<&(String, String)> {
+        self.get(code).and_then(|p| p.get_string_pair())
     }
 
     /// Find the user value for the requested user key, if any
-    pub fn find_user(&self, key: &str) -> Option<&str> {
+    pub fn find_user_property(&self, key: &str) -> Option<&str> {
         property_values!(self.0, Property::User)
             .filter_map(|(k, v)| {
                 if k == key {
@@ -783,6 +803,11 @@ impl Properties {
     pub fn iter(&self) -> Iter<'_, Property> {
         self.0.iter()
     }
+
+    /// Create a mutable iterator through the properties.
+    pub fn iter_mut(&mut self) -> IterMut<'_, Property> {
+        self.0.iter_mut()
+    }
 }
 
 impl From<Vec<Property>> for Properties {
@@ -791,12 +816,50 @@ impl From<Vec<Property>> for Properties {
     }
 }
 
-impl TryFrom<&ffi::MQTTProperties> for Properties {
-    type Error = Error;
+impl From<&[Property]> for Properties {
+    fn from(props: &[Property]) -> Self {
+        Self(props.to_vec())
+    }
+}
 
-    fn try_from(cprop: &ffi::MQTTProperties) -> Result<Self> {
-        // TODO: Implement this
-        Ok(Self::default())
+impl From<&ffi::MQTTProperties> for Properties {
+    fn from(cprops: &ffi::MQTTProperties) -> Self {
+        use PropertyType::*;
+
+        let mut props = Self::new();
+        let ffi_props = PropertiesFfi::from(cprops);
+
+        for prop in ffi_props.iter() {
+            let code = prop.property_code();
+
+            match prop.property_type() {
+                Byte => {
+                    let val = prop.get_byte().unwrap();
+                    props.push(Property::new(code, val).unwrap());
+                }
+                TwoByteInteger => {
+                    let val = prop.get_u16().unwrap();
+                    props.push(Property::new(code, val).unwrap());
+                }
+                FourByteInteger | VariableByteInteger => {
+                    let val = prop.get_u32().unwrap();
+                    props.push(Property::new(code, val).unwrap());
+                }
+                BinaryData => {
+                    let val = prop.get_binary().unwrap();
+                    props.push(Property::new(code, val).unwrap());
+                }
+                Utf8EncodedString => {
+                    let val = prop.get_string().unwrap();
+                    props.push(Property::new(code, val).unwrap());
+                }
+                Utf8StringPair => {
+                    let (key, val) = prop.get_string_pair().unwrap();
+                    props.push(Property::new(code, (key, val)).unwrap());
+                }
+            }
+        }
+        props
     }
 }
 
@@ -1465,15 +1528,6 @@ impl PropertiesFfi {
         Self::default()
     }
 
-    /// Creates a set of properties from an underlying C struct.
-    ///
-    /// This does a deep copy of the properties in the C lib and then keeps
-    /// the copy.
-    pub fn from_c_struct(cprops: &ffi::MQTTProperties) -> Self {
-        let cprops = unsafe { ffi::MQTTProperties_copy(cprops) };
-        Self { cprops }
-    }
-
     /// Determines if the property list has no items in it.
     pub fn is_empty(&self) -> bool {
         self.cprops.count == 0
@@ -1592,7 +1646,7 @@ impl PropertiesFfi {
     }
 
     /// Gets an iterator for all the properties
-    pub fn iter(&self, code: PropertyCode) -> PropertyIterator<'_> {
+    pub fn iter(&self) -> PropertyIterator {
         PropertyIterator {
             props: self,
             code: None,
@@ -1714,6 +1768,23 @@ impl Drop for PropertiesFfi {
     }
 }
 
+impl From<ffi::MQTTProperties> for PropertiesFfi {
+    /// Creates a set of properties from an underlying C struct.
+    fn from(cprops: ffi::MQTTProperties) -> Self {
+        Self { cprops }
+    }
+}
+
+impl From<&ffi::MQTTProperties> for PropertiesFfi {
+    /// Creates a set of properties from an underlying C struct.
+    /// This does a deep copy of the properties in the C lib and then keeps
+    /// the copy.
+    fn from(cprops: &ffi::MQTTProperties) -> Self {
+        let cprops = unsafe { ffi::MQTTProperties_copy(cprops) };
+        Self { cprops }
+    }
+}
+
 /// Iterator over the values for a speciifc property
 pub struct PropertyIterator<'a> {
     props: &'a PropertiesFfi,
@@ -1786,15 +1857,15 @@ impl From<&Properties> for PropertiesFfi {
             match prop.property_type() {
                 Byte => {
                     let val = prop.get_byte().unwrap();
-                    ffi_props.push_byte(code, val).unwrap();
+                    ffi_props.push_byte(code, *val).unwrap();
                 }
                 TwoByteInteger => {
                     let val = prop.get_u16().unwrap();
-                    ffi_props.push_u16(code, val).unwrap();
+                    ffi_props.push_u16(code, *val).unwrap();
                 }
                 FourByteInteger | VariableByteInteger => {
                     let val = prop.get_u32().unwrap();
-                    ffi_props.push_u32(code, val).unwrap();
+                    ffi_props.push_u32(code, *val).unwrap();
                 }
                 BinaryData => {
                     let val = prop.get_binary().unwrap();
@@ -2306,15 +2377,9 @@ mod tests {
 
         let mut props = Properties::new();
 
-        props
-            .push(Property::new_string_pair(code, "user0", "val0").unwrap())
-            .unwrap();
-        props
-            .push(Property::new_string_pair(code, "user1", "val1").unwrap())
-            .unwrap();
-        props
-            .push(Property::new_string_pair(code, "user2", "val2").unwrap())
-            .unwrap();
+        props.push(Property::new(code, ("user0", "val0")).unwrap());
+        props.push(Property::new(code, ("user1", "val1")).unwrap());
+        props.push(Property::new(code, ("user2", "val2")).unwrap());
 
         assert_eq!(Some("val0"), props.find_user_property("user0").as_deref());
         assert_eq!(Some("val1"), props.find_user_property("user1").as_deref());
@@ -2330,9 +2395,9 @@ mod tests {
 
         // Some different properties
         let props = properties! {
-            PropertyCode::ResponseTopic => "responses/somewhere",
-            PropertyCode::CorrelationData => b"12345",
-            PropertyCode::MaximumQos => 1,
+            ResponseTopic("responses/somewhere".into()),
+            CorrelationData(b"12345".into()),
+            MaximumQos(1),
         };
 
         assert!(!props.is_empty());
@@ -2343,7 +2408,7 @@ mod tests {
         );
 
         let props = properties! {
-            PropertyCode::SessionExpiryInterval => 60,
+            PropertyCode(60),
         };
 
         assert_eq!(1, props.len());
