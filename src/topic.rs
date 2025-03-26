@@ -4,7 +4,7 @@
 //
 
 /*******************************************************************************
- * Copyright (c) 2017-2023 Frank Pagliughi <fpagliughi@mindspring.com>
+ * Copyright (c) 2017-2025 Frank Pagliughi <fpagliughi@mindspring.com>
  *
  * All rights reserved. This program and the accompanying materials
  * are made available under the terms of the Eclipse Public License v2.0
@@ -419,7 +419,8 @@ impl<'a> SyncTopic<'a> {
 ///     '+' - Matches a single field
 ///     '#' - Matches all subsequent fields (must be last field in filter)
 ///
-/// It can be used to match against topics.
+/// It's primary use is to match against incoming topics. The internal
+/// implementation is optimized for that use case.
 #[derive(Debug)]
 pub enum TopicFilter {
     /// If there are no wildcards, the filter is a straight topic string
@@ -432,10 +433,7 @@ impl TopicFilter {
     /// Creates a new topic filter from the string.
     /// This can fail if the filter is not correct, such as having a '#'
     /// wildcard in anyplace other than the last field, or if
-    pub fn new<S>(filter: S) -> Result<Self>
-    where
-        S: Into<String>,
-    {
+    pub fn new<S: Into<String>>(filter: S) -> Result<Self> {
         let filter = filter.into();
         let n = filter.len();
 
@@ -451,7 +449,7 @@ impl TopicFilter {
         };
 
         let v = if wild {
-            let fields = filter.split('/').map(|s| s.to_string()).collect();
+            let fields = filter.split('/').map(String::from).collect();
             Self::Fields(fields)
         }
         else {
@@ -462,17 +460,28 @@ impl TopicFilter {
     }
 
     /// Creates a new topic filter from the string without checking it.
-    pub fn new_unchecked<S>(filter: S) -> Self
-    where
-        S: Into<String>,
-    {
+    pub fn new_unchecked<S: Into<String>>(filter: S) -> Self {
         let filter = filter.into();
 
-        if filter.contains('+') || filter.ends_with('#') {
-            Self::Fields(filter.split('/').map(|s| s.to_string()).collect())
+        if filter.ends_with('#') || filter.contains('+') {
+            Self::Fields(filter.split('/').map(String::from).collect())
         }
         else {
             Self::Topic(filter)
+        }
+    }
+
+    /// Determines if the filter contains wildcards.
+    #[inline]
+    pub fn has_wildcards(&self) -> bool {
+        matches!(self, Self::Fields(_))
+    }
+
+    /// Gets the number of fields in the topic filter.
+    pub fn num_fields(&self) -> usize {
+        match self {
+            Self::Topic(filter) => filter.chars().filter(|&c| c == '/').count() + 1,
+            Self::Fields(fields) => fields.len(),
         }
     }
 
@@ -515,37 +524,66 @@ mod tests {
 
     #[test]
     fn test_nonwild_topic_filter() {
-        const FILTER: &str = "some/topic";
+        const FILTER0: &str = "test";
 
-        let filter = TopicFilter::new(FILTER).unwrap();
-        assert!(filter.is_match(FILTER));
+        let filter = TopicFilter::new(FILTER0).unwrap();
+        assert!(matches!(filter, TopicFilter::Topic(ref s) if s == FILTER0));
+        assert!(filter.is_match(FILTER0));
+        assert!(!filter.has_wildcards());
+        assert_eq!(filter.num_fields(), 1);
+        assert_eq!(format!("{}", filter), FILTER0);
 
-        let s = format!("{}", filter);
-        assert_eq!(s, FILTER);
+        const FILTER1: &str = "some/random/topic";
+
+        let filter = TopicFilter::new(FILTER1).unwrap();
+        assert!(matches!(filter, TopicFilter::Topic(ref s) if s == FILTER1));
+        assert!(filter.is_match(FILTER1));
+        assert!(!filter.has_wildcards());
+        assert_eq!(filter.num_fields(), 3);
+        assert_eq!(format!("{}", filter), FILTER1);
     }
 
     #[test]
     fn test_basic_topic_filter() {
+        const FILTER0: &str = "#";
+
+        let filter = TopicFilter::new(FILTER0).unwrap();
+        assert!(matches!(filter, TopicFilter::Fields(_)));
+        assert!(filter.is_match("this"));
+        assert!(filter.is_match("this/that"));
+        assert!(filter.is_match("some/topic/thing"));
+        assert!(filter.has_wildcards());
+        assert_eq!(filter.num_fields(), 1);
+        assert_eq!(format!("{}", filter), FILTER0);
+
         const FILTER1: &str = "some/topic/#";
 
         let filter = TopicFilter::new(FILTER1).unwrap();
+        assert!(matches!(filter, TopicFilter::Fields(_)));
         assert!(filter.is_match("some/topic/thing"));
-
-        let s = format!("{}", filter);
-        assert_eq!(s, FILTER1);
+        assert!(filter.has_wildcards());
+        assert_eq!(filter.num_fields(), 3);
+        assert_eq!(format!("{}", filter), FILTER1);
 
         const FILTER2: &str = "some/+/thing";
+
         let filter = TopicFilter::new(FILTER2).unwrap();
+        assert!(matches!(filter, TopicFilter::Fields(_)));
         assert!(filter.is_match("some/topic/thing"));
         assert!(!filter.is_match("some/topic/plus/thing"));
-
-        let s = format!("{}", filter);
-        assert_eq!(s, FILTER2);
+        assert!(filter.has_wildcards());
+        assert_eq!(filter.num_fields(), 3);
+        assert_eq!(format!("{}", filter), FILTER2);
 
         const FILTER3: &str = "some/+";
+
         let filter = TopicFilter::new(FILTER3).unwrap();
+        assert!(matches!(filter, TopicFilter::Fields(_)));
         assert!(filter.is_match("some/thing"));
         assert!(!filter.is_match("some/thing/plus"));
+        assert!(filter.has_wildcards());
+        assert_eq!(filter.num_fields(), 2);
+        assert_eq!(format!("{}", filter), FILTER3);
     }
 
     #[test]

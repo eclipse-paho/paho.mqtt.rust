@@ -148,7 +148,10 @@ mod bindings {
 
     pub fn place_bindings(_inc_dir: &Path) {
         let target = env::var("TARGET").unwrap();
-        println!("debug:Looking for existing Paho C binding for target: {}", target);
+        println!(
+            "debug:Looking for existing Paho C binding for target: {}",
+            target
+        );
 
         let out_dir = env::var("OUT_DIR").unwrap();
         let out_path = Path::new(&out_dir).join("bindings.rs");
@@ -232,7 +235,7 @@ mod bindings {
         if !Path::new(&bindings).exists() {
             match fs::copy(out_path, &bindings) {
                 Ok(_) => println!("debug:Created new bindings file {}", bindings),
-                Err(err) => println!("debug:Error copying new binding file: {}", err)
+                Err(err) => println!("debug:Error copying new binding file: {}", err),
             }
         }
     }
