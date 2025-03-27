@@ -505,6 +505,22 @@ impl TopicFilter {
     }
 }
 
+impl TryFrom<&str> for TopicFilter {
+    type Error = Error;
+
+    fn try_from(s: &str) -> Result<Self> {
+        Self::new(s)
+    }
+}
+
+impl TryFrom<String> for TopicFilter {
+    type Error = Error;
+
+    fn try_from(s: String) -> Result<Self> {
+        Self::new(s)
+    }
+}
+
 impl fmt::Display for TopicFilter {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
