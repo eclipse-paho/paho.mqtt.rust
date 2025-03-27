@@ -9,7 +9,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## v0.13.2  (Unreleased)
 
-- Added some query methods to `TopicFilter`, `has_wildcards()` and `num_fields()`.
+- Added some methods to `TopicFilter`:
+    - Queries `has_wildcards()` and `num_fields()`.
+    - TryFrom for `&str` and `String`
 
 
 ## [v0.13.1](https://github.com/eclipse/paho.mqtt.rust/compare/v0.13.0..v0.13.1) - (2025-02-19)

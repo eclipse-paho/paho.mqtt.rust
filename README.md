@@ -169,11 +169,31 @@ To combine the two separate libraries into one universal binary please use the l
 
 ### Fully Static Builds with MUSL
 
-Using _musl_ would allow you to create fully-static applications that do not rely on any shared libraries... at all. You would need a _musl_ target for your Rust compiler, and the _musl_ build tools for your target ar well. 
+Using _musl_ would allow you to create fully-static applications that do not rely on any shared libraries... at all. You would need a _musl_ target for your Rust compiler, and the _musl_ build tools for your target ar well.
 
-Then you can use Casro to build your application, like:
+Then you would be able to use Cargo to build your application, like:
 
     $ cargo build --target=x86_64-unknown-linux-musl
+
+On a recent Ubuntu/Mint Linux host it should work as follows, but should be similar on any development host once the tools are installed.
+
+First install the Rust compiler for _musl_ and the tools:
+
+    $ rustup target add x86_64-unknown-linux-musl
+    $ sudo apt install musl-tools
+
+Check the _musl_ compiler:
+
+    $ musl-gcc --version
+    cc (Ubuntu 7.5.0-3ubuntu1~18.04) 7.5.0
+    ...
+
+Building without SSL is like this:
+
+```
+$  cargo build --no-default-features --features="bundled" \
+    --target=x86_64-unknown-linux-musl --examples
+```
 
 When using SSL/TLS with _musl_, you need a static version of the OpenSSL library built for _musl_. If you don't have one built and installed, you can use _vendored-ssl_. So, in your _Cargo.toml:_
 
@@ -400,30 +420,6 @@ After that, you should be able to build the project for any of the supported tar
 ```
 $ cross build --target=armv7-unknown-linux-gnueabihf \
     --features=vendored-ssl --examples
-```
-
-## Fully Static Builds with _musl_
-
-With the v0.9 release and beyond, it should be fairly easy to create fully static builds of applications that use the Paho crate using the _musl_ library and tools.
-
-On a recent Ubuntu/Mint Linux host it should work as follows, but should be similar on any development host once the tools are installed.
-
-First install the Rust compiler for _musl_ and the tools:
-
-    $ rustup target add x86_64-unknown-linux-musl
-    $ sudo apt install musl-tools
-
-Check the _musl_ compiler:
-
-    $ musl-gcc --version
-    cc (Ubuntu 7.5.0-3ubuntu1~18.04) 7.5.0
-    ...
-
-Building without SSL is like this:
-
-```
-$  cargo build --no-default-features --features="bundled" \
-    --target=x86_64-unknown-linux-musl --examples
 ```
 
 ## Logging
