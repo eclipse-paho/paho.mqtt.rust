@@ -41,7 +41,7 @@ use paho_mqtt as mqtt;
 use std::{env, process, time::Duration};
 
 // The topics to which we subscribe.
-const TOPICS: &[&str] = &["test", "hello"];
+const TOPICS: &[&str] = &["test/#", "hello"];
 const QOS: &[i32] = &[1, 1];
 
 /////////////////////////////////////////////////////////////////////////////

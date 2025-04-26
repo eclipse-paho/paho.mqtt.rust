@@ -99,6 +99,11 @@ impl<T> Node<T> {
         self.value.is_none() && self.children.is_empty()
     }
 
+    /// Gets a reference to the value
+    fn value_ref(&self) -> Option<(&str, &T)> {
+        self.value.as_ref().map(|(k, v)| (k.as_str(), v))
+    }
+
     /// Gets an iterator for the node and _all_ of its children.
     fn iter(&self) -> NodeIter<T> {
         Box::new(
@@ -230,10 +235,7 @@ impl<T> TopicMatcher<T> {
     }
 
     /// Inserts a new topic filter and value into the collection.
-    pub fn insert<S>(&mut self, filter: S, val: T)
-    where
-        S: Into<String>,
-    {
+    pub fn insert<S: Into<String>>(&mut self, filter: S, val: T) {
         let filter = filter.into();
         let mut curr = &mut self.root;
 
@@ -243,18 +245,20 @@ impl<T> TopicMatcher<T> {
         curr.value = Some((filter, val));
     }
 
-    /// Gets a reference to a value from the collection using an exact
-    /// filter match.
-    pub fn get(&self, topic: &str) -> Option<&T> {
-        self.get_key_value(topic).map(|(_, v)| v)
+    /// Gets a reference to a value from the collection using the precise
+    /// filter. This does not do wildcard matching but looks for the value
+    /// for the exact, specified filter.
+    pub fn get(&self, filter: &str) -> Option<&T> {
+        self.get_key_value(filter).map(|(_, v)| v)
     }
 
-    /// Gets a reference to a value from the collection using an exact
-    /// filter match.
-    pub fn get_key_value(&self, topic: &str) -> Option<(&str, &T)> {
+    /// Gets a reference to a value from the collection using the precise
+    /// filter. This does not do wildcard matching but looks for the entry
+    /// for the exact, specified filter.
+    pub fn get_key_value(&self, filter: &str) -> Option<(&str, &T)> {
         let mut curr = &self.root;
 
-        for field in topic.split('/') {
+        for field in filter.split('/') {
             curr = match curr.children.get(field) {
                 Some(node) => node,
                 None => return None,
@@ -264,11 +268,11 @@ impl<T> TopicMatcher<T> {
     }
 
     /// Gets a mutable mutable reference to a value from the collection
-    /// using an exact filter match.
-    pub fn get_mut(&mut self, topic: &str) -> Option<&mut T> {
+    /// using an exact filter as the key.
+    pub fn get_mut(&mut self, filter: &str) -> Option<&mut T> {
         let mut curr = &mut self.root;
 
-        for field in topic.split('/') {
+        for field in filter.split('/') {
             curr = match curr.children.get_mut(field) {
                 Some(node) => node,
                 None => return None,
@@ -282,10 +286,10 @@ impl<T> TopicMatcher<T> {
     /// This removes the value from the internal node, but leaves the node,
     /// even if it is empty. To remove empty nodes, see [`prune`](Self::prune)
     /// or [`shrink_to_fit`](Self::shrink_to_fit).
-    pub fn remove(&mut self, topic: &str) -> Option<T> {
+    pub fn remove(&mut self, filter: &str) -> Option<T> {
         let mut curr = &mut self.root;
 
-        for field in topic.split('/') {
+        for field in filter.split('/') {
             curr = match curr.children.get_mut(field) {
                 Some(node) => node,
                 None => return None,
@@ -347,6 +351,26 @@ impl<T> Default for TopicMatcher<T> {
     }
 }
 
+impl<T> From<HashMap<&str, T>> for TopicMatcher<T> {
+    fn from(mut m: HashMap<&str, T>) -> Self {
+        let mut matcher = Self::new();
+        for (filt, val) in m.drain() {
+            matcher.insert(filt, val);
+        }
+        matcher
+    }
+}
+
+impl<T> From<HashMap<String, T>> for TopicMatcher<T> {
+    fn from(mut m: HashMap<String, T>) -> Self {
+        let mut matcher = Self::new();
+        for (filt, val) in m.drain() {
+            matcher.insert(filt, val);
+        }
+        matcher
+    }
+}
+
 impl<'a, T: 'a> IntoIterator for &'a TopicMatcher<T> {
     type Item = (&'a str, &'a T);
     type IntoIter = NodeIter<'a, T>;
@@ -396,15 +420,13 @@ impl<'a, 'b, T> MatchIter<'a, 'b, T> {
 }
 
 impl<'a, 'b, T> Iterator for MatchIter<'a, 'b, T> {
+    /// Gets the full filter string and value at the matching nodes
     type Item = (&'a str, &'a T);
 
     /// Gets the next value that matches the iterator's topic.
     fn next(&mut self) -> Option<Self::Item> {
         // If no more nodes to search, we're done
-        let (node, mut fields, first) = match self.remaining.pop() {
-            Some(val) => val,
-            None => return None,
-        };
+        let (node, mut fields, first) = self.remaining.pop()?;
 
         let field = match fields.next() {
             Some(field) => field,
@@ -413,7 +435,12 @@ impl<'a, 'b, T> Iterator for MatchIter<'a, 'b, T> {
                     .value
                     .as_ref()
                     .map(|(k, v)| (k.as_str(), v))
-                    .or_else(|| self.next())
+                    .or_else(|| {
+                        node.children
+                            .get("#")
+                            .and_then(|child| child.value_ref())
+                            .or_else(|| self.next())
+                    })
             }
         };
 
@@ -431,7 +458,7 @@ impl<'a, 'b, T> Iterator for MatchIter<'a, 'b, T> {
 
             if let Some(child) = node.children.get("#") {
                 // By protocol definition, a '#' must be a terminating leaf.
-                return child.value.as_ref().map(|(k, v)| (k.as_str(), v));
+                return child.value_ref();
             }
         }
 
@@ -471,6 +498,8 @@ mod tests {
             "some/prod/topic" => 155
         };
 
+        // 'get()' is a standard string comparison looking for the filter
+        // itself as the key.
         assert_eq!(tm.get("some/test/topic"), Some(&19));
         assert_eq!(tm.get("some/test/bubba"), None);
 
@@ -514,6 +543,8 @@ mod tests {
         assert!(tm! {"foo/+" => ()}.has_match("foo/bar"));
         assert!(tm! {"foo/+/baz" => ()}.has_match("foo/bar/baz"));
         assert!(tm! {"foo/+/#"=> ()}.has_match("foo/bar/baz"));
+        assert!(tm! {"foo/bar/#"=> ()}.has_match("foo/bar/baz"));
+        assert!(tm! {"foo/bar/#"=> ()}.has_match("foo/bar"));
         assert!(tm! {"A/B/+/#"=> ()}.has_match("A/B/B/C"));
         assert!(tm! {"#"=> ()}.has_match("foo/bar/baz"));
         assert!(tm! {"#"=> ()}.has_match("/foo/bar"));
@@ -543,6 +574,8 @@ mod tests {
         assert!(topic_matches("foo/+", "foo/bar"));
         assert!(topic_matches("foo/+/baz", "foo/bar/baz"));
         assert!(topic_matches("foo/+/#", "foo/bar/baz"));
+        assert!(topic_matches("foo/bar/#", "foo/bar/baz"));
+        assert!(topic_matches("foo/bar/#", "foo/bar"));
         assert!(topic_matches("A/B/+/#", "A/B/B/C"));
         assert!(topic_matches("#", "foo/bar/baz"));
         assert!(topic_matches("#", "/foo/bar"));
