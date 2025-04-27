@@ -423,7 +423,8 @@ impl<'a> SyncTopic<'a> {
 /// implementation is optimized for that use case.
 #[derive(Debug)]
 pub enum TopicFilter {
-    /// If there are no wildcards, the filter is a straight topic string
+    /// If there are no wildcards, the filter is a straight topic string.
+    /// A match is a straight string comparison
     Topic(String),
     /// If there are wildcards, the filter is split by fields.
     Fields(Vec<String>),
@@ -577,6 +578,7 @@ mod tests {
         let filter = TopicFilter::new(FILTER1).unwrap();
         assert!(matches!(filter, TopicFilter::Fields(_)));
         assert!(filter.is_match("some/topic/thing"));
+        assert!(filter.is_match("some/topic"));
         assert!(filter.has_wildcards());
         assert_eq!(filter.num_fields(), 3);
         assert_eq!(format!("{}", filter), FILTER1);
@@ -610,6 +612,8 @@ mod tests {
         assert!(TopicFilter::new_unchecked("foo/+").matches("foo/bar"));
         assert!(TopicFilter::new_unchecked("foo/+/baz").matches("foo/bar/baz"));
         assert!(TopicFilter::new_unchecked("foo/+/#").matches("foo/bar/baz"));
+        assert!(TopicFilter::new_unchecked("foo/bar/#").matches("foo/bar/baz"));
+        assert!(TopicFilter::new_unchecked("foo/bar/#").matches("foo/bar"));
         assert!(TopicFilter::new_unchecked("A/B/+/#").matches("A/B/B/C"));
         assert!(TopicFilter::new_unchecked("#").matches("foo/bar/baz"));
         assert!(TopicFilter::new_unchecked("#").matches("/foo/bar"));

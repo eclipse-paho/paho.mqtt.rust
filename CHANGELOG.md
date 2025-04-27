@@ -7,6 +7,12 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## **v0.13.3**  (Unreleased)
+
+- `TopicMatcher` implements `From(HashMap)` for the value type.
+- [#243](https://github.com/eclipse-paho/paho.mqtt.rust/issues/243) `TopicMatcher` not matching parent when using '#' wildcard.
+
+
 ## [v0.13.2](https://github.com/eclipse/paho.mqtt.rust/compare/v0.13.1..v0.13.2) - (2025-03-27)
 
 - Added some methods to `TopicFilter`:
@@ -50,7 +56,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 - Added some missing Eclipse Paho legal documents.
 - Added `TopicMatcher::insert_many()`
 - [#216](https://github.com/eclipse/paho.mqtt.rust/issues/216) Deref QoS pointers for SubscribeMany and UnsubscribeMany in server response
-- [#215](https://github.com/eclipse/paho.mqtt.rust/issues/215) Now `subscribe_many()` returns an error if slices not the same length. Also added `subscribe_many_same_qos()` to the clients. 
+- [#215](https://github.com/eclipse/paho.mqtt.rust/issues/215) Now `subscribe_many()` returns an error if slices not the same length. Also added `subscribe_many_same_qos()` to the clients.
 
 
 ## [v0.12.4](https://github.com/eclipse/paho.mqtt.rust/compare/v0.12.3..v0.12.4) - 2024-05-19
@@ -158,7 +164,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 - Websocket HTTP/HTTPS proxy support
 - Added missing MQTT v5 support:
     - Subscribe and Unsubscribe can now have v5 properties, thus enabling Subscription Identifiers.
-- [Breaking] Persistence defaults to `None` if no Client ID specified in creation. 
+- [Breaking] Persistence defaults to `None` if no Client ID specified in creation.
 - Ability to specify a path when using File persistence
 - Updated bindings to Paho C v1.3.8
 - Ability to start publishing (queuing) messages before fir first successful connection.
@@ -168,7 +174,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 - New persistence options:
     - The option to not restore messages from persistence on startup (fresh restart).
     - The option to not persist QoS 0 messages.
-- 
+-
 - [#110] Update to `futures-timer` v3.0
 - [#95] Added Send bounds to `ClientPersistence`
 - [#92] Vendored SSL with _openssl-sys_ crate (optional)
@@ -190,10 +196,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 - Removed old asynchronous (futures 0.1-style) examples
 - Message and option structs were reimplemented internally with pinned inner data structs.
 - Removed `AsyncClientBuilder`. Use `CreateClientBuilder` instead, possibly with new `create_client()` function.
-- `SslOptions` using `Path` and `PathBuf` for file names in the API instead of `String`. 
+- `SslOptions` using `Path` and `PathBuf` for file names in the API instead of `String`.
 - The reason code returned from the server moved into the `ServerResponse` struct.
 - Added `ConnectResponse` as a struct instead of a tuple for the data returned in CONNACK.
-- Upgraded crate to 2018 Edition 
+- Upgraded crate to 2018 Edition
 
 ## [v0.7.1](https://github.com/eclipse/paho.mqtt.rust/compare/v0.7..v0.7.1) - 2020-04-28
 
@@ -212,7 +218,7 @@ Version 0.7 brings full support for MQTT v5, including:
 - New callback `on_disconnect()` for when the client receives a disconnect packet from the server, complete with a reason code and properties.
 - Example for a simple chat application _(mqttrs_chat)_ using the v5 "No Local" subscription option. The publisher does not get their own messages echoed back to them.
  - Examples for RPC using v5 _Properties_ for _ResponseTopic_ and _CorrelationData:_
-     - A math RPC service/server _(rpc_math_srvr)_ that performs basic operations on a list of numbers. 
+     - A math RPC service/server _(rpc_math_srvr)_ that performs basic operations on a list of numbers.
      - A math RPC client  _(rpc_math_cli)_ that can send requests.
 
 Also:
@@ -227,7 +233,7 @@ Note that v0.7 still targets Futures v0.1 and Rust Edition 2015. Support for asy
 
 ## [v0.6](https://github.com/eclipse/paho.mqtt.rust/compare/v0.5..v0.6) - 2019-10-12
 
-The v0.6 release added support for Futures and cleaned up the internal implementation of the library. 
+The v0.6 release added support for Futures and cleaned up the internal implementation of the library.
 
 - **Futures support:**
     - Compatible with the [Rust Futures](https://docs.rs/futures/0.1.25/futures/) library v0.1
@@ -237,16 +243,16 @@ The v0.6 release added support for Futures and cleaned up the internal implement
     - New examples of a publisher and subscriber implemented with futures.
 
 - **Server Responses**
-    - There are now several different types of tokens corresponding to different requests for which the server can return a response: _ConnectToken_, _DeliveryToken_, _SubscribeToken_, etc. 
+    - There are now several different types of tokens corresponding to different requests for which the server can return a response: _ConnectToken_, _DeliveryToken_, _SubscribeToken_, etc.
     - Tokens now track the type of request and get the server response upon completion. This is the Futures _Item_ type for the token.
     - In particular this is useful for connecting subscribers. The app can now determine if a persistent session is already present, and only needs to subscribe if not.
-    
+
 - **Send and Sync Traits**
     - The clients are now marked as _Send_ and _Sync_
     - The _Token_ types are _Send_
     - Most of the option types are _Send_ and _Sync_
     - _AsyncClient_ and _Token_ objects are now just _Arc_ wrappers around inner structs making it easy to clone and pass references around.
-    
+
 - **Internal Cleanup**
     - Updated to wrap Paho C v1.3.1 which has a number of important bug fixes.
     - Moved `Tokens` into their own source file.
