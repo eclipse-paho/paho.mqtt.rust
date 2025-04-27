@@ -38,7 +38,7 @@ use crate::{
     will_options::WillOptions,
     Error, Result,
 };
-use std::{ffi::CString, os::raw::c_int, pin::Pin, ptr, time::Duration};
+use std::{ffi::CString, os::raw::{c_int, c_void}, pin::Pin, ptr, time::Duration};
 
 /////////////////////////////////////////////////////////////////////////////
 // Connections
@@ -70,6 +70,7 @@ struct ConnectOptionsData {
     http_headers: Option<NameValueCollection>,
     http_proxy: Option<CString>,
     https_proxy: Option<CString>,
+    binary_password: Option<Box<[u8]>>,
 }
 
 impl ConnectOptions {
@@ -149,6 +150,19 @@ impl ConnectOptions {
         copts.password = match data.password {
             Some(ref password) => password.as_ptr(),
             _ => ptr::null(),
+        };
+
+        use crate::ffi::MQTTAsync_connectOptions__bindgen_ty_1 as MQTTAsync_connectOptions__binarypwd;
+
+        copts.binarypwd = match data.binary_password {
+            Some(ref binary_password) => MQTTAsync_connectOptions__binarypwd {
+                len: binary_password.len() as c_int,
+                data: binary_password.as_ptr() as *const c_void,
+            },
+            None => MQTTAsync_connectOptions__binarypwd {
+                len: 0,
+                data: ptr::null(),
+            },
         };
 
         let n = data.server_uris.len();
@@ -525,6 +539,25 @@ impl ConnectOptionsBuilder {
         self
     }
 
+    /// Sets the binary password for authentication with the broker.
+    ///
+    /// If a password has been set previously with `password` method,
+    /// then this password will be ignored.
+    ///
+    /// # Arguments
+    ///
+    /// `binary_password` The binary password to send to the broker.
+    ///
+    pub fn binary_password<B>(&mut self, binary_password: B) -> &mut Self
+    where
+        B: Into<Box<[u8]>>,
+    {
+        if self.data.password.is_none() {
+            self.data.binary_password = Some(binary_password.into());
+        }
+        self
+    }
+
     /// Sets the time interval to allow the connect to complete.
     ///
     /// # Arguments
@@ -662,6 +695,7 @@ mod tests {
 
     const NAME: &str = "some-random-name";
     const PSWD: &str = "some-random-password";
+    const BIN_PSWD: &[u8] = b"some-random-binary-password";
     const TRUST_STORE: &str = "some_file.crt";
 
     // Identifier fo a C connect options struct
@@ -762,6 +796,26 @@ mod tests {
 
         let s = unsafe { CStr::from_ptr(opts.copts.password) };
         assert_eq!(PSWD, s.to_str().unwrap());
+    }
+
+    #[test]
+    fn test_binary_password() {
+        let opts = ConnectOptionsBuilder::new().binary_password(BIN_PSWD).finalize();
+
+        assert_eq!(opts.copts.binarypwd.len, BIN_PSWD.len() as c_int);
+        assert!(!opts.copts.binarypwd.data.is_null());
+
+        let binary_password = opts.data.binary_password.as_deref().unwrap();
+        assert_eq!(BIN_PSWD, binary_password);
+
+        let s = unsafe {
+            std::slice::from_raw_parts(
+                opts.copts.binarypwd.data as *const u8,
+                opts.copts.binarypwd.len as usize
+            )
+        };
+
+        assert_eq!(s, BIN_PSWD);
     }
 
     #[test]
