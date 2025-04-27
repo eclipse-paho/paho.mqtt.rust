@@ -38,7 +38,13 @@ use crate::{
     will_options::WillOptions,
     Error, Result,
 };
-use std::{ffi::CString, os::raw::{c_int, c_void}, pin::Pin, ptr, time::Duration};
+use std::{
+    ffi::CString,
+    os::raw::{c_int, c_void},
+    pin::Pin,
+    ptr,
+    time::Duration,
+};
 
 /////////////////////////////////////////////////////////////////////////////
 // Connections
@@ -772,7 +778,7 @@ mod tests {
         let s = unsafe {
             std::slice::from_raw_parts(
                 opts.copts.binarypwd.data as *const u8,
-                opts.copts.binarypwd.len as usize
+                opts.copts.binarypwd.len as usize,
             )
         };
         assert_eq!(PSWD.as_bytes(), s);
@@ -786,14 +792,17 @@ mod tests {
         assert_eq!(opts.copts.binarypwd.len, BIN_PSWD.len() as c_int);
 
         let binary_password = unsafe {
-            std::slice::from_raw_parts(opts.copts.binarypwd.data as *const u8, opts.copts.binarypwd.len as usize)
+            std::slice::from_raw_parts(
+                opts.copts.binarypwd.data as *const u8,
+                opts.copts.binarypwd.len as usize,
+            )
         };
         assert_eq!(BIN_PSWD, binary_password);
 
         let s = unsafe {
             std::slice::from_raw_parts(
                 opts.copts.binarypwd.data as *const u8,
-                opts.copts.binarypwd.len as usize
+                opts.copts.binarypwd.len as usize,
             )
         };
 
@@ -931,16 +940,16 @@ mod tests {
             USER_NAME,
             opts.data.user_name.as_ref().unwrap().to_str().unwrap()
         );
-        assert_eq!(
-            PASSWORD.as_bytes(),
-            opts.data.password.as_ref().unwrap()
-        );
+        assert_eq!(PASSWORD.as_bytes(), opts.data.password.as_ref().unwrap());
 
         let user_name = opts.data.user_name.as_deref().unwrap();
         assert_eq!(user_name.as_ptr(), opts.copts.username);
 
         let password = opts.data.password.as_deref().unwrap();
-        assert_eq!(password.as_ptr() as *const c_void, opts.copts.binarypwd.data);
+        assert_eq!(
+            password.as_ptr() as *const c_void,
+            opts.copts.binarypwd.data
+        );
 
         assert_eq!(CONNECT_TIMEOUT_SECS as i32, opts.copts.connectTimeout);
     }
@@ -980,16 +989,16 @@ mod tests {
             USER_NAME,
             opts.data.user_name.as_ref().unwrap().to_str().unwrap()
         );
-        assert_eq!(
-            PASSWORD.as_bytes(),
-            opts.data.password.as_ref().unwrap(),
-        );
+        assert_eq!(PASSWORD.as_bytes(), opts.data.password.as_ref().unwrap(),);
 
         let user_name = opts.data.user_name.as_deref().unwrap();
         assert_eq!(user_name.as_ptr(), opts.copts.username);
 
         let password = opts.data.password.as_deref().unwrap();
-        assert_eq!(password.as_ptr() as *const c_void, opts.copts.binarypwd.data);
+        assert_eq!(
+            password.as_ptr() as *const c_void,
+            opts.copts.binarypwd.data
+        );
 
         assert_eq!(CONNECT_TIMEOUT_SECS as i32, opts.copts.connectTimeout);
     }
