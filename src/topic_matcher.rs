@@ -621,4 +621,26 @@ mod tests {
         assert_eq!(tm.get("some/prod/topic"), Some(&42));
         assert_eq!(tm.get("some/test/bubba"), None);
     }
+
+    #[test]
+    fn test_topic_matcher_values() {
+        let tm = topic_matcher! {
+            "some/topic/#" => 42
+        };
+
+        let matches: Vec<_> = tm
+            .matches("some/topic/thing")
+            .map(|(_, val)| *val)
+            .collect();
+
+        assert_eq!(matches, &[42]);
+
+        let matches: Vec<_> = tm.matches("some/topic").map(|(_, val)| *val).collect();
+
+        assert_eq!(matches, &[42]);
+
+        let matches: Vec<_> = tm.matches("some/bad/topic").map(|(_, val)| *val).collect();
+
+        assert_eq!(matches, &[]);
+    }
 }
