@@ -628,10 +628,7 @@ mod tests {
             "some/topic/#" => 42
         };
 
-        let m: Vec<_> = tm
-            .matches("some/topic/thing")
-            .map(|(_, v)| *v)
-            .collect();
+        let m: Vec<_> = tm.matches("some/topic/thing").map(|(_, v)| *v).collect();
         assert_eq!(m, &[42]);
 
         let m: Vec<_> = tm.matches("some/topic").map(|(_, v)| *v).collect();
