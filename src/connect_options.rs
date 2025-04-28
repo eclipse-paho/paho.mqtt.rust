@@ -31,7 +31,11 @@ use crate::{
     SslOptionsFfi, Token, TokenInner, WillOptions,
 };
 use std::{
-    collections::HashMap, ffi::CString, os::raw::c_int, pin::Pin, ptr, time::Duration,
+    collections::HashMap,
+    ffi::{c_int, c_void, CString},
+    pin::Pin,
+    ptr,
+    time::Duration,
 };
 
 /// The default keep alive interval for MQTT (TCP) & MQTTS (TLS) connections.
@@ -582,7 +586,7 @@ struct ConnectOptionsFfiData {
     will: Option<WillOptions>,
     ssl: Option<SslOptionsFfi>,
     user_name: Option<CString>,
-    password: Option<CString>,
+    password: Option<Vec<u8>>,
     server_uris: StringCollection,
     props: PropertiesFfi,
     will_props: PropertiesFfi,
@@ -773,7 +777,7 @@ impl From<&ConnectOptions> for ConnectOptionsFfiData {
             data.user_name = Some(CString::new(user_name.clone()).unwrap());
         }
         if let Some(password) = &opts.password {
-            data.password = Some(CString::new(password.clone()).unwrap());
+            data.password = Some(password.clone());
         }
         if !opts.server_uris.is_empty() {
             data.server_uris = StringCollection::from(opts.server_uris.as_slice());
@@ -897,6 +901,10 @@ mod tests {
     #[test]
     fn test_password() {
         const PSWD: &str = "some-random-password";
+
+        //assert!(!opts.copts.binarypwd.data.is_null());
+        //assert_eq!(opts.copts.binarypwd.len, PSWD.len() as c_int);
+
 
         let opts = ConnectOptionsBuilder::new().password(PSWD).to_ffi();
         assert!(!opts.copts.password.is_null());

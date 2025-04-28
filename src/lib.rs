@@ -101,14 +101,13 @@ pub use crate::async_client::{
     ConnectionLostCallback,
     DisconnectedCallback,
     MessageArrivedCallback,
-    //SslErrorCallback,
+    SslErrorCallback,
 };
 
 /// The synchronous API
 pub mod client;
 pub use crate::client::Client; //ClientBuilder};
 
-pub use crate::client_persistence::*;
 pub use crate::connect_options::*; //{ConnectOptions, ConnectOptionsBuilder, MQTT_VERSION_3_1_1, ...};
 pub use crate::create_options::*; //{CreateOptions, CreateOptionsBuilder};
 pub use crate::disconnect_options::*; //{DisconnectOptions, DisconnectOptionsBuilder};
