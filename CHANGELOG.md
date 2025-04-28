@@ -11,7 +11,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 - `TopicMatcher` implements `From(HashMap)` for the value type.
 - [#243](https://github.com/eclipse-paho/paho.mqtt.rust/issues/243) `TopicMatcher` not matching parent when using '#' wildcard.
-- [#248](https://github.com/eclipse-paho/paho.mqtt.rust/pull/248) Imlement binary password support
 
 
 ## [v0.13.2](https://github.com/eclipse/paho.mqtt.rust/compare/v0.13.1..v0.13.2) - (2025-03-27)
