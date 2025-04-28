@@ -38,7 +38,13 @@ use crate::{
     will_options::WillOptions,
     Error, Result,
 };
-use std::{ffi::CString, os::raw::c_int, pin::Pin, ptr, time::Duration};
+use std::{
+    ffi::CString,
+    os::raw::{c_int, c_void},
+    pin::Pin,
+    ptr,
+    time::Duration,
+};
 
 /////////////////////////////////////////////////////////////////////////////
 // Connections
@@ -63,7 +69,7 @@ struct ConnectOptionsData {
     will: Option<WillOptions>,
     ssl: Option<SslOptions>,
     user_name: Option<CString>,
-    password: Option<CString>,
+    password: Option<Vec<u8>>,
     server_uris: StringCollection,
     props: Option<Properties>,
     will_props: Option<Properties>,
@@ -146,9 +152,17 @@ impl ConnectOptions {
             _ => ptr::null(),
         };
 
-        copts.password = match data.password {
-            Some(ref password) => password.as_ptr(),
-            _ => ptr::null(),
+        use crate::ffi::MQTTAsync_connectOptions__bindgen_ty_1 as MQTTAsync_connectOptions__binarypwd;
+
+        copts.binarypwd = match data.password {
+            Some(ref binary_password) => MQTTAsync_connectOptions__binarypwd {
+                len: binary_password.len() as c_int,
+                data: binary_password.as_ptr() as *const c_void,
+            },
+            None => MQTTAsync_connectOptions__binarypwd {
+                len: 0,
+                data: ptr::null(),
+            },
         };
 
         let n = data.server_uris.len();
@@ -516,11 +530,11 @@ impl ConnectOptionsBuilder {
     ///
     /// `password` The password to send to the broker.
     ///
-    pub fn password<S>(&mut self, password: S) -> &mut Self
+    pub fn password<P>(&mut self, password: P) -> &mut Self
     where
-        S: Into<String>,
+        P: Into<Vec<u8>>,
     {
-        let password = CString::new(password.into()).unwrap();
+        let password = password.into();
         self.data.password = Some(password);
         self
     }
@@ -662,6 +676,7 @@ mod tests {
 
     const NAME: &str = "some-random-name";
     const PSWD: &str = "some-random-password";
+    const BIN_PSWD: &[u8] = b"some-random-binary-password";
     const TRUST_STORE: &str = "some_file.crt";
 
     // Identifier fo a C connect options struct
@@ -686,6 +701,8 @@ mod tests {
 
         assert!(opts.copts.username.is_null());
         assert!(opts.copts.password.is_null());
+        assert!(opts.copts.binarypwd.data.is_null());
+        assert!(opts.copts.binarypwd.len == 0);
         assert!(opts.copts.ssl.is_null());
 
         assert!(opts.copts.context.is_null());
@@ -755,13 +772,41 @@ mod tests {
     fn test_password() {
         let opts = ConnectOptionsBuilder::new().password(PSWD).finalize();
 
-        assert!(!opts.copts.password.is_null());
+        assert!(!opts.copts.binarypwd.data.is_null());
+        assert_eq!(opts.copts.binarypwd.len, PSWD.len() as c_int);
 
-        let password = opts.data.password.as_deref().unwrap();
-        assert_eq!(PSWD, password.to_str().unwrap());
+        let s = unsafe {
+            std::slice::from_raw_parts(
+                opts.copts.binarypwd.data as *const u8,
+                opts.copts.binarypwd.len as usize,
+            )
+        };
+        assert_eq!(PSWD.as_bytes(), s);
+    }
 
-        let s = unsafe { CStr::from_ptr(opts.copts.password) };
-        assert_eq!(PSWD, s.to_str().unwrap());
+    #[test]
+    fn test_binary_password() {
+        let opts = ConnectOptionsBuilder::new().password(BIN_PSWD).finalize();
+
+        assert!(!opts.copts.binarypwd.data.is_null());
+        assert_eq!(opts.copts.binarypwd.len, BIN_PSWD.len() as c_int);
+
+        let binary_password = unsafe {
+            std::slice::from_raw_parts(
+                opts.copts.binarypwd.data as *const u8,
+                opts.copts.binarypwd.len as usize,
+            )
+        };
+        assert_eq!(BIN_PSWD, binary_password);
+
+        let s = unsafe {
+            std::slice::from_raw_parts(
+                opts.copts.binarypwd.data as *const u8,
+                opts.copts.binarypwd.len as usize,
+            )
+        };
+
+        assert_eq!(s, BIN_PSWD);
     }
 
     #[test]
@@ -895,16 +940,16 @@ mod tests {
             USER_NAME,
             opts.data.user_name.as_ref().unwrap().to_str().unwrap()
         );
-        assert_eq!(
-            PASSWORD,
-            opts.data.password.as_ref().unwrap().to_str().unwrap()
-        );
+        assert_eq!(PASSWORD.as_bytes(), opts.data.password.as_ref().unwrap());
 
         let user_name = opts.data.user_name.as_deref().unwrap();
         assert_eq!(user_name.as_ptr(), opts.copts.username);
 
         let password = opts.data.password.as_deref().unwrap();
-        assert_eq!(password.as_ptr(), opts.copts.password);
+        assert_eq!(
+            password.as_ptr() as *const c_void,
+            opts.copts.binarypwd.data
+        );
 
         assert_eq!(CONNECT_TIMEOUT_SECS as i32, opts.copts.connectTimeout);
     }
@@ -944,16 +989,16 @@ mod tests {
             USER_NAME,
             opts.data.user_name.as_ref().unwrap().to_str().unwrap()
         );
-        assert_eq!(
-            PASSWORD,
-            opts.data.password.as_ref().unwrap().to_str().unwrap()
-        );
+        assert_eq!(PASSWORD.as_bytes(), opts.data.password.as_ref().unwrap(),);
 
         let user_name = opts.data.user_name.as_deref().unwrap();
         assert_eq!(user_name.as_ptr(), opts.copts.username);
 
         let password = opts.data.password.as_deref().unwrap();
-        assert_eq!(password.as_ptr(), opts.copts.password);
+        assert_eq!(
+            password.as_ptr() as *const c_void,
+            opts.copts.binarypwd.data
+        );
 
         assert_eq!(CONNECT_TIMEOUT_SECS as i32, opts.copts.connectTimeout);
     }
