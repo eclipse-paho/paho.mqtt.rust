@@ -628,19 +628,16 @@ mod tests {
             "some/topic/#" => 42
         };
 
-        let matches: Vec<_> = tm
+        let m: Vec<_> = tm
             .matches("some/topic/thing")
-            .map(|(_, val)| *val)
+            .map(|(_, v)| *v)
             .collect();
+        assert_eq!(m, &[42]);
 
-        assert_eq!(matches, &[42]);
+        let m: Vec<_> = tm.matches("some/topic").map(|(_, v)| *v).collect();
+        assert_eq!(m, &[42]);
 
-        let matches: Vec<_> = tm.matches("some/topic").map(|(_, val)| *val).collect();
-
-        assert_eq!(matches, &[42]);
-
-        let matches: Vec<_> = tm.matches("some/bad/topic").map(|(_, val)| *val).collect();
-
-        assert_eq!(matches, &[]);
+        let m: Vec<_> = tm.matches("some/bad/topic").map(|(_, v)| *v).collect();
+        assert_eq!(m, &[]);
     }
 }
