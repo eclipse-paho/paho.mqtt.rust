@@ -26,7 +26,7 @@ paho-mqtt-sys = { version = "0.10", path = "paho-mqtt-sys", default-features=fal
 libc = "0.2"
 futures = "0.3"
 futures-timer = "3.0"
-async-channel = "1.6"
+async-channel = "2.3"
 crossbeam-channel = "0.5"
 log = "0.4"
 thiserror = "1.0"
