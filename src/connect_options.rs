@@ -766,7 +766,8 @@ impl From<&ConnectOptions> for ConnectOptionsFfiData {
 
         if let Some(msg) = &opts.will {
             data.will = Some(WillOptions::from(msg.clone()));
-            data.will_props = msg.properties().clone(); //PropertiesFfi::from(msg.properties());
+            //data.will_props = msg.properties().clone(); //PropertiesFfi::from(msg.properties());
+            data.will_props = PropertiesFfi::from(msg.properties());
         }
         if let Some(ssl) = &opts.ssl {
             // TODO: Return the error

@@ -375,7 +375,7 @@ impl TryFrom<&SslOptions> for SslOptionsFfi {
 }
 
 impl TryFrom<SslOptions> for SslOptionsFfi {
-    type Error = crate::Error;
+    type Error = Error;
 
     fn try_from(opts: SslOptions) -> Result<Self> {
         SslOptionsFfi::try_from(&opts)

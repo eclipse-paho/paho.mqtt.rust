@@ -4,7 +4,7 @@
 //
 
 /*******************************************************************************
- * Copyright (c) 2017-2022 Frank Pagliughi <fpagliughi@mindspring.com>
+ * Copyright (c) 2017-2025 Frank Pagliughi <fpagliughi@mindspring.com>
  *
  * All rights reserved. This program and the accompanying materials
  * are made available under the terms of the Eclipse Public License v2.0
@@ -26,7 +26,7 @@ use std::{borrow::Cow, os::raw::c_void, pin::Pin, ptr};
 
 use crate::{
     ffi,
-    message::{Message, MessageData},
+    message::{Message, MessageFfi, MessageFfiData},
     properties::Properties,
 };
 
@@ -52,7 +52,7 @@ pub struct WillOptions {
     /// The underlying C options struct
     pub(crate) copts: ffi::MQTTAsync_willOptions,
     /// The local data cache for the C options
-    data: Pin<Box<MessageData>>,
+    data: Pin<Box<MessageFfiData>>,
     /// The will properties
     props: Properties,
 }
@@ -74,7 +74,7 @@ impl WillOptions {
             qos,
             ..ffi::MQTTAsync_willOptions::default()
         };
-        Self::from_data(copts, MessageData::new(topic, payload))
+        Self::from_data(copts, MessageFfiData::new(topic, payload))
     }
 
     /// Creates a new WillOptions message with the 'retain' flag set.
@@ -95,14 +95,14 @@ impl WillOptions {
     }
 
     // Updates the C struct from the cached topic and payload vars
-    fn from_data(copts: ffi::MQTTAsync_willOptions, data: MessageData) -> Self {
+    fn from_data(copts: ffi::MQTTAsync_willOptions, data: MessageFfiData) -> Self {
         Self::from_pinned_data(copts, Box::pin(data))
     }
 
     // Updates the C struct from the cached topic and payload vars
     fn from_pinned_data(
         mut copts: ffi::MQTTAsync_willOptions,
-        data: Pin<Box<MessageData>>,
+        data: Pin<Box<MessageFfiData>>,
     ) -> Self {
         copts.topicName = if !data.topic.as_bytes().is_empty() {
             data.topic.as_ptr()
@@ -163,7 +163,7 @@ impl Default for WillOptions {
     fn default() -> Self {
         Self::from_data(
             ffi::MQTTAsync_willOptions::default(),
-            MessageData::default(),
+            MessageFfiData::default(),
         )
     }
 }
@@ -183,6 +183,9 @@ unsafe impl Sync for WillOptions {}
 impl From<Message> for WillOptions {
     /// Create `WillOptions` from a `Message`
     fn from(msg: Message) -> Self {
+        // TODO: Convert to try_from()
+        let msg = MessageFfi::try_from(msg).unwrap();
+
         let copts = ffi::MQTTAsync_willOptions {
             qos: msg.cmsg.qos,
             retained: msg.cmsg.retained,

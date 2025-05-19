@@ -177,7 +177,7 @@ fn main() -> mqtt::Result<()> {
 
             let sub_id = msg
                 .properties()
-                .get_int(mqtt::PropertyCode::SubscriptionIdentifier)
+                .get_uint(mqtt::PropertyCode::SubscriptionIdentifier)
                 .expect("No Subscription ID") as usize;
 
             if !handler[sub_id - 1](msg) {

@@ -92,9 +92,9 @@ impl fmt::Display for MqttVersion {
 #[repr(u8)]
 pub enum QoS {
     /// At most once
+    #[default]
     AtMostOnce = 0,
     /// At least once
-    #[default]
     AtLeastOnce = 1,
     /// Exactly Once
     ExactlyOnce = 2,

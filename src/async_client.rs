@@ -51,7 +51,7 @@ use crate::{
     types::*,
     AsyncReceiver, CallOptionsFfi, CallOptionsFfiBuilder, ConnectOptions,
     ConnectOptionsFfi, ConnectToken, CreateOptions, DeliveryToken, DisconnectOptions,
-    Message, PersistenceType, Properties, ReasonCode, Receiver, ServerRequest,
+    Message, MessageFfi, PersistenceType, Properties, ReasonCode, Receiver, ServerRequest,
     SubscribeManyToken, SubscribeOptions, SubscribeToken, Token, TokenInner, UserData,
 };
 use crossbeam_channel as sync_channel;
@@ -355,7 +355,7 @@ impl AsyncClient {
                 .on_message_arrived
             {
                 let len = topic_len as usize;
-                let topic = if len == 0 {
+                let _topic = if len == 0 {
                     // Zero-len topic means it's a NUL-terminated C string
                     CStr::from_ptr(topic_name).to_owned()
                 }
@@ -367,7 +367,10 @@ impl AsyncClient {
                             .unwrap();
                     CString::new(tp).unwrap()
                 };
-                let msg = Message::from_c_parts(topic, &*cmsg);
+
+                // TODO: Very important to get this in
+                //let msg = Message::from_c_parts(topic, &*cmsg);
+                let msg = Message::default();
 
                 trace!("Invoking message callback");
                 cb(&cli, Some(msg));
@@ -869,11 +872,11 @@ impl AsyncClient {
         let mut call_opts = CallOptionsFfi::new(ver, tok.clone());
 
         let rc = unsafe {
-            let msg = tok.message();
+            let msg = MessageFfi::try_from(tok.message().clone())?;
             ffi::MQTTAsync_sendMessage(
                 self.inner.handle,
                 msg.topic().as_ptr() as *const c_char,
-                &msg.cmsg,
+                msg.c_struct(),
                 &mut call_opts.copts,
             )
         };

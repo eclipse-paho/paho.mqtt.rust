@@ -153,7 +153,7 @@ fn handle_request(cli: &mqtt::AsyncClient, msg: mqtt::Message) -> mqtt::Result<(
 
         // Form a reply message, using the correlation ID
 
-        let props = mqtt::properties![CorrelationData(corr_id)];
+        let props = mqtt::properties![CorrelationData(corr_id.into())];
 
         // Create the reply message and publish it on the response topic
 
