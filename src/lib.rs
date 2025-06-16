@@ -219,11 +219,13 @@ pub fn is_secure_uri(uri: &str) -> bool {
 }
 
 /// Convert a Rust bool to a Paho C integer boolean
+#[inline]
 pub fn to_c_bool(on: bool) -> c_int {
     c_int::from(on)
 }
 
 /// Converts a C integer boolean to a Rust bool
+#[inline]
 pub fn from_c_bool(on: c_int) -> bool {
     on != 0
 }

@@ -22,7 +22,7 @@
 use std::{
     borrow::Cow,
     convert::From,
-    ffi::{CString, c_void},
+    ffi::{CString, c_void, c_char},
     fmt,
     pin::Pin,
     slice,
@@ -41,23 +41,35 @@ use crate::{
 /// An MQTT Message.
 /// This represents all the information passed in an MQTT PUBLISH packet.
 /// It's the primary data transfer mechanism for the protocol.
-#[derive(Debug, Default, Clone)]
-pub struct Message {
-    /// The message topic
-    pub topic: String,
-    /// The message payload
-    pub payload: Vec<u8>,
-    /// The message quality of service
-    pub qos: QoS,
-    /// Whether this is a retain message
-    pub retain: bool,
-    /// The message properties
-    pub props: Properties,
-    /// Whether this is a duplicate
-    /// Not to be set by the application
-    pub dup: bool,
-    /// The message identifier.
-    pub msgid: Option<u16>,
+#[derive(Debug)]
+pub enum Message {
+    Outbound {
+        /// The message topic
+        topic: String,
+        /// The message payload
+        payload: Vec<u8>,
+        /// The message quality of service
+        qos: QoS,
+        /// Whether this is a retain message
+        retain: bool,
+        /// The message properties
+        props: Properties,
+        /// Whether this is a duplicate
+        /// Not to be set by the application
+        dup: bool,
+        /// The message identifier.
+        msgid: Option<u16>,
+    },
+    Inbound {
+        /// The message topic from the C lib.
+        /// The underlying library promises that this is UTF-8
+        topic: *const c_char,
+        /// The string length of the topic.
+        /// It's not guaranteed to be NUL terminated
+        topic_len: usize,
+        /// The C message structure
+        cmsg: ffi::MQTTAsync_message,
+    }
 }
 
 impl Message {
@@ -74,7 +86,7 @@ impl Message {
         V: Into<Vec<u8>>,
         Q: Into<QoS>,
     {
-        Self {
+        Self::Outbound {
             topic: topic.into(),
             payload: payload.into(),
             qos: qos.into(),
@@ -97,20 +109,40 @@ impl Message {
         V: Into<Vec<u8>>,
         Q: Into<QoS>,
     {
-        Self {
+        Self::Outbound {
             retain: true,
             ..Self::new(topic, payload, qos)
         }
     }
 
+    /// Creates a message from the C parts
+    pub(crate) fn from_c_parts(topic: *const c_char, topic_len: usize, cmsg: ffi::MQTTAsync_message) -> Self {
+        Self::Inbound {
+            topic,
+            topic_len,
+            cmsg,
+        }
+    }
+
     /// Gets the message topic.
     pub fn topic(&self) -> &str {
-        &self.topic
+        match self {
+            Self::Outbound{ topic, .. } => &topic,
+            Self::Inbound{ topic, topic_len, .. } => unsafe {
+                let by = slice::from_raw_parts(topic as *const _ as *const u8, *topic_len);
+                str::from_utf8_unchecked(by)
+            }
+        }
     }
 
     /// Gets the message payload
     pub fn payload(&self) -> &[u8] {
-        &self.payload
+        match self {
+            Self::Outbound{ payload, .. } => &payload,
+            Self::Inbound{ cmsg, .. } => unsafe {
+                slice::from_raw_parts(cmsg.payload as _ as *const u8, cmsg.payloadlen as usize)
+            }
+        }
     }
 
     /// Gets the payload of the message as a string.
@@ -121,35 +153,62 @@ impl Message {
     /// Otherwise, it will replace any invalid UTF-8 sequences with U+FFFD
     /// REPLACEMENT CHARACTER and return a `Cow::Owned(String)` with the result.
     pub fn payload_str(&self) -> Cow<'_, str> {
-        String::from_utf8_lossy(&self.payload)
+        String::from_utf8_lossy(self.payload())
     }
 
     /// Gets the QoS of the message.
     pub fn qos(&self) -> QoS {
-        self.qos
+        match self {
+            Self::Outbound{ qos, .. } => *qos,
+            Self::Inbound{ cmsg, .. } => cmsg.qos.into()
+        }
     }
 
     /// Gets the retain flag of the message
     pub fn retain(&self) -> bool {
-        self.retain
+        match self {
+            Self::Outbound{ retain, .. } => *retain,
+            Self::Inbound{ cmsg, .. } => crate::from_c_bool(cmsg.retained),
+        }
     }
 
     // TODO: Mark as deprecated?
     /// Gets the retain flag of the message
+    #[inline]
     pub fn retained(&self) -> bool {
-        self.retain
+        self.retain()
     }
 
     /// Gets the properties in the message
     pub fn properties(&self) -> &Properties {
-        &self.props
+        match self {
+            Self::Outbound{ props, .. } => props,
+            Self::Inbound{ cmsg, .. } => cmsg.properties.into()
+        }
+    }
+}
+
+unsafe impl Send for Message {}
+unsafe impl Sync for Message {}
+
+impl Default for Message {
+    fn default() -> Self {
+        Self::Outbound {
+            topic: String::new(),
+            payload: Vec::new(),
+            qos: QoS::default(),
+            retain: false,
+            props: Properties::default(),
+            dup: false,
+            msgid: None,
+        }
     }
 }
 
 impl fmt::Display for Message {
     /// Formats the message for display
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}: {}", self.topic, self.payload_str())
+        write!(f, "{}: {}", self.topic(), self.payload_str())
     }
 }
 
@@ -157,7 +216,23 @@ impl fmt::Display for Message {
 
 /// Builder to create a new Message
 #[derive(Debug, Default, Clone)]
-pub struct MessageBuilder(Message);
+pub struct MessageBuilder {
+    /// The message topic
+    topic: String,
+    /// The message payload
+    payload: Vec<u8>,
+    /// The message quality of service
+    qos: QoS,
+    /// Whether this is a retain message
+    retain: bool,
+    /// The message properties
+    props: Properties,
+    /// Whether this is a duplicate
+    /// Not to be set by the application
+    dup: bool,
+    /// The message identifier.
+    msgid: Option<u16>,
+}
 
 impl MessageBuilder {
     /// Create a new message builder.
@@ -171,7 +246,7 @@ impl MessageBuilder {
     ///
     /// `topic` The topic on which the message should be published.
     pub fn topic<T: Into<String>>(mut self, topic: T) -> Self {
-        self.0.topic = topic.into();
+        self.topic = topic.into();
         self
     }
 
@@ -180,11 +255,8 @@ impl MessageBuilder {
     /// # Arguments
     ///
     /// `payload` The binary payload of the message
-    pub fn payload<V>(mut self, payload: V) -> Self
-    where
-        V: Into<Vec<u8>>,
-    {
-        self.0.payload = payload.into();
+    pub fn payload<V: Into<Vec<u8>>>(mut self, payload: V) -> Self {
+        self.payload = payload.into();
         self
     }
 
@@ -194,7 +266,7 @@ impl MessageBuilder {
     ///
     /// `qos` The quality of service for the message.
     pub fn qos<Q: Into<QoS>>(mut self, qos: Q) -> Self {
-        self.0.qos = qos.into();
+        self.qos = qos.into();
         self
     }
 
@@ -206,7 +278,7 @@ impl MessageBuilder {
     /// `retained` Set true if the message should be retained by the broker,
     ///            false if not.
     pub fn retain(mut self, retain: bool) -> Self {
-        self.0.retain = retain;
+        self.retain = retain;
         self
     }
 
@@ -222,13 +294,21 @@ impl MessageBuilder {
     ///
     /// `props` The collection of properties to include with the message.
     pub fn properties(mut self, props: Properties) -> Self {
-        self.0.props = props;
+        self.props = props;
         self
     }
 
     /// Finalize the builder to create the message.
     pub fn finalize(self) -> Message {
-        self.0
+        Message::Outbound {
+            topic: self.topic,
+            payload: self.payload,
+            qos: self.qos,
+            retain: self.retain,
+            props: self.props,
+            dup: self.dup,
+            msgid: self.msgid,
+        }
     }
 
 /*
