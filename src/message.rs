@@ -205,6 +205,28 @@ impl Default for Message {
     }
 }
 
+impl Clone for Message {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Outbound{ topic, payload, qos, retain, props, dup, msgid } => {
+                Self::Outbound{
+                    topic: topic.clone(),
+                    payload: payload.clone(),
+                    qos: *qos,
+                    retain: *retain,
+                    props: props.clone(),
+                    dup: *dup,
+                    msgid: msgid.clone()
+                }
+            }
+            Self::Inbound{ _topic, _topic_len, _cmsg } => {
+                // TODO: Implement this
+                Self::default()
+            }
+        }
+    }
+}
+
 impl fmt::Display for Message {
     /// Formats the message for display
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
