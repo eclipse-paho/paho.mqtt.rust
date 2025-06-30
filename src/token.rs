@@ -194,7 +194,7 @@ impl TokenInner {
     /// Creates a new, un-signaled delivery Token.
     /// This is a token which tracks delivery of a message.
     pub fn from_message(msg: &Message) -> Arc<Self> {
-        let msgid = msg.msgid.unwrap_or_default();
+        let msgid = msg.msgid().unwrap_or_default();
         Arc::new(Self {
             lock: Mutex::new(TokenData::from_message_id(msgid as i16)),
             ..Self::default()
