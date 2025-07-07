@@ -21,8 +21,7 @@
 
 use std::{
     borrow::Cow,
-    convert::From,
-    ffi::{c_char, c_void, CString},
+    ffi::{c_char, c_int, c_void, CString},
     fmt,
     pin::Pin,
     slice,
@@ -110,47 +109,58 @@ impl OutMessage {
 /// payload.
 #[derive(Debug)]
 pub struct InMessage {
-    /// The message topic from the C lib.
+    /// Pointer to the message topic from the C lib.
     /// The underlying library promises that this is UTF-8
-    topic: *const c_char,
-    /// The string length of the topic.
-    /// It's not guaranteed to be NUL terminated
-    topic_len: usize,
+    topic_ptr: *const c_char,
+    /// The topic as a slice
+    topic: &'static str,
     /// The C message structure
-    cmsg: ffi::MQTTAsync_message,
+    cmsg: &'static ffi::MQTTAsync_message,
+    /// The payload as a slice
+    payload: &'static [u8],
+    /// The properties in Rust format
+    props: Properties,
 }
 
 impl InMessage {
     //// Creates a new inbound message from the C parts.
     pub(crate) fn new(
-        topic: *const c_char,
+        topic_ptr: *const c_char,
         topic_len: usize,
-        cmsg: ffi::MQTTAsync_message,
+        cmsg: *const ffi::MQTTAsync_message,
     ) -> Self {
-        Self {
-            topic,
-            topic_len,
-            cmsg,
+        // TODO: Handle UTF-8 error(s) in the topic?
+        unsafe {
+            let topic = str::from_utf8_unchecked(slice::from_raw_parts(
+                topic_ptr as *const _ as *const u8,
+                topic_len,
+            ));
+
+            let cmsg = cmsg.as_ref().unwrap();
+
+            let payload =
+                slice::from_raw_parts(cmsg.payload as *const u8, cmsg.payloadlen as usize);
+
+            let props = (&cmsg.properties).into();
+
+            Self {
+                topic_ptr,
+                topic,
+                cmsg,
+                payload,
+                props,
+            }
         }
     }
 
     /// Gets the message topic.
     pub fn topic(&self) -> &str {
-        unsafe {
-            let by =
-                slice::from_raw_parts(self.topic as *const _ as *const u8, self.topic_len);
-            str::from_utf8_unchecked(by)
-        }
+        self.topic
     }
 
     /// Gets the message payload
     pub fn payload(&self) -> &[u8] {
-        unsafe {
-            slice::from_raw_parts(
-                self.cmsg.payload as *const u8,
-                self.cmsg.payloadlen as usize,
-            )
-        }
+        self.payload
     }
 
     /// Gets the payload of the message as a string.
@@ -161,7 +171,7 @@ impl InMessage {
     /// Otherwise, it will replace any invalid UTF-8 sequences with U+FFFD
     /// REPLACEMENT CHARACTER and return a `Cow::Owned(String)` with the result.
     pub fn payload_str(&self) -> Cow<'_, str> {
-        String::from_utf8_lossy(self.payload())
+        String::from_utf8_lossy(self.payload)
     }
 
     /// Gets the QoS of the message.
@@ -175,8 +185,8 @@ impl InMessage {
     }
 
     /// Gets the properties in the message
-    pub fn properties(&self) -> Properties {
-        (&self.cmsg.properties).into()
+    pub fn properties(&self) -> &Properties {
+        &self.props
     }
 
     /// Gets the message identifier.
@@ -188,6 +198,17 @@ impl InMessage {
 
 unsafe impl Send for InMessage {}
 unsafe impl Sync for InMessage {}
+
+impl Drop for InMessage {
+    // Deallocate the memory from the Paho C lib.
+    fn drop(&mut self) {
+        let mut cmsg = self.cmsg as *const _ as *mut ffi::MQTTAsync_message;
+        unsafe {
+            ffi::MQTTAsync_freeMessage(&mut cmsg);
+            ffi::MQTTAsync_free(self.topic_ptr as *mut c_void);
+        }
+    }
+}
 
 /////////////////////////////////////////////////////////////////////////////
 
@@ -241,7 +262,7 @@ impl Message {
     pub(crate) fn from_c_parts(
         topic: *const c_char,
         topic_len: usize,
-        cmsg: ffi::MQTTAsync_message,
+        cmsg: *const ffi::MQTTAsync_message,
     ) -> Self {
         Self::In(InMessage::new(topic, topic_len, cmsg))
     }
@@ -297,9 +318,9 @@ impl Message {
     }
 
     /// Gets the properties in the message
-    pub fn properties(&self) -> Properties {
+    pub fn properties(&self) -> &Properties {
         match self {
-            Self::Out(msg) => msg.props.clone(),
+            Self::Out(msg) => &msg.props,
             Self::In(msg) => msg.properties(),
         }
     }
@@ -323,9 +344,22 @@ impl Clone for Message {
     fn clone(&self) -> Self {
         match self {
             Self::Out(msg) => Self::Out(msg.clone()),
-            Self::In(_msg) => {
-                // TODO: Implement this
-                Self::default()
+            Self::In(msg) => {
+                let topic = msg.topic().to_string();
+                let payload = msg.payload().to_vec();
+                let qos = msg.qos();
+                let retain = msg.retain();
+                let props = msg.properties().clone();
+
+                Self::Out(OutMessage {
+                    topic,
+                    payload,
+                    qos,
+                    retain,
+                    props,
+                    // TODO: Implement these?
+                    ..OutMessage::default()
+                })
             }
         }
     }
@@ -466,35 +500,6 @@ impl MessageFfi {
         Self { cmsg, data }
     }
 
-    /// Creates a new message from C language components.
-    ///
-    /// # Arguments
-    ///
-    /// * `topic` The topic on which the message is published.
-    /// * `msg` The message struct from the C library
-    ///
-    /// # Safety
-    ///
-    /// Caller must make sure that cmsg is valid
-    pub unsafe fn from_c_parts(topic: CString, cmsg: &ffi::MQTTAsync_message) -> Self {
-        let len = cmsg.payloadlen as usize;
-
-        let payload = if cmsg.payload.is_null() {
-            Vec::new()
-        }
-        else {
-            slice::from_raw_parts(cmsg.payload as *mut u8, len).to_vec()
-        };
-
-        let data = MessageFfiData {
-            topic,
-            payload,
-            props: PropertiesFfi::from(&cmsg.properties),
-        };
-
-        Self::from_data(*cmsg, data)
-    }
-
     /// Gets the topic for the message.
     pub fn topic(&self) -> &str {
         self.data
@@ -513,66 +518,12 @@ impl TryFrom<Message> for MessageFfi {
             payload: msg.payload().to_vec(),
             props: msg.properties().into(),
         };
-        // TODO: Implement this!
-        let cmsg = ffi::MQTTAsync_message::default();
+        let mut cmsg = ffi::MQTTAsync_message::default();
+        cmsg.qos = msg.qos() as c_int;
+        cmsg.retained = msg.retain() as c_int;
         Ok(Self::from_data(cmsg, data))
     }
 }
-
-/*
-impl Default for MessageFfi {
-    /// Creates a default, empty message
-    fn default() -> Message {
-        Self::from_data(ffi::MQTTAsync_message::default(), MessageFfiData::default())
-    }
-}
-
-impl Clone for MessageFfi {
-    /// Create a clone of the message
-    fn clone(&self) -> Self {
-        Self::from_data(self.cmsg, (*self.data).clone())
-    }
-}
-
-unsafe impl Send for MessageFfi {}
-unsafe impl Sync for MessageFfi {}
-*/
-
-/*
-impl<'a, 'b> From<(&'a str, &'b [u8])> for Message {
-    fn from((topic, payload): (&'a str, &'b [u8])) -> Self {
-        Self::from_data(
-            ffi::MQTTAsync_message::default(),
-            MessageFfiData::new(topic, payload),
-        )
-    }
-}
-
-impl<'a, 'b> From<(&'a str, &'b [u8], i32, bool)> for Message {
-    fn from((topic, payload, qos, retained): (&'a str, &'b [u8], i32, bool)) -> Self {
-        let cmsg = ffi::MQTTAsync_message {
-            qos,
-            retained: to_c_bool(retained),
-            ..ffi::MQTTAsync_message::default()
-        };
-        Self::from_data(cmsg, MessageFfiData::new(topic, payload))
-    }
-}
-
-impl fmt::Display for Message {
-    /// Formats the message for display
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let topic = match self.data.topic.as_c_str().to_str() {
-            Ok(s) => s,
-            Err(_) => return Err(fmt::Error),
-        };
-        let payload = self.payload_str();
-        write!(f, "{}: {}", topic, payload)
-    }
-}
-*/
-
-/////////////////////////////////////////////////////////////////////////////
 
 /////////////////////////////////////////////////////////////////////////////
 //                              Unit Tests

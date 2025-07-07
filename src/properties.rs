@@ -1646,7 +1646,7 @@ impl PropertiesFfi {
     }
 
     /// Gets an iterator for all the properties
-    pub fn iter(&self) -> PropertyIterator {
+    pub fn iter(&self) -> PropertyIterator<'_> {
         PropertyIterator {
             props: self,
             code: None,
@@ -1655,7 +1655,7 @@ impl PropertiesFfi {
     }
 
     /// Gets an iterator for a property instance
-    pub fn code_iter(&self, code: PropertyCode) -> PropertyIterator {
+    pub fn code_iter(&self, code: PropertyCode) -> PropertyIterator<'_> {
         PropertyIterator {
             props: self,
             code: Some(code),

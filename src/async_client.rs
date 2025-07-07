@@ -332,55 +332,42 @@ impl AsyncClient {
     // We pass the call on to the handler registered with the client, if any.
     unsafe extern "C" fn on_message_arrived(
         context: *mut c_void,
-        topic_name: *mut c_char,
+        topic: *mut c_char,
         topic_len: c_int,
-        mut cmsg: *mut ffi::MQTTAsync_message,
+        cmsg: *mut ffi::MQTTAsync_message,
     ) -> c_int {
-        if context.is_null() {
-            warn!("on_message_arrived: null client context.");
+        if context.is_null() || topic.is_null() || cmsg.is_null() {
+            warn!("on_message_arrived: null pointer.");
+            return 1;
         }
-        else {
-            debug!(
-                "Message arrived. Client: {:?}, topic: {:?} len {:?} cmsg: {:?}: {:?}",
-                context, topic_name, topic_len, cmsg, *cmsg
-            );
+        debug!(
+            "Message arrived. Client: {:?}, topic: {:?} len {:?} cmsg: {:?}: {:?}",
+            context, topic, topic_len, cmsg, *cmsg
+        );
 
-            let cli = AsyncClient::from_raw(context);
+        let cli = AsyncClient::from_raw(context);
 
-            if let Some(ref mut cb) = cli
-                .inner
-                .callback_context
-                .lock()
-                .unwrap()
-                .on_message_arrived
-            {
-                let len = topic_len as usize;
-                let _topic = if len == 0 {
-                    // Zero-len topic means it's a NUL-terminated C string
-                    CStr::from_ptr(topic_name).to_owned()
-                }
-                else {
-                    // If we get a len for the topic, then there's no NUL terminator.
-                    // TODO: Handle UTF-8 error(s)
-                    let tp =
-                        str::from_utf8(slice::from_raw_parts(topic_name as *mut u8, len))
-                            .unwrap();
-                    CString::new(tp).unwrap()
-                };
+        if let Some(ref mut cb) = cli
+            .inner
+            .callback_context
+            .lock()
+            .unwrap()
+            .on_message_arrived
+        {
+            let len = match topic_len {
+                // Zero-len topic means it's a NUL-terminated C string
+                0 => CStr::from_ptr(topic).count_bytes(),
+                len if len < 0 => 0,
+                _ => topic_len as usize,
+            };
 
-                // TODO: Very important to get this in
-                //let msg = Message::from_c_parts(topic, &*cmsg);
-                let msg = Message::default();
+            let msg = Message::from_c_parts(topic, len, cmsg);
 
-                trace!("Invoking message callback");
-                cb(&cli, Some(msg));
-            }
-
-            let _ = cli.into_raw();
+            trace!("Invoking message callback");
+            cb(&cli, Some(msg));
         }
 
-        ffi::MQTTAsync_freeMessage(&mut cmsg);
-        ffi::MQTTAsync_free(topic_name as *mut c_void);
+        let _ = cli.into_raw();
         1
     }
 
