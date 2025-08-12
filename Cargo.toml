@@ -27,7 +27,7 @@ libc = "0.2"
 futures = "0.3"
 futures-timer = "3.0"
 async-channel = "1.6"
-crossbeam-channel = "0.5"
+crossbeam-channel = "0.5.15"
 log = "0.4"
 thiserror = "1.0"
 
