@@ -7,8 +7,12 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## v0.14.0  (Unreleased)
+## [v0.13.4](https://github.com/eclipse/paho.mqtt.rust/compare/v0.13.3..v0.13.4) - (2025-09-02)
 
+- Fixed some elided lifetime warnings
+- Bumped depedencies:
+    - thiserror to v2.0
+    - toml to v0.9
 - [#227](https://github.com/eclipse-paho/paho.mqtt.rust/issues/227) Bump async-channel to v2
 - [#248](https://github.com/eclipse-paho/paho.mqtt.rust/pull/248) Imlement binary password support
 
