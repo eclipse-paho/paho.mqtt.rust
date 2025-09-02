@@ -6,7 +6,7 @@
 //
 
 /*******************************************************************************
- * Copyright (c) 2019-2020 Frank Pagliughi <fpagliughi@mindspring.com>
+ * Copyright (c) 2019-2025 Frank Pagliughi <fpagliughi@mindspring.com>
  *
  * All rights reserved. This program and the accompanying materials
  * are made available under the terms of the Eclipse Public License v2.0
@@ -976,7 +976,7 @@ impl Properties {
     }
 
     /// Gets an iterator for a property instance
-    pub fn iter(&self, code: PropertyCode) -> PropertyIterator {
+    pub fn iter(&self, code: PropertyCode) -> PropertyIterator<'_> {
         PropertyIterator {
             props: self,
             code,
@@ -1044,7 +1044,7 @@ impl Properties {
     }
 
     /// Gets an iterator into the user property string pairs.
-    pub fn user_iter(&self) -> StringPairIterator {
+    pub fn user_iter(&self) -> StringPairIterator<'_> {
         StringPairIterator {
             props: self,
             code: PropertyCode::UserProperty,

@@ -90,7 +90,15 @@ pub use crossbeam_channel::{self as sync_channel, Receiver};
 
 /// The asynchronous API
 pub mod async_client;
-pub use crate::async_client::AsyncClient; //AsyncClientBuilder?;
+pub use crate::async_client::{
+    AsyncClient,
+    //AsyncClientBuilder,
+    ConnectedCallback,
+    ConnectionLostCallback,
+    DisconnectedCallback,
+    MessageArrivedCallback,
+    //SslErrorCallback,
+};
 
 /// The synchronous API
 pub mod client;
