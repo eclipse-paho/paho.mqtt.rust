@@ -82,11 +82,28 @@
 extern crate log;
 extern crate paho_mqtt_sys as ffi;
 
+/// Re-export async_channel
 pub use async_channel::Receiver as AsyncReceiver;
-pub use crossbeam_channel::Receiver;
 
-pub use crate::async_client::*; //{AsyncClient, AsyncClientBuilder};
-pub use crate::client::*; //{Client, ClientBuilder};
+/// Re-export crossbeam channel as sync components
+pub use crossbeam_channel::{self as sync_channel, Receiver};
+
+/// The asynchronous API
+pub mod async_client;
+pub use crate::async_client::{
+    AsyncClient,
+    //AsyncClientBuilder,
+    ConnectedCallback,
+    ConnectionLostCallback,
+    DisconnectedCallback,
+    MessageArrivedCallback,
+    //SslErrorCallback,
+};
+
+/// The synchronous API
+pub mod client;
+pub use crate::client::Client; //ClientBuilder};
+
 pub use crate::client_persistence::*;
 pub use crate::connect_options::*; //{ConnectOptions, ConnectOptionsBuilder, MQTT_VERSION_3_1_1, ...};
 pub use crate::create_options::*; //{CreateOptions, CreateOptionsBuilder};
@@ -109,12 +126,6 @@ pub use crate::will_options::*; //{WillOptions, WillOptionsBuilder}; //{Result, 
 use std::{any::Any, os::raw::c_int};
 
 mod macros;
-
-/// The asynchronous API
-pub mod async_client;
-
-/// The synchronous API
-pub mod client;
 
 /// Client creation options
 pub mod create_options;

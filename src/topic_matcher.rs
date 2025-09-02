@@ -105,7 +105,7 @@ impl<T> Node<T> {
     }
 
     /// Gets an iterator for the node and _all_ of its children.
-    fn iter(&self) -> NodeIter<T> {
+    fn iter(&self) -> NodeIter<'_, T> {
         Box::new(
             self.value
                 .iter()
@@ -115,7 +115,7 @@ impl<T> Node<T> {
     }
 
     /// Gets a mutable iterator for the node and _all_ of its children.
-    fn iter_mut(&mut self) -> NodeIterMut<T> {
+    fn iter_mut(&mut self) -> NodeIterMut<'_, T> {
         Box::new(
             self.value
                 .iter_mut()
@@ -310,12 +310,12 @@ impl<T> TopicMatcher<T> {
     }
 
     /// Gets an iterator over all the items in the collection.
-    pub fn iter(&self) -> NodeIter<T> {
+    pub fn iter(&self) -> NodeIter<'_, T> {
         self.root.iter()
     }
 
     /// Gets a muable iterator over all the items in the collection.
-    pub fn iter_mut(&mut self) -> NodeIterMut<T> {
+    pub fn iter_mut(&mut self) -> NodeIterMut<'_, T> {
         self.root.iter_mut()
     }
 

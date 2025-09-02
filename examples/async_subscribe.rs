@@ -21,7 +21,7 @@
 //! broker to emit the LWT message.
 
 /*******************************************************************************
- * Copyright (c) 2017-2023 Frank Pagliughi <fpagliughi@mindspring.com>
+ * Copyright (c) 2017-2025 Frank Pagliughi <fpagliughi@mindspring.com>
  *
  * All rights reserved. This program and the accompanying materials
  * are made available under the terms of the Eclipse Public License v2.0
@@ -36,7 +36,7 @@
  *    Frank Pagliughi - initial implementation and documentation
  *******************************************************************************/
 
-use futures::{executor::block_on, stream::StreamExt};
+use futures::executor::block_on;
 use paho_mqtt as mqtt;
 use std::{env, process, time::Duration};
 
@@ -71,7 +71,7 @@ fn main() {
 
     if let Err(err) = block_on(async {
         // Get message stream before connecting.
-        let mut strm = cli.get_stream(25);
+        let strm = cli.get_stream(25);
 
         // Define the set of options for the connection
         let lwt = mqtt::Message::new(
@@ -103,7 +103,7 @@ fn main() {
         // whatever) the server will get an unexpected drop and then
         // should emit the LWT message.
 
-        while let Some(msg_opt) = strm.next().await {
+        while let Ok(msg_opt) = strm.recv().await {
             if let Some(msg) = msg_opt {
                 println!("{}", msg);
             }
