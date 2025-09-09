@@ -83,7 +83,7 @@ extern crate log;
 extern crate paho_mqtt_sys as ffi;
 
 /// Re-export async_channel
-pub use async_channel::Receiver as AsyncReceiver;
+pub use async_channel::{self, Receiver as AsyncReceiver};
 
 /// Re-export crossbeam channel as sync components
 pub use crossbeam_channel::{self as sync_channel, Receiver};
