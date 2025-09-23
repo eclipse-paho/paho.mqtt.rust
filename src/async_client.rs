@@ -170,7 +170,7 @@ impl AsyncClient {
 
         let mut cli = InnerAsyncClient {
             handle: ptr::null_mut(),
-            mqtt_version: AtomicU32::new(MQTT_VERSION_DEFAULT),
+            mqtt_version: AtomicU32::new(opts.mqtt_version_raw()),
             opts: Mutex::new(ConnectOptions::new()),
             callback_context: Mutex::new(CallbackContext::default()),
             server_uri: CString::new(opts.server_uri)?,
@@ -1285,6 +1285,7 @@ impl Drop for InnerAsyncClient {
 mod tests {
     use super::*;
     use crate::create_options::CreateOptionsBuilder;
+    use crate::MessageBuilder;
     use std::sync::{Arc, Mutex, RwLock};
     use std::thread;
 
@@ -1469,5 +1470,20 @@ mod tests {
         );
         let retrieved = client.unwrap().server_uri();
         assert_eq!(retrieved, server_uri.to_string());
+    }
+
+    // See: <https://github.com/eclipse-paho/paho.mqtt.rust/pull/257>
+    #[test]
+    fn test_publish_before_connect() {
+        let server_uri = "tcp://localhost:1883";
+        let client = CreateOptionsBuilder::new()
+            .server_uri(server_uri)
+            .mqtt_version(MqttVersion::V5)
+            .send_while_disconnected(true)
+            .allow_disconnected_send_at_anytime(true)
+            .create_client()
+            .unwrap();
+        let res = client.try_publish(MessageBuilder::new().topic("test").payload(&[]).finalize());
+        assert!(res.is_ok(), "Failed to publish message before connecting");
     }
 }
