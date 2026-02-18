@@ -48,7 +48,7 @@ type LenString = ffi::MQTTLenString;
 
 /// The underlying data type for a specific property
 #[repr(u32)]
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum PropertyType {
     /// A property containing a single byte
     Byte = 0,
@@ -116,35 +116,83 @@ impl TryFrom<ffi::MQTTPropertyTypes> for PropertyType {
 /// (Correlation Data, Server Keep Alive) and the data type held by the
 /// property.
 #[repr(u32)]
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[allow(missing_docs)]
 pub enum PropertyCode {
+    /// [Byte, u8] Indicates whether the payload is unspecified, possibly
+    /// binary (0) or UTF-8 text (1).
     PayloadFormatIndicator = 1,
+    /// [FouByteInteger, u32] The lifetime of the application message in seconds.
+    /// The broker is required to delete expired messages that have not been
+    /// passed to a subscriber.
     MessageExpiryInterval = 2,
+    /// [String] Description of the payload. Often the MIME type describing
+    /// the serialization.
     ContentType = 3,
+    /// [String] The topic name for a response message, such as for the
+    /// RPC pattern.
     ResponseTopic = 8,
+    /// [Binary] Used by the sender of a request message to identify the response.
+    /// Typically used with the RPC pattern, or just to identify related messages.
     CorrelationData = 9,
+    /// [VariableByteInteger] The identifier of the subscription.
     SubscriptionIdentifier = 11,
+    /// [FourByteInteger, u32] The number of seconds after which the network
+    /// connection is closed that the server should keep a persistent session.
     SessionExpiryInterval = 17,
+    /// [String] The ClientID assigned by the server when it receives a
+    /// zero-length ClientID in the CONNECT message.
     AssignedClientIdentifer = 18,
+    /// [TwoByteInteger, u16] The Keep Alive duration that the server requires.
     ServerKeepAlive = 19,
+    /// [String] The name of the authentication method.
     AuthenticationMethod = 21,
+    /// [Binary] The authentication data
     AuthenticationData = 22,
+    /// [Byte,  u8] The Client uses this value to indicate whether the Reason
+    /// String or User Properties are sent in the case of failures.
     RequestProblemInformation = 23,
+    /// [Four Byte Integer, u32] The number of seconds after which a network
+    /// connection is lost before the server should publish the LWT message.
     WillDelayInterval = 24,
+    /// [Byte, u8] Request that the server return Response Information in the CONNACK
     RequestResponseInformation = 25,
+    /// [String] A hint for the client to create a response topic.
     ResponseInformation = 26,
+    /// [String] Can be used by the client to identify another server to use.
     ServerReference = 28,
+    /// [String] A reason associated with the response.
     ReasonString = 31,
+    /// [TwoByteInteger, u16] The maximum number of QoS 1 and QoS 2
+    /// publications that it is willing to process concurrently. If absent,
+    /// defaults to 65,535.
     ReceiveMaximum = 33,
+    /// [TwoByteInteger, u16] The highest value that the Client will accept
+    /// as a Topic Alias sent by the Server. The Client uses this value to
+    /// limit the number of Topic Aliases that it is willing to hold on this
+    /// connection.
     TopicAliasMaximum = 34,
+    /// [TwoByteInteger, u16] An integer value that is used to identify the
+    /// topic instead of using the Topic Name. This reduces the size of the
+    /// PUBLISH packet.
     TopicAlias = 35,
+    /// [Byte] The maximum QoS supported by the server.
     MaximumQos = 36,
+    /// [Byte] Whether retain messages are supported (1) or not (0).
     RetainAvailable = 37,
+    /// [StringPair] A user defined property as a key/value string pair.
     UserProperty = 38,
+    /// [FourByteInteger, u32] The maximum packet size that the client is
+    /// willing to accept.
     MaximumPacketSize = 39,
+    /// [Byte, u8] Whether the server supports wildcard subscriptions (1)
+    /// or not (0).
     WildcardSubscriptionAvailable = 40,
+    /// [Byte, u8] Whether the server supports subscription identifiers (1)
+    /// or not (0).
     SubscriptionIdentifiersAvailable = 41,
+    /// [Byte, u8] Whether the server supports shared subscriptions (1)
+    /// or not (0).
     SharedSubscriptionAvailable = 42,
 }
 
@@ -778,7 +826,7 @@ impl Drop for Property {
         unsafe {
             match self.property_type() {
                 PropertyType::BinaryData => {
-                    debug!(
+                    trace!(
                         "Dropping binary property: {:?}",
                         self.cprop.value.__bindgen_anon_1.data.data
                     );
@@ -786,14 +834,14 @@ impl Drop for Property {
                     let _ = Vec::from_raw_parts(self.cprop.value.__bindgen_anon_1.data.data, n, n);
                 }
                 PropertyType::Utf8EncodedString => {
-                    debug!(
+                    trace!(
                         "Dropping string property: {:?}",
                         self.cprop.value.__bindgen_anon_1.data.data
                     );
                     let _ = CString::from_raw(self.cprop.value.__bindgen_anon_1.data.data);
                 }
                 PropertyType::Utf8StringPair => {
-                    debug!(
+                    trace!(
                         "Dropping string pair property: {:?}, {:?}",
                         self.cprop.value.__bindgen_anon_1.data.data,
                         self.cprop.value.__bindgen_anon_1.value.data

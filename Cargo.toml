@@ -1,8 +1,8 @@
 [package]
 name = "paho-mqtt"
-version = "0.13.4"
+version = "0.14.0-pre.0"
 edition = "2021"
-rust-version = "1.73"
+rust-version = "1.75.0"
 authors = ["Frank Pagliughi <fpagliughi@mindspring.com>"]
 homepage = "https://github.com/eclipse/paho.mqtt.rust"
 repository = "https://github.com/eclipse/paho.mqtt.rust"
@@ -26,7 +26,7 @@ paho-mqtt-sys = { version = "0.10", path = "paho-mqtt-sys", default-features=fal
 libc = "0.2"
 futures = "0.3"
 futures-timer = "3.0"
-async-channel = "2.3"
+async-channel = "2.5"
 crossbeam-channel = "0.5"
 log = "0.4"
 thiserror = "2.0"

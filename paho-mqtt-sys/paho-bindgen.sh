@@ -34,5 +34,5 @@ printf "Generating bindings for: Paho C v%s, on %s\n" "${VERSION}" "${HOST_TRIPL
 # Note: It would be really nice to have the doc comments from the C lib, 
 #     but some are odd and cause warnings when generating Rust docs.
 
-bindgen --rust-target 1.73.0 --no-doc-comments wrapper.h -- -I./paho.mqtt.c/src \
+bindgen --rust-target 1.75.0 --no-doc-comments wrapper.h -- -I./paho.mqtt.c/src \
     > bindings/bindings_paho_mqtt_c_${VERSION}-${HOST_TRIPLE}.rs
