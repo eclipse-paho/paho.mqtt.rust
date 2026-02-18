@@ -9,7 +9,6 @@ repository = "https://github.com/eclipse/paho.mqtt.rust"
 keywords = [ "MQTT", "IoT", "Paho", "messaging" ]
 license = "EPL-2.0"
 readme = "README.md"
-package = "build.rs"
 description = """
 Low-level, unsafe Rust wrapper for the Paho MQTT C Client Library.
 This is part of the official Eclipse Paho Rust Client Library.
