@@ -52,9 +52,9 @@ type LenString = ffi::MQTTLenString;
 pub enum PropertyType {
     /// A property containing a single byte
     Byte = 0,
-    /// A property containing a 16-bit integer, `i16` or `u16`.
+    /// A property containing a 16-bit unsigned integer, `u16`.
     TwoByteInteger = 1,
-    /// A property containing a 32-bit integer, `i32` or `u32`.
+    /// A property containing a 32-bit unsigned integer, `u32`.
     FourByteInteger = 2,
     /// A property containing a variable-byte value.
     VariableByteInteger = 3,
@@ -82,7 +82,7 @@ impl PropertyType {
             Byte => TypeId::of::<u8>(),
             TwoByteInteger => TypeId::of::<u16>(),
             FourByteInteger => TypeId::of::<u32>(),
-            VariableByteInteger => TypeId::of::<i32>(),
+            VariableByteInteger => TypeId::of::<u32>(),
             BinaryData => TypeId::of::<Binary>(),
             Utf8EncodedString => TypeId::of::<String>(),
             Utf8StringPair => TypeId::of::<(String, String)>(),
