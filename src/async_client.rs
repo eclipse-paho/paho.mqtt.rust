@@ -60,7 +60,7 @@ use crate::{
     subscribe_options::SubscribeOptions,
     token::{ConnectToken, DeliveryToken, SubscribeManyToken, SubscribeToken, Token},
     types::*,
-    AsyncReceiver, Receiver, UserData,
+    AsyncReceiver, Event, Receiver, UserData,
 };
 use crossbeam_channel as channel;
 use std::{
@@ -1216,8 +1216,8 @@ impl AsyncClient {
         L: Into<Option<usize>>,
     {
         let (tx, rx) = match buffer_lim.into() {
-            None => async_channel::unbounded(),
             Some(lim) => async_channel::bounded(lim),
+            None => async_channel::unbounded(),
         };
 
         // Make sure at least the low-level connection lost handlers are in
@@ -1233,6 +1233,70 @@ impl AsyncClient {
                 else {
                     error!("Stream error: {:?}", err);
                 }
+            }
+        });
+
+        rx
+    }
+
+    /// Creates a futures stream for consuming events.
+    ///
+    /// This will install an internal callback to receive the incoming
+    /// events from the client, and return the receive side of the channel.
+    /// The stream will stay open for the life of the client.
+    ///
+    /// The stream will rely on a bounded channel with the given buffer
+    /// capacity if 'buffer_sz' is 'Some' or will rely on an unbounded channel
+    /// if 'buffer_sz' is 'None'.
+    ///
+    /// It's a best practice to open the stream _before_ connecting to the
+    /// server. When using persistent (non-clean) sessions, messages could
+    /// arriving as soon as the connection is made - even before the
+    /// connect() call returns.
+    pub fn get_event_stream<L>(&mut self, buffer_lim: L) -> AsyncReceiver<Event>
+    where
+        L: Into<Option<usize>>,
+    {
+        fn stream_result<T>(res: std::result::Result<(), async_channel::TrySendError<T>>) {
+            match res {
+                Err(err) if err.is_full() => warn!("Event stream full. Losing messages"),
+                Err(_) => warn!("Event stream closed"),
+                _ => (),
+            }
+        }
+
+        let (tx, rx) = match buffer_lim.into() {
+            Some(lim) => async_channel::bounded(lim),
+            None => async_channel::unbounded(),
+        };
+
+        self.set_connected_callback({
+            let tx = tx.clone();
+            move |_cli| {
+                stream_result(tx.try_send(Event::Connected));
+            }
+        });
+
+        self.set_message_callback({
+            let tx = tx.clone();
+            move |_cli, msg| {
+                if let Some(msg) = msg {
+                    stream_result(tx.try_send(Event::Message(msg)));
+                }
+            }
+        });
+
+        self.set_connection_lost_callback({
+            let tx = tx.clone();
+            move |_cli| {
+                stream_result(tx.try_send(Event::ConnectionLost));
+            }
+        });
+
+        self.set_disconnected_callback({
+            let tx = tx.clone();
+            move |_cli, props, reason_code| {
+                stream_result(tx.try_send(Event::Disconnected { props, reason_code }));
             }
         });
 

@@ -109,6 +109,7 @@ pub use crate::connect_options::*; //{ConnectOptions, ConnectOptionsBuilder, MQT
 pub use crate::create_options::*; //{CreateOptions, CreateOptionsBuilder};
 pub use crate::disconnect_options::*; //{DisconnectOptions, DisconnectOptionsBuilder};
 pub use crate::errors::*;
+pub use crate::event::Event;
 pub use crate::message::*; //{Message, MessageBuilder};
 pub use crate::name_value::*; //{NameValueCollection};
 pub use crate::properties::*; //{Property, Properties};
@@ -178,6 +179,9 @@ pub mod client_persistence;
 
 /// The MQTT errors
 pub mod errors;
+
+/// Events emitted by the client
+pub mod event;
 
 /// Utility for creating string collections (to pass to the C library).
 pub mod string_collection;
