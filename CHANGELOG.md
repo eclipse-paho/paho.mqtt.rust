@@ -9,6 +9,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## v0.14.0 (Unreleased)
 
+- Added synchronous (blocking) and async event streams.
+    - All events from the client flow through the stream: 
+      Connect, Connection Lost, Disconnected, Incoming Message 
 - Typeof Variable Byte Integer is u32 (not i32)
 - `PropertyType` enum now supports `Ord`, `PartialOrd`, and `Hash` traits
 

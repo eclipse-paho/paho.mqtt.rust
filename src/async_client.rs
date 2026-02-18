@@ -60,14 +60,16 @@ use crate::{
     subscribe_options::SubscribeOptions,
     token::{ConnectToken, DeliveryToken, SubscribeManyToken, SubscribeToken, Token},
     types::*,
-    AsyncReceiver, Event, Receiver, UserData,
+    AsyncReceiver, Event, SyncReceiver, UserData,
 };
-use crossbeam_channel as channel;
+use crossbeam_channel as sync_channel;
 use std::{
     ffi::{CStr, CString},
     mem,
     os::raw::{c_char, c_int, c_void},
-    ptr, slice, str,
+    ptr,
+    result::Result as StdResult,
+    slice, str,
     sync::{
         atomic::{AtomicU32, Ordering},
         Arc, Mutex, Once,
@@ -1165,15 +1167,16 @@ impl AsyncClient {
 
     /// Starts the client consuming messages for a blocking (non-async) app.
     ///
-    /// This starts the client receiving messages and placing them into an
-    /// mpsc queue. It returns the receiving-end of the queue for the
+    /// This starts the client receiving messages and placing them into a
+    /// channel. It returns the receiving-end of the channel for the
     /// application to get the messages.
-    /// This can be called at any time after the client is created, but it
-    /// should be called before subscribing to any topics, otherwise messages
-    /// can be lost.
-    //
-    pub fn start_consuming(&self) -> Receiver<Option<Message>> {
-        let (tx, rx) = channel::unbounded();
+    ///
+    /// This should normall be called before the client is connected,
+    /// especially if the application is requesting a persistent session.
+    /// With a clean session, this should be called before subscribing to
+    /// ensure that messages are not lost.
+    pub fn start_consuming(&self) -> SyncReceiver<Option<Message>> {
+        let (tx, rx) = sync_channel::unbounded();
 
         // Make sure at least the low-level connection_lost handler is in
         // place to notify us when the connection is lost (sends a 'None' to
@@ -1181,10 +1184,8 @@ impl AsyncClient {
         self.set_disconnection_callbacks();
 
         // Message callback just queues incoming messages.
-        self.set_message_callback(move |_, msg| {
-            if tx.send(msg).is_err() {
-                error!("Consumer channel is closed.");
-            }
+        self.set_message_callback(move |_, optmsg| {
+            log_channel_err(tx.try_send(optmsg));
         });
 
         rx
@@ -1193,6 +1194,62 @@ impl AsyncClient {
     /// Stops the client from consuming messages.
     pub fn stop_consuming(&self) {
         self.remove_message_callback();
+    }
+
+    /// Creates a futures stream for consuming events.
+    ///
+    /// This will install an internal callback to receive the incoming
+    /// events from the client, and return the receive side of the channel.
+    /// The stream will stay open for the life of the client.
+    ///
+    /// The stream will rely on a bounded channel with the given buffer
+    /// capacity if 'buffer_sz' is 'Some' or will rely on an unbounded channel
+    /// if 'buffer_sz' is 'None'.
+    ///
+    /// It's a best practice to open the stream _before_ connecting to the
+    /// server. When using persistent (non-clean) sessions, messages could
+    /// arriving as soon as the connection is made - even before the
+    /// connect() call returns.
+    pub fn start_consuming_events<L>(&mut self, buffer_lim: L) -> SyncReceiver<Event>
+    where
+        L: Into<Option<usize>>,
+    {
+        let (tx, rx) = match buffer_lim.into() {
+            Some(lim) => sync_channel::bounded(lim),
+            None => sync_channel::unbounded(),
+        };
+
+        self.set_connected_callback({
+            let tx = tx.clone();
+            move |_cli| {
+                log_channel_err(tx.try_send(Event::Connected));
+            }
+        });
+
+        self.set_message_callback({
+            let tx = tx.clone();
+            move |_cli, msg| {
+                if let Some(msg) = msg {
+                    log_channel_err(tx.try_send(Event::Message(msg)));
+                }
+            }
+        });
+
+        self.set_connection_lost_callback({
+            let tx = tx.clone();
+            move |_cli| {
+                log_channel_err(tx.try_send(Event::ConnectionLost));
+            }
+        });
+
+        self.set_disconnected_callback({
+            let tx = tx.clone();
+            move |_cli, props, reason_code| {
+                log_channel_err(tx.try_send(Event::Disconnected { props, reason_code }));
+            }
+        });
+
+        rx
     }
 
     /// Creates a futures stream for consuming messages.
@@ -1220,20 +1277,15 @@ impl AsyncClient {
             None => async_channel::unbounded(),
         };
 
-        // Make sure at least the low-level connection lost handlers are in
+        // Make sure at least the low-level connection-lost handlers are in
         // place to notify us when the connection is lost (sends a 'None' to
         // the receiver).
         self.set_disconnection_callbacks();
 
-        self.set_message_callback(move |_, msg| {
-            if let Err(err) = tx.try_send(msg) {
-                if err.is_full() {
-                    warn!("Input stream full. Losing messages");
-                }
-                else {
-                    error!("Stream error: {:?}", err);
-                }
-            }
+        self.set_message_callback(move |_, msg| match tx.try_send(msg) {
+            Err(err) if err.is_full() => warn!("Message stream full. Losing messages"),
+            Err(_) => error!("Message stream closed"),
+            _ => (),
         });
 
         rx
@@ -1257,14 +1309,6 @@ impl AsyncClient {
     where
         L: Into<Option<usize>>,
     {
-        fn stream_result<T>(res: std::result::Result<(), async_channel::TrySendError<T>>) {
-            match res {
-                Err(err) if err.is_full() => warn!("Event stream full. Losing messages"),
-                Err(_) => warn!("Event stream closed"),
-                _ => (),
-            }
-        }
-
         let (tx, rx) = match buffer_lim.into() {
             Some(lim) => async_channel::bounded(lim),
             None => async_channel::unbounded(),
@@ -1273,7 +1317,7 @@ impl AsyncClient {
         self.set_connected_callback({
             let tx = tx.clone();
             move |_cli| {
-                stream_result(tx.try_send(Event::Connected));
+                log_stream_err(tx.try_send(Event::Connected));
             }
         });
 
@@ -1281,7 +1325,7 @@ impl AsyncClient {
             let tx = tx.clone();
             move |_cli, msg| {
                 if let Some(msg) = msg {
-                    stream_result(tx.try_send(Event::Message(msg)));
+                    log_stream_err(tx.try_send(Event::Message(msg)));
                 }
             }
         });
@@ -1289,14 +1333,14 @@ impl AsyncClient {
         self.set_connection_lost_callback({
             let tx = tx.clone();
             move |_cli| {
-                stream_result(tx.try_send(Event::ConnectionLost));
+                log_stream_err(tx.try_send(Event::ConnectionLost));
             }
         });
 
         self.set_disconnected_callback({
             let tx = tx.clone();
             move |_cli, props, reason_code| {
-                stream_result(tx.try_send(Event::Disconnected { props, reason_code }));
+                log_stream_err(tx.try_send(Event::Disconnected { props, reason_code }));
             }
         });
 
@@ -1338,6 +1382,22 @@ impl Drop for InnerAsyncClient {
                 ffi::MQTTAsync_destroy(&mut self.handle as *mut *mut c_void);
             }
         }
+    }
+}
+
+fn log_channel_err<T>(res: StdResult<(), sync_channel::TrySendError<T>>) {
+    match res {
+        Err(err) if err.is_full() => warn!("Event stream full. Losing messages"),
+        Err(_) => warn!("Event stream closed"),
+        _ => (),
+    }
+}
+
+fn log_stream_err<T>(res: StdResult<(), async_channel::TrySendError<T>>) {
+    match res {
+        Err(err) if err.is_full() => warn!("Event stream full. Losing messages"),
+        Err(_) => warn!("Event stream closed"),
+        _ => (),
     }
 }
 

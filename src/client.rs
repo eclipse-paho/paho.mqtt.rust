@@ -4,7 +4,7 @@
 //
 
 /*******************************************************************************
- * Copyright (c) 2017-2020 Frank Pagliughi <fpagliughi@mindspring.com>
+ * Copyright (c) 2017-2026 Frank Pagliughi <fpagliughi@mindspring.com>
  *
  * All rights reserved. This program and the accompanying materials
  * are made available under the terms of the Eclipse Public License v2.0
@@ -32,7 +32,7 @@ use crate::{
     async_client::AsyncClient, connect_options::ConnectOptions, create_options::CreateOptions,
     disconnect_options::DisconnectOptions, errors::Result, message::Message,
     properties::Properties, server_response::ServerResponse, subscribe_options::SubscribeOptions,
-    QoS, Receiver,
+    Event, QoS, SyncReceiver,
 };
 use std::time::Duration;
 
@@ -301,20 +301,42 @@ impl Client {
 
     /// Starts the client consuming messages.
     ///
-    /// This starts the client receiving messages and placing them into an
-    /// mpsc queue. It returns the receiving-end of the queue for the
+    /// This starts the client receiving messages and placing them into a
+    /// channel. It returns the receiving-end of the channel for the
     /// application to get the messages.
+    ///
     /// This can be called at any time after the client is created, but it
     /// should be called before subscribing to any topics, otherwise messages
     /// can be lost.
     //
-    pub fn start_consuming(&self) -> Receiver<Option<Message>> {
+    pub fn start_consuming(&self) -> SyncReceiver<Option<Message>> {
         self.cli.start_consuming()
     }
 
     /// Stops the client consumer.
     pub fn stop_consuming(&self) {
         self.cli.stop_consuming();
+    }
+
+    /// Creates a futures stream for consuming events.
+    ///
+    /// This will install an internal callback to receive the incoming
+    /// events from the client, and return the receive side of the channel.
+    /// The stream will stay open for the life of the client.
+    ///
+    /// The stream will rely on a bounded channel with the given buffer
+    /// capacity if 'buffer_lim' is 'Some' or will rely on an unbounded channel
+    /// if 'buffer_lim' is 'None'.
+    ///
+    /// It's a best practice to open the stream _before_ connecting to the
+    /// server. When using persistent (non-clean) sessions, messages could
+    /// arriving as soon as the connection is made - even before the
+    /// connect() call returns.
+    pub fn start_consuming_events<L>(&mut self, buffer_lim: L) -> SyncReceiver<Event>
+    where
+        L: Into<Option<usize>>,
+    {
+        self.cli.start_consuming_events(buffer_lim)
     }
 
     /// Returns client ID used for client instance

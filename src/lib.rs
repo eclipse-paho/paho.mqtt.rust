@@ -86,7 +86,7 @@ extern crate paho_mqtt_sys as ffi;
 pub use async_channel::{self, Receiver as AsyncReceiver};
 
 /// Re-export crossbeam channel as sync components
-pub use crossbeam_channel::{self as sync_channel, Receiver};
+pub use crossbeam_channel::{self as sync_channel, Receiver as SyncReceiver};
 
 /// The asynchronous API
 pub mod async_client;
