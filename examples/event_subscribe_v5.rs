@@ -122,7 +122,7 @@ fn main() {
                     while let Err(err) = cli.reconnect().await {
                         println!("  Error reconnecting: {}", err);
                         // For tokio use: tokio::time::delay_for()
-                        async_std::task::sleep(Duration::from_millis(1000)).await;
+                        smol::Timer::after(Duration::from_millis(1000)).await;
                     }
                 }
                 Event::Disconnected { reason_code, .. } => {

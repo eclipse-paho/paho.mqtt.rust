@@ -114,7 +114,7 @@ fn main() {
                     rconn_attempt += 1;
                     println!("Error reconnecting #{}: {}", rconn_attempt, err);
                     // For tokio use: tokio::time::delay_for()
-                    async_std::task::sleep(Duration::from_secs(1)).await;
+                    smol::Timer::after(Duration::from_secs(1)).await;
                 }
                 println!("Reconnected.");
             }
