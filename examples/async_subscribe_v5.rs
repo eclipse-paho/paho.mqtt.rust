@@ -46,6 +46,8 @@ use std::{env, process, time::Duration};
 const TOPICS: &[&str] = &["test", "hello"];
 const QOS: &[i32] = &[1, 1];
 
+const RECONN_RETRY_PERIOD: Duration = Duration::from_secs(1);
+
 /////////////////////////////////////////////////////////////////////////////
 
 fn main() {
@@ -65,19 +67,16 @@ fn main() {
         .client_id("rust_async_sub_v5")
         .finalize();
 
-    // Create the client connection
-    let mut cli = mqtt::AsyncClient::new(create_opts).unwrap_or_else(|e| {
-        println!("Error creating the client: {:?}", e);
-        process::exit(1);
-    });
-
-    // Notification callback(s)
-
-    cli.set_disconnected_callback(|_, _props, reason| {
-        println!("Server disconnected with reason: {}", reason);
-    });
-
     if let Err(err) = block_on(async {
+        // Create the client connection
+        let mut cli = mqtt::AsyncClient::new(create_opts)?;
+
+        // Notification callback(s)
+
+        cli.set_disconnected_callback(|_, _props, reason| {
+            println!("Server disconnected with reason: {}", reason);
+        });
+
         // Get message stream before connecting.
         let strm = cli.get_stream(25);
 
@@ -126,8 +125,7 @@ fn main() {
                 println!("Lost connection. Attempting reconnect.");
                 while let Err(err) = cli.reconnect().await {
                     println!("Error reconnecting: {}", err);
-                    // For tokio use: tokio::time::delay_for()
-                    smol::Timer::after(Duration::from_millis(1000)).await;
+                    smol::Timer::after(RECONN_RETRY_PERIOD).await;
                 }
             }
         }
@@ -136,5 +134,6 @@ fn main() {
         Ok::<(), mqtt::Error>(())
     }) {
         eprintln!("{}", err);
+        process::exit(1);
     }
 }

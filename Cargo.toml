@@ -30,6 +30,7 @@ async-channel = "2.5"
 crossbeam-channel = "0.5"
 log = "0.4"
 thiserror = "2.0"
+tokio = { version = "1.49", features = ["full"], optional = true }
 
 [dev-dependencies]
 env_logger = "0.11"
@@ -40,4 +41,12 @@ lazy_static = "1.4"
 futures-util = "0.3"
 ctrlc = "3.2"
 smol = "2.0"
+
+[[example]]
+name = "tokio_event_subscribe_v5"
+required-features = ["tokio"]
+
+[[example]]
+name = "tokio_publish"
+required-features = ["tokio"]
 

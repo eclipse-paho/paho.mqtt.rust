@@ -46,6 +46,8 @@ use std::{env, process, time::Duration};
 const TOPICS: &[&str] = &["test", "hello"];
 const QOS: &[i32] = &[1, 1];
 
+const RECONN_RETRY_PERIOD: Duration = Duration::from_secs(1);
+
 /////////////////////////////////////////////////////////////////////////////
 
 fn main() {
@@ -121,8 +123,7 @@ fn main() {
                     println!("Lost connection. Attempting reconnect...");
                     while let Err(err) = cli.reconnect().await {
                         println!("  Error reconnecting: {}", err);
-                        // For tokio use: tokio::time::delay_for()
-                        smol::Timer::after(Duration::from_millis(1000)).await;
+                        smol::Timer::after(RECONN_RETRY_PERIOD).await;
                     }
                 }
                 Event::Disconnected { reason_code, .. } => {

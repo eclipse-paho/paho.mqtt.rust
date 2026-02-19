@@ -44,6 +44,8 @@ use std::{env, process, time::Duration};
 const TOPICS: &[&str] = &["test/#", "hello"];
 const QOS: &[i32] = &[1, 1];
 
+const RECONN_RETRY_PERIOD: Duration = Duration::from_secs(1);
+
 /////////////////////////////////////////////////////////////////////////////
 
 fn main() {
@@ -63,13 +65,10 @@ fn main() {
         .client_id("rust_async_subscribe")
         .finalize();
 
-    // Create the client connection
-    let mut cli = mqtt::AsyncClient::new(create_opts).unwrap_or_else(|e| {
-        println!("Error creating the client: {:?}", e);
-        process::exit(1);
-    });
-
     if let Err(err) = block_on(async {
+        // Create the client connection
+        let mut cli = mqtt::AsyncClient::new(create_opts)?;
+
         // Get message stream before connecting.
         let strm = cli.get_stream(25);
 
@@ -113,8 +112,7 @@ fn main() {
                 while let Err(err) = cli.reconnect().await {
                     rconn_attempt += 1;
                     println!("Error reconnecting #{}: {}", rconn_attempt, err);
-                    // For tokio use: tokio::time::delay_for()
-                    smol::Timer::after(Duration::from_secs(1)).await;
+                    smol::Timer::after(RECONN_RETRY_PERIOD).await;
                 }
                 println!("Reconnected.");
             }
@@ -124,5 +122,6 @@ fn main() {
         Ok::<(), mqtt::Error>(())
     }) {
         eprintln!("{}", err);
+        process::exit(1);
     }
 }
