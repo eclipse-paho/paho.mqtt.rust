@@ -29,42 +29,30 @@ The initial version of this crate is a wrapper for the Paho C library, and inclu
     - Traditional asynchronous (token/wait) API
     - Synchronous/blocking  API
 
-Requires Paho C v1.3.14, or possibly later.
+Requires Paho C v1.3.16, or possibly later.
 
 ## Latest News
 
 To keep up with the latest announcements for this project, follow:
 
-**Twitter:** [@eclipsepaho](https://twitter.com/eclipsepaho) and [@fmpagliughi](https://twitter.com/fmpagliughi)
+**Mastodon:** [@fpagliughi@fosstodon.org](https://fosstodon.org/@fpagliughi)
 
 **EMail:** [Eclipse Paho Mailing List](https://accounts.eclipse.org/mailing-list/paho-dev)
 
-### What's New in v0.13
+### What's New in v0.14
 
-Version v0.13.0 now wraps Paho C v0.3.14, which has several new features, including support for UNIX-domain sockets on *nix systems and HTTP proxy improvements.
+Version v0.14.x now wraps Paho C v0.3.16, which has several performance enhancements and bug fixes. Some additional updates:
 
-- Updated License to EPL-v2.0
-- Added some missing Paho legal documents to the repo.
-- Bumped MSRV to Rust v1.73.0
-- Bumped -sys to v0.10.0
-    - Wrapping Paho C v0.3.14 with some new features:
-        - Support for UNIX-domain sockets on local machine (*nix only)
-        - HTTP proxy improvements:
-            - The environment variable PAHO_C_CLIENT_USE_HTTP_PROXY must be set to TRUE for http_proxy environment variable to be used
-        - The http_proxy environment variable to be read is lower case only
-        - The no_proxy environment variable can be set to exclude hosts from using an environment set proxy
-    - `build.rs` builds optional UNIX sockets into Paho C on non-Windows systems (*nix)
-- Reworked the Error type
-    - Remove `Paho` and `PahoDescr` errors. De-nested them into the top-level.
-    - Parsing the error messages from PahoDescr for new error types.
-    - Removed Paho error constants. Now errors can be matched easily/directly.
-- `Token` simplified to create an `Option<Result<ServerResponse>>` instead of individual components.
-- Created new enumeration types:
-    - `MqttVersion`
-    - `ConnectReturnCode` (for MQTT v3.x)
-    - `QoS`
+- Support for Paho C v1.3.16
+    - Improved performance and lower latency for connect and publish operations.
+- Added synchronous (blocking) and async event streams.
+    - All events from the client flow through the stream:
+      Connect, Connection Lost, Disconnected, Incoming Message
+- Typeof Variable Byte Integer is u32 (not i32)
+- `PropertyType` enum now supports `Ord`, `PartialOrd`, and `Hash` traits
+- Bumped paho-mqtt-sys to v0.11
 
-For additional updates and bug fixes, see the CHANGELOG.
+For additional updates and bug fixes, see the [CHANGELOG](https://github.com/eclipse-paho/paho.mqtt.rust/blob/master/CHANGELOG.md)
 
 ### New work for future releases
 
@@ -76,7 +64,7 @@ One set of breaking changes will be around the library's errors. The Paho C erro
 
 To use the library, simply add this to your application's `Cargo.toml` dependencies list:
 
-    paho-mqtt = "0.13"
+    paho-mqtt = "0.14"
 
 By default it enables the features "bundled" and "ssl" meaning it will attempt to compile the Paho C library for the target, using the pre-built bindings, and will enable secure sockets capabilities using the system OpenSSL library.
 
@@ -123,17 +111,17 @@ In particular:
 So, by default, your application will build for SSL/TLS, assuming an existing install of the OpenSSL library. In your _Cargo.toml_, just:
 
     # Use the system OpenSSL library
-    paho-mqtt = "0.13"
+    paho-mqtt = "0.14"
 
 If you don't have OpenSSL installed for your target and want to build it with your app:
 
     # Build OpenSSL with the project
-    paho-mqtt = { version = "0.13", features=["vendored-ssl"] }
+    paho-mqtt = { version = "0.14", features=["vendored-ssl"] }
 
 If you want to build your app _without_ SSL/TLS, disable the default features, then add "bundled" back in (if desired):
 
     # Don't use SSL at all
-    paho-mqtt = { version = "0.13", default-features=false, features=["bundled"] }
+    paho-mqtt = { version = "0.14", default-features=false, features=["bundled"] }
 
 ### Windows
 
@@ -146,7 +134,7 @@ If you install OpenSSL, you usually need tell the Rust build tools where to find
 Point it to wherever you installed the library. Alternately, you can tell Cargo to build it with the app, using the _vendored-ssl_ feature:
 
     # Build OpenSSL with the project
-    paho-mqtt = { version = "0.13", features=["vendored-ssl"] }
+    paho-mqtt = { version = "0.14", features=["vendored-ssl"] }
 
 ### macOS Universal Binaries
 
@@ -197,7 +185,7 @@ $  cargo build --no-default-features --features="bundled" \
 
 When using SSL/TLS with _musl_, you need a static version of the OpenSSL library built for _musl_. If you don't have one built and installed, you can use _vendored-ssl_. So, in your _Cargo.toml:_
 
-    paho-mqtt = { version = "0.13", features=["vendored-ssl"] }
+    paho-mqtt = { version = "0.14", features=["vendored-ssl"] }
 
 When using _musl_ with OpenSSL, it appears that you also need to manually link with the C library. There are two ways to do this. First, you can create a simple `build.rs` for your application, specifying the link:
 
@@ -245,7 +233,7 @@ Generates reference documentation.
 
 ###  The Paho C Library and _paho-mqtt-sys_
 
-The Paho Rust crate is a wrapper around the Paho C library. This version is **specifically matched to Paho C v 1.3.x**, and is currently using version 1.3.14. It will generally not build against newer versions of the C library, as the C lib expands functionality by extending structures, thus breaking the Rust build.
+The Paho Rust crate is a wrapper around the Paho C library. This version is **specifically matched to Paho C v 1.3.x**, and is currently using version 1.3.16. It will generally not build against newer versions of the C library, as the C lib expands functionality by extending structures, thus breaking the Rust build.
 
 The project includes a Rust _-sys_ crate, called _paho-mqtt-sys_, which provides unsafe bindings to the C library.  The repository contains a Git submodule pointing to the specific version of the C library that the Rust crate requires, and by default, it will automatically build and link to that library, using pre-generated C bindings that are also included in the repo.
 
@@ -349,25 +337,25 @@ The crate comes with a number of pre-built bindings for several popular targets 
 
 Some of these include:
 
-    bindings_paho_mqtt_c_1.3.14-x86_64-unknown-linux-gnu.rs
-    bindings_paho_mqtt_c_1.3.14-x86_64-pc-windows-msvc.rs
-    bindings_paho_mqtt_c_1.3.14-aarch64-unknown-linux-gnu.rs
-    bindings_paho_mqtt_c_1.3.14-armv7-unknown-linux-gnueabihf.rs
-    bindings_paho_mqtt_c_1.3.14-x86_64-apple-darwin.rs
-    bindings_paho_mqtt_c_1.3.14-default-32.rs
-    bindings_paho_mqtt_c_1.3.14-default-64.rs
+    bindings_paho_mqtt_c_1.3.16-x86_64-unknown-linux-gnu.rs
+    bindings_paho_mqtt_c_1.3.16-x86_64-pc-windows-msvc.rs
+    bindings_paho_mqtt_c_1.3.16-aarch64-unknown-linux-gnu.rs
+    bindings_paho_mqtt_c_1.3.16-armv7-unknown-linux-gnueabihf.rs
+    bindings_paho_mqtt_c_1.3.16-x86_64-apple-darwin.rs
+    bindings_paho_mqtt_c_1.3.16-default-32.rs
+    bindings_paho_mqtt_c_1.3.16-default-64.rs
 
 Bindings can be created for new versions of the Paho C library or for different target platforms using the command-line _bindgen_ tool. For example on an x86 version of Windows using MSVC, you can re-generate the bindings like this:
 
 ```
 $ cd paho-mqtt-sys
-$ bindgen wrapper.h -o bindings/bindings_paho_mqtt_c_1.3.14-x86_64-pc-windows-msvc.rs -- -Ipaho.mqtt.c/src
+$ bindgen wrapper.h -o bindings/bindings_paho_mqtt_c_1.3.16-x86_64-pc-windows-msvc.rs -- -Ipaho.mqtt.c/src
 ```
 
 To create bindings for a different target, use the _TARGET_ environment variable. For example, to build the 32-bit MSVC bindings for Windows on a 64-bit host, use the _i686-pc-windows-msvc_ target:
 
 ```
-$ TARGET=i686-pc-windows-msvc bindgen wrapper.h -o bindings/bindings_paho_mqtt_c_1.3.14-i686-pc-windows-msvc.rs -- -Ipaho.mqtt.c/src
+$ TARGET=i686-pc-windows-msvc bindgen wrapper.h -o bindings/bindings_paho_mqtt_c_1.3.16-i686-pc-windows-msvc.rs -- -Ipaho.mqtt.c/src
 ```
 
 ##### Bindgen linker issue
@@ -376,7 +364,7 @@ Bindgen requires a relatively recent version of the Clang library installed on t
 
 But the safest thing would be to set the `LIBCLANG_PATH` environment variable to point to a supported version, like:
 ```
-export LIBCLANG_PATH=/usr/lib/llvm-3.9/lib
+export LIBCLANG_PATH=/usr/lib/llvm-3.19/lib
 ```
 
 ### Cross-Compiling
@@ -388,7 +376,7 @@ https://github.com/japaric/rust-cross
 [The Rust Book](https://rust-lang.github.io/rustup/cross-compilation.html)
 
 
-For example, to do a full build for `ARMv7`, which includes Raspberry Pi's, BeagleBones, UDOO Neo's, and lots of other ARM maker boards:
+For example, to do a full build for `ARMv7`, which includes Raspberry Pi's, BeagleBones, and lots of other ARM maker boards:
 
     $ cargo build --target=armv7-unknown-linux-gnueabihf --examples
 
@@ -456,7 +444,7 @@ extern crate paho_mqtt as mqtt;
 
 fn main() {
     // Create a client & define connect options
-    let cli = mqtt::Client::new("tcp://localhost:1883").unwrap_or_else(|err| {
+    let cli = mqtt::Client::new("mqtt://localhost:1883").unwrap_or_else(|err| {
         println!("Error creating the client: {:?}", err);
         process::exit(1);
     });
