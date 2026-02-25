@@ -201,6 +201,9 @@ mod bindings {
         // to bindgen, and lets you build up options for
         // the resulting bindings.
         let bindings = bindgen::Builder::default()
+            // Set the Rust target to a specific stable version
+            // or use RustTarget::stable(major, minor) for dynamic versions
+            .rust_target(bindgen::RustTarget::stable(73, 0).unwrap())
             // Older clang versions (~v3.6) improperly mangle the functions.
             // We shouldn't require mangling for straight C library.
             .trust_clang_mangling(false)

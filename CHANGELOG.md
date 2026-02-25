@@ -9,11 +9,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## v0.14.0 (Unreleased)
 
+- Support for Paho C v1.3.16
+    - Improved performance and lower latency for connect and publish operations.
 - Added synchronous (blocking) and async event streams.
-    - All events from the client flow through the stream: 
-      Connect, Connection Lost, Disconnected, Incoming Message 
+    - All events from the client flow through the stream:
+      Connect, Connection Lost, Disconnected, Incoming Message
 - Typeof Variable Byte Integer is u32 (not i32)
 - `PropertyType` enum now supports `Ord`, `PartialOrd`, and `Hash` traits
+- Bumped paho-mqtt-sys to v0.11
+
 
 ## [v0.13.4](https://github.com/eclipse/paho.mqtt.rust/compare/v0.13.3..v0.13.4) - (2025-09-02)
 
