@@ -8,14 +8,24 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  MSRV: "1.76.0"
 
 jobs:
+  setup:
+    name: Setup
+    runs-on: ubuntu-latest
+    outputs:
+      msrv: ${{ steps.set-msrv.outputs.msrv }}
+    steps:
+      - id: set-msrv
+        run: echo "msrv=${{ env.MSRV }}" >> $GITHUB_OUTPUT
+
   fmt:
     name: Rustfmt
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions-rs/toolchain@v1
+      - uses: actions/checkout@v6
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: nightly
           override: true
@@ -25,15 +35,16 @@ jobs:
   check:
     name: Rust Build Check
     runs-on: ubuntu-latest
+    needs: setup
     strategy:
       fail-fast: false
       matrix:
         rust:
           - stable
-          - 1.73.0
+          - ${{ needs.setup.outputs.msrv }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions-rs/toolchain@v1
+      - uses: actions/checkout@v6
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: ${{ matrix.rust }}
           override: true
@@ -42,11 +53,30 @@ jobs:
   clippy:
     name: Rust Clippy
     runs-on: ubuntu-latest
+    needs: setup
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions-rs/toolchain@v1
+      - uses: actions/checkout@v6
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
-          toolchain: 1.73.0
+          toolchain: ${{ needs.setup.outputs.msrv }}
           override: true
           components: clippy
       - run: cargo clippy -- -D warnings
+
+  test:
+    name: Rust Tests
+    runs-on: ubuntu-latest
+    needs: setup
+    strategy:
+      fail-fast: false
+      matrix:
+        rust:
+          - stable
+          - ${{ needs.setup.outputs.msrv }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: ${{ matrix.rust }}
+          override: true
+      - run: cargo test --no-default-features --features bundled,vendored-ssl --no-fail-fast

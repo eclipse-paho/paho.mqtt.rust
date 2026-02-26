@@ -24,7 +24,6 @@
 #![macro_use]
 
 /// Return an error from a function.
-
 macro_rules! bail {
     ($expr:expr) => {
         return Err(::std::convert::From::from($expr));

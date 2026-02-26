@@ -197,10 +197,6 @@ type NodeIterMut<'a, T> = Box<dyn Iterator<Item = (&'a str, &'a mut T)> + 'a>;
 ///
 /// which use a prefix tree (trie) to store the values.
 ///
-
-/// A collection of topic filters that can compare against a topic to
-/// produce an iterator of all matched items.
-///
 /// This is particularly useful at creating a lookup table of callbacks or
 /// individual channels for subscriptions, especially when the subscriptions
 /// contain wildcards.
@@ -259,10 +255,7 @@ impl<T> TopicMatcher<T> {
         let mut curr = &self.root;
 
         for field in filter.split('/') {
-            curr = match curr.children.get(field) {
-                Some(node) => node,
-                None => return None,
-            };
+            curr = curr.children.get(field)?;
         }
         curr.value.as_ref().map(|(k, v)| (k.as_str(), v))
     }
@@ -273,10 +266,7 @@ impl<T> TopicMatcher<T> {
         let mut curr = &mut self.root;
 
         for field in filter.split('/') {
-            curr = match curr.children.get_mut(field) {
-                Some(node) => node,
-                None => return None,
-            };
+            curr = curr.children.get_mut(field)?;
         }
         curr.value.as_mut().map(|(_, v)| v)
     }
@@ -290,10 +280,7 @@ impl<T> TopicMatcher<T> {
         let mut curr = &mut self.root;
 
         for field in filter.split('/') {
-            curr = match curr.children.get_mut(field) {
-                Some(node) => node,
-                None => return None,
-            };
+            curr = curr.children.get_mut(field)?;
         }
         curr.value.take().map(|(_, v)| v)
     }

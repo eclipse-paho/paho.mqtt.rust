@@ -33,7 +33,8 @@
 //! ```
 //! use paho_mqtt as mqtt;
 //!
-//! let cli = mqtt::AsyncClient::new("mqtt://localhost:1883").unwrap();
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! let cli = mqtt::AsyncClient::new("mqtt://mqtt-broker-host:1883").unwrap();
 //!
 //! // Start an async operation and get the token for it.
 //! let tok = cli.connect(mqtt::ConnectOptions::new());
@@ -41,7 +42,10 @@
 //! // ...do something else...
 //!
 //! // Wait for the async operation to complete.
-//! tok.wait().unwrap();
+//! let connect_result = tok.wait();
+//! # assert!(connect_result.is_err());
+//! # Ok(())
+//! # }
 //! ```
 
 use crate::{
@@ -443,7 +447,7 @@ impl AsyncClient {
     /// # Arguments
     ///
     /// * `opts` The connect options. This can be `None`, in which case the
-    ///          default options are used.
+    ///   default options are used.
     ///
     pub fn connect<T>(&self, opts: T) -> ConnectToken
     where
@@ -627,7 +631,7 @@ impl AsyncClient {
     /// # Arguments
     ///
     /// * `cb` The callback to register with the library. This can be a
-    ///     function or a closure.
+    ///   function or a closure.
     pub fn set_connected_callback<F>(&self, cb: F)
     where
         F: FnMut(&AsyncClient) + Send + 'static,
@@ -661,7 +665,7 @@ impl AsyncClient {
     /// # Arguments
     ///
     /// * `cb` The callback to register with the library. This can be a
-    ///     function or a closure.
+    ///   function or a closure.
     pub fn set_connection_lost_callback<F>(&self, cb: F)
     where
         F: FnMut(&AsyncClient) + Send + 'static,
@@ -707,7 +711,7 @@ impl AsyncClient {
     /// # Arguments
     ///
     /// * `cb` The callback to register with the library. This can be a
-    ///     function or a closure.
+    ///   function or a closure.
     pub fn set_disconnected_callback<F>(&self, cb: F)
     where
         F: FnMut(&AsyncClient, Properties, ReasonCode) + Send + 'static,
@@ -741,7 +745,7 @@ impl AsyncClient {
     /// # Arguments
     ///
     /// * `cb` The callback to register with the library. This can be a
-    ///     function or a closure.
+    ///   function or a closure.
     ///
     pub fn set_message_callback<F>(&self, cb: F)
     where
