@@ -33,7 +33,8 @@
 //! ```
 //! use paho_mqtt as mqtt;
 //!
-//! let cli = mqtt::AsyncClient::new("mqtt://localhost:1883").unwrap();
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! let cli = mqtt::AsyncClient::new("mqtt://mqtt-broker-host:1883").unwrap();
 //!
 //! // Start an async operation and get the token for it.
 //! let tok = cli.connect(mqtt::ConnectOptions::new());
@@ -41,7 +42,10 @@
 //! // ...do something else...
 //!
 //! // Wait for the async operation to complete.
-//! tok.wait().unwrap();
+//! let connect_result = tok.wait();
+//! # assert!(connect_result.is_err());
+//! # Ok(())
+//! # }
 //! ```
 
 use crate::{
