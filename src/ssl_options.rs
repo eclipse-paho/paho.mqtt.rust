@@ -234,7 +234,7 @@ impl SslOptionsBuilder {
             trust_store
                 .as_ref()
                 .to_str()
-                .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "Path string error"))?,
+                .ok_or_else(|| io::Error::other("Path string error"))?,
         )?;
         Ok(self)
     }
@@ -251,7 +251,7 @@ impl SslOptionsBuilder {
             key_store
                 .as_ref()
                 .to_str()
-                .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "Path string error"))?,
+                .ok_or_else(|| io::Error::other("Path string error"))?,
         )?;
         Ok(self)
     }
@@ -266,7 +266,7 @@ impl SslOptionsBuilder {
             private_key
                 .as_ref()
                 .to_str()
-                .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "Path string error"))?,
+                .ok_or_else(|| io::Error::other("Path string error"))?,
         )?;
         Ok(self)
     }
@@ -327,7 +327,7 @@ impl SslOptionsBuilder {
             ca_path
                 .as_ref()
                 .to_str()
-                .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "Path string error"))?,
+                .ok_or_else(|| io::Error::other("Path string error"))?,
         )?;
         Ok(self)
     }

@@ -447,7 +447,7 @@ impl AsyncClient {
     /// # Arguments
     ///
     /// * `opts` The connect options. This can be `None`, in which case the
-    ///          default options are used.
+    ///   default options are used.
     ///
     pub fn connect<T>(&self, opts: T) -> ConnectToken
     where
@@ -631,7 +631,7 @@ impl AsyncClient {
     /// # Arguments
     ///
     /// * `cb` The callback to register with the library. This can be a
-    ///     function or a closure.
+    ///   function or a closure.
     pub fn set_connected_callback<F>(&self, cb: F)
     where
         F: FnMut(&AsyncClient) + Send + 'static,
@@ -665,7 +665,7 @@ impl AsyncClient {
     /// # Arguments
     ///
     /// * `cb` The callback to register with the library. This can be a
-    ///     function or a closure.
+    ///   function or a closure.
     pub fn set_connection_lost_callback<F>(&self, cb: F)
     where
         F: FnMut(&AsyncClient) + Send + 'static,
@@ -711,7 +711,7 @@ impl AsyncClient {
     /// # Arguments
     ///
     /// * `cb` The callback to register with the library. This can be a
-    ///     function or a closure.
+    ///   function or a closure.
     pub fn set_disconnected_callback<F>(&self, cb: F)
     where
         F: FnMut(&AsyncClient, Properties, ReasonCode) + Send + 'static,
@@ -745,7 +745,7 @@ impl AsyncClient {
     /// # Arguments
     ///
     /// * `cb` The callback to register with the library. This can be a
-    ///     function or a closure.
+    ///   function or a closure.
     ///
     pub fn set_message_callback<F>(&self, cb: F)
     where

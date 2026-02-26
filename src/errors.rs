@@ -301,7 +301,7 @@ impl From<Error> for io::Error {
         match err {
             Error::Io(e) => e,
             Error::Timeout => io::Error::new(io::ErrorKind::TimedOut, err),
-            _ => io::Error::new(io::ErrorKind::Other, err),
+            _ => io::Error::other(err),
         }
     }
 }
