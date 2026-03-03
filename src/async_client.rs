@@ -30,7 +30,7 @@
 //! For example, you can start a connection, do something else, and then
 //! wait for the connection to complete.
 //!
-//! ```
+//! ```ignore
 //! use paho_mqtt as mqtt;
 //!
 //! let cli = mqtt::AsyncClient::new("mqtt://localhost:1883").unwrap();
