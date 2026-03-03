@@ -26,6 +26,7 @@ The initial version of this crate is a wrapper for the Paho C library, and inclu
 - High Availability
 - Several API's:
     - Async/Await with Rust Futures and Streams for asynchronous operations.
+        - Agnostic to async runtimes. Tested with _tokio_ and _smol_.
     - Traditional asynchronous (token/wait) API
     - Synchronous/blocking  API
 
@@ -41,7 +42,9 @@ To keep up with the latest announcements for this project, follow:
 
 ### What's New in v0.14
 
-Version v0.14.x now wraps Paho C v0.3.16, which has several performance enhancements and bug fixes. Some additional updates:
+Version v0.14.0 now wraps Paho C v0.3.16, which was mainly concerned with internal performance improvements. For may aplications, there is a noticable decrease in latency for a number of operations.
+
+Some additional updates:
 
 - Support for Paho C v1.3.16
     - Improved performance and lower latency for connect and publish operations.
@@ -59,6 +62,19 @@ For additional updates and bug fixes, see the [CHANGELOG](https://github.com/ecl
 Work has started to revamp multiple aspects of the internal code without seriously disrupting the API. Some of this will be to hide aspects of the Paho C library that leaked into the Rust API and start the march towards a 100% Rust implementation of this library. (That won't happen too soon, but it's time to start.)
 
 One set of breaking changes will be around the library's errors. The Paho C errors will be de-nested and made easier to match. More information will also be extracted from the C library when possible.
+
+## A Note on Async Runtimes
+
+This library works with Rust async/await features, but is agnostic to async runtimes. It should work with any runtime for the supported operating systems (Linux, Windows, and MacOS), and is tested against _tokio_ and _smol_. It was also working against _async-std_ but since that project is no longer maintained, we no longer test with it. The library does _not_ use a runtime for internal operations.
+
+This library pre-dates Rust async/await by a number of years. It was originally written with a legacy async API in which I/O operations were started by the calling function, but those functions did not block awaiting the operation to complete. Instead, the I/O functions returned a `Token` object which could be used to monitor progress of the operation, or later block the caller to wait for it to complete. Internally the `Token` uses a condition variable to signal when the operation completes and fill in the result. The I/O operation and signaling are performed by a pair of threads internal to the library which run the operations and signal the condition variable.
+
+To make the library compatible with the async/await paradigm, the `Token` simply implemented the [std::future::Future](https://doc.rust-lang.org/std/future/trait.Future.html) trait. This made them compatible with modern Rust, but have a few implications:
+
+- I/O operations return a simple `Future` that are compatible with any runtime that can poll it.
+- Stream-style input uses [async-channel's](https://crates.io/crates/async-channel) which are runtime agnostic.
+- Unlike most futures, the I/O operations are started as soon as the function is called. They don't need an _.await_ to start. Awaiting the token simply pauses the task until the operation completes.
+- The legacy async API is still working under the hood, so you can still use async-style operations without an async runtime. In that case you don't use _.await_, but rather use the `Token::wait()` functions which block the calling thread waiting for completion.
 
 ## Using the Crate
 

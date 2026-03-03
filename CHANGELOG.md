@@ -16,6 +16,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
       Connect, Connection Lost, Disconnected, Incoming Message
 - Typeof Variable Byte Integer is u32 (not i32)
 - `PropertyType` enum now supports `Ord`, `PartialOrd`, and `Hash` traits
+- Added a _tokio_ build feature for cargo, and a few tokio example apps.
+  Enabing the feature simply builds the _tokio_ examples. (The library is still fully runtime agnostic).
+- Bumped MSRV to Rust v1.75
 - Bumped paho-mqtt-sys to v0.11
 
 
