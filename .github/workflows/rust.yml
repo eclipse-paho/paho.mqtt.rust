@@ -14,7 +14,7 @@ jobs:
     name: Rustfmt
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: actions-rs/toolchain@v1
         with:
           toolchain: nightly
@@ -32,7 +32,7 @@ jobs:
           - stable
           - 1.75.0
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: actions-rs/toolchain@v1
         with:
           toolchain: ${{ matrix.rust }}
@@ -51,7 +51,7 @@ jobs:
     name: Rust Clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: actions-rs/toolchain@v1
         with:
           toolchain: 1.75.0
@@ -66,3 +66,29 @@ jobs:
 
       - name: Clippy lints
         run: cargo +1.75.0 clippy --no-deps --all-targets --all-features -- -D warnings
+
+  test:
+    name: Rust Tests
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        rust:
+          - stable
+          - 1.75.0
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions-rs/toolchain@v1
+        with:
+          toolchain: ${{ matrix.rust }}
+          override: true
+
+      - name: Resolve dependencies for MSRV
+        run: |
+          mkdir -p $HOME/.cargo
+          echo 'resolver.incompatible-rust-versions = "fallback"' > $HOME/.cargo/config.toml
+          cargo +stable update
+
+      - name: Run tests
+        run: cargo test --no-default-features --features bundled,vendored-ssl --no-fail-fast
+
