@@ -1208,7 +1208,7 @@ mod tests {
     #[test]
     fn test_property_generic_new() {
         let prop = Property::new(PropertyCode::ResponseTopic, 42u16);
-        assert!(!prop.is_ok());
+        assert!(prop.is_err());
 
         let prop = Property::new(PropertyCode::MaximumQos, 2u8);
         assert!(prop.is_ok());

@@ -548,6 +548,6 @@ mod tests {
             assert_eq!(PAYLOAD, msg.data.payload.as_slice());
             assert_eq!(QOS, msg.qos());
         });
-        let _ = thr.join().unwrap();
+        thr.join().unwrap();
     }
 }

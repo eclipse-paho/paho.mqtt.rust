@@ -214,7 +214,7 @@ mod tests {
         assert!(opts.copts.onSuccess5.is_none());
         assert!(opts.copts.onFailure5.is_none());
 
-        let _ = unsafe { Token::from_raw(inner) };
+        unsafe { Token::from_raw(inner) };
     }
 
     #[test]
@@ -231,7 +231,7 @@ mod tests {
         assert!(opts.copts.onSuccess5.is_some());
         assert!(opts.copts.onFailure5.is_some());
 
-        let _ = unsafe { Token::from_raw(inner) };
+        unsafe { Token::from_raw(inner) };
     }
 
     #[test]
@@ -254,7 +254,7 @@ mod tests {
 
         assert!(opts.copts.subscribeOptions.noLocal != 0);
 
-        let _ = unsafe { Token::from_raw(inner) };
+        unsafe { Token::from_raw(inner) };
     }
 
     #[test]
@@ -288,6 +288,6 @@ mod tests {
             assert!(sub_opts_list[3].noLocal != 0);
         }
 
-        let _ = unsafe { Token::from_raw(inner) };
+        unsafe { Token::from_raw(inner) };
     }
 }

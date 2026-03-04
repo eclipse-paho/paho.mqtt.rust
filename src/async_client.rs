@@ -1546,7 +1546,7 @@ mod tests {
         let thr = thread::spawn(move || {
             assert!(!cli.is_connected());
         });
-        let _ = thr.join().unwrap();
+        thr.join().unwrap();
     }
 
     // Determine that a client can be shared across threads using an Arc.
@@ -1565,7 +1565,7 @@ mod tests {
             assert!(!cli.is_connected());
         });
         assert!(!cli2.is_connected());
-        let _ = thr.join().unwrap();
+        thr.join().unwrap();
     }
 
     #[test]

@@ -193,7 +193,7 @@ mod tests {
             assert_eq!(STRUCT_ID, opts.copts.struct_id);
             assert_eq!(STRUCT_VERSION, opts.copts.struct_version);
         });
-        let _ = thr.join().unwrap();
+        thr.join().unwrap();
     }
 
     #[test]

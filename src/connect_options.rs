@@ -820,7 +820,7 @@ mod tests {
         assert_eq!(servers.len() as i32, opts.copts.serverURIcount);
 
         // Compare the strings to the C-arrays in copts
-        for (i, ref svr) in servers.iter().enumerate() {
+        for (i, svr) in servers.iter().enumerate() {
             let s = unsafe { CStr::from_ptr(*opts.copts.serverURIs.add(i)) };
             assert_eq!(&svr[..], s.to_str().unwrap());
         }
@@ -1082,6 +1082,6 @@ mod tests {
         let thr = thread::spawn(move || {
             assert_eq!(STRUCT_ID, opts.copts.struct_id);
         });
-        let _ = thr.join().unwrap();
+        thr.join().unwrap();
     }
 }
