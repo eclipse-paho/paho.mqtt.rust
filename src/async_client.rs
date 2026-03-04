@@ -1607,7 +1607,7 @@ mod tests {
             .allow_disconnected_send_at_anytime(true)
             .create_client()
             .unwrap();
-        let res = client.try_publish(MessageBuilder::new().topic("test").payload(&[]).finalize());
+        let res = client.try_publish(MessageBuilder::new().topic("test").payload([]).finalize());
         assert!(res.is_ok(), "Failed to publish message before connecting");
     }
 }
