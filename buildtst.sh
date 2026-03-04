@@ -19,7 +19,7 @@ printf "    Ok\n"
 get_crate_msrv
 printf "\nUsing MSRV %s\n" "${MSRV}"
 
-FEATURES="bundled bundled,build_bindgen bundled,ssl,vendored-ssl"
+# Check the default build for stable & MSRV
 
 for VER in stable ${MSRV} ; do
     printf "\n\nChecking default features for version: %s...\n" "${VER}"
@@ -27,15 +27,9 @@ for VER in stable ${MSRV} ; do
         cargo +${VER} check && \
         cargo +${VER} test
     [ "$?" -ne 0 ] && exit 1
-
-    for FEATURE in ${FEATURES}; do
-        printf "\n\nBuilding with feature(s) [%s] for version: %s...\n" "${FEATURE}" "${VER}"
-        cargo clean && \
-            cargo +${VER} check --no-default-features --features="$FEATURE" && \
-            cargo +${VER} test --no-default-features --features="$FEATURE"
-        [ "$?" -ne 0 ] && exit 1
-    done
 done
+
+# Check docs and clippy
 
 printf "\nCreating docs for version: %s...\n" "${MSRV}"
 cargo clean
@@ -44,7 +38,21 @@ printf "    Ok\n"
 
 printf "\nChecking clippy for version: %s...\n" "${MSRV}"
 cargo clean
-! cargo +"${MSRV}" clippy && exit 1
+! cargo +"${MSRV}" clippy --no-deps --all-targets --all-features && exit 1
+
+# Check combinations of build features
+
+FEATURES="bundled bundled,build_bindgen bundled,ssl,vendored-ssl"
+
+for VER in stable ${MSRV} ; do
+    for FEATURE in ${FEATURES}; do
+        printf "\n\nBuilding with feature(s) [%s] for version: %s...\n" "${FEATURE}" "${VER}"
+        cargo clean && \
+            cargo +${VER} check --no-default-features --features="$FEATURE" && \
+            cargo +${VER} test --no-default-features --features="$FEATURE"
+        [ "$?" -ne 0 ] && exit 1
+    done
+done
 
 cargo clean
 printf "\n\n*** All builds succeeded ***\n"
