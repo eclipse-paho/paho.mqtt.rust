@@ -268,7 +268,7 @@ impl MessageBuilder {
     ///
     /// # Arguments
     ///
-    /// `topic` The topic on which the message should be published.
+    /// * `topic` The topic on which the message should be published.
     pub fn topic<T>(mut self, topic: T) -> Self
     where
         T: Into<String>,
@@ -281,7 +281,7 @@ impl MessageBuilder {
     ///
     /// # Arguments
     ///
-    /// `payload` The binary payload of the message
+    /// * `payload` The binary payload of the message
     pub fn payload<V>(mut self, payload: V) -> Self
     where
         V: Into<Vec<u8>>,
@@ -294,7 +294,7 @@ impl MessageBuilder {
     ///
     /// # Arguments
     ///
-    /// `qos` The quality of service for the message.
+    /// * `qos` The quality of service for the message.
     pub fn qos<Q: Into<QoS>>(mut self, qos: Q) -> Self {
         self.qos = qos.into();
         self
@@ -305,8 +305,8 @@ impl MessageBuilder {
     ///
     /// # Arguments
     ///
-    /// `retained` Set true if the message should be retained by the broker,
-    ///            false if not.
+    /// * `retained` Set true if the message should be retained by the broker,
+    ///   false if not.
     pub fn retained(mut self, retained: bool) -> Self {
         self.retained = retained;
         self
@@ -316,7 +316,7 @@ impl MessageBuilder {
     ///
     /// # Arguments
     ///
-    /// `props` The collection of properties to include with the message.
+    /// * `props` The collection of properties to include with the message.
     pub fn properties(mut self, props: Properties) -> Self {
         self.props = props;
         self

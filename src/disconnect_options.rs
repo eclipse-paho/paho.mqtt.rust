@@ -115,8 +115,8 @@ impl DisconnectOptionsBuilder {
     ///
     /// # Arguments
     ///
-    /// `timeout` The time interval to allow the disconnect to
-    ///           complete. This has a resolution of milliseconds.
+    /// * `timeout` The time interval to allow the disconnect to
+    ///   complete. This has a resolution of milliseconds.
     pub fn timeout(&mut self, timeout: Duration) -> &mut Self {
         let millis = timeout.as_millis();
         self.copts.timeout = if millis == 0 { 1 } else { millis as i32 };
@@ -144,8 +144,8 @@ impl DisconnectOptionsBuilder {
     ///
     /// # Arguments
     ///
-    /// `props` The collection of properties to include with the
-    ///     disconnect message.
+    /// * `props` The collection of properties to include with the
+    ///   disconnect message.
     pub fn properties(&mut self, props: Properties) -> &mut Self {
         self.props = props;
         self

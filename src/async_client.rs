@@ -149,7 +149,7 @@ impl AsyncClient {
     ///
     /// # Arguments
     ///
-    /// `opts` The create options for the client.
+    /// * `opts` The create options for the client.
     ///
     pub fn new<T>(opts: T) -> Result<AsyncClient>
     where
@@ -443,7 +443,7 @@ impl AsyncClient {
     /// # Arguments
     ///
     /// * `opts` The connect options. This can be `None`, in which case the
-    ///          default options are used.
+    ///   default options are used.
     ///
     pub fn connect<T>(&self, opts: T) -> ConnectToken
     where
@@ -565,8 +565,8 @@ impl AsyncClient {
     ///
     /// # Arguments
     ///
-    /// `opt_opts` Optional disconnect options. Specifying `None` will use
-    ///            default of immediate (zero timeout) disconnect.
+    /// * `opt_opts` Optional disconnect options. Specifying `None` will use
+    ///   default of immediate (zero timeout) disconnect.
     ///
     pub fn disconnect<T>(&self, opt_opts: T) -> Token
     where
@@ -609,8 +609,8 @@ impl AsyncClient {
     ///
     /// # Arguments
     ///
-    /// `timeout` The amount of time to wait for the disconnect. This has
-    ///           a resolution in milliseconds.
+    /// * `timeout` The amount of time to wait for the disconnect. This has
+    ///   a resolution in milliseconds.
     ///
     pub fn disconnect_after(&self, timeout: Duration) -> Token {
         let disconn_opts = DisconnectOptionsBuilder::new().timeout(timeout).finalize();
@@ -627,7 +627,7 @@ impl AsyncClient {
     /// # Arguments
     ///
     /// * `cb` The callback to register with the library. This can be a
-    ///     function or a closure.
+    ///   function or a closure.
     pub fn set_connected_callback<F>(&self, cb: F)
     where
         F: FnMut(&AsyncClient) + Send + 'static,
@@ -661,7 +661,7 @@ impl AsyncClient {
     /// # Arguments
     ///
     /// * `cb` The callback to register with the library. This can be a
-    ///     function or a closure.
+    ///   function or a closure.
     pub fn set_connection_lost_callback<F>(&self, cb: F)
     where
         F: FnMut(&AsyncClient) + Send + 'static,
@@ -707,7 +707,7 @@ impl AsyncClient {
     /// # Arguments
     ///
     /// * `cb` The callback to register with the library. This can be a
-    ///     function or a closure.
+    ///   function or a closure.
     pub fn set_disconnected_callback<F>(&self, cb: F)
     where
         F: FnMut(&AsyncClient, Properties, ReasonCode) + Send + 'static,
@@ -741,7 +741,7 @@ impl AsyncClient {
     /// # Arguments
     ///
     /// * `cb` The callback to register with the library. This can be a
-    ///     function or a closure.
+    ///   function or a closure.
     ///
     pub fn set_message_callback<F>(&self, cb: F)
     where
@@ -824,8 +824,8 @@ impl AsyncClient {
     ///
     /// # Arguments
     ///
-    /// `topic` The topic name
-    /// `qos` The quality of service requested for messages
+    /// * `topic` The topic name
+    /// * `qos` The quality of service requested for messages
     ///
     pub fn subscribe<S, Q>(&self, topic: S, qos: Q) -> SubscribeToken
     where
@@ -856,10 +856,10 @@ impl AsyncClient {
     ///
     /// # Arguments
     ///
-    /// `topic` The topic name
-    /// `qos` The quality of service requested for messages
-    /// `opts` Options for the subscription
-    /// `props` MQTT v5 properties
+    /// * `topic` The topic name
+    /// * `qos` The quality of service requested for messages
+    /// * `opts` Options for the subscription
+    /// * `props` MQTT v5 properties
     ///
     pub fn subscribe_with_options<S, Q, T, P>(
         &self,
@@ -904,8 +904,8 @@ impl AsyncClient {
     ///
     /// # Arguments
     ///
-    /// `topics` The collection of topic names
-    /// `qos` The quality of service requested for messages
+    /// * `topics` The collection of topic names
+    /// * `qos` The quality of service requested for messages
     ///
     pub fn subscribe_many<T, Q>(&self, topics: &[T], qos: &[Q]) -> SubscribeManyToken
     where
@@ -950,8 +950,8 @@ impl AsyncClient {
     ///
     /// # Arguments
     ///
-    /// `topics` The collection of topic names
-    /// `qos` The quality of service requested for all messages
+    /// * `topics` The collection of topic names
+    /// * `qos` The quality of service requested for all messages
     ///
     pub fn subscribe_many_same_qos<T>(&self, topics: &[T], qos: i32) -> SubscribeManyToken
     where
@@ -965,10 +965,10 @@ impl AsyncClient {
     ///
     /// # Arguments
     ///
-    /// `topics` The collection of topic names
-    /// `qos` The quality of service requested for messages
-    /// `opts` Subscribe options (one per topic)
-    /// `props` MQTT v5 properties
+    /// * `topics` The collection of topic names
+    /// * `qos` The quality of service requested for messages
+    /// * `opts` Subscribe options (one per topic)
+    /// * `props` MQTT v5 properties
     ///
     pub fn subscribe_many_with_options<T, Q, P>(
         &self,
@@ -1024,8 +1024,8 @@ impl AsyncClient {
     ///
     /// # Arguments
     ///
-    /// `topic` The topic to unsubscribe. It must match a topic from a
-    ///         previous subscribe.
+    /// * `topic` The topic to unsubscribe. It must match a topic from a
+    ///   previous subscribe.
     ///
     pub fn unsubscribe<S>(&self, topic: S) -> Token
     where
@@ -1054,9 +1054,9 @@ impl AsyncClient {
     ///
     /// # Arguments
     ///
-    /// `topic` The topic to unsubscribe. It must match a topic from a
-    ///         previous subscribe.
-    /// `props` MQTT v5 properties for the unsubscribe.
+    /// * `topic` The topic to unsubscribe. It must match a topic from a
+    ///   previous subscribe.
+    /// * `props` MQTT v5 properties for the unsubscribe.
     ///
     pub fn unsubscribe_with_options<S>(&self, topic: S, props: Properties) -> Token
     where
@@ -1090,8 +1090,8 @@ impl AsyncClient {
     ///
     /// # Arguments
     ///
-    /// `topic` The topics to unsubscribe. Each must match a topic from a
-    ///         previous subscribe.
+    /// * `topic` The topics to unsubscribe. Each must match a topic from a
+    ///   previous subscribe.
     ///
     pub fn unsubscribe_many<T>(&self, topics: &[T]) -> Token
     where
@@ -1127,9 +1127,9 @@ impl AsyncClient {
     ///
     /// # Arguments
     ///
-    /// `topic` The topics to unsubscribe. Each must match a topic from a
-    ///         previous subscribe.
-    /// `props` MQTT v5 properties for the unsubscribe.
+    /// * `topic` The topics to unsubscribe. Each must match a topic from a
+    ///   previous subscribe.
+    /// * `props` MQTT v5 properties for the unsubscribe.
     ///
     pub fn unsubscribe_many_with_options<T>(&self, topics: &[T], props: Properties) -> Token
     where

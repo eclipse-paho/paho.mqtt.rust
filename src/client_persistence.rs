@@ -39,26 +39,26 @@ pub const PERSISTENCE_ERROR: c_int = ffi::MQTTCLIENT_PERSISTENCE_ERROR;
 /// Trait to implement custom persistence in the client.
 pub trait ClientPersistence {
     /// Open and initialize the persistent store.
-    /// `client_id` The unique client identifier.
-    /// `server_uri` The address of the server to which the client is
-    ///              connected.
+    /// * `client_id` The unique client identifier.
+    /// * `server_uri` The address of the server to which the client is
+    ///   connected.
     fn open(&mut self, client_id: &str, server_uri: &str) -> Result<()>;
 
     /// Close the persistence store.
     fn close(&mut self) -> Result<()>;
 
     /// Put data into the persistence store.
-    /// `key` The key to the data.
-    /// `buffers` The data to place into the store. Note that these can be
-    ///           concatenated into a single, contiguous unit if helpful.
+    /// * `key` The key to the data.
+    /// * `buffers` The data to place into the store. Note that these can be
+    ///   concatenated into a single, contiguous unit if helpful.
     fn put(&mut self, key: &str, buffers: Vec<&[u8]>) -> Result<()>;
 
     /// Gets data from the persistence store.
-    /// `key` They key for the desired data.
+    /// * `key` They key for the desired data.
     fn get(&mut self, key: &str) -> Result<Vec<u8>>;
 
     /// Removes data for the specified key.
-    /// `key` The key for the data to remove.
+    /// * `key` The key for the data to remove.
     fn remove(&mut self, key: &str) -> Result<()>;
 
     /// Gets the keys that are currently in the persistence store
@@ -68,7 +68,7 @@ pub trait ClientPersistence {
     fn clear(&mut self) -> Result<()>;
 
     /// Determines if the persistence store contains the key.
-    /// `key` The key to look for.
+    /// * `key` The key to look for.
     fn contains_key(&mut self, key: &str) -> bool;
 }
 

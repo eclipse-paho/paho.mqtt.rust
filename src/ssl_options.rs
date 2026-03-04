@@ -4,7 +4,7 @@
 //
 
 /*******************************************************************************
- * Copyright (c) 2017-2022 Frank Pagliughi <fpagliughi@mindspring.com>
+ * Copyright (c) 2017-2026 Frank Pagliughi <fpagliughi@mindspring.com>
  *
  * All rights reserved. This program and the accompanying materials
  * are made available under the terms of the Eclipse Public License v2.0
@@ -234,7 +234,7 @@ impl SslOptionsBuilder {
             trust_store
                 .as_ref()
                 .to_str()
-                .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "Path string error"))?,
+                .ok_or_else(|| io::Error::other("Path string error"))?,
         )?;
         Ok(self)
     }
@@ -251,7 +251,7 @@ impl SslOptionsBuilder {
             key_store
                 .as_ref()
                 .to_str()
-                .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "Path string error"))?,
+                .ok_or_else(|| io::Error::other("Path string error"))?,
         )?;
         Ok(self)
     }
@@ -266,7 +266,7 @@ impl SslOptionsBuilder {
             private_key
                 .as_ref()
                 .to_str()
-                .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "Path string error"))?,
+                .ok_or_else(|| io::Error::other("Path string error"))?,
         )?;
         Ok(self)
     }
@@ -327,7 +327,7 @@ impl SslOptionsBuilder {
             ca_path
                 .as_ref()
                 .to_str()
-                .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "Path string error"))?,
+                .ok_or_else(|| io::Error::other("Path string error"))?,
         )?;
         Ok(self)
     }

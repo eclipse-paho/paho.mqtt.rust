@@ -74,7 +74,7 @@ impl Client {
     ///
     /// ## Arguments
     ///
-    ///  `timeout` The timeout to use for synchronous calls, like
+    /// * `timeout` The timeout to use for synchronous calls, like
     ///     connect(), disconnect(), publish(), etc.
     ///
     pub fn set_timeout(&mut self, timeout: Duration) {
@@ -93,8 +93,8 @@ impl Client {
     ///
     /// ## Arguments
     ///
-    /// `opt_opts` Optional disconnect options. Specifying `None` will use
-    ///            default of immediate (zero timeout) disconnect.
+    /// * `opt_opts` Optional disconnect options. Specifying `None` will use
+    ///   default of immediate (zero timeout) disconnect.
     ///
     pub fn disconnect<T>(&self, opt_opts: T) -> Result<()>
     where
@@ -112,8 +112,8 @@ impl Client {
     ///
     /// # Arguments
     ///
-    /// `timeout` The amount of time to wait for the disconnect. This has
-    ///           a resolution in milliseconds.
+    /// * `timeout` The amount of time to wait for the disconnect. This has
+    ///   a resolution in milliseconds.
     ///
     pub fn disconnect_after(&self, timeout: Duration) -> Result<()> {
         self.cli.disconnect_after(timeout).wait_for(self.timeout)?;
@@ -141,8 +141,8 @@ impl Client {
     ///
     /// # Arguments
     ///
-    /// `topic` The topic name
-    /// `qos` The quality of service requested for messages
+    /// * `topic` The topic name
+    /// * `qos` The quality of service requested for messages
     ///
     pub fn subscribe<Q>(&self, topic: &str, qos: Q) -> Result<ServerResponse>
     where
@@ -155,10 +155,10 @@ impl Client {
     ///
     /// # Arguments
     ///
-    /// `topic` The topic name
-    /// `qos` The quality of service requested for messages
-    /// `opts` Options for the subscription
-    /// `props` MQTT v5 properties
+    /// * `topic` The topic name
+    /// * `qos` The quality of service requested for messages
+    /// * `opts` Options for the subscription
+    /// * `props` MQTT v5 properties
     ///
     pub fn subscribe_with_options<S, Q, T, P>(
         &self,
@@ -182,8 +182,8 @@ impl Client {
     ///
     /// # Arguments
     ///
-    /// `topic` The topic name
-    /// `qos` The quality of service requested for messages
+    /// * `topic` The topic name
+    /// * `qos` The quality of service requested for messages
     ///
     pub fn subscribe_many<T, Q>(&self, topics: &[T], qos: &[Q]) -> Result<ServerResponse>
     where
@@ -198,8 +198,8 @@ impl Client {
     ///
     /// # Arguments
     ///
-    /// `topics` The collection of topic names
-    /// `qos` The quality of service requested for all messages
+    /// * `topics` The collection of topic names
+    /// * `qos` The quality of service requested for all messages
     ///
     pub fn subscribe_many_same_qos<T>(&self, topics: &[T], qos: i32) -> Result<ServerResponse>
     where
@@ -214,10 +214,10 @@ impl Client {
     ///
     /// # Arguments
     ///
-    /// `topics` The collection of topic names
-    /// `qos` The quality of service requested for messages
-    /// `opts` Subscribe options (one per topic)
-    /// `props` MQTT v5 properties
+    /// * `topics` The collection of topic names
+    /// * `qos` The quality of service requested for messages
+    /// * `opts` Subscribe options (one per topic)
+    /// * `props` MQTT v5 properties
     ///
     pub fn subscribe_many_with_options<T, Q, P>(
         &self,
@@ -240,8 +240,8 @@ impl Client {
     ///
     /// # Arguments
     ///
-    /// `topic` The topic to unsubscribe. It must match a topic from a
-    ///         previous subscribe.
+    /// * `topic` The topic to unsubscribe. It must match a topic from a
+    ///   previous subscribe.
     ///
     pub fn unsubscribe(&self, topic: &str) -> Result<()> {
         self.cli.unsubscribe(topic).wait_for(self.timeout)?;
@@ -252,9 +252,9 @@ impl Client {
     ///
     /// # Arguments
     ///
-    /// `topic` The topic to unsubscribe. It must match a topic from a
-    ///         previous subscribe.
-    /// `props` MQTT v5 properties for the unsubscribe.
+    /// * `topic` The topic to unsubscribe. It must match a topic from a
+    ///   previous subscribe.
+    /// * `props` MQTT v5 properties for the unsubscribe.
     ///
     pub fn unsubscribe_with_options<S>(&self, topic: S, props: Properties) -> Result<()>
     where
@@ -270,8 +270,8 @@ impl Client {
     ///
     /// # Arguments
     ///
-    /// `topic` The topics to unsubscribe. Each must match a topic from a
-    ///         previous subscribe.
+    /// * `topic` The topics to unsubscribe. Each must match a topic from a
+    ///   previous subscribe.
     ///
     pub fn unsubscribe_many<T>(&self, topics: &[T]) -> Result<()>
     where
@@ -285,9 +285,9 @@ impl Client {
     ///
     /// # Arguments
     ///
-    /// `topic` The topics to unsubscribe. Each must match a topic from a
-    ///         previous subscribe.
-    /// `props` MQTT v5 properties for the unsubscribe.
+    /// * `topic` The topics to unsubscribe. Each must match a topic from a
+    ///   previous subscribe.
+    /// * `props` MQTT v5 properties for the unsubscribe.
     ///
     pub fn unsubscribe_many_with_options<T>(&self, topics: &[T], props: Properties) -> Result<()>
     where

@@ -61,9 +61,9 @@ impl<'a> Topic<'a> {
     ///
     /// # Arguments
     ///
-    /// `cli` The client used to publish the messages.
-    /// `topic` The topic on which to publish the messages
-    /// `qos` The quality of service for messages
+    /// * `cli` The client used to publish the messages.
+    /// * `topic` The topic on which to publish the messages
+    /// * `qos` The quality of service for messages
     ///
     pub fn new<T, Q>(cli: &'a AsyncClient, topic: T, qos: Q) -> Self
     where
@@ -83,9 +83,9 @@ impl<'a> Topic<'a> {
     ///
     /// # Arguments
     ///
-    /// `cli` The client used to publish the messages.
-    /// `topic` The topic on which to publish the messages
-    /// `qos` The quality of service for messages
+    /// * `cli` The client used to publish the messages.
+    /// * `topic` The topic on which to publish the messages
+    /// * `qos` The quality of service for messages
     ///
     pub fn new_retained<T, Q>(cli: &'a AsyncClient, topic: T, qos: Q) -> Self
     where
@@ -162,7 +162,7 @@ impl<'a> Topic<'a> {
     ///
     /// # Arguments
     ///
-    /// `payload` The payload of the message
+    /// * `payload` The payload of the message
     ///
     pub fn publish<V>(&self, payload: V) -> DeliveryToken
     where
@@ -182,7 +182,7 @@ impl<'a> Topic<'a> {
     ///
     /// # Arguments
     ///
-    /// `payload` The payload of the message
+    /// * `payload` The payload of the message
     ///
     /// Returns a Publish Error containing the complete message on failure.
     pub fn try_publish<V>(&self, payload: V) -> Result<DeliveryToken>
@@ -211,12 +211,12 @@ impl<'a> Topic<'a> {
     ///
     /// # Arguments
     ///
-    /// `alias` The integer alias to use for subsequent message publishing.
-    ///     This must be in the range 1 - `TopicAliasMaximum` as reported by
-    ///     the server in the CONNACK package. Using a value of zero
-    ///     instructs this object to stop using the alias and go back to
-    ///     publishing with the string topic name.
-    /// `payload` The payload of the message
+    /// * `alias` The integer alias to use for subsequent message publishing.
+    ///   This must be in the range 1 - `TopicAliasMaximum` as reported by
+    ///   the server in the CONNACK package. Using a value of zero
+    ///   instructs this object to stop using the alias and go back to
+    ///   publishing with the string topic name.
+    /// * `payload` The payload of the message
     ///
     pub fn publish_with_alias<V>(&mut self, alias: u16, payload: V) -> DeliveryToken
     where
@@ -282,9 +282,9 @@ impl<'a> SyncTopic<'a> {
     ///
     /// # Arguments
     ///
-    /// `cli` The client used to publish the messages.
-    /// `topic` The topic on which to publish the messages
-    /// `qos` The quality of service for messages
+    /// * `cli` The client used to publish the messages.
+    /// * `topic` The topic on which to publish the messages
+    /// * `qos` The quality of service for messages
     ///
     pub fn new<T, Q>(cli: &'a Client, topic: T, qos: Q) -> Self
     where
@@ -301,9 +301,9 @@ impl<'a> SyncTopic<'a> {
     ///
     /// # Arguments
     ///
-    /// `cli` The client used to publish the messages.
-    /// `topic` The topic on which to publish the messages
-    /// `qos` The quality of service for messages
+    /// * `cli` The client used to publish the messages.
+    /// * `topic` The topic on which to publish the messages
+    /// * `qos` The quality of service for messages
     ///
     pub fn new_retained<T, Q>(cli: &'a Client, topic: T, qos: Q) -> Self
     where
@@ -347,7 +347,7 @@ impl<'a> SyncTopic<'a> {
     ///
     /// # Arguments
     ///
-    /// `payload` The payload of the message
+    /// * `payload` The payload of the message
     ///
     pub fn publish<V>(&self, payload: V) -> Result<()>
     where
@@ -375,12 +375,12 @@ impl<'a> SyncTopic<'a> {
     ///
     /// # Arguments
     ///
-    /// `alias` The integer alias to use for subsequent message publishing.
-    ///     This must be in the range 1 - `TopicAliasMaximum` as reported by
-    ///     the server in the CONNACK package. Using a value of zero
-    ///     instructs this object to stop using the alias and go back to
-    ///     publishing with the string topic name.
-    /// `payload` The payload of the message
+    /// * `alias` The integer alias to use for subsequent message publishing.
+    ///   This must be in the range 1 - `TopicAliasMaximum` as reported by
+    ///   the server in the CONNACK package. Using a value of zero
+    ///   instructs this object to stop using the alias and go back to
+    ///   publishing with the string topic name.
+    /// * `payload` The payload of the message
     ///
     pub fn publish_with_alias<V>(&mut self, alias: u16, payload: V) -> Result<()>
     where

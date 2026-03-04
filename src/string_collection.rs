@@ -53,7 +53,7 @@ impl StringCollection {
     ///
     /// # Arguments
     ///
-    /// `coll` A collection of string references.
+    /// * `coll` A collection of string references.
     ///
     pub fn new<T>(coll: &[T]) -> Self
     where

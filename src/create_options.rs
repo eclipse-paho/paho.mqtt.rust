@@ -262,7 +262,7 @@ impl CreateOptionsBuilder {
     ///
     /// # Arguments
     ///
-    /// `server_uri` The URI string to specify the server in the form
+    /// * `server_uri` The URI string to specify the server in the form
     ///              _protocol://host:port_, where the protocol can be
     ///              _tcp_ or _ssl_, and the host can be an IP address
     ///              or domain name.
@@ -289,7 +289,7 @@ impl CreateOptionsBuilder {
     ///
     /// # Arguments
     ///
-    /// `client_id` A UTF-8 string identifying the client to the server.
+    /// * `client_id` A UTF-8 string identifying the client to the server.
     ///
     pub fn client_id<S>(mut self, client_id: S) -> Self
     where
@@ -306,7 +306,7 @@ impl CreateOptionsBuilder {
     ///
     /// # Arguments
     ///
-    /// `persist` The type of persistence to use.
+    /// * `persist` The type of persistence to use.
     ///
     pub fn persistence<P>(mut self, persist: P) -> Self
     where
@@ -323,7 +323,7 @@ impl CreateOptionsBuilder {
     ///
     /// # Arguments
     ///
-    /// `persist` An application-defined custom persistence store.
+    /// * `persist` An application-defined custom persistence store.
     ///
     pub fn user_persistence<T>(mut self, persistence: T) -> Self
     where
@@ -344,8 +344,8 @@ impl CreateOptionsBuilder {
     ///
     /// # Arguments
     ///
-    /// `n` The maximum number of messages that can be buffered. Setting this
-    ///     to zero also disables any off-line buffering.
+    /// * `n` The maximum number of messages that can be buffered. Setting this
+    ///   to zero also disables any off-line buffering.
     ///
     pub fn max_buffered_messages(mut self, n: i32) -> Self {
         // Note that the C lib seems to need at least a single slot
@@ -367,7 +367,7 @@ impl CreateOptionsBuilder {
     ///
     /// # Arguments
     ///
-    /// `on` Whether to allow off-line buffering in the client.
+    /// * `on` Whether to allow off-line buffering in the client.
     ///
     pub fn send_while_disconnected(mut self, on: bool) -> Self {
         self.copts.sendWhileDisconnected = to_c_bool(on);
@@ -378,7 +378,7 @@ impl CreateOptionsBuilder {
     ///
     /// # Arguments
     ///
-    /// `ver` The version of MQTT to use when connecting to the broker.
+    /// * `ver` The version of MQTT to use when connecting to the broker.
     ///       * (0) try the latest version (3.1.1) and work backwards
     ///       * (3) only try v3.1
     ///       * (4) only try v3.1.1

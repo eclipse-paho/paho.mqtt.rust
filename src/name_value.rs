@@ -56,7 +56,7 @@ impl NameValueCollection {
     ///
     /// # Arguments
     ///
-    /// `coll` A collection of string pair references.
+    /// * `coll` A collection of string pair references.
     ///
     pub fn new<N, V>(coll: &[(N, V)]) -> Self
     where

@@ -414,9 +414,9 @@ impl ConnectOptionsBuilder {
     ///
     /// # Arguments
     ///
-    /// `keep_alive_interval` The maximum time that should pass without
-    ///                       communication between the client and server.
-    ///                       This has a resolution in seconds.
+    /// * `keep_alive_interval` The maximum time that should pass without
+    ///   communication between the client and server.
+    ///   This has a resolution in seconds.
     pub fn keep_alive_interval(&mut self, keep_alive_interval: Duration) -> &mut Self {
         let secs = keep_alive_interval.as_secs();
         self.copts.keepAliveInterval = if secs == 0 { 1 } else { secs as i32 };
@@ -430,8 +430,8 @@ impl ConnectOptionsBuilder {
     ///
     /// # Arguments
     ///
-    /// `clean` Whether the broker should remove any previously-stored
-    ///         information for this client.
+    /// * `clean` Whether the broker should remove any previously-stored
+    ///   information for this client.
     pub fn clean_session(&mut self, clean: bool) -> &mut Self {
         self.copts.cleansession = to_c_bool(clean);
 
@@ -450,8 +450,8 @@ impl ConnectOptionsBuilder {
     ///
     /// # Arguments
     ///
-    /// `clean` Whether the broker should remove any previously-stored
-    ///         information for this client.
+    /// * `clean` Whether the broker should remove any previously-stored
+    ///   information for this client.
     pub fn clean_start(&mut self, clean: bool) -> &mut Self {
         self.copts.cleanstart = to_c_bool(clean);
 
@@ -468,8 +468,8 @@ impl ConnectOptionsBuilder {
     ///
     /// # Arguments
     ///
-    /// `max_inflight` The maximum number of messages that can be in-flight
-    ///                at any given time with this client.
+    /// * `max_inflight` The maximum number of messages that can be in-flight
+    ///   at any given time with this client.
     pub fn max_inflight(&mut self, max_inflight: i32) -> &mut Self {
         self.copts.maxInflight = max_inflight;
         self
@@ -479,7 +479,7 @@ impl ConnectOptionsBuilder {
     ///
     /// # Arguments
     ///
-    /// `will` The LWT options for the connection.
+    /// * `will` The LWT options for the connection.
     #[deprecated(note = "Pass in a message with `will_message` instead")]
     pub fn will_options(&mut self, will: WillOptions) -> &mut Self {
         self.data.will = Some(will);
@@ -490,7 +490,7 @@ impl ConnectOptionsBuilder {
     ///
     /// # Arguments
     ///
-    /// `will` The LWT options for the connection.
+    /// * `will` The LWT options for the connection.
     pub fn will_message(&mut self, will: Message) -> &mut Self {
         self.data.will_props = Some(will.properties().clone());
         self.data.will = Some(WillOptions::from(will));
@@ -501,7 +501,7 @@ impl ConnectOptionsBuilder {
     ///
     /// # Arguments
     ///
-    /// `ssl` The SSL options for the connection.
+    /// * `ssl` The SSL options for the connection.
     pub fn ssl_options(&mut self, ssl: SslOptions) -> &mut Self {
         self.data.ssl = Some(ssl);
         self
@@ -512,7 +512,7 @@ impl ConnectOptionsBuilder {
     ///
     /// # Arguments
     ///
-    /// `user_name` The user name to send to the broker.
+    /// * `user_name` The user name to send to the broker.
     ///
     pub fn user_name<S>(&mut self, user_name: S) -> &mut Self
     where
@@ -528,7 +528,7 @@ impl ConnectOptionsBuilder {
     ///
     /// # Arguments
     ///
-    /// `password` The password to send to the broker.
+    /// * `password` The password to send to the broker.
     ///
     pub fn password<P>(&mut self, password: P) -> &mut Self
     where
@@ -543,8 +543,8 @@ impl ConnectOptionsBuilder {
     ///
     /// # Arguments
     ///
-    /// `timeout` The time interval to allow the connect to
-    ///           complete. This has a resolution of seconds.
+    /// * `timeout` The time interval to allow the connect to
+    ///   complete. This has a resolution of seconds.
     ///
     pub fn connect_timeout(&mut self, timeout: Duration) -> &mut Self {
         let secs = timeout.as_secs();
@@ -556,7 +556,7 @@ impl ConnectOptionsBuilder {
     ///
     /// # Arguments
     ///
-    /// `interval` The retry interval. This has a resolution of seconds.
+    /// * `interval` The retry interval. This has a resolution of seconds.
     pub fn retry_interval(&mut self, interval: Duration) -> &mut Self {
         let secs = interval.as_secs();
         self.copts.retryInterval = if secs == 0 { 1 } else { secs as i32 };
@@ -567,8 +567,8 @@ impl ConnectOptionsBuilder {
     ///
     /// # Arguments
     ///
-    /// `server_uris` The addresses of the brokers to which this client
-    ///               should connect.
+    /// * `server_uris` The addresses of the brokers to which this client
+    ///   should connect.
     //
     pub fn server_uris<T>(&mut self, server_uris: &[T]) -> &mut Self
     where
@@ -582,11 +582,10 @@ impl ConnectOptionsBuilder {
     ///
     /// # Arguments
     ///
-    /// `min_retry_interval` The minimum retry interval. Doubled on each
-    ///                      failed retry. This has a resolution in seconds.
-    /// `max_retry_interval` The maximum retry interval. Doubling stops here
-    ///                      on failed retries. This has a resolution in
-    ///                      seconds.
+    /// * `min_retry_interval` The minimum retry interval. Doubled on each
+    ///   failed retry. This has a resolution in seconds.
+    /// * `max_retry_interval` The maximum retry interval. Doubling stops here
+    ///   on failed retries. This has a resolution in seconds.
     pub fn automatic_reconnect(
         &mut self,
         min_retry_interval: Duration,
@@ -606,7 +605,7 @@ impl ConnectOptionsBuilder {
     ///
     /// # Arguments
     ///
-    /// `props` The collection of properties to include with the connect message.
+    /// * `props` The collection of properties to include with the connect message.
     pub fn properties(&mut self, props: Properties) -> &mut Self {
         self.data.props = Some(props);
 
@@ -632,7 +631,7 @@ impl ConnectOptionsBuilder {
     ///
     /// # Arguments
     ///
-    /// `proxy` The HTTP proxy
+    /// * `proxy` The HTTP proxy
     ///
     pub fn http_proxy<S>(&mut self, proxy: S) -> &mut Self
     where
@@ -647,7 +646,7 @@ impl ConnectOptionsBuilder {
     ///
     /// # Arguments
     ///
-    /// `proxy` The HTTPS proxy
+    /// * `proxy` The HTTPS proxy
     ///
     pub fn https_proxy<S>(&mut self, proxy: S) -> &mut Self
     where
