@@ -293,7 +293,26 @@ impl TokenInner {
 
         if let Some(rsp) = rsp.as_ref() {
             msgid = rsp.token as u16;
-            rc = if rsp.code == 0 { -1 } else { rsp.code as i32 };
+            rc = if rsp.reasonCode > 0 {
+                debug!(
+                    "Token w ID {} failed with reason code: {}",
+                    msgid, rsp.reasonCode
+                );
+                rsp.reasonCode as i32
+            }
+            // it is unclear if the C library will ever return a success code here, but if it does,
+            // we should treat it as a failure with no reason code.
+            else if rsp.code == ffi::MQTTASYNC_SUCCESS as i32 {
+                debug!(
+                    "Token w ID {} failed with no reason code, but success return code: {}",
+                    msgid, rsp.code
+                );
+                ffi::MQTTASYNC_FAILURE
+            }
+            else {
+                debug!("Token w ID {} failed with return code: {}", msgid, rsp.code);
+                rsp.code as i32
+            };
 
             if !rsp.message.is_null() {
                 if let Ok(cmsg) = CStr::from_ptr(rsp.message).to_str() {
@@ -302,8 +321,6 @@ impl TokenInner {
                 }
             }
         }
-
-        debug!("Token w ID {} failed with code: {}", msgid, rc);
 
         // Fire off any user callbacks
 
@@ -320,17 +337,7 @@ impl TokenInner {
         // Signal completion of the token
 
         let mut data = tok.inner.lock.lock().unwrap();
-        data.res = Some(if rc == 0 {
-            if let Some(rsp) = rsp.as_ref() {
-                Ok(ServerResponse::from_failure5(rsp))
-            }
-            else {
-                Ok(ServerResponse::default())
-            }
-        }
-        else {
-            Err(Error::from((rc, err_msg)))
-        });
+        data.res = Some(Err(Error::from((rc, err_msg))));
 
         // If this is none, it means that no one is waiting on
         // the future yet, so we don't need to wake it.
