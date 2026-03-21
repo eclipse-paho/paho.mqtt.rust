@@ -79,6 +79,7 @@ impl TryFrom<u8> for ConnectReturnCode {
             3 => Ok(ServerUnavailable),
             4 => Ok(BadUserNameOrPassword),
             5 => Ok(NotAuthorized),
+            c if c >= 128 => Err(Error::ReasonCode(ReasonCode::from(c as u32))),
             _ => Err(Error::Failure),
         }
     }
@@ -236,6 +237,9 @@ impl From<i32> for Error {
             ffi::MQTTASYNC_0_LEN_WILL_TOPIC => ZeroLenWillTopic,
             ffi::MQTTASYNC_COMMAND_IGNORED => CommandIgnored,
             ffi::MQTTASYNC_MAX_BUFFERED => MaxBufferedZero,
+            code if code >= crate::reason_code::ReasonCode::UnspecifiedError as i32 => {
+                Error::ReasonCode(crate::reason_code::ReasonCode::from(code as u32))
+            }
             _ => Failure,
         }
     }
@@ -262,6 +266,11 @@ impl From<(i32, &str)> for Error {
                 Err(err) => err,
             },
             (rc, "socket error") => SocketError(rc),
+            (reason_code, _)
+                if reason_code >= crate::reason_code::ReasonCode::UnspecifiedError as i32 =>
+            {
+                Error::ReasonCode(crate::reason_code::ReasonCode::from(reason_code as u32))
+            }
             _ => Failure,
         }
     }
@@ -301,7 +310,7 @@ impl From<Error> for io::Error {
         match err {
             Error::Io(e) => e,
             Error::Timeout => io::Error::new(io::ErrorKind::TimedOut, err),
-            _ => io::Error::other(err),
+            _ => io::Error::new(io::ErrorKind::Other, err),
         }
     }
 }
@@ -352,15 +361,23 @@ where
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_error_from_rc() {
-        let err = Error::from(ffi::MQTTASYNC_BAD_QOS);
-        assert!(matches!(err, Error::BadQos));
+    #[test_case::test_case(ffi::MQTTASYNC_FAILURE => matches Error::Failure)]
+    #[test_case::test_case(ffi::MQTTASYNC_BAD_QOS => matches Error::BadQos)]
+    #[test_case::test_case(127 => matches Error::Failure)]
+    #[test_case::test_case(128 => matches Error::ReasonCode(ReasonCode::UnspecifiedError))]
+    #[test_case::test_case(135 => matches Error::ReasonCode(ReasonCode::NotAuthorized))]
+    fn test_error_from_rc(code: i32) -> Error {
+        Error::from(code)
     }
 
-    #[test]
-    fn test_error_from_msg() {
-        let err = Error::from((ffi::MQTTASYNC_FAILURE, "TCP connect timeout"));
-        assert!(matches!(err, Error::TcpConnectTimeout));
+    #[test_case::test_case(ffi::MQTTASYNC_FAILURE, "unspecified error" => matches Error::Failure)]
+    #[test_case::test_case(ffi::MQTTASYNC_FAILURE, "TCP connect timeout" => matches Error::TcpConnectTimeout)]
+    #[test_case::test_case(-34, "socket error" => matches Error::SocketError(-34))]
+    #[test_case::test_case(127, "socket error" => matches Error::SocketError(127))]
+    #[test_case::test_case(127, "any text" => matches Error::Failure)]
+    #[test_case::test_case(128, "ignored message" => matches Error::ReasonCode(ReasonCode::UnspecifiedError))]
+    #[test_case::test_case(135, "ignored message" => matches Error::ReasonCode(ReasonCode::NotAuthorized))]
+    fn test_error_from_rc_and_msg(code: i32, msg: &str) -> Error {
+        Error::from((code, msg))
     }
 }
