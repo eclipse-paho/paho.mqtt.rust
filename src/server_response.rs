@@ -229,23 +229,6 @@ impl ServerResponse {
         }
     }
 
-    /// Creates the response object from the v5 "failure" data structure
-    /// sent by the C lib on completion of the operation.
-    ///
-    /// # Safety
-    ///
-    /// This function runs in the context of a C callback indicating a
-    /// failed v5 action. It directly accesses the pointers and unions
-    /// in the C `MQTTAsync_failureData5` struct.
-    ///
-    pub unsafe fn from_failure5(rsp: &ffi::MQTTAsync_failureData5) -> Self {
-        Self {
-            rsp: RequestResponse::default(),
-            props: Properties::from_c_struct(&rsp.properties),
-            reason_code: rsp.reasonCode.into(),
-        }
-    }
-
     /// Gets the response for the specific type of request.
     pub fn request_response(&self) -> &RequestResponse {
         &self.rsp

@@ -938,7 +938,7 @@ impl Properties {
     /// Gets the number of bytes required for the serialized list on
     /// the wire.
     pub fn byte_len(&self) -> usize {
-        let p = &self.cprops as *const _ as *mut ffi::MQTTProperties;
+        let p = &self.cprops as *const ffi::MQTTProperties;
         unsafe { ffi::MQTTProperties_len(p) as usize }
     }
 
@@ -1011,7 +1011,7 @@ impl Properties {
 
     /// Gets a property instance when there are possibly multiple values.
     pub fn get_at(&self, code: PropertyCode, idx: usize) -> Option<Property> {
-        let ps = &self.cprops as *const _ as *mut ffi::MQTTProperties;
+        let ps = &self.cprops as *const ffi::MQTTProperties;
         unsafe {
             let p = ffi::MQTTProperties_getPropertyAt(ps, code as Code, idx as c_int);
             if !p.is_null() {
@@ -1113,6 +1113,7 @@ impl Properties {
 }
 
 unsafe impl Send for Properties {}
+unsafe impl Sync for Properties {}
 
 impl Clone for Properties {
     /// Creates a clone of the property.

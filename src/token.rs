@@ -4,7 +4,7 @@
 //
 
 /*******************************************************************************
- * Copyright (c) 2018-2023 Frank Pagliughi <fpagliughi@mindspring.com>
+ * Copyright (c) 2018-2026 Frank Pagliughi <fpagliughi@mindspring.com>
  *
  * All rights reserved. This program and the accompanying materials
  * are made available under the terms of the Eclipse Public License v2.0
@@ -36,6 +36,7 @@ use {
         async_client::AsyncClient,
         ffi,
         message::Message,
+        properties::Properties,
         server_response::{ServerRequest, ServerResponse},
         Error, Result,
     },
@@ -203,11 +204,12 @@ impl TokenInner {
         context: *mut c_void,
         rsp: *mut ffi::MQTTAsync_successData,
     ) {
-        debug!("Token success! Token: {:?}, Response: {:?}", context, rsp);
         if context.is_null() {
+            warn!("Received a token v3 success callback with no context");
             return;
         }
 
+        debug!("Token success! Token: {:?}, Response: {:?}", context, rsp);
         let tok = Token::from_raw(context);
 
         // TODO: Maybe compare this msgid to the one in the token?
@@ -223,11 +225,12 @@ impl TokenInner {
         context: *mut c_void,
         rsp: *mut ffi::MQTTAsync_failureData,
     ) {
-        debug!("Token failure! Token: {:?}, Response: {:?}", context, rsp);
         if context.is_null() {
+            warn!("Received a token v3 failure callback with no context");
             return;
         }
 
+        debug!("Token failure! Token: {:?}, Response: {:?}", context, rsp);
         let tok = Token::from_raw(context);
 
         let mut msgid = 0;
@@ -254,22 +257,36 @@ impl TokenInner {
         context: *mut c_void,
         rsp: *mut ffi::MQTTAsync_successData5,
     ) {
+        if context.is_null() {
+            warn!("Received a token v5 success callback with no context");
+            return;
+        }
+
         debug!(
             "Token v5 success! Token: {:?}, Response: {:?}",
             context, rsp
         );
-        if context.is_null() {
-            return;
-        }
-
         let tok = Token::from_raw(context);
 
         // TODO: Maybe compare this msgid to the one in the token?
-        let msgid = match rsp.is_null() {
-            false => 0,
-            true => (*rsp).token as u16,
-        };
-        tok.inner.on_complete5(msgid, 0, None, rsp);
+        let msgid = rsp.as_ref().map(|rsp| rsp.token as u16).unwrap_or(0);
+
+        // Get the response from the server, if any.
+        debug!("Expecting server response for: {:?}", tok.inner.req);
+
+        let rsp = rsp
+            .as_ref()
+            .map(|rsp| ServerResponse::from_success5(tok.inner.req, rsp))
+            .unwrap_or_default();
+        debug!("Got response: {rsp:?}");
+
+        if let Some(rsp) = rsp.connect_response() {
+            if let Some(cli) = tok.inner.cli.as_ref() {
+                cli.set_mqtt_version(rsp.mqtt_version);
+            }
+        }
+
+        tok.inner.on_complete5(msgid, 0, Ok(rsp));
     }
 
     // Callback from the C library when an MQTT v5 async operation fails.
@@ -277,36 +294,35 @@ impl TokenInner {
         context: *mut c_void,
         rsp: *mut ffi::MQTTAsync_failureData5,
     ) {
+        if context.is_null() {
+            warn!("Received a token v5 failure callback with no context");
+            return;
+        }
+
         debug!(
             "Token v5 failure! Token: {:?}, Response: {:?}",
             context, rsp
         );
-        if context.is_null() {
-            return;
-        }
-
         let tok = Token::from_raw(context);
 
         let mut msgid = 0;
         let mut rc = -1;
         let mut err_msg = None;
+        let mut props = Properties::default();
 
         if let Some(rsp) = rsp.as_ref() {
             msgid = rsp.token as u16;
-            rc = if rsp.reasonCode > 0 {
+            rc = if rsp.reasonCode >= 0x80 {
                 debug!(
                     "Token w ID {} failed with reason code: {}",
                     msgid, rsp.reasonCode
                 );
+                props = Properties::from_c_struct(&rsp.properties);
                 rsp.reasonCode as i32
             }
-            // it is unclear if the C library will ever return a success code here, but if it does,
-            // we should treat it as a failure with no reason code.
-            else if rsp.code == ffi::MQTTASYNC_SUCCESS as i32 {
-                debug!(
-                    "Token w ID {} failed with no reason code, but success return code: {}",
-                    msgid, rsp.code
-                );
+            else if rsp.code == 0 {
+                // This shouldn't happen, but if so, treat as a general failure
+                warn!("Token w ID {} failed with no reported error", msgid);
                 ffi::MQTTASYNC_FAILURE
             }
             else {
@@ -322,32 +338,19 @@ impl TokenInner {
             }
         }
 
-        // Fire off any user callbacks
-
-        if let Some(ref cli) = tok.inner.cli {
-            if let Some(ref cb) = tok.inner.on_failure {
-                trace!(
-                    "Invoking Token failure callback for client handle {:?}",
-                    cli.handle()
-                );
-                cb(cli, msgid, rc);
-            }
+        let err = if rc > 0 {
+            debug_assert!(rc >= 0x80);
+            Err(Error::from_reason_code(rc as u8, props))
         }
+        else {
+            Err(Error::from((rc, err_msg)))
+        };
 
-        // Signal completion of the token
-
-        let mut data = tok.inner.lock.lock().unwrap();
-        data.res = Some(Err(Error::from((rc, err_msg))));
-
-        // If this is none, it means that no one is waiting on
-        // the future yet, so we don't need to wake it.
-        if let Some(waker) = data.waker.take() {
-            waker.wake();
-        }
+        tok.inner.on_complete5(msgid, rc, err);
     }
 
     // Callback function to update the token when the action completes.
-    pub(crate) fn on_complete(
+    fn on_complete(
         &self,
         msgid: u16,
         rc: i32,
@@ -380,8 +383,9 @@ impl TokenInner {
         // Signal completion of the token
 
         let mut data = self.lock.lock().unwrap();
-        unsafe {
-            data.res = Some(if rc == 0 {
+
+        let res = unsafe {
+            if rc == 0 {
                 // Get the response from the server, if any.
                 debug!("Expecting server response for: {:?}", self.req);
                 let rsp = if let Some(rsp) = rsp.as_ref() {
@@ -399,10 +403,21 @@ impl TokenInner {
                 }
                 Ok(rsp)
             }
+            else if rc > 0 {
+                if self.req == ServerRequest::Connect {
+                    Err(Error::from_connect_return_code(rc as u8))
+                }
+                else {
+                    warn!("Unknown positive return code for {:?}: {}", self.req, rc);
+                    Err(Error::from(-1))
+                }
+            }
             else {
                 Err(Error::from((rc, err_msg)))
-            });
-        }
+            }
+        };
+
+        data.res = Some(res);
 
         // If this is none, it means that no one is waiting on
         // the future yet, so we don't need to wake it.
@@ -412,14 +427,8 @@ impl TokenInner {
     }
 
     // Callback function to update the token when the action completes.
-    pub(crate) fn on_complete5(
-        &self,
-        msgid: u16,
-        rc: i32,
-        err_msg: Option<String>,
-        rsp: *mut ffi::MQTTAsync_successData5,
-    ) {
-        debug!("Token completed with code: {}", rc);
+    fn on_complete5(&self, msgid: u16, rc: i32, res: Result<ServerResponse>) {
+        debug!("Completing v5 Token w ID {} and code: {}", msgid, rc);
 
         // Fire off any user callbacks
 
@@ -445,29 +454,7 @@ impl TokenInner {
         // Signal completion of the token
 
         let mut data = self.lock.lock().unwrap();
-        unsafe {
-            data.res = Some(if rc == 0 {
-                // Get the response from the server, if any.
-                debug!("Expecting server response for: {:?}", self.req);
-                let rsp = if let Some(rsp) = rsp.as_ref() {
-                    ServerResponse::from_success5(self.req, rsp)
-                }
-                else {
-                    ServerResponse::default()
-                };
-                debug!("Got response: {:?}", rsp);
-
-                if let Some(rsp) = rsp.connect_response() {
-                    if let Some(cli) = &self.cli {
-                        cli.set_mqtt_version(rsp.mqtt_version);
-                    }
-                }
-                Ok(rsp)
-            }
-            else {
-                Err(Error::from((rc, err_msg)))
-            });
-        }
+        data.res = Some(res);
 
         // If this is none, it means that no one is waiting on
         // the future yet, so we don't need to wake it.
@@ -549,13 +536,6 @@ impl Token {
     pub fn from_error(rc: i32) -> Self {
         Self {
             inner: TokenInner::from_error(rc),
-        }
-    }
-
-    /// Creates a new Token signaled with a "success" return code.
-    pub fn from_success() -> Self {
-        Self {
-            inner: TokenInner::from_error(ffi::MQTTASYNC_SUCCESS as i32),
         }
     }
 
@@ -758,6 +738,7 @@ impl Future for DeliveryToken {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{ConnectReturnCode, ReasonCode};
     use std::thread;
 
     #[test]
@@ -824,6 +805,104 @@ mod tests {
 
         tok2.inner.on_complete(0, 0, None, ptr::null_mut());
         let _ = thr.join().unwrap();
+    }
+
+    // A v3 connect token signaled with a positive rc should return
+    // Error::ConnectReturn.
+    #[test]
+    fn test_v3_connect_error() {
+        use ConnectReturnCode::*;
+
+        // Unacceptable Protocol Version (1)
+        let tok = Token::from_request(None, ServerRequest::Connect);
+        tok.inner.on_complete(0, 1, None, ptr::null_mut());
+        let res = tok.wait();
+        assert!(matches!(
+            res,
+            Err(Error::ConnectReturn(UnacceptableProtocolVersion))
+        ));
+
+        // Server Unavailable (3)
+        let tok = Token::from_request(None, ServerRequest::Connect);
+        tok.inner.on_complete(0, 3, None, ptr::null_mut());
+        let res = tok.wait();
+        assert!(matches!(res, Err(Error::ConnectReturn(ServerUnavailable))));
+    }
+
+    // A v5 operation that succeeds should resolve to Ok.
+    #[test]
+    fn test_on_success5() {
+        let tok = Token::from_request(None, ServerRequest::Subscribe);
+        let tok_wait = tok.clone();
+        let ctx = tok.into_raw();
+
+        let mut rsp = unsafe { std::mem::zeroed::<ffi::MQTTAsync_successData5>() };
+        rsp.token = 1;
+
+        unsafe { TokenInner::on_success5(ctx, &mut rsp) };
+
+        let res = tok_wait.wait();
+        assert!(res.is_ok());
+    }
+
+    // A v5 failure with a negative Paho C return code should map to the
+    // corresponding Error variant.
+    #[test]
+    fn test_on_failure5_c_error() {
+        let tok = Token::from_request(None, ServerRequest::Subscribe);
+        let tok_wait = tok.clone();
+        let ctx = tok.into_raw();
+
+        // reasonCode is 0 (< 0x80), so the C library code field drives the error.
+        let mut rsp = unsafe { std::mem::zeroed::<ffi::MQTTAsync_failureData5>() };
+        rsp.token = 2;
+        rsp.code = ffi::MQTTASYNC_DISCONNECTED;
+
+        unsafe { TokenInner::on_failure5(ctx, &mut rsp) };
+
+        let res = tok_wait.wait();
+        assert!(matches!(res, Err(Error::Disconnected)));
+    }
+
+    #[test]
+    fn test_on_failure5_reason_code() {
+        // A v5 failure with reason code 0x80 (UnspecifiedError) should
+        // map to Error::ReasonCode(ReasonCode::UnspecifiedError).
+
+        let tok = Token::from_request(None, ServerRequest::Subscribe);
+        let tok_wait = tok.clone();
+        let ctx = tok.into_raw();
+
+        let mut rsp = unsafe { std::mem::zeroed::<ffi::MQTTAsync_failureData5>() };
+        rsp.token = 3;
+        rsp.reasonCode = ffi::MQTTReasonCodes_MQTTREASONCODE_UNSPECIFIED_ERROR;
+
+        unsafe { TokenInner::on_failure5(ctx, &mut rsp) };
+
+        let res = tok_wait.wait();
+        assert!(matches!(
+            res,
+            Err(Error::ReasonCode(ReasonCode::UnspecifiedError, _))
+        ));
+
+        // A v5 failure with reason code 0x87 (NotAuthorized) should map to
+        // Error::ReasonCode(ReasonCode::NotAuthorized).
+
+        let tok = Token::from_request(None, ServerRequest::Subscribe);
+        let tok_wait = tok.clone();
+        let ctx = tok.into_raw();
+
+        let mut rsp = unsafe { std::mem::zeroed::<ffi::MQTTAsync_failureData5>() };
+        rsp.token = 4;
+        rsp.reasonCode = ffi::MQTTReasonCodes_MQTTREASONCODE_NOT_AUTHORIZED;
+
+        unsafe { TokenInner::on_failure5(ctx, &mut rsp) };
+
+        let res = tok_wait.wait();
+        assert!(matches!(
+            res,
+            Err(Error::ReasonCode(ReasonCode::NotAuthorized, _))
+        ));
     }
 
     #[test]

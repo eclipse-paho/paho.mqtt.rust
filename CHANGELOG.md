@@ -18,8 +18,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 - `PropertyType` enum now supports `Ord`, `PartialOrd`, and `Hash` traits
 - Added a _tokio_ build feature for cargo, and a few tokio example apps.
   Enabing the feature simply builds the _tokio_ examples. (The library is still fully runtime agnostic).
+- Removed _async-std_ from examples. Using _smol_ instead.
+- Properties::byte_len and Properties::get_at no longer cast *const MQTTProperties to *mut before calling C functions that are correctly declared const in the bindings.
+- [#244](https://github.com/eclipse-paho/paho.mqtt.rust/issues/244) Error handling for MQTT5 seems inconsistent
+    - [#264](https://github.com/eclipse-paho/paho.mqtt.rust/pull/264) Fix async MQTT5 error handling
+    - Proper handling of v5 failures w/ Reason Codes
+    - **[Breaking]** Reason Code Error variant now contains Properties from ACK packet
+    - **[Breaking]** ACKs with a single reason code error generate an Error result, instead of an Ok() with a possible error code in it.
+        - Subscribe Many & Unsubscribe Many still return Ok, possibly with a combination of success and error reason codes
 - Bumped MSRV to Rust v1.75
 - Bumped paho-mqtt-sys to v0.11
+- Various new clippy warnings fixed
+- [#257](https://github.com/eclipse-paho/paho.mqtt.rust/pull/257) initialize mqtt version from create options instead of assuming
+- [#261](https://github.com/eclipse-paho/paho.mqtt.rust/pull/261) Remove undefined property from Cargo.toml
+-
 
 
 ## [v0.13.4](https://github.com/eclipse/paho.mqtt.rust/compare/v0.13.3..v0.13.4) - (2025-09-02)

@@ -25,55 +25,124 @@ use std::{ffi::CStr, fmt};
 
 /// MQTT v5 single-byte reason codes.
 #[repr(u8)]
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-#[allow(missing_docs)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ReasonCode {
+    /// The operation completed successfully.
+    /// Also used as `NormalDisconnection` and `GrantedQos0`.
     #[default]
-    Success = 0, // also: NormalDisconnection & GrantedQos0
-    GrantedQos1 = 1,
-    GrantedQos2 = 2,
-    DisconnectWithWillMessage = 4,
-    NoMatchingSubscribers = 16,
-    NoSubscriptionFound = 17,
-    ContinueAuthentication = 24,
-    ReAuthenticate = 25,
+    Success = 0x00,
+    /// The subscription was accepted and the maximum QoS sent will be 1.
+    GrantedQos1 = 0x01,
+    /// The subscription was accepted and the maximum QoS sent will be 2.
+    GrantedQos2 = 0x02,
+    /// The client wishes to disconnect but requires that the server also
+    /// publishes its Will message.
+    DisconnectWithWillMessage = 0x04,
+    /// The message was accepted but there are no subscribers.
+    /// Only sent by the broker if the broker was configured to send
+    /// this when there are no matching subscribers.
+    NoMatchingSubscribers = 0x10,
+    /// No matching topic filter is being used by the client.
+    /// Only sent by the broker in response to an UNSUBSCRIBE packet.
+    NoSubscriptionFound = 0x11,
+    /// Continue the authentication with another step.
+    ContinueAuthentication = 0x18,
+    /// Initiate re-authentication.
+    ReAuthenticate = 0x19,
 
-    UnspecifiedError = 128,
-    MalformedPacket = 129,
-    ProtocolError = 130,
-    ImplementationSpecificError = 131,
-    UnsupportedProtocolVersion = 132,
-    ClientIdentifierNotValid = 133,
-    BadUserNameOrPassword = 134,
-    NotAuthorized = 135,
-    ServerUnavailable = 136,
-    ServerBusy = 137,
-    Banned = 138,
-    ServerShuttingDown = 139,
-    BadAuthenticationMethod = 140,
-    KeepAliveTimeout = 141,
-    SessionTakenOver = 142,
-    TopicFilterInvalid = 143,
-    TopicNameInvalid = 144,
-    PacketIdentifierInUse = 145,
-    PacketIdentifierNotFound = 146,
-    ReceiveMaximumExceeded = 147,
-    TopicAliasInvalid = 148,
-    PacketTooLarge = 149,
-    MessageRateTooHigh = 150,
-    QuotaExceeded = 151,
-    AdministrativeAction = 152,
-    PayloadFormatInvalid = 153,
-    RetainNotSupported = 154,
-    QosNotSupported = 155,
-    UseAnotherServer = 156,
-    ServerMoved = 157,
-    SharedSubscriptionsNotSupported = 158,
-    ConnectionRateExceeded = 159,
-    MaximumConnectTime = 160,
-    SubscriptionIdentifiersNotSupported = 161,
-    WildcardSubscriptionsNotSupported = 162,
-    MqttppV3Code = 255, // This is not a protocol code; used internally by the library
+    /// The server does not wish to reveal the reason for the failure,
+    /// or none of the other reason codes apply.
+    UnspecifiedError = 0x80,
+    /// Data within the packet could not be correctly parsed.
+    MalformedPacket = 0x81,
+    /// Data in the packet does not conform to the MQTT specification.
+    ProtocolError = 0x82,
+    /// An operation is not accepted and the server is not willing to
+    /// reveal the reason.
+    ImplementationSpecificError = 0x83,
+    /// The server does not support the version of the MQTT protocol
+    /// requested by the client.
+    UnsupportedProtocolVersion = 0x84,
+    /// The client identifier is a valid string but is not allowed by the
+    /// server.
+    ClientIdentifierNotValid = 0x85,
+    /// The server does not accept the user name or password specified
+    /// by the client.
+    BadUserNameOrPassword = 0x86,
+    /// The request is not authorized.
+    NotAuthorized = 0x87,
+    /// The MQTT server is not available.
+    ServerUnavailable = 0x88,
+    /// The server is busy. Try again later.
+    ServerBusy = 0x89,
+    /// This client has been banned by administrative action. Contact the
+    /// server operator.
+    Banned = 0x8A,
+    /// The server is shutting down.
+    ServerShuttingDown = 0x8B,
+    /// The authentication method is not supported or does not match the
+    /// authentication method currently in use.
+    BadAuthenticationMethod = 0x8C,
+    /// The connection is closed because no packet has been received for
+    /// 1.5x the keep-alive time.
+    KeepAliveTimeout = 0x8D,
+    /// Another connection using the same client ID has connected, causing
+    /// this connection to be closed.
+    SessionTakenOver = 0x8E,
+    /// The topic filter format is not allowed by the server.
+    TopicFilterInvalid = 0x8F,
+    /// The topic name is not accepted by the client or server.
+    TopicNameInvalid = 0x90,
+    /// The packet identifier is already in use. This might indicate a
+    /// mismatch in the session state between the client and server.
+    PacketIdentifierInUse = 0x91,
+    /// The packet identifier is not known. This is not an error during
+    /// recovery; it is a sign of mismatch between the session state on
+    /// the client and server.
+    PacketIdentifierNotFound = 0x92,
+    /// The client or server has received more than the receive maximum
+    /// it sent in the CONNECT or CONNACK packet.
+    ReceiveMaximumExceeded = 0x93,
+    /// The topic alias was greater than the maximum topic alias sent in
+    /// the CONNECT or CONNACK packet.
+    TopicAliasInvalid = 0x94,
+    /// The packet size is greater than the maximum packet size for this
+    /// client or server.
+    PacketTooLarge = 0x95,
+    /// The received data rate is too high.
+    MessageRateTooHigh = 0x96,
+    /// An implementation or administrative imposed limit has been exceeded.
+    QuotaExceeded = 0x97,
+    /// The connection is closed due to an administrative action.
+    AdministrativeAction = 0x98,
+    /// The payload format does not match the one specified in the
+    /// payload format indicator.
+    PayloadFormatInvalid = 0x99,
+    /// The server does not support retained messages.
+    RetainNotSupported = 0x9A,
+    /// The client specified a QoS greater than the QoS specified in a
+    /// maximum QoS in the CONNACK.
+    QosNotSupported = 0x9B,
+    /// The client should temporarily use another server.
+    UseAnotherServer = 0x9C,
+    /// The client should permanently use another server.
+    ServerMoved = 0x9D,
+    /// The server does not support shared subscriptions.
+    SharedSubscriptionsNotSupported = 0x9E,
+    /// The connection rate limit has been exceeded.
+    ConnectionRateExceeded = 0x9F,
+    /// The maximum connection time authorized for this connection has
+    /// been exceeded.
+    MaximumConnectTime = 0xA0,
+    /// The server does not support subscription identifiers.
+    /// The subscription is not accepted.
+    SubscriptionIdentifiersNotSupported = 0xA1,
+    /// The server does not support wildcard subscriptions; the subscription
+    /// is not accepted.
+    WildcardSubscriptionsNotSupported = 0xA2,
+    /// Not a protocol-defined reason code. Used internally by the Paho C
+    /// library for MQTT v3 error codes.
+    MqttppV3Code = 0xFF,
 }
 
 // Some aliased ReasonCode values
@@ -103,50 +172,50 @@ impl From<ffi::MQTTReasonCodes> for ReasonCode {
     fn from(code: ffi::MQTTReasonCodes) -> Self {
         use ReasonCode::*;
         match code {
-            0 => Success, // also: NormalDisconnection & GrantedQos0
-            1 => GrantedQos1,
-            2 => GrantedQos2,
-            4 => DisconnectWithWillMessage,
-            16 => NoMatchingSubscribers,
-            17 => NoSubscriptionFound,
-            24 => ContinueAuthentication,
-            25 => ReAuthenticate,
+            0x00 => Success, // also: NormalDisconnection & GrantedQos0
+            0x01 => GrantedQos1,
+            0x02 => GrantedQos2,
+            0x04 => DisconnectWithWillMessage,
+            0x10 => NoMatchingSubscribers,
+            0x11 => NoSubscriptionFound,
+            0x18 => ContinueAuthentication,
+            0x19 => ReAuthenticate,
 
-            128 => UnspecifiedError,
-            129 => MalformedPacket,
-            130 => ProtocolError,
-            131 => ImplementationSpecificError,
-            132 => UnsupportedProtocolVersion,
-            133 => ClientIdentifierNotValid,
-            134 => BadUserNameOrPassword,
-            135 => NotAuthorized,
-            136 => ServerUnavailable,
-            137 => ServerBusy,
-            138 => Banned,
-            139 => ServerShuttingDown,
-            140 => BadAuthenticationMethod,
-            141 => KeepAliveTimeout,
-            142 => SessionTakenOver,
-            143 => TopicFilterInvalid,
-            144 => TopicNameInvalid,
-            145 => PacketIdentifierInUse,
-            146 => PacketIdentifierNotFound,
-            147 => ReceiveMaximumExceeded,
-            148 => TopicAliasInvalid,
-            149 => PacketTooLarge,
-            150 => MessageRateTooHigh,
-            151 => QuotaExceeded,
-            152 => AdministrativeAction,
-            153 => PayloadFormatInvalid,
-            154 => RetainNotSupported,
-            155 => QosNotSupported,
-            156 => UseAnotherServer,
-            157 => ServerMoved,
-            158 => SharedSubscriptionsNotSupported,
-            159 => ConnectionRateExceeded,
-            160 => MaximumConnectTime,
-            161 => SubscriptionIdentifiersNotSupported,
-            162 => WildcardSubscriptionsNotSupported,
+            0x80 => UnspecifiedError,
+            0x81 => MalformedPacket,
+            0x82 => ProtocolError,
+            0x83 => ImplementationSpecificError,
+            0x84 => UnsupportedProtocolVersion,
+            0x85 => ClientIdentifierNotValid,
+            0x86 => BadUserNameOrPassword,
+            0x87 => NotAuthorized,
+            0x88 => ServerUnavailable,
+            0x89 => ServerBusy,
+            0x8A => Banned,
+            0x8B => ServerShuttingDown,
+            0x8C => BadAuthenticationMethod,
+            0x8D => KeepAliveTimeout,
+            0x8E => SessionTakenOver,
+            0x8F => TopicFilterInvalid,
+            0x90 => TopicNameInvalid,
+            0x91 => PacketIdentifierInUse,
+            0x92 => PacketIdentifierNotFound,
+            0x93 => ReceiveMaximumExceeded,
+            0x94 => TopicAliasInvalid,
+            0x95 => PacketTooLarge,
+            0x96 => MessageRateTooHigh,
+            0x97 => QuotaExceeded,
+            0x98 => AdministrativeAction,
+            0x99 => PayloadFormatInvalid,
+            0x9A => RetainNotSupported,
+            0x9B => QosNotSupported,
+            0x9C => UseAnotherServer,
+            0x9D => ServerMoved,
+            0x9E => SharedSubscriptionsNotSupported,
+            0x9F => ConnectionRateExceeded,
+            0xA0 => MaximumConnectTime,
+            0xA1 => SubscriptionIdentifiersNotSupported,
+            0xA2 => WildcardSubscriptionsNotSupported,
             _ => MqttppV3Code, // This is not a protocol code; used internally by the library
         }
     }

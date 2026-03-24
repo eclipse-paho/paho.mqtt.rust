@@ -6,7 +6,7 @@
 //
 
 /*******************************************************************************
- * Copyright (c) 2017-2023 Frank Pagliughi <fpagliughi@mindspring.com>
+ * Copyright (c) 2017-2026 Frank Pagliughi <fpagliughi@mindspring.com>
  *
  * All rights reserved. This program and the accompanying materials
  * are made available under the terms of the Eclipse Public License v2.0
@@ -21,7 +21,7 @@
  *    Frank Pagliughi - initial implementation and documentation
  *******************************************************************************/
 
-use crate::{ffi, message::Message, reason_code::ReasonCode};
+use crate::{ffi, message::Message, properties::Properties, reason_code::ReasonCode};
 use std::{fmt, io, result, str};
 use thiserror::Error;
 
@@ -79,7 +79,6 @@ impl TryFrom<u8> for ConnectReturnCode {
             3 => Ok(ServerUnavailable),
             4 => Ok(BadUserNameOrPassword),
             5 => Ok(NotAuthorized),
-            c if c >= 128 => Err(Error::ReasonCode(ReasonCode::from(c as u32))),
             _ => Err(Error::Failure),
         }
     }
@@ -159,7 +158,7 @@ pub enum Error {
     #[error("Max buffered is zero")]
     MaxBufferedZero,
 
-    // ----- From Paho string messages -----
+    // ----- From Paho return code w/ string message -----
     /// The TCP connection timed out
     #[error("TCP connect timeout")]
     TcpConnectTimeout,
@@ -183,8 +182,9 @@ pub enum Error {
     #[error("{}", error_message(*.0))]
     Publish(i32, Message),
     /// An MQTT v5 error from a reason code.
+    /// Any reason code >= 0x80 indicates an error.
     #[error("{0}")]
-    ReasonCode(ReasonCode),
+    ReasonCode(ReasonCode, Properties),
     /// A bad topic filter
     #[error("Bad topic filter")]
     BadTopicFilter,
@@ -214,9 +214,13 @@ pub enum Error {
     GeneralString(String),
 }
 
-impl From<i32> for Error {
+impl Error {
     /// Create an error from a Paho C return code.
-    fn from(rc: i32) -> Error {
+    ///
+    /// These should not be confused with Connect Return Codes (v3.x) or
+    /// Reason Codes (v5), although the C lib is sometimes vague about
+    /// which integer value it is returning.
+    pub fn from_return_code(rc: i32) -> Self {
         use Error::*;
         match rc {
             ffi::MQTTASYNC_PERSISTENCE_ERROR => PersistenceError,
@@ -237,20 +241,38 @@ impl From<i32> for Error {
             ffi::MQTTASYNC_0_LEN_WILL_TOPIC => ZeroLenWillTopic,
             ffi::MQTTASYNC_COMMAND_IGNORED => CommandIgnored,
             ffi::MQTTASYNC_MAX_BUFFERED => MaxBufferedZero,
-            code if code >= crate::reason_code::ReasonCode::UnspecifiedError as i32 => {
-                Error::ReasonCode(crate::reason_code::ReasonCode::from(code as u32))
-            }
             _ => Failure,
         }
     }
+
+    /// Create an error from an MQTT v3 Connect Return Code
+    pub fn from_connect_return_code(code: u8) -> Self {
+        match ConnectReturnCode::try_from(code) {
+            Ok(cr) => Error::ConnectReturn(cr),
+            Err(err) => err,
+        }
+    }
+
+    /// Create an error from an MQTT v5 Reason Code and properties
+    pub fn from_reason_code(code: u8, props: Properties) -> Self {
+        Error::ReasonCode(ReasonCode::from(code as ffi::MQTTReasonCodes), props)
+    }
 }
 
+impl From<i32> for Error {
+    /// Create an error from a Paho C return code.
+    fn from(rc: i32) -> Error {
+        Self::from_return_code(rc)
+    }
+}
 impl From<(i32, &str)> for Error {
-    // The Paho C library passes up error description strings that are
-    // supposed to be for "additional" information, but they actually
-    // describe specific errors that should have actually been enumerated.
-    // This is somewhat of a hack to use the string to enumerate errors.
-    // These strings are
+    /// Convert a Paho C return code w/ reason string to an Error.
+    ///
+    /// The Paho C library passes up error description strings that are
+    /// supposed to be for "additional" information, but they actually
+    /// describe specific errors that should have been enumerated.
+    /// This is somewhat of a hack to use the string to enumerate errors.
+    /// These strings are pulled directly from the C sources, and could change.
     fn from((rc, msg): (i32, &str)) -> Self {
         use Error::*;
         match (rc, msg) {
@@ -266,11 +288,6 @@ impl From<(i32, &str)> for Error {
                 Err(err) => err,
             },
             (rc, "socket error") => SocketError(rc),
-            (reason_code, _)
-                if reason_code >= crate::reason_code::ReasonCode::UnspecifiedError as i32 =>
-            {
-                Error::ReasonCode(crate::reason_code::ReasonCode::from(reason_code as u32))
-            }
             _ => Failure,
         }
     }
@@ -361,23 +378,63 @@ where
 mod tests {
     use super::*;
 
-    #[test_case::test_case(ffi::MQTTASYNC_FAILURE => matches Error::Failure)]
-    #[test_case::test_case(ffi::MQTTASYNC_BAD_QOS => matches Error::BadQos)]
-    #[test_case::test_case(127 => matches Error::Failure)]
-    #[test_case::test_case(128 => matches Error::ReasonCode(ReasonCode::UnspecifiedError))]
-    #[test_case::test_case(135 => matches Error::ReasonCode(ReasonCode::NotAuthorized))]
-    fn test_error_from_rc(code: i32) -> Error {
-        Error::from(code)
+    #[test]
+    fn test_error_from() {
+        assert!(matches!(
+            Error::from(ffi::MQTTASYNC_FAILURE),
+            Error::Failure
+        ));
+        assert!(matches!(Error::from(ffi::MQTTASYNC_BAD_QOS), Error::BadQos));
+
+        // Out of range is considered a general failure.
+        assert!(matches!(Error::from(127), Error::Failure));
     }
 
-    #[test_case::test_case(ffi::MQTTASYNC_FAILURE, "unspecified error" => matches Error::Failure)]
-    #[test_case::test_case(ffi::MQTTASYNC_FAILURE, "TCP connect timeout" => matches Error::TcpConnectTimeout)]
-    #[test_case::test_case(-34, "socket error" => matches Error::SocketError(-34))]
-    #[test_case::test_case(127, "socket error" => matches Error::SocketError(127))]
-    #[test_case::test_case(127, "any text" => matches Error::Failure)]
-    #[test_case::test_case(128, "ignored message" => matches Error::ReasonCode(ReasonCode::UnspecifiedError))]
-    #[test_case::test_case(135, "ignored message" => matches Error::ReasonCode(ReasonCode::NotAuthorized))]
-    fn test_error_from_rc_and_msg(code: i32, msg: &str) -> Error {
-        Error::from((code, msg))
+    #[test]
+    fn test_error_from_tuple() {
+        assert!(matches!(
+            Error::from((ffi::MQTTASYNC_FAILURE, "unspecified error")),
+            Error::Failure
+        ));
+        assert!(matches!(
+            Error::from((ffi::MQTTASYNC_FAILURE, "TCP connect timeout")),
+            Error::TcpConnectTimeout
+        ));
+        assert!(matches!(
+            Error::from((-34, "socket error")),
+            Error::SocketError(-34)
+        ));
+    }
+
+    #[test]
+    fn test_error_from_reason_code() {
+        use crate::Properties;
+        use ReasonCode::*;
+
+        assert!(matches!(
+            Error::from_reason_code(0x80, Properties::default()),
+            Error::ReasonCode(UnspecifiedError, _)
+        ));
+        assert!(matches!(
+            Error::from_reason_code(0x87, Properties::default()),
+            Error::ReasonCode(NotAuthorized, _)
+        ));
+    }
+
+    #[test]
+    fn test_error_from_v3_connect_return() {
+        use ConnectReturnCode::*;
+
+        // Unacceptable Protocol Version (1)
+        assert!(matches!(
+            Error::from_connect_return_code(1),
+            Error::ConnectReturn(UnacceptableProtocolVersion)
+        ));
+
+        // Server Unavailable (3)
+        assert!(matches!(
+            Error::from_connect_return_code(3),
+            Error::ConnectReturn(ServerUnavailable)
+        ));
     }
 }

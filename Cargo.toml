@@ -1,6 +1,6 @@
 [package]
 name = "paho-mqtt"
-version = "0.14.0-pre.0"
+version = "0.14.0-pre.2"
 edition = "2021"
 rust-version = "1.75.0"
 authors = ["Frank Pagliughi <fpagliughi@mindspring.com>"]
@@ -41,7 +41,6 @@ lazy_static = "1.4"
 futures-util = "0.3"
 ctrlc = "3.2"
 smol = "2.0"
-test-case = "3.3.1"
 
 [[example]]
 name = "tokio_event_subscribe_v5"
