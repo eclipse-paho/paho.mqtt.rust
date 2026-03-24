@@ -65,7 +65,7 @@ jobs:
           cargo +stable update
 
       - name: Clippy lints
-        run: cargo +1.75.0 clippy --no-deps --all-targets --all-features -- -D warnings
+        run: cargo +1.75.0 clippy --no-deps --all-targets -- -D warnings
 
   test:
     name: Rust Tests

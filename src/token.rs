@@ -385,35 +385,37 @@ impl TokenInner {
         let mut data = self.lock.lock().unwrap();
 
         let res = unsafe {
-            if rc == 0 {
-                // Get the response from the server, if any.
-                debug!("Expecting server response for: {:?}", self.req);
-                let rsp = if let Some(rsp) = rsp.as_ref() {
-                    ServerResponse::from_success(self.req, rsp)
-                }
-                else {
-                    ServerResponse::default()
-                };
-                debug!("Got response: {:?}", rsp);
+            use std::cmp::Ordering;
 
-                if let Some(rsp) = rsp.connect_response() {
-                    if let Some(cli) = &self.cli {
-                        cli.set_mqtt_version(rsp.mqtt_version);
+            match rc.cmp(&0) {
+                Ordering::Equal => {
+                    // Get the response from the server, if any.
+                    debug!("Expecting server response for: {:?}", self.req);
+                    let rsp = if let Some(rsp) = rsp.as_ref() {
+                        ServerResponse::from_success(self.req, rsp)
+                    }
+                    else {
+                        ServerResponse::default()
+                    };
+                    debug!("Got response: {:?}", rsp);
+
+                    if let Some(rsp) = rsp.connect_response() {
+                        if let Some(cli) = &self.cli {
+                            cli.set_mqtt_version(rsp.mqtt_version);
+                        }
+                    }
+                    Ok(rsp)
+                }
+                Ordering::Greater => {
+                    if self.req == ServerRequest::Connect {
+                        Err(Error::from_connect_return_code(rc as u8))
+                    }
+                    else {
+                        warn!("Unknown positive return code for {:?}: {}", self.req, rc);
+                        Err(Error::from(-1))
                     }
                 }
-                Ok(rsp)
-            }
-            else if rc > 0 {
-                if self.req == ServerRequest::Connect {
-                    Err(Error::from_connect_return_code(rc as u8))
-                }
-                else {
-                    warn!("Unknown positive return code for {:?}: {}", self.req, rc);
-                    Err(Error::from(-1))
-                }
-            }
-            else {
-                Err(Error::from((rc, err_msg)))
+                Ordering::Less => Err(Error::from((rc, err_msg))),
             }
         };
 
