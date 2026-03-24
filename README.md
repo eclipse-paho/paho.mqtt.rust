@@ -40,7 +40,9 @@ To keep up with the latest announcements for this project, follow:
 
 **EMail:** [Eclipse Paho Mailing List](https://accounts.eclipse.org/mailing-list/paho-dev)
 
-### What's New in v0.14
+### What's Coming in v0.14
+
+**This branch is currently a pre-release of v0.14. Please report any issues.**
 
 Version v0.14.0 now wraps Paho C v0.3.16, which was mainly concerned with internal performance improvements. For may aplications, there is a noticable decrease in latency for a number of operations.
 
