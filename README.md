@@ -93,6 +93,8 @@ The default behaviour can be altered by enabling or disabling the features:
 - _"build_bindgen"_ - Whether to build the bindings for the target using _bindgen_. If not set, the build will attempt to find and use pre-built bindings for the target.
 - _"ssl"_ - Whether to enable the use of secure sockets and secure websocket connections.
 - _"vendored-ssl"_ - Whether to build OpenSSL. This passes the "vendored" option to the _openssl-sys_ crate.
+- _"tokio"_ - Builds some tokio examples (the library is fully compatible with tokio even without this feature).
+
 
 The _bundled_ feature requires `CMake` and a C compiler for the target.
 

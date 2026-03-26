@@ -46,6 +46,10 @@
 //! * **vendored-ssl**
 //!   Download an build OpenSSL for the target.
 //!
+//! * **tokio**
+//!   Just enables some additional tokio examples. The library ie fully
+//!   compatible with tokio whether or not this feature is enabled.
+//!
 //! # Logging
 //!
 //! The library uses the standard Rust log facility with the target/module
