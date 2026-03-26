@@ -40,9 +40,7 @@ To keep up with the latest announcements for this project, follow:
 
 **EMail:** [Eclipse Paho Mailing List](https://accounts.eclipse.org/mailing-list/paho-dev)
 
-### What's Coming in v0.14
-
-**This branch is currently a pre-release of v0.14. Please report any issues.**
+### What's New in v0.14
 
 Version v0.14.0 now wraps Paho C v0.3.16, which was mainly concerned with internal performance improvements. For may aplications, there is a noticable decrease in latency for a number of operations.
 
@@ -53,17 +51,11 @@ Some additional updates:
 - Added synchronous (blocking) and async event streams.
     - All events from the client flow through the stream:
       Connect, Connection Lost, Disconnected, Incoming Message
-- Typeof Variable Byte Integer is u32 (not i32)
-- `PropertyType` enum now supports `Ord`, `PartialOrd`, and `Hash` traits
-- Bumped paho-mqtt-sys to v0.11
+- Adds some tokio examples.
+- Fixed up some MQTT v5 error handling to properly report reason code errors.
 
-For additional updates and bug fixes, see the [CHANGELOG](https://github.com/eclipse-paho/paho.mqtt.rust/blob/master/CHANGELOG.md)
+For the complete list of updates and bug fixes, see the [CHANGELOG](https://github.com/eclipse-paho/paho.mqtt.rust/blob/master/CHANGELOG.md)
 
-### New work for future releases
-
-Work has started to revamp multiple aspects of the internal code without seriously disrupting the API. Some of this will be to hide aspects of the Paho C library that leaked into the Rust API and start the march towards a 100% Rust implementation of this library. (That won't happen too soon, but it's time to start.)
-
-One set of breaking changes will be around the library's errors. The Paho C errors will be de-nested and made easier to match. More information will also be extracted from the C library when possible.
 
 ## A Note on Async Runtimes
 

@@ -1,6 +1,6 @@
 [package]
 name = "paho-mqtt"
-version = "0.14.0-pre.2"
+version = "0.14.0"
 edition = "2021"
 rust-version = "1.75.0"
 authors = ["Frank Pagliughi <fpagliughi@mindspring.com>"]
@@ -8,7 +8,6 @@ homepage = "https://github.com/eclipse/paho.mqtt.rust"
 repository = "https://github.com/eclipse/paho.mqtt.rust"
 keywords = [ "MQTT", "IoT", "Paho", "messaging" ]
 license = "EPL-2.0"
-readme = "README.md"
 description = """
 The Official Eclipse Paho MQTT Rust Client Library.
 This is a wrapper around the Paho C library.

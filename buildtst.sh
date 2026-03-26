@@ -42,7 +42,7 @@ cargo clean
 
 # Check combinations of build features
 
-FEATURES="bundled bundled,build_bindgen bundled,ssl,vendored-ssl"
+FEATURES="bundled bundled,tokio bundled,tokio,ssl bundled,build_bindgen bundled,ssl,vendored-ssl"
 
 for VER in stable ${MSRV} ; do
     for FEATURE in ${FEATURES}; do
