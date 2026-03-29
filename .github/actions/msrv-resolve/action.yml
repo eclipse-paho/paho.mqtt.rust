@@ -1,0 +1,12 @@
+name: Resolve MSRV dependencies
+description: Configure the cargo resolver for MSRV compatibility and update dependencies
+
+runs:
+  using: composite
+  steps:
+    - name: Resolve dependencies for MSRV
+      shell: bash
+      run: |
+        mkdir -p $HOME/.cargo
+        echo 'resolver.incompatible-rust-versions = "fallback"' > $HOME/.cargo/config.toml
+        cargo +stable update

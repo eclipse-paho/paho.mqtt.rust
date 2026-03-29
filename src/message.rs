@@ -115,7 +115,7 @@ impl Message {
     /// the individual components in the data, all of which get pinned.
     fn from_data(mut cmsg: ffi::MQTTAsync_message, data: MessageData) -> Self {
         let data = Box::pin(data);
-        cmsg.payload = data.payload.as_ptr() as *const _ as *mut c_void;
+        cmsg.payload = data.payload.as_ptr() as *mut c_void;
         cmsg.payloadlen = data.payload.len() as i32;
         cmsg.properties = data.props.cprops;
         Self { cmsg, data }

@@ -355,6 +355,9 @@ mod build {
                     println!("cargo:rustc-link-lib{}=crypt32", linkage);
                     println!("cargo:rustc-link-lib{}=rpcrt4", linkage);
                 }
+                // advapi32 provides the CryptAcquireContext/CryptHashData/etc.
+                // symbols used by OpenSSL's SHA1 implementation on Windows
+                println!("cargo:rustc-link-lib=advapi32");
                 println!("cargo:rustc-link-lib=User32");
             }
         }

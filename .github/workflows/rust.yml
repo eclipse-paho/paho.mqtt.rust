@@ -8,10 +8,11 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  MSRV: "1.75.0"
 
 jobs:
   fmt:
-    name: Rustfmt
+    name: Rust Format Check
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -24,13 +25,24 @@ jobs:
 
   check:
     name: Rust Build Check
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
+        os:
+          - ubuntu-latest
+          - windows-latest
+          - macos-latest
         rust:
           - stable
-          - 1.75.0
+          - "1.75.0"  # MSRV — keep in sync with env.MSRV
+        include:
+          - os: windows-latest
+            features: bundled,vendored-ssl
+          - os: ubuntu-latest
+            features: bundled,ssl
+          - os: macos-latest
+            features: bundled,ssl
     steps:
       - uses: actions/checkout@v6
       - uses: actions-rs/toolchain@v1
@@ -38,14 +50,10 @@ jobs:
           toolchain: ${{ matrix.rust }}
           override: true
 
-      - name: Resolve dependencies for MSRV
-        run: |
-          mkdir -p $HOME/.cargo
-          echo 'resolver.incompatible-rust-versions = "fallback"' > $HOME/.cargo/config.toml
-          cargo +stable update
+      - uses: ./.github/actions/msrv-resolve
 
       - name: Build check
-        run: cargo check --all-targets
+        run: cargo check --no-default-features --features ${{ matrix.features }} --all-targets
 
   clippy:
     name: Rust Clippy
@@ -54,28 +62,35 @@ jobs:
       - uses: actions/checkout@v6
       - uses: actions-rs/toolchain@v1
         with:
-          toolchain: 1.75.0
+          toolchain: ${{ env.MSRV }}
           override: true
           components: clippy
 
-      - name: Resolve dependencies for MSRV
-        run: |
-          mkdir -p $HOME/.cargo
-          echo 'resolver.incompatible-rust-versions = "fallback"' > $HOME/.cargo/config.toml
-          cargo +stable update
+      - uses: ./.github/actions/msrv-resolve
 
       - name: Clippy lints
-        run: cargo +1.75.0 clippy --no-deps --all-targets -- -D warnings
+        run: cargo +${{ env.MSRV }} clippy --no-deps --all-targets -- -D warnings
 
   test:
     name: Rust Tests
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
+        os:
+          - ubuntu-latest
+          - windows-latest
+          - macos-latest
         rust:
           - stable
-          - 1.75.0
+          - "1.75.0"  # MSRV — keep in sync with env.MSRV
+        include:
+          - os: windows-latest
+            features: bundled,vendored-ssl
+          - os: ubuntu-latest
+            features: bundled,ssl
+          - os: macos-latest
+            features: bundled,ssl
     steps:
       - uses: actions/checkout@v6
       - uses: actions-rs/toolchain@v1
@@ -83,12 +98,8 @@ jobs:
           toolchain: ${{ matrix.rust }}
           override: true
 
-      - name: Resolve dependencies for MSRV
-        run: |
-          mkdir -p $HOME/.cargo
-          echo 'resolver.incompatible-rust-versions = "fallback"' > $HOME/.cargo/config.toml
-          cargo +stable update
+      - uses: ./.github/actions/msrv-resolve
 
       - name: Run tests
-        run: cargo test --no-default-features --features bundled,vendored-ssl --no-fail-fast
+        run: cargo test --no-default-features --features ${{ matrix.features }} --no-fail-fast
 
