@@ -412,6 +412,41 @@ impl<'a> SyncTopic<'a> {
 //                          TopicFilter
 /////////////////////////////////////////////////////////////////////////////
 
+/// Checks whether an MQTT topic filter is valid.
+///
+/// Rules:
+/// - Must not be empty.
+/// - Must not contain the null character (`\0`).
+/// - `+` (single-level wildcard) must occupy an entire level by itself
+/// - `#` (multi-level wildcard) must be the last character and must be either
+///   the only character or preceded by `/`.
+pub fn is_topic_filter_valid(filter: &str) -> bool {
+    if filter.is_empty() || filter.contains('\0') {
+        return false;
+    }
+
+    let fields: Vec<&str> = filter.split('/').collect();
+    let n = fields.len();
+
+    for (i, field) in fields.iter().enumerate() {
+        match *field {
+            "#" => {
+                if i != n - 1 {
+                    return false;
+                }
+            }
+            "+" => (), // '+' as a whole level is fine
+            _ => {
+                if field.contains('#') || field.contains('+') {
+                    return false;
+                }
+            }
+        }
+    }
+
+    true
+}
+
 /// A topic filter.
 ///
 /// An MQTT topic filter is a multi-field string, delimited by forward
@@ -436,18 +471,13 @@ impl TopicFilter {
     /// wildcard in anyplace other than the last field, or if
     pub fn new<S: Into<String>>(filter: S) -> Result<Self> {
         let filter = filter.into();
-        let n = filter.len();
 
-        if n == 0 {
+        if !is_topic_filter_valid(&filter) {
             return Err(Error::BadTopicFilter);
         }
 
         // If the topic contains any wildcards.
-        let wild = match filter.find('#') {
-            Some(i) if i < n - 1 => return Err(Error::BadTopicFilter),
-            Some(_) => true,
-            None => filter.contains('+'),
-        };
+        let wild = filter.contains('+') || filter.contains('#');
 
         let v = if wild {
             let fields = filter.split('/').map(String::from).collect();
@@ -605,9 +635,50 @@ mod tests {
     }
 
     #[test]
-    fn test_topic_filter() {
-        // Should match
+    fn test_valid_topic_filters() {
+        assert!(is_topic_filter_valid("foo/bar/baz"));
+        assert!(is_topic_filter_valid("foo/+/baz"));
+        assert!(is_topic_filter_valid("+/bar/#"));
+        assert!(is_topic_filter_valid("#"));
+        assert!(is_topic_filter_valid("+"));
+        assert!(is_topic_filter_valid("foo/#"));
+        assert!(is_topic_filter_valid("/"));
+        assert!(is_topic_filter_valid("foo/bar/+"));
+        assert!(is_topic_filter_valid("+/+/+"));
 
+        assert!(TopicFilter::new("foo/bar/baz").is_ok());
+        assert!(TopicFilter::new("foo/+/baz").is_ok());
+        assert!(TopicFilter::new("+/bar/#").is_ok());
+        assert!(TopicFilter::new("#").is_ok());
+        assert!(TopicFilter::new("+").is_ok());
+        assert!(TopicFilter::new("foo/#").is_ok());
+        assert!(TopicFilter::new("/").is_ok());
+        assert!(TopicFilter::new("foo/bar/+").is_ok());
+        assert!(TopicFilter::new("+/+/+").is_ok());
+    }
+
+    #[test]
+    fn test_invalid_topic_filters() {
+        assert!(!is_topic_filter_valid(""));
+        assert!(!is_topic_filter_valid("foo/bar#"));
+        assert!(!is_topic_filter_valid("foo/bar/#/baz"));
+        assert!(!is_topic_filter_valid("foo+"));
+        assert!(!is_topic_filter_valid("foo/bar+baz"));
+        assert!(!is_topic_filter_valid("foo/#/"));
+        assert!(!is_topic_filter_valid("hello\0world"));
+
+        assert!(TopicFilter::new("").is_err());
+        assert!(TopicFilter::new("foo/bar#").is_err());
+        assert!(TopicFilter::new("foo/bar/#/baz").is_err());
+        assert!(TopicFilter::new("foo+").is_err());
+        assert!(TopicFilter::new("foo/bar+baz").is_err());
+        assert!(TopicFilter::new("foo/#/").is_err());
+        assert!(TopicFilter::new("hello\0world").is_err());
+    }
+
+    #[test]
+    fn test_topic_filter_matching() {
+        // These should all match
         assert!(TopicFilter::new_unchecked("foo/bar").matches("foo/bar"));
         assert!(TopicFilter::new_unchecked("foo/+").matches("foo/bar"));
         assert!(TopicFilter::new_unchecked("foo/+/baz").matches("foo/bar/baz"));
@@ -621,9 +692,11 @@ mod tests {
         assert!(TopicFilter::new_unchecked("$SYS/bar").matches("$SYS/bar"));
         assert!(TopicFilter::new_unchecked("foo/#").matches("foo/$bar"));
         assert!(TopicFilter::new_unchecked("foo/+/baz").matches("foo/$bar/baz"));
+    }
 
-        // Should not match
-
+    #[test]
+    fn test_topic_filter_non_matching() {
+        // None of these should match
         assert!(!TopicFilter::new_unchecked("test/6/#").matches("test/3"));
         assert!(!TopicFilter::new_unchecked("foo/bar").matches("foo"));
         assert!(!TopicFilter::new_unchecked("foo/+").matches("foo/bar/baz"));
