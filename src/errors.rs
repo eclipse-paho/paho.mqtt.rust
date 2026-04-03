@@ -265,6 +265,7 @@ impl From<i32> for Error {
         Self::from_return_code(rc)
     }
 }
+
 impl From<(i32, &str)> for Error {
     /// Convert a Paho C return code w/ reason string to an Error.
     ///
@@ -361,7 +362,7 @@ pub fn error_message(rc: i32) -> &'static str {
     }
 }
 
-/// Gets an error message from an error code with optional
+/// Gets an error message from an error code with optional message.
 pub fn error_message_opt<M>(rc: i32, msg: M) -> String
 where
     M: Into<Option<String>>,

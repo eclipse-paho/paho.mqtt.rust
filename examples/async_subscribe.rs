@@ -40,9 +40,11 @@ use futures::executor::block_on;
 use paho_mqtt as mqtt;
 use std::{env, process, time::Duration};
 
-// The topics to which we subscribe.
-const TOPICS: &[&str] = &["test/#", "hello"];
-const QOS: &[i32] = &[1, 1];
+// The default topic to which we subscribe.
+const DEFAULT_TOPIC: &str = "test/#";
+
+/// The QoS for the subscription(s)
+const QOS: i32 = 1;
 
 const RECONN_RETRY_PERIOD: Duration = Duration::from_secs(1);
 
@@ -52,9 +54,20 @@ fn main() {
     // Initialize the logger from the environment
     env_logger::init();
 
-    let host = env::args()
-        .nth(1)
+    let mut args = env::args().skip(1);
+
+    let host = args
+        .next()
         .unwrap_or_else(|| "mqtt://localhost:1883".to_string());
+
+    let topics: Vec<String> = args.collect();
+    let topics: Vec<&str> = if topics.is_empty() {
+        vec![DEFAULT_TOPIC]
+    }
+    else {
+        topics.iter().map(String::as_str).collect()
+    };
+    let qos: Vec<i32> = vec![QOS; topics.len()];
 
     println!("Connecting to the MQTT server at '{}'...", host);
 
@@ -89,8 +102,8 @@ fn main() {
         // Make the connection to the broker
         cli.connect(conn_opts).await?;
 
-        println!("Subscribing to topics: {:?}", TOPICS);
-        cli.subscribe_many(TOPICS, QOS).await?;
+        println!("Subscribing to topics: {:?}", topics);
+        cli.subscribe_many(&topics, &qos).await?;
 
         // Just loop on incoming messages.
         println!("Waiting for messages...");
