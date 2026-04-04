@@ -906,7 +906,6 @@ mod tests {
         //assert!(!opts.copts.binarypwd.data.is_null());
         //assert_eq!(opts.copts.binarypwd.len, PSWD.len() as c_int);
 
-
         let opts = ConnectOptionsBuilder::new().password(PSWD).to_ffi();
         assert!(!opts.copts.password.is_null());
 

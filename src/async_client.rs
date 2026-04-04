@@ -44,6 +44,7 @@
 //! tok.wait().unwrap();
 //! ```
 
+use crate::event::Event;
 use crate::{
     errors::{self, Error, Result},
     ffi,
@@ -51,8 +52,9 @@ use crate::{
     types::*,
     AsyncReceiver, CallOptionsFfi, CallOptionsFfiBuilder, ConnectOptions,
     ConnectOptionsFfi, ConnectToken, CreateOptions, DeliveryToken, DisconnectOptions,
-    Message, MessageFfi, PersistenceType, Properties, ReasonCode, Receiver, ServerRequest,
-    SubscribeManyToken, SubscribeOptions, SubscribeToken, Token, TokenInner, UserData,
+    Message, MessageFfi, PersistenceType, Properties, ReasonCode, ServerRequest,
+    SubscribeManyToken, SubscribeOptions, SubscribeToken, SyncReceiver, Token, TokenInner,
+    UserData,
 };
 use crossbeam_channel as sync_channel;
 use std::{
@@ -163,7 +165,7 @@ impl AsyncClient {
 
         let mut cli = InnerAsyncClient {
             handle: ptr::null_mut(),
-            mqtt_version: AtomicU32::new(opts.mqtt_version_raw()),
+            mqtt_version: AtomicU32::new(MqttVersion::Default as u32),
             opts,
             conn_opts: RwLock::new(ConnectOptions::new()),
             callback_context: Mutex::new(CallbackContext::default()),
@@ -1695,7 +1697,8 @@ mod tests {
             .allow_disconnected_send_at_anytime(true)
             .create_client()
             .unwrap();
-        let res = client.try_publish(MessageBuilder::new().topic("test").payload([]).finalize());
+        let res =
+            client.try_publish(MessageBuilder::new().topic("test").payload([]).finalize());
         assert!(res.is_ok(), "Failed to publish message before connecting");
     }
 }

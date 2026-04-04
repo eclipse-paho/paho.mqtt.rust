@@ -342,7 +342,7 @@ impl TokenInner {
                     "Token w ID {} failed with reason code: {}",
                     msgid, rsp.reasonCode
                 );
-                props = Properties::from_c_struct(&rsp.properties);
+                props = Properties::from(&rsp.properties);
                 rsp.reasonCode as i32
             }
             else if rsp.code == 0 {

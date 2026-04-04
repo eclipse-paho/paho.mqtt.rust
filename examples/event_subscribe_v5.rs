@@ -90,7 +90,7 @@ fn main() {
         // (3600sec) if the service disconnects or restarts.
         let conn_opts = mqtt::ConnectOptionsBuilder::with_mqtt_version(MQTT_VERSION_5)
             .clean_start(false)
-            .properties(mqtt::properties![mqtt::PropertyCode::SessionExpiryInterval => 3600])
+            .properties(mqtt::properties![SessionExpiryInterval(3600)])
             .will_message(lwt)
             .finalize();
 
@@ -98,7 +98,8 @@ fn main() {
         cli.connect(conn_opts).await?;
 
         println!("Subscribing to topics: {:?}", TOPICS);
-        let sub_opts = vec![mqtt::SubscribeOptions::with_retain_as_published(); TOPICS.len()];
+        let sub_opts =
+            vec![mqtt::SubscribeOptions::with_retain_as_published(); TOPICS.len()];
         cli.subscribe_many_with_options(TOPICS, QOS, &sub_opts, None)
             .await?;
 
