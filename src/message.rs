@@ -521,6 +521,9 @@ impl TryFrom<Message> for MessageFfi {
         let mut cmsg = ffi::MQTTAsync_message::default();
         cmsg.qos = msg.qos() as c_int;
         cmsg.retained = msg.retain() as c_int;
+        if let Some(id) = msg.msgid() {
+            cmsg.msgid = id as c_int;
+        }
         Ok(Self::from_data(cmsg, data))
     }
 }

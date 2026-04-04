@@ -57,22 +57,37 @@ impl DisconnectOptions {
         }
     }
 
-    /// Gets an FFI C struct for the disconnect options.
-    pub(crate) fn c_struct(&self) -> ffi::MQTTAsync_disconnectOptions {
+    /// Gets an FFI representation of the disconnect options.
+    pub(crate) fn to_ffi(&self) -> DisconnectOptionsFfi {
         let props = PropertiesFfi::from(&self.props);
-
-        ffi::MQTTAsync_disconnectOptions {
+        let copts = ffi::MQTTAsync_disconnectOptions {
             timeout: self.timeout.as_millis() as c_int,
             properties: props.cprops,
             reasonCode: self.reason_code as ffi::MQTTReasonCodes,
             ..ffi::MQTTAsync_disconnectOptions::default()
-        }
+        };
+        DisconnectOptionsFfi { copts, props }
     }
 
     /// Gets the properties used to disconnect.
     pub fn properties(&self) -> &Properties {
         &self.props
     }
+}
+
+/////////////////////////////////////////////////////////////////////////////
+// DisconnectOptionsFfi
+
+/// The FFI representation of disconnect options.
+///
+/// This keeps the [`PropertiesFfi`] alive alongside the C struct so that
+/// `copts.properties.array` remains valid for the duration of the FFI call.
+pub(crate) struct DisconnectOptionsFfi {
+    /// The underlying C options struct.
+    pub(crate) copts: ffi::MQTTAsync_disconnectOptions,
+    /// The properties data cache. Must outlive `copts`.
+    #[allow(dead_code)]
+    props: PropertiesFfi,
 }
 
 /////////////////////////////////////////////////////////////////////////////
@@ -162,10 +177,10 @@ mod tests {
     #[test]
     fn test_new() {
         let opts = DisconnectOptions::new();
-        let copts = opts.c_struct();
+        let ffi = opts.to_ffi();
 
-        assert_eq!(STRUCT_ID, copts.struct_id);
-        assert_eq!(STRUCT_VERSION, copts.struct_version);
+        assert_eq!(STRUCT_ID, ffi.copts.struct_id);
+        assert_eq!(STRUCT_VERSION, ffi.copts.struct_version);
     }
 
     #[test]
@@ -173,9 +188,9 @@ mod tests {
         let opts = DisconnectOptions::new();
 
         let thr = thread::spawn(move || {
-            let copts = opts.c_struct();
-            assert_eq!(STRUCT_ID, copts.struct_id);
-            assert_eq!(STRUCT_VERSION, copts.struct_version);
+            let ffi = opts.to_ffi();
+            assert_eq!(STRUCT_ID, ffi.copts.struct_id);
+            assert_eq!(STRUCT_VERSION, ffi.copts.struct_version);
         });
         thr.join().unwrap();
     }
@@ -214,7 +229,7 @@ mod tests {
         );
 
         let opts = DisconnectOptionsBuilder::new().properties(props).finalize();
-        let copts = opts.c_struct();
+        let _ffi = opts.to_ffi();
 
         let props = opts.properties();
 

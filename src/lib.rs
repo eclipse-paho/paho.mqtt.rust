@@ -125,7 +125,6 @@ pub use crate::token::*; //{Token}
 pub use crate::topic::*; //{Topic, TopicFilter, TopicMatcher};
 pub use crate::topic_matcher::TopicMatcher;
 pub use crate::types::*; //...
-pub use crate::will_options::*; //{WillOptions, WillOptionsBuilder}; //{Result, Error, ErrorKind};
 
 use std::{any::Any, os::raw::c_int};
 

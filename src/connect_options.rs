@@ -5,7 +5,7 @@
 //
 
 /*******************************************************************************
- * Copyright (c) 2017-2025 Frank Pagliughi <fpagliughi@mindspring.com>
+ * Copyright (c) 2017-2026 Frank Pagliughi <fpagliughi@mindspring.com>
  *
  * All rights reserved. This program and the accompanying materials
  * are made available under the terms of the Eclipse Public License v2.0
@@ -27,8 +27,8 @@
 
 use crate::{
     ffi, name_value::NameValueCollection, string_collection::StringCollection, to_c_bool,
-    types::*, ConnectToken, Error, Message, Properties, PropertiesFfi, Result, SslOptions,
-    SslOptionsFfi, Token, TokenInner, WillOptions,
+    types::*, will_options::WillOptions, ConnectToken, Error, Message, Properties,
+    PropertiesFfi, Result, SslOptions, SslOptionsFfi, Token, TokenInner,
 };
 use std::{
     collections::HashMap,
@@ -708,15 +708,6 @@ impl ConnectOptionsFfi {
     }
 }
 
-impl Default for ConnectOptionsFfi {
-    fn default() -> Self {
-        Self::from_data(
-            ffi::MQTTAsync_connectOptions::default(),
-            ConnectOptionsFfiData::default(),
-        )
-    }
-}
-
 unsafe impl Send for ConnectOptionsFfi {}
 unsafe impl Sync for ConnectOptionsFfi {}
 
@@ -737,6 +728,11 @@ impl From<&ConnectOptions> for ConnectOptionsFfi {
         secs = opts.timeout.as_secs();
         copts.connectTimeout = if secs == 0 { 1 } else { secs as i32 };
 
+        if let Some(retry) = opts.retry_interval {
+            secs = retry.as_secs();
+            copts.retryInterval = if secs == 0 { 1 } else { secs as i32 };
+        }
+
         copts.MQTTVersion = opts.mqtt_version as c_int;
 
         if opts.auto_reconnect {
@@ -751,12 +747,6 @@ impl From<&ConnectOptions> for ConnectOptionsFfi {
 
         let data = ConnectOptionsFfiData::from(opts);
         Self::from_data(copts, data)
-    }
-}
-
-impl From<ConnectOptions> for ConnectOptionsFfi {
-    fn from(opts: ConnectOptions) -> Self {
-        Self::from(&opts)
     }
 }
 
@@ -903,11 +893,9 @@ mod tests {
     fn test_password() {
         const PSWD: &str = "some-random-password";
 
-        //assert!(!opts.copts.binarypwd.data.is_null());
-        //assert_eq!(opts.copts.binarypwd.len, PSWD.len() as c_int);
-
         let opts = ConnectOptionsBuilder::new().password(PSWD).to_ffi();
-        assert!(!opts.copts.password.is_null());
+        assert!(!opts.copts.binarypwd.data.is_null());
+        assert_eq!(opts.copts.binarypwd.len, PSWD.len() as c_int);
 
         let s = unsafe {
             std::slice::from_raw_parts(
@@ -920,18 +908,10 @@ mod tests {
 
     #[test]
     fn test_binary_password() {
-        let opts = ConnectOptionsBuilder::new().password(BIN_PSWD).finalize();
+        let opts = ConnectOptionsBuilder::new().password(BIN_PSWD).to_ffi();
 
         assert!(!opts.copts.binarypwd.data.is_null());
         assert_eq!(opts.copts.binarypwd.len, BIN_PSWD.len() as c_int);
-
-        let binary_password = unsafe {
-            std::slice::from_raw_parts(
-                opts.copts.binarypwd.data as *const u8,
-                opts.copts.binarypwd.len as usize,
-            )
-        };
-        assert_eq!(BIN_PSWD, binary_password);
 
         let s = unsafe {
             std::slice::from_raw_parts(
@@ -939,8 +919,7 @@ mod tests {
                 opts.copts.binarypwd.len as usize,
             )
         };
-
-        assert_eq!(s, BIN_PSWD);
+        assert_eq!(BIN_PSWD, s);
     }
 
     #[test]
@@ -1138,7 +1117,9 @@ mod tests {
         let props = Properties::with_property(Property::SessionExpiryInterval(60));
 
         // Remember, you can only set properties on a v5 connection.
-        let opts = ConnectOptionsBuilder::new_v5().properties(props).to_ffi();
+        let opts = ConnectOptionsBuilder::new_v5()
+            .properties(props.clone())
+            .to_ffi();
 
         assert_eq!(1, props.len());
         assert_eq!(

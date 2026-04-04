@@ -27,7 +27,6 @@ use std::{borrow::Cow, os::raw::c_void, pin::Pin, ptr};
 use crate::{
     ffi,
     message::{Message, MessageFfi, MessageFfiData},
-    properties::Properties,
 };
 
 /// The options for the Last Will and Testament (LWT).
@@ -53,8 +52,6 @@ pub struct WillOptions {
     pub(crate) copts: ffi::MQTTAsync_willOptions,
     /// The local data cache for the C options
     data: Pin<Box<MessageFfiData>>,
-    /// The will properties
-    props: Properties,
 }
 
 impl WillOptions {
@@ -119,11 +116,7 @@ impl WillOptions {
         };
         // Note: For some reason, properties aren't in the will options
         //   They're in the connect options
-        Self {
-            copts,
-            data,
-            props: Properties::default(),
-        }
+        Self { copts, data }
     }
 
     /// Gets the topic string for the LWT
@@ -150,11 +143,6 @@ impl WillOptions {
     /// Gets the 'retained' flag for the message.
     pub fn retained(&self) -> bool {
         self.copts.retained != 0
-    }
-
-    /// Gets the properties for the will message.
-    pub fn properties(&self) -> &Properties {
-        &self.props
     }
 }
 

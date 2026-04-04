@@ -634,24 +634,24 @@ impl AsyncClient {
         let opts = opts.into().unwrap_or_default();
         trace!("Disconnect options: {:?}", opts);
 
-        let mut copts = opts.c_struct();
+        let mut ffi_opts = opts.to_ffi();
 
         let tok = Token::with_client(self, ServerRequest::Disconnect);
-        copts.context = tok.clone().into_raw();
+        ffi_opts.copts.context = tok.clone().into_raw();
 
         if self.mqtt_version() < MqttVersion::V5 {
-            copts.onSuccess = Some(TokenInner::on_success);
-            copts.onFailure = Some(TokenInner::on_failure);
+            ffi_opts.copts.onSuccess = Some(TokenInner::on_success);
+            ffi_opts.copts.onFailure = Some(TokenInner::on_failure);
         }
         else {
-            copts.onSuccess5 = Some(TokenInner::on_success5);
-            copts.onFailure5 = Some(TokenInner::on_failure5);
+            ffi_opts.copts.onSuccess5 = Some(TokenInner::on_success5);
+            ffi_opts.copts.onFailure5 = Some(TokenInner::on_failure5);
         }
 
-        let rc = unsafe { ffi::MQTTAsync_disconnect(self.inner.handle, &copts) };
+        let rc = unsafe { ffi::MQTTAsync_disconnect(self.inner.handle, &ffi_opts.copts) };
 
         if rc != 0 {
-            mem::drop(unsafe { Token::from_raw(copts.context) });
+            mem::drop(unsafe { Token::from_raw(ffi_opts.copts.context) });
             return Token::from_error(rc);
         }
 

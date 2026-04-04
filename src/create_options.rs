@@ -70,6 +70,10 @@ pub struct CreateOptions {
     /// Whether to persist QoS0 publish commands - an option to not persist them.
     /// Defaults to true.
     pub persist_qos0: bool,
+    /// The MQTT protocol version to use for connections from this client.
+    /// Defaults to v5, which enables a persistence store compatible with
+    /// either v3.x or v5 connections.
+    pub mqtt_version: MqttVersion,
     /// The type of persistence used by the client.
     pub persistence: PersistenceType,
     /// User-defined data to store in the client, if any
@@ -125,6 +129,7 @@ impl Default for CreateOptions {
             delete_oldest: false,
             restore_msgs: true,
             persist_qos0: true,
+            mqtt_version: MqttVersion::V5,
             persistence: PersistenceType::default(),
             user_data: None,
         }
@@ -345,6 +350,12 @@ impl CreateOptionsBuilder {
         self
     }
 
+    /// Sets the MQTT protocol version for connections from this client.
+    pub fn mqtt_version<V: Into<MqttVersion>>(mut self, ver: V) -> Self {
+        self.opts.mqtt_version = ver.into();
+        self
+    }
+
     /// Sets the user-defined data structure for the client.
     pub fn user_data(mut self, data: UserData) -> Self {
         self.opts.user_data = Some(data);
@@ -361,7 +372,7 @@ impl CreateOptionsBuilder {
         AsyncClient::new(self.finalize())
     }
 
-    /// Finalize the builder and create an asynchronous client.
+    /// Finalize the builder and create a synchronous client.
     pub fn create_client(self) -> Result<Client> {
         Client::new(self.finalize())
     }
