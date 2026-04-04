@@ -230,7 +230,7 @@ impl SslOptionsBuilder {
     /// Sets the SSL/TLS error callback.
     pub fn error_callback<F>(&mut self, cb: F) -> &mut Self
     where
-        F: Fn(&AsyncClient, &str) + Send + 'static,
+        F: Fn(&AsyncClient, &str) + Send + Sync + 'static,
     {
         self.0.on_ssl_error = Some(Arc::new(cb));
         self

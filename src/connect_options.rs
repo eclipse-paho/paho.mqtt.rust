@@ -150,7 +150,11 @@ impl ConnectOptions {
         }
     }
 
-    /// Does a check of the options to determine if their valid.
+    /// Does a check of the options to determine if they're valid.
+    ///
+    /// Rules:
+    /// - If you specify a secure URI ("tls://", "wss://", etc), you must
+    ///   supply SSL options.
     pub fn check(&self) -> Result<()> {
         if !self.server_uris.is_empty() {
             let uris = &self.server_uris;
@@ -216,20 +220,6 @@ impl ConnectOptions {
     pub fn has_ssl_options(&self) -> bool {
         self.ssl.is_some()
     }
-
-    // TODO: Do we need this?
-    /*
-    /// Sets the token to ber used for connect completion callbacks.
-    ///
-    /// Note that we leak the token to give to the C lib. When we're
-    /// done with it, we must recover and drop it (i.e. in the completion
-    /// callback).
-    pub fn set_token(&mut self, tok: ConnectToken) {
-        let tok: Token = tok;
-        self.copts.context = tok.into_raw();
-        self.fix_callbacks();
-    }
-    */
 }
 
 impl Default for ConnectOptions {
@@ -330,7 +320,6 @@ impl ConnectOptionsBuilder {
     /// `clean` Whether the broker should remove any previously-stored
     ///         information for this client.
     pub fn clean_session(&mut self, clean: bool) -> &mut Self {
-        // TODO: Error on version mismatch?
         self.0.clean_start = clean;
         self
     }
@@ -345,7 +334,6 @@ impl ConnectOptionsBuilder {
     /// `clean` Whether the broker should remove any previously-stored
     ///         information for this client.
     pub fn clean_start(&mut self, clean: bool) -> &mut Self {
-        // TODO: Error on version mismatch?
         self.0.clean_start = clean;
         self
     }
@@ -399,8 +387,14 @@ impl ConnectOptionsBuilder {
     where
         S: Into<String>,
     {
-        // TODO: Into option?
         self.0.user_name = Some(user_name.into());
+        self
+    }
+
+    /// Clears the user name.
+    /// This sets the option to `None`
+    pub fn clear_user_name(&mut self) -> &mut Self {
+        self.0.user_name = None;
         self
     }
 
@@ -411,12 +405,43 @@ impl ConnectOptionsBuilder {
     ///
     /// `password` The password to send to the broker.
     ///
-    pub fn password<S>(&mut self, password: S) -> &mut Self
+    pub fn password<P>(&mut self, password: P) -> &mut Self
     where
-        S: Into<Vec<u8>>,
+        P: Into<Vec<u8>>,
     {
-        // TODO: Into option?
         self.0.password = Some(password.into());
+        self
+    }
+
+    /// Clear the password.
+    /// This sets the option to `None`
+    pub fn clear_password(&mut self) -> &mut Self {
+        self.0.password = None;
+        self
+    }
+
+    /// Sets the user name and password for authentication with the broker.
+    ///
+    /// # Arguments
+    ///
+    /// `user_name` The user name to send to the broker.
+    /// `password` The password to send to the broker.
+    ///
+    pub fn user_name_password<S, P>(&mut self, user_name: S, password: P) -> &mut Self
+    where
+        S: Into<String>,
+        P: Into<Vec<u8>>,
+    {
+        self.0.user_name = Some(user_name.into());
+        self.0.password = Some(password.into());
+        self
+    }
+
+    /// Clears the user name and password.
+    /// This sets both options to `None`
+    pub fn clear_user_name_password(&mut self) -> &mut Self {
+        self.0.user_name = None;
+        self.0.password = None;
         self
     }
 
@@ -797,53 +822,15 @@ impl From<&ConnectOptions> for ConnectOptionsFfiData {
 mod tests {
     use super::*;
     use crate::{message::MessageBuilder, properties::*, ssl_options::SslOptionsBuilder};
-    use std::{ffi::CStr, os::raw::c_char};
+    use std::ffi::CStr;
 
     const NAME: &str = "some-random-name";
     const PSWD: &str = "some-random-password";
     const BIN_PSWD: &[u8] = b"some-random-binary-password";
     const TRUST_STORE: &str = "some_file.crt";
 
-    // Identifier fo a C connect options struct
-    const STRUCT_ID: [c_char; 4] = [
-        b'M' as c_char,
-        b'Q' as c_char,
-        b'T' as c_char,
-        b'C' as c_char,
-    ];
-
-    // The currently supported connect struct version
-    const STRUCT_VERSION: i32 = ffi::CONNECT_OPTIONS_STRUCT_VERSION;
-
-    #[test]
-    fn test_new() {
-        let opts = ConnectOptionsFfi::from(&ConnectOptions::new());
-
-        assert_eq!(STRUCT_ID, opts.copts.struct_id);
-        assert_eq!(STRUCT_VERSION, opts.copts.struct_version);
-        assert!(opts.copts.will.is_null());
-        assert_eq!(1, opts.copts.cleansession);
-
-        assert!(opts.copts.username.is_null());
-        assert!(opts.copts.password.is_null());
-        assert!(opts.copts.binarypwd.data.is_null());
-        assert!(opts.copts.binarypwd.len == 0);
-        assert!(opts.copts.ssl.is_null());
-
-        assert!(opts.copts.context.is_null());
-
-        assert_eq!(0, opts.copts.serverURIcount);
-        assert!(opts.copts.serverURIs.is_null());
-
-        assert_eq!(0, opts.copts.MQTTVersion);
-        assert_eq!(0, opts.copts.automaticReconnect);
-
-        assert!(opts.copts.httpHeaders.is_null());
-        assert_eq!(0, opts.copts.cleanstart);
-
-        assert!(opts.copts.connectProperties.is_null());
-        assert!(opts.copts.willProperties.is_null());
-    }
+    fn assert_implements_send<T: Send>() {}
+    fn assert_implements_sync<T: Sync>() {}
 
     #[test]
     fn test_new_versions() {
@@ -979,145 +966,12 @@ mod tests {
         assert_eq!(HTTPS, s.to_str().unwrap());
     }
 
-    /*
-    #[test]
-    fn test_opts_check() {
-        // Default must pass check
-        let opts = ConnectOptionsBuilder::new().finalize();
-        assert!(opts.check().is_ok());
-
-        // Non-secure connections w/o SSL opts should pass
-        let servers = ["tcp://server1:1883", "mqtt://server2:2883"];
-
-        let opts = ConnectOptionsBuilder::new()
-            .server_uris(&servers)
-            .finalize();
-
-        assert!(opts.check().is_ok());
-
-        // Secure connections w/o SSL opts should fail
-        let servers = ["tcp://server1:1883", "mqtts://server2:8883"];
-
-        let opts = ConnectOptionsBuilder::new()
-            .server_uris(&servers)
-            .finalize();
-
-        println!("{:?}", opts.check());
-        assert!(matches!(opts.check(), Err(Error::MissingSslOptions)));
-
-        // Secure connections with SSL opts should pass
-        let servers = ["tcp://server1:1883", "wss://server2:8883/ws"];
-
-        let ssl_opts = SslOptionsBuilder::new()
-            .trust_store(TRUST_STORE)
-            .unwrap()
-            .finalize();
-
-        let opts = ConnectOptionsBuilder::new()
-            .server_uris(&servers)
-            .ssl_options(ssl_opts)
-            .finalize();
-
-        assert!(opts.check().is_ok());
-    }
-
-    #[test]
-    fn test_assign() {
-        const KEEP_ALIVE_SECS: u64 = 30;
-        const MAX_INFLIGHT: i32 = 25;
-        const USER_NAME: &str = "some-name";
-        const PASSWORD: &str = "some-password";
-        const CONNECT_TIMEOUT_SECS: u64 = 120;
-
-        let org_opts = ConnectOptionsBuilder::new()
-            .keep_alive_interval(Duration::new(KEEP_ALIVE_SECS, 0))
-            .clean_session(false)
-            .max_inflight(MAX_INFLIGHT)
-            .user_name(USER_NAME)
-            .password(PASSWORD)
-            .connect_timeout(Duration::new(CONNECT_TIMEOUT_SECS, 0))
-            .finalize();
-
-        let opts = org_opts;
-
-        assert_eq!(KEEP_ALIVE_SECS as c_int, opts.copts.keepAliveInterval);
-        assert_eq!(0, opts.copts.cleansession);
-        assert_eq!(MAX_INFLIGHT, opts.copts.maxInflight);
-
-        assert_eq!(
-            USER_NAME,
-            opts.data.user_name.as_ref().unwrap().to_str().unwrap()
-        );
-        assert_eq!(PASSWORD.as_bytes(), opts.data.password.as_ref().unwrap());
-
-        let user_name = opts.data.user_name.as_deref().unwrap();
-        assert_eq!(user_name.as_ptr(), opts.copts.username);
-
-        let password = opts.data.password.as_deref().unwrap();
-        assert_eq!(
-            password.as_ptr() as *const c_void,
-            opts.copts.binarypwd.data
-        );
-
-        assert_eq!(CONNECT_TIMEOUT_SECS as i32, opts.copts.connectTimeout);
-    }
-
-    #[test]
-    fn test_clone() {
-        const KEEP_ALIVE_SECS: u64 = 30;
-        const MAX_INFLIGHT: i32 = 25;
-        const USER_NAME: &str = "some-name";
-        const PASSWORD: &str = "some-password";
-        const CONNECT_TIMEOUT_SECS: u64 = 120;
-
-        let org_opts = ConnectOptionsBuilder::new()
-            .keep_alive_interval(Duration::new(KEEP_ALIVE_SECS, 0))
-            .clean_session(false)
-            .max_inflight(MAX_INFLIGHT)
-            .user_name(USER_NAME)
-            .password(PASSWORD)
-            .connect_timeout(Duration::new(CONNECT_TIMEOUT_SECS, 0))
-            .finalize();
-
-        let opts = org_opts.clone();
-
-        // Test original still intact
-
-        assert_eq!(KEEP_ALIVE_SECS as c_int, org_opts.copts.keepAliveInterval);
-        assert_eq!(0, org_opts.copts.cleansession);
-        assert_eq!(MAX_INFLIGHT, org_opts.copts.maxInflight);
-
-        // Now test the copy
-
-        assert_eq!(KEEP_ALIVE_SECS as c_int, opts.copts.keepAliveInterval);
-        assert_eq!(0, opts.copts.cleansession);
-        assert_eq!(MAX_INFLIGHT, opts.copts.maxInflight);
-
-        assert_eq!(
-            USER_NAME,
-            opts.data.user_name.as_ref().unwrap().to_str().unwrap()
-        );
-        assert_eq!(PASSWORD.as_bytes(), opts.data.password.as_ref().unwrap(),);
-
-        let user_name = opts.data.user_name.as_deref().unwrap();
-        assert_eq!(user_name.as_ptr(), opts.copts.username);
-
-        let password = opts.data.password.as_deref().unwrap();
-        assert_eq!(
-            password.as_ptr() as *const c_void,
-            opts.copts.binarypwd.data
-        );
-
-        assert_eq!(CONNECT_TIMEOUT_SECS as i32, opts.copts.connectTimeout);
-    }
-    */
-
     #[test]
     fn test_connect_properties() {
         let props = Properties::with_property(Property::SessionExpiryInterval(60));
 
         // Remember, you can only set properties on a v5 connection.
-        let opts = ConnectOptionsBuilder::new_v5()
+        let _opts = ConnectOptionsBuilder::new_v5()
             .properties(props.clone())
             .to_ffi();
 
@@ -1162,39 +1016,103 @@ mod tests {
         );
     }
 
-    /*
-        #[test]
-        fn test_clone() {
-            const TRUST_STORE: &str = "some_file.crt";
-            // Make sure the original goes out of scope
-            // before testing the clone.
-            let opts = {
-                let org_opts = SslOptionsBuilder::new()
-                    .trust_store(TRUST_STORE)
-                    .finalize();
-
-                org_opts.clone()
-            };
-
-            assert_eq!(TRUST_STORE, opts.trust_store.to_str().unwrap());
-            let ts = unsafe { CStr::from_ptr(opts.copts.trustStore) };
-            assert_eq!(TRUST_STORE, ts.to_str().unwrap());
-        }
-    */
-
-    /*
     // Determine that the options can be sent across threads.
-    // As long as it compiles, this indicates that ConnectOptions implements
-    // the Send trait.
+    // As long as it compiles, this indicates that ConnectOptions
+    // implements the traits.
     #[test]
     fn test_send() {
-        let opts = ConnectOptions::new();
-
-        // TODO: Fill in some values and check them.
-        let thr = thread::spawn(move || {
-            assert_eq!(STRUCT_ID, opts.copts.struct_id);
-        });
-        thr.join().unwrap();
+        assert_implements_send::<ConnectOptions>();
+        assert_implements_sync::<ConnectOptions>();
     }
-    */
+
+    #[test]
+    fn test_set_and_clear() {
+        let msg = Message::new("lwt", "disconnected", 1);
+        let ssl = SslOptions::default();
+
+        // user_name: set then clear
+        let opts = ConnectOptionsBuilder::new().user_name(NAME).finalize();
+        assert_eq!(opts.user_name.as_deref(), Some(NAME));
+
+        let opts = ConnectOptionsBuilder::new()
+            .user_name(NAME)
+            .clear_user_name()
+            .finalize();
+        assert!(opts.user_name.is_none());
+
+        // password: set then clear
+        let opts = ConnectOptionsBuilder::new().password(PSWD).finalize();
+        assert_eq!(opts.password.as_deref(), Some(PSWD.as_bytes()));
+
+        let opts = ConnectOptionsBuilder::new()
+            .password(PSWD)
+            .clear_password()
+            .finalize();
+        assert!(opts.password.is_none());
+
+        // will_message: set then clear with None
+        let opts = ConnectOptionsBuilder::new()
+            .will_message(msg.clone())
+            .finalize();
+        assert!(opts.will.is_some());
+
+        let opts = ConnectOptionsBuilder::new()
+            .will_message(msg)
+            .will_message(None)
+            .finalize();
+        assert!(opts.will.is_none());
+
+        // ssl_options: set then clear with None
+        let opts = ConnectOptionsBuilder::new().ssl_options(ssl).finalize();
+        assert!(opts.ssl.is_some());
+
+        let opts = ConnectOptionsBuilder::new()
+            .ssl_options(SslOptions::default())
+            .ssl_options(None)
+            .finalize();
+        assert!(opts.ssl.is_none());
+
+        // retry_interval: set then clear with None
+        let opts = ConnectOptionsBuilder::new()
+            .retry_interval(Duration::from_secs(5))
+            .finalize();
+        assert_eq!(opts.retry_interval, Some(Duration::from_secs(5)));
+
+        let opts = ConnectOptionsBuilder::new()
+            .retry_interval(Duration::from_secs(5))
+            .retry_interval(None)
+            .finalize();
+        assert!(opts.retry_interval.is_none());
+    }
+
+    #[test]
+    fn test_new_ffi() {
+        let opts = ConnectOptionsFfi::from(&ConnectOptions::new());
+        let default_copts = ffi::MQTTAsync_connectOptions::default();
+
+        assert_eq!(default_copts.struct_id, opts.copts.struct_id);
+        assert_eq!(default_copts.struct_version, opts.copts.struct_version);
+        assert!(opts.copts.will.is_null());
+        assert_eq!(1, opts.copts.cleansession);
+
+        assert!(opts.copts.username.is_null());
+        assert!(opts.copts.password.is_null());
+        assert!(opts.copts.binarypwd.data.is_null());
+        assert!(opts.copts.binarypwd.len == 0);
+        assert!(opts.copts.ssl.is_null());
+
+        assert!(opts.copts.context.is_null());
+
+        assert_eq!(0, opts.copts.serverURIcount);
+        assert!(opts.copts.serverURIs.is_null());
+
+        assert_eq!(0, opts.copts.MQTTVersion);
+        assert_eq!(0, opts.copts.automaticReconnect);
+
+        assert!(opts.copts.httpHeaders.is_null());
+        assert_eq!(0, opts.copts.cleanstart);
+
+        assert!(opts.copts.connectProperties.is_null());
+        assert!(opts.copts.willProperties.is_null());
+    }
 }

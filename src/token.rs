@@ -802,7 +802,9 @@ mod tests {
     fn test_from_message() {
         const MSG_ID: i16 = 42;
         let mut msg = Message::new("hello", "Hi there", 1);
-        msg.cmsg.msgid = MSG_ID as i32;
+        if let Message::Out(ref mut out) = msg {
+            out.msgid = Some(MSG_ID as u16);
+        }
 
         let tok = DeliveryToken::new(msg);
         let data = tok.inner.lock.lock().unwrap();

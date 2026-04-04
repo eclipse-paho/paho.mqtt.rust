@@ -535,16 +535,10 @@ impl TryFrom<Message> for MessageFfi {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{os::raw::c_char, thread};
-
-    const STRUCT_ID: [c_char; 4] = [
-        b'M' as c_char,
-        b'Q' as c_char,
-        b'T' as c_char,
-        b'M' as c_char,
-    ];
-
-    const STRUCT_VERSION: i32 = ffi::MESSAGE_STRUCT_VERSION;
+    use std::{
+        os::raw::{c_int, c_void},
+        thread,
+    };
 
     // These should differ from defaults
     const TOPIC: &str = "test";
@@ -560,113 +554,85 @@ mod tests {
     fn test_new() {
         let msg = Message::new(TOPIC, PAYLOAD, QOS);
 
-        assert_eq!(STRUCT_ID, msg.cmsg.struct_id);
-        assert_eq!(STRUCT_VERSION, msg.cmsg.struct_version);
+        assert_eq!(TOPIC, msg.topic());
+        assert_eq!(PAYLOAD, msg.payload());
+        assert_eq!(QOS, msg.qos());
+        assert!(!msg.retained());
 
-        assert_eq!(TOPIC, msg.data.topic.to_str().unwrap());
-        assert_eq!(PAYLOAD, msg.data.payload.as_slice());
-
-        assert_eq!(msg.data.payload.len() as i32, msg.cmsg.payloadlen);
-        assert_eq!(msg.data.payload.as_ptr() as *mut c_void, msg.cmsg.payload);
-
-        assert_eq!(QOS as c_int, msg.cmsg.qos);
-        assert!(msg.cmsg.retained == 0);
-    }
-
-    #[test]
-    fn test_from_2_tuple() {
-        let msg = Message::from((TOPIC, PAYLOAD));
-
-        // The topic is only kept in the Rust struct as a CString
-        assert_eq!(TOPIC, msg.data.topic.to_str().unwrap());
-        assert_eq!(PAYLOAD, msg.data.payload.as_slice());
-
-        assert_eq!(msg.data.payload.len() as i32, msg.cmsg.payloadlen);
-        assert_eq!(msg.data.payload.as_ptr() as *mut c_void, msg.cmsg.payload);
-    }
-
-    #[test]
-    fn test_from_4_tuple() {
-        let msg = Message::from((TOPIC, PAYLOAD, QOS as i32, RETAINED));
-
-        // The topic is only kept in the Rust struct as a CString
-        assert_eq!(TOPIC, msg.data.topic.to_str().unwrap());
-        assert_eq!(PAYLOAD, msg.data.payload.as_slice());
-
-        assert_eq!(msg.data.payload.len() as i32, msg.cmsg.payloadlen);
-        assert_eq!(msg.data.payload.as_ptr() as *mut c_void, msg.cmsg.payload);
-
-        assert_eq!(QOS as c_int, msg.cmsg.qos);
-        assert!(msg.cmsg.retained != 0);
+        let ffi = MessageFfi::try_from(msg).unwrap();
+        let default_cmsg = ffi::MQTTAsync_message::default();
+        assert_eq!(default_cmsg.struct_id, ffi.cmsg.struct_id);
+        assert_eq!(default_cmsg.struct_version, ffi.cmsg.struct_version);
+        assert_eq!(ffi.data.payload.len() as i32, ffi.cmsg.payloadlen);
+        assert_eq!(ffi.data.payload.as_ptr() as *mut c_void, ffi.cmsg.payload);
+        assert_eq!(QOS as c_int, ffi.cmsg.qos);
+        assert!(ffi.cmsg.retained == 0);
     }
 
     #[test]
     fn test_builder_default() {
         let msg = MessageBuilder::new().finalize();
-        let cmsg = ffi::MQTTAsync_message::default();
+        let default_cmsg = ffi::MQTTAsync_message::default();
 
-        assert_eq!(STRUCT_ID, cmsg.struct_id);
-        assert_eq!(STRUCT_VERSION, cmsg.struct_version);
+        let ffi = MessageFfi::try_from(msg).unwrap();
+        assert_eq!(default_cmsg.struct_id, ffi.cmsg.struct_id);
+        assert_eq!(default_cmsg.struct_version, ffi.cmsg.struct_version);
 
-        assert_eq!(cmsg.struct_id, msg.cmsg.struct_id);
-        assert_eq!(cmsg.struct_version, msg.cmsg.struct_version);
-
-        assert_eq!(0, msg.data.topic.as_bytes().len());
-        assert_eq!(&[] as &[u8], msg.data.topic.as_bytes());
-        assert_eq!(&[] as &[u8], msg.data.payload.as_slice());
+        assert_eq!(0, ffi.data.topic.as_bytes().len());
+        assert_eq!(&[] as &[u8], ffi.data.topic.as_bytes());
+        assert_eq!(&[] as &[u8], ffi.data.payload.as_slice());
     }
 
     #[test]
     fn test_builder_topic() {
-        const TOPIC: &str = "test";
-
         let msg = MessageBuilder::new().topic(TOPIC).finalize();
-
-        // The topic is only kept in the Rust struct as a CString
-        assert_eq!(TOPIC, msg.data.topic.to_str().unwrap());
         assert_eq!(TOPIC, msg.topic());
+
+        let ffi = MessageFfi::try_from(msg).unwrap();
+        assert_eq!(TOPIC, ffi.data.topic.to_str().unwrap());
     }
 
     #[test]
     fn test_builder_payload() {
-        const PAYLOAD: &[u8] = b"Hello world";
-
         let msg = MessageBuilder::new().payload(PAYLOAD).finalize();
-
-        assert_eq!(PAYLOAD, msg.data.payload.as_slice());
         assert_eq!(PAYLOAD, msg.payload());
 
-        assert_eq!(msg.data.payload.len() as i32, msg.cmsg.payloadlen);
-        assert_eq!(msg.data.payload.as_ptr() as *mut c_void, msg.cmsg.payload);
+        let ffi = MessageFfi::try_from(msg).unwrap();
+        assert_eq!(PAYLOAD, ffi.data.payload.as_slice());
+        assert_eq!(ffi.data.payload.len() as i32, ffi.cmsg.payloadlen);
+        assert_eq!(ffi.data.payload.as_ptr() as *mut c_void, ffi.cmsg.payload);
     }
 
     #[test]
     fn test_builder_qos() {
         let msg = MessageBuilder::new().qos(QOS).finalize();
-
-        assert_eq!(QOS as c_int, msg.cmsg.qos);
         assert_eq!(QOS, msg.qos());
+
+        let ffi = MessageFfi::try_from(msg).unwrap();
+        assert_eq!(QOS as c_int, ffi.cmsg.qos);
 
         let qos = 1;
         let msg = MessageBuilder::new().qos(qos).finalize();
-
-        assert_eq!(qos, msg.cmsg.qos);
         assert_eq!(QoS::from(qos), msg.qos());
+
+        let ffi = MessageFfi::try_from(msg).unwrap();
+        assert_eq!(qos, ffi.cmsg.qos);
     }
 
     #[test]
     fn test_builder_retained() {
         let msg = MessageBuilder::new().retained(false).finalize();
-        assert!(msg.cmsg.retained == 0);
+        assert!(!msg.retained());
+        let ffi = MessageFfi::try_from(msg).unwrap();
+        assert!(ffi.cmsg.retained == 0);
 
         let msg = MessageBuilder::new().retained(true).finalize();
-        assert!(msg.cmsg.retained != 0);
         assert!(msg.retained());
+        let ffi = MessageFfi::try_from(msg).unwrap();
+        assert!(ffi.cmsg.retained != 0);
     }
 
-    // Make sure assignment works properly
-    // This primarily ensures that C pointers stay fixed to cached values,
-    // and/or that the cached buffers don't move due to assignment.
+    // Make sure assignment works properly.
     #[test]
     fn test_assign() {
         let org_msg = MessageBuilder::new()
@@ -677,28 +643,23 @@ mod tests {
             .finalize();
 
         let msg = org_msg;
+        assert_eq!(TOPIC, msg.topic());
+        assert_eq!(PAYLOAD, msg.payload());
+        assert_eq!(QOS, msg.qos());
+        assert!(msg.retained());
 
-        // The topic is only kept in the Rust struct as a CString
-        assert_eq!(TOPIC, msg.data.topic.to_str().unwrap());
-        assert_eq!(PAYLOAD, msg.data.payload.as_slice());
-
-        assert_eq!(msg.data.payload.len() as i32, msg.cmsg.payloadlen);
-        assert_eq!(msg.data.payload.as_ptr() as *mut c_void, msg.cmsg.payload);
-
-        assert_eq!(QOS as c_int, msg.cmsg.qos);
-        assert!(msg.cmsg.retained != 0);
+        let ffi = MessageFfi::try_from(msg).unwrap();
+        assert_eq!(ffi.data.payload.len() as i32, ffi.cmsg.payloadlen);
+        assert_eq!(ffi.data.payload.as_ptr() as *mut c_void, ffi.cmsg.payload);
+        assert_eq!(QOS as c_int, ffi.cmsg.qos);
+        assert!(ffi.cmsg.retained != 0);
     }
 
     // Test that a clone works properly.
-    // This ensures that the cached values are cloned and that the C pointers
-    // in the new object point to those clones.
+    // This ensures that the cloned FFI struct's pointers point into the
+    // clone's own data, not the original's.
     #[test]
     fn test_clone() {
-        const TOPIC: &str = "test";
-        const PAYLOAD: &[u8] = b"Hello world";
-        const QOS: QoS = QoS::ExactlyOnce;
-        const RETAINED: bool = true;
-
         let msg = {
             // Make sure the original goes out of scope before testing
             let org_msg = MessageBuilder::new()
@@ -710,26 +671,25 @@ mod tests {
             org_msg.clone()
         };
 
-        assert_eq!(TOPIC, msg.data.topic.to_str().unwrap());
-        assert_eq!(PAYLOAD, msg.data.payload.as_slice());
+        assert_eq!(TOPIC, msg.topic());
+        assert_eq!(PAYLOAD, msg.payload());
+        assert_eq!(QOS, msg.qos());
+        assert!(msg.retained());
 
-        assert_eq!(msg.data.payload.len() as i32, msg.cmsg.payloadlen);
-        assert_eq!(msg.data.payload.as_ptr() as *mut c_void, msg.cmsg.payload);
-
-        assert_eq!(QOS as c_int, msg.cmsg.qos);
-        assert!(msg.cmsg.retained != 0);
+        let ffi = MessageFfi::try_from(msg).unwrap();
+        assert_eq!(ffi.data.payload.len() as i32, ffi.cmsg.payloadlen);
+        assert_eq!(ffi.data.payload.as_ptr() as *mut c_void, ffi.cmsg.payload);
+        assert_eq!(QOS as c_int, ffi.cmsg.qos);
+        assert!(ffi.cmsg.retained != 0);
     }
 
     // Determine that a message can be sent across threads.
-    // As long as it compiles, this indicates that Message implements
-    // the Send trait.
     #[test]
     fn test_message_send() {
         let msg = Message::new(TOPIC, PAYLOAD, QOS);
-
         let thr = thread::spawn(move || {
-            assert_eq!(TOPIC, msg.data.topic.to_str().unwrap());
-            assert_eq!(PAYLOAD, msg.data.payload.as_slice());
+            assert_eq!(TOPIC, msg.topic());
+            assert_eq!(PAYLOAD, msg.payload());
             assert_eq!(QOS, msg.qos());
         });
         thr.join().unwrap();

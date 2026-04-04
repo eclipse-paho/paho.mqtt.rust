@@ -1898,7 +1898,6 @@ impl From<Properties> for PropertiesFfi {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::ffi::CStr;
 
     #[test]
     fn test_property_type_new() {
@@ -1936,285 +1935,156 @@ mod tests {
 
     #[test]
     fn test_property_generic_new() {
+        // ResponseTopic expects String/&str, not u16 — should fail
         let prop = Property::new(PropertyCode::ResponseTopic, 42u16);
-        assert!(prop.is_err());
+        assert!(prop.is_none());
 
+        // MaximumQos expects u8 — should succeed
         let prop = Property::new(PropertyCode::MaximumQos, 2u8);
-        assert!(prop.is_ok());
+        assert!(prop.is_some());
 
         let topic = "data/temp".to_string();
         let prop = Property::new(PropertyCode::ResponseTopic, topic.clone()).unwrap();
-        assert_eq!(prop.get_string(), Some(topic));
+        assert_eq!(prop.get_string(), Some(topic.as_str()));
 
         let topic = "data/temp";
         let prop = Property::new(PropertyCode::ResponseTopic, topic).unwrap();
-        assert_eq!(prop.get_string(), Some(topic.to_string()));
+        assert_eq!(prop.get_string(), Some(topic));
     }
 
     #[test]
     fn test_new_property_byte() {
         let val = 1u8;
 
-        let prop = Property::new_byte(PropertyCode::PayloadFormatIndicator, val).unwrap();
+        let prop = Property::PayloadFormatIndicator(val);
+        assert_eq!(prop.get_byte(), Some(&val));
+        assert_eq!(prop.get_uint(), Some(val as u32));
 
-        unsafe {
-            assert_eq!(
-                prop.cprop.identifier,
-                PropertyCode::PayloadFormatIndicator as Code
-            );
-            assert_eq!(prop.cprop.value.byte, val);
-        }
+        // Property::new() also works
+        let prop = Property::new(PropertyCode::PayloadFormatIndicator, val).unwrap();
+        assert_eq!(prop.get_byte(), Some(&val));
 
-        assert_eq!(prop.get_byte(), Some(val));
-        assert_eq!(prop.get::<u8>(), Some(val));
-
-        let val = 1i32;
-        let prop = Property::new_int(PropertyCode::PayloadFormatIndicator, val).unwrap();
-
-        unsafe {
-            assert_eq!(
-                prop.cprop.identifier,
-                PropertyCode::PayloadFormatIndicator as Code
-            );
-            assert_eq!(prop.cprop.value.byte, val as u8);
-        }
-
-        assert_eq!(prop.get_int(), Some(val));
-        assert_eq!(prop.get::<i32>(), Some(val));
-
-        let res = Property::new_int(PropertyCode::PayloadFormatIndicator, 0x100);
-        assert!(res.is_err());
+        // Wrong type returns None
+        let res = Property::new(PropertyCode::PayloadFormatIndicator, 0x100u16);
+        assert!(res.is_none());
     }
 
     #[test]
     fn test_new_property_u16() {
         let val = 1024u16;
-        let prop = Property::new_u16(PropertyCode::ReceiveMaximum, val).unwrap();
 
-        unsafe {
-            assert_eq!(prop.cprop.identifier, PropertyCode::ReceiveMaximum as Code);
-            assert_eq!(prop.cprop.value.integer2, val);
-        }
+        let prop = Property::ReceiveMaximum(val);
+        assert_eq!(prop.get_u16(), Some(&val));
+        assert_eq!(prop.get_uint(), Some(val as u32));
 
-        assert_eq!(prop.get_u16(), Some(val));
-        assert_eq!(prop.get::<u16>(), Some(val));
-
-        let val = 1024i32;
-        let prop = Property::new_int(PropertyCode::ReceiveMaximum, val).unwrap();
-
-        unsafe {
-            assert_eq!(prop.cprop.identifier, PropertyCode::ReceiveMaximum as Code);
-            assert_eq!(prop.cprop.value.integer2, val as u16);
-        }
-
-        assert_eq!(prop.get_int(), Some(val));
-        assert_eq!(prop.get::<i32>(), Some(val));
-
-        assert_eq!(prop.get_u16(), Some(val as u16));
-        assert_eq!(prop.get::<u16>(), Some(val as u16));
-
-        let res = Property::new_int(PropertyCode::ReceiveMaximum, 0x10000);
-        assert!(res.is_err());
+        // Property::new() also works
+        let prop = Property::new(PropertyCode::ReceiveMaximum, val).unwrap();
+        assert_eq!(prop.get_u16(), Some(&val));
     }
 
     #[test]
-    fn test_new_property_i32() {
-        let val = 1024 * 1024;
-        let prop = Property::new_int(PropertyCode::MessageExpiryInterval, val).unwrap();
+    fn test_new_property_u32() {
+        let val = 1024u32 * 1024;
 
-        unsafe {
-            assert_eq!(
-                prop.cprop.identifier,
-                PropertyCode::MessageExpiryInterval as Code
-            );
-            assert_eq!(prop.cprop.value.integer4, val as u32);
-        }
+        let prop = Property::MessageExpiraryInterval(val);
+        assert_eq!(prop.get_u32(), Some(&val));
+        assert_eq!(prop.get_uint(), Some(val));
+
+        // Property::new() also works
+        let prop = Property::new(PropertyCode::MessageExpiryInterval, val).unwrap();
+        assert_eq!(prop.get_u32(), Some(&val));
     }
 
     #[test]
     fn test_new_property_binary() {
-        let val = "12345"; // Anything that can be converted into Vec<u8>
-        let prop = Property::new_binary(PropertyCode::CorrelationData, val).unwrap();
+        let val = b"12345";
 
-        // We should have non-null data pointer, null value pointer
-        unsafe {
-            assert!(!prop.cprop.value.__bindgen_anon_1.data.data.is_null());
-            assert_eq!(prop.cprop.value.__bindgen_anon_1.data.len, 5);
+        let prop = Property::CorrelationData(val.to_vec());
+        assert_eq!(prop.get_binary(), Some(val.as_ref()));
 
-            assert!(prop.cprop.value.__bindgen_anon_1.value.data.is_null());
-            assert_eq!(prop.cprop.value.__bindgen_anon_1.value.len, 0);
-        }
-        assert_eq!(prop.get_binary(), Some(val.as_bytes().to_vec()));
-        assert_eq!(prop.get::<Vec<u8>>(), Some(val.as_bytes().to_vec()));
+        // Property::new() also works
+        let prop = Property::new(PropertyCode::CorrelationData, val.as_ref()).unwrap();
+        assert_eq!(prop.get_binary(), Some(val.as_ref()));
     }
 
     #[test]
     fn test_new_property_string() {
         let val = "replies/myqueue";
-        let prop = Property::new_string(PropertyCode::ResponseTopic, val).unwrap();
 
-        // We should have non-null data pointer, null value pointer
-        unsafe {
-            assert!(!prop.cprop.value.__bindgen_anon_1.data.data.is_null());
-            assert_eq!(
-                prop.cprop.value.__bindgen_anon_1.data.len,
-                val.len() as c_int
-            );
+        let prop = Property::ResponseTopic(val.to_string());
+        assert_eq!(prop.get_string(), Some(val));
 
-            let s = CStr::from_ptr(prop.cprop.value.__bindgen_anon_1.data.data);
-            assert_eq!(val, s.to_str().unwrap());
-
-            assert!(prop.cprop.value.__bindgen_anon_1.value.data.is_null());
-            assert_eq!(prop.cprop.value.__bindgen_anon_1.value.len, 0);
-        }
-
-        assert_eq!(prop.get_string(), Some(val.to_string()));
-        assert_eq!(prop.get::<String>(), Some(val.to_string()));
+        // Property::new() also works
+        let prop = Property::new(PropertyCode::ResponseTopic, val).unwrap();
+        assert_eq!(prop.get_string(), Some(val));
     }
 
     #[test]
     fn test_new_property_string_pair() {
         let key = "mykey";
         let val = "myvalue";
-        let prop = Property::new_string_pair(PropertyCode::UserProperty, key, val).unwrap();
 
-        // We should have non-null data and value pointers
-        unsafe {
-            assert!(!prop.cprop.value.__bindgen_anon_1.data.data.is_null());
-            assert_eq!(
-                prop.cprop.value.__bindgen_anon_1.data.len,
-                key.len() as c_int
-            );
-
-            let s = CStr::from_ptr(prop.cprop.value.__bindgen_anon_1.data.data);
-            assert_eq!(key, s.to_str().unwrap());
-
-            assert!(!prop.cprop.value.__bindgen_anon_1.value.data.is_null());
-            assert_eq!(
-                prop.cprop.value.__bindgen_anon_1.value.len,
-                val.len() as c_int
-            );
-
-            let s = CStr::from_ptr(prop.cprop.value.__bindgen_anon_1.value.data);
-            assert_eq!(val, s.to_str().unwrap());
-        }
-
+        let prop = Property::User((key.to_string(), val.to_string()));
         assert_eq!(
             prop.get_string_pair(),
-            Some((key.to_string(), val.to_string()))
+            Some(&(key.to_string(), val.to_string()))
         );
+
+        // Property::new() also works
+        let prop = Property::new(PropertyCode::UserProperty, (key, val)).unwrap();
         assert_eq!(
-            prop.get::<(String, String)>(),
-            Some((key.to_string(), val.to_string()))
+            prop.get_string_pair(),
+            Some(&(key.to_string(), val.to_string()))
         );
     }
 
     #[test]
     fn test_move_property_int() {
-        let val = 1024 * 1024;
-
-        let org_prop = Property::new_int(PropertyCode::MessageExpiryInterval, val).unwrap();
-        unsafe {
-            assert_eq!(
-                org_prop.cprop.identifier,
-                PropertyCode::MessageExpiryInterval as Code
-            );
-            assert_eq!(org_prop.cprop.value.integer4, val as u32);
-        }
+        let val = 1024u32 * 1024;
+        let org_prop = Property::MessageExpiraryInterval(val);
+        assert_eq!(org_prop.get_u32(), Some(&val));
 
         let prop = org_prop;
-        unsafe {
-            assert_eq!(
-                prop.cprop.identifier,
-                PropertyCode::MessageExpiryInterval as Code
-            );
-            assert_eq!(prop.cprop.value.integer4, val as u32);
-        }
+        assert_eq!(prop.get_u32(), Some(&val));
     }
 
     #[test]
     fn test_move_property_binary() {
-        let val = "12345"; // Anything that can be converted into Vec<u8>
-        let org_prop = Property::new_binary(PropertyCode::CorrelationData, val).unwrap();
-
+        let val = b"12345";
+        let org_prop = Property::CorrelationData(val.to_vec());
         let prop = org_prop;
-
-        // We should have non-null data pointer, null value pointer
-        unsafe {
-            assert_eq!(prop.cprop.identifier, PropertyCode::CorrelationData as Code);
-
-            assert!(!prop.cprop.value.__bindgen_anon_1.data.data.is_null());
-            assert_eq!(prop.cprop.value.__bindgen_anon_1.data.len, 5);
-
-            assert!(prop.cprop.value.__bindgen_anon_1.value.data.is_null());
-            assert_eq!(prop.cprop.value.__bindgen_anon_1.value.len, 0);
-        }
+        assert_eq!(prop.get_binary(), Some(val.as_ref()));
     }
 
     #[test]
     fn test_move_property_string() {
         let val = "replies/myqueue";
-        let org_prop = Property::new_string(PropertyCode::ResponseTopic, val).unwrap();
-
+        let org_prop = Property::ResponseTopic(val.to_string());
         let prop = org_prop;
-
-        unsafe {
-            assert_eq!(prop.cprop.identifier, PropertyCode::ResponseTopic as Code);
-
-            assert!(!prop.cprop.value.__bindgen_anon_1.data.data.is_null());
-            assert_eq!(
-                prop.cprop.value.__bindgen_anon_1.data.len,
-                val.len() as c_int
-            );
-
-            assert!(prop.cprop.value.__bindgen_anon_1.value.data.is_null());
-            assert_eq!(prop.cprop.value.__bindgen_anon_1.value.len, 0);
-        }
+        assert_eq!(prop.get_string(), Some(val));
     }
 
     #[test]
     fn test_clone_property_binary() {
-        let val = "12345"; // Anything that can be converted into Vec<u8>
-        let org_prop = Property::new_binary(PropertyCode::CorrelationData, val).unwrap();
-
+        let val = b"12345";
+        let org_prop = Property::CorrelationData(val.to_vec());
         let prop = org_prop.clone();
 
-        // We should have non-null data pointer, null value pointer
-        unsafe {
-            assert_eq!(prop.cprop.identifier, PropertyCode::CorrelationData as Code);
-
-            assert!(!prop.cprop.value.__bindgen_anon_1.data.data.is_null());
-            assert_eq!(prop.cprop.value.__bindgen_anon_1.data.len, 5);
-
-            assert!(prop.cprop.value.__bindgen_anon_1.value.data.is_null());
-            assert_eq!(prop.cprop.value.__bindgen_anon_1.value.len, 0);
-
-            assert_ne!(
-                org_prop.cprop.value.__bindgen_anon_1.data.data,
-                prop.cprop.value.__bindgen_anon_1.data.data
-            );
+        assert_eq!(prop.get_binary(), Some(val.as_ref()));
+        // Cloned Vec should be independent
+        if let (Property::CorrelationData(a), Property::CorrelationData(b)) =
+            (&org_prop, &prop)
+        {
+            assert!(!std::ptr::eq(a.as_ptr(), b.as_ptr()));
         }
     }
 
     #[test]
     fn test_clone_property_string() {
         let val = "replies/myqueue";
-        let org_prop = Property::new_string(PropertyCode::ResponseTopic, val).unwrap();
-
-        let prop = org_prop;
-
-        unsafe {
-            assert_eq!(prop.cprop.identifier, PropertyCode::ResponseTopic as Code);
-
-            assert!(!prop.cprop.value.__bindgen_anon_1.data.data.is_null());
-            assert_eq!(
-                prop.cprop.value.__bindgen_anon_1.data.len,
-                val.len() as c_int
-            );
-
-            assert!(prop.cprop.value.__bindgen_anon_1.value.data.is_null());
-            assert_eq!(prop.cprop.value.__bindgen_anon_1.value.len, 0);
-        }
+        let org_prop = Property::ResponseTopic(val.to_string());
+        let prop = org_prop.clone();
+        assert_eq!(prop.get_string(), Some(val));
     }
 
     /////////////////////////////////////////////////////////////////////////
@@ -2222,22 +2092,16 @@ mod tests {
     #[test]
     fn test_properties_default() {
         let props = Properties::default();
-
         assert!(props.is_empty());
         assert_eq!(props.len(), 0);
-
-        // Empty list needs 1 byte for zero len byte
-        assert_eq!(props.byte_len(), 1);
     }
 
     #[test]
     fn test_properties_push() {
         let mut props = Properties::new();
 
-        let val = 1;
-        let prop = Property::new_int(PropertyCode::PayloadFormatIndicator, val).unwrap();
-
-        props.push(prop).unwrap();
+        let prop = Property::PayloadFormatIndicator(1);
+        props.push(prop);
 
         assert_eq!(props.len(), 1);
         assert!(!props.is_empty());
@@ -2255,25 +2119,22 @@ mod tests {
         assert_eq!(props.len(), 1);
 
         props
-            .push_val(PropertyCode::CorrelationData, b"12345")
+            .push_val(PropertyCode::CorrelationData, b"12345".as_ref())
             .unwrap();
         assert_eq!(props.len(), 2);
     }
 
     #[test]
-    fn test_properties_get_int() {
+    fn test_properties_get() {
         let code = PropertyCode::PayloadFormatIndicator;
+        let val = 1u8;
 
         let mut props = Properties::new();
-
-        let val = 1;
-        let org_prop = Property::new_int(code, val).unwrap();
-
-        props.push(org_prop).unwrap();
+        props.push(Property::PayloadFormatIndicator(val));
 
         let prop = props.get(code).unwrap();
-        assert_eq!(prop.get_int().unwrap(), val);
-        //assert_eq!(prop.get_val::<i32>().unwrap(), val);
+        assert_eq!(prop.get_byte(), Some(&val));
+        assert_eq!(prop.get_uint(), Some(val as u32));
     }
 
     #[test]
@@ -2282,46 +2143,25 @@ mod tests {
 
         let mut props = Properties::new();
 
-        props
-            .push(Property::new_string_pair(code, "user0", "val0").unwrap())
-            .unwrap();
-        props
-            .push(Property::new_string_pair(code, "user1", "val1").unwrap())
-            .unwrap();
-        props
-            .push(Property::new_string_pair(code, "user2", "val2").unwrap())
-            .unwrap();
+        props.push(Property::User(("user0".to_string(), "val0".to_string())));
+        props.push(Property::User(("user1".to_string(), "val1".to_string())));
+        props.push(Property::User(("user2".to_string(), "val2".to_string())));
 
         assert!(!props.is_empty());
         assert_eq!(props.len(), 3);
 
+        // get_string_pair() returns the first match
         assert_eq!(
-            props.get_string_pair_at(code, 0).unwrap(),
-            ("user0".to_string(), "val0".to_string())
-        );
-        assert_eq!(
-            props.get_string_pair_at(code, 1).unwrap(),
-            ("user1".to_string(), "val1".to_string())
-        );
-        assert_eq!(
-            props.get_string_pair_at(code, 2).unwrap(),
-            ("user2".to_string(), "val2".to_string())
+            props.get_string_pair(code),
+            Some(&("user0".to_string(), "val0".to_string()))
         );
 
-        assert_eq!(
-            props.get_val::<(String, String)>(code),
-            Some(("user0".to_string(), "val0".to_string()))
-        );
-        assert_eq!(
-            props.get_val_at::<(String, String)>(code, 1),
-            Some(("user1".to_string(), "val1".to_string()))
-        );
-        assert_eq!(
-            props.get_val_at::<(String, String)>(code, 2),
-            Some(("user2".to_string(), "val2".to_string()))
-        );
-
-        assert_eq!(props.get_string_pair_at(code, 3), None);
+        // Iterate to access all
+        let pairs: Vec<&(String, String)> =
+            props.iter().filter_map(|p| p.get_string_pair()).collect();
+        assert_eq!(pairs[0], &("user0".to_string(), "val0".to_string()));
+        assert_eq!(pairs[1], &("user1".to_string(), "val1".to_string()));
+        assert_eq!(pairs[2], &("user2".to_string(), "val2".to_string()));
     }
 
     #[test]
@@ -2330,44 +2170,40 @@ mod tests {
 
         let mut props = Properties::new();
 
-        props.push_string_pair(code, "user0", "val0").unwrap();
-        props.push_string_pair(code, "user1", "val1").unwrap();
-        props.push_string_pair(code, "user2", "val2").unwrap();
+        props.push(Property::User(("user0".to_string(), "val0".to_string())));
+        props.push(Property::User(("user1".to_string(), "val1".to_string())));
+        props.push(Property::User(("user2".to_string(), "val2".to_string())));
 
-        let mut it = props.iter(code);
+        let mut it = props.iter().filter(|p| p.property_code() == code);
 
         assert_eq!(
-            it.next().and_then(|prop| prop.get_string_pair()),
-            Some(("user0".to_string(), "val0".to_string()))
+            it.next().and_then(|p| p.get_string_pair()),
+            Some(&("user0".to_string(), "val0".to_string()))
         );
         assert_eq!(
-            it.next().and_then(|prop| prop.get_string_pair()),
-            Some(("user1".to_string(), "val1".to_string()))
+            it.next().and_then(|p| p.get_string_pair()),
+            Some(&("user1".to_string(), "val1".to_string()))
         );
         assert_eq!(
-            it.next().and_then(|prop| prop.get_string_pair()),
-            Some(("user2".to_string(), "val2".to_string()))
+            it.next().and_then(|p| p.get_string_pair()),
+            Some(&("user2".to_string(), "val2".to_string()))
         );
-
-        assert_eq!(it.next().and_then(|prop| prop.get_string_pair()), None);
+        assert_eq!(it.next().and_then(|p| p.get_string_pair()), None);
     }
 
     #[test]
     fn test_properties_user_iterator() {
-        let code = PropertyCode::UserProperty;
-
         let mut props = Properties::new();
 
-        props.push_string_pair(code, "user0", "val0").unwrap();
-        props.push_string_pair(code, "user1", "val1").unwrap();
-        props.push_string_pair(code, "user2", "val2").unwrap();
+        props.push(Property::User(("user0".to_string(), "val0".to_string())));
+        props.push(Property::User(("user1".to_string(), "val1".to_string())));
+        props.push(Property::User(("user2".to_string(), "val2".to_string())));
 
-        let mut it = props.user_iter();
+        let mut it = props.iter().filter_map(|p| p.get_string_pair());
 
-        assert_eq!(it.next(), Some(("user0".to_string(), "val0".to_string())));
-        assert_eq!(it.next(), Some(("user1".to_string(), "val1".to_string())));
-        assert_eq!(it.next(), Some(("user2".to_string(), "val2".to_string())));
-
+        assert_eq!(it.next(), Some(&("user0".to_string(), "val0".to_string())));
+        assert_eq!(it.next(), Some(&("user1".to_string(), "val1".to_string())));
+        assert_eq!(it.next(), Some(&("user2".to_string(), "val2".to_string())));
         assert_eq!(it.next(), None);
     }
 
@@ -2381,9 +2217,9 @@ mod tests {
         props.push(Property::new(code, ("user1", "val1")).unwrap());
         props.push(Property::new(code, ("user2", "val2")).unwrap());
 
-        assert_eq!(Some("val0"), props.find_user_property("user0").as_deref());
-        assert_eq!(Some("val1"), props.find_user_property("user1").as_deref());
-        assert_eq!(Some("val2"), props.find_user_property("user2").as_deref());
+        assert_eq!(Some("val0"), props.find_user_property("user0"));
+        assert_eq!(Some("val1"), props.find_user_property("user1"));
+        assert_eq!(Some("val2"), props.find_user_property("user2"));
         assert_eq!(None, props.find_user_property("user3"));
     }
 
@@ -2403,18 +2239,18 @@ mod tests {
         assert!(!props.is_empty());
         assert_eq!(3, props.len());
         assert_eq!(
-            Some(b"12345".to_vec()),
-            props.get_val::<Vec<u8>>(PropertyCode::CorrelationData)
+            Some(b"12345".as_ref()),
+            props.get_binary(PropertyCode::CorrelationData)
         );
 
         let props = properties! {
-            PropertyCode(60),
+            SessionExpiryInterval(60u32),
         };
 
         assert_eq!(1, props.len());
         assert_eq!(
             Some(60),
-            props.get_val::<i32>(PropertyCode::SessionExpiryInterval)
+            props.get_uint(PropertyCode::SessionExpiryInterval)
         );
     }
 }

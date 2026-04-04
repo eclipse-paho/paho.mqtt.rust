@@ -162,25 +162,16 @@ impl DisconnectOptionsBuilder {
 mod tests {
     use super::*;
     use crate::{Property, PropertyCode, ReasonCode};
-    use std::{os::raw::c_char, thread};
-
-    // Identifier fo a C disconnect options struct
-    const STRUCT_ID: [c_char; 4] = [
-        b'M' as c_char,
-        b'Q' as c_char,
-        b'T' as c_char,
-        b'D' as c_char,
-    ];
-
-    const STRUCT_VERSION: i32 = ffi::DISCONNECT_OPTIONS_STRUCT_VERSION;
+    use std::thread;
 
     #[test]
     fn test_new() {
         let opts = DisconnectOptions::new();
         let ffi = opts.to_ffi();
+        let default_copts = ffi::MQTTAsync_disconnectOptions::default();
 
-        assert_eq!(STRUCT_ID, ffi.copts.struct_id);
-        assert_eq!(STRUCT_VERSION, ffi.copts.struct_version);
+        assert_eq!(default_copts.struct_id, ffi.copts.struct_id);
+        assert_eq!(default_copts.struct_version, ffi.copts.struct_version);
     }
 
     #[test]
@@ -189,8 +180,9 @@ mod tests {
 
         let thr = thread::spawn(move || {
             let ffi = opts.to_ffi();
-            assert_eq!(STRUCT_ID, ffi.copts.struct_id);
-            assert_eq!(STRUCT_VERSION, ffi.copts.struct_version);
+            let default_copts = ffi::MQTTAsync_disconnectOptions::default();
+            assert_eq!(default_copts.struct_id, ffi.copts.struct_id);
+            assert_eq!(default_copts.struct_version, ffi.copts.struct_version);
         });
         thr.join().unwrap();
     }

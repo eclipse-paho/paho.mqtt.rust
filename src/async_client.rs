@@ -112,8 +112,8 @@ pub type DisconnectedCallback =
 pub type MessageArrivedCallback = dyn FnMut(&AsyncClient, Option<Message>) + Send + 'static;
 
 /// User callback type for an SSL/TLS error
-pub type SslErrorCallback = dyn Fn(&AsyncClient, &str) + Send + 'static;
-//pub type SslErrorCallback = dyn Fn(&AsyncClient, String) + Send + 'static;
+pub type SslErrorCallback = dyn Fn(&AsyncClient, &str) + Send + Sync + 'static;
+//pub type SslErrorCallback = dyn Fn(&AsyncClient, String) + Send + Sync + 'static;
 
 // The context provided for the client callbacks.
 //
@@ -165,7 +165,7 @@ impl AsyncClient {
 
         let mut cli = InnerAsyncClient {
             handle: ptr::null_mut(),
-            mqtt_version: AtomicU32::new(MqttVersion::Default as u32),
+            mqtt_version: AtomicU32::new(MqttVersion::V5 as u32),
             opts,
             conn_opts: RwLock::new(ConnectOptions::new()),
             callback_context: Mutex::new(CallbackContext::default()),
@@ -1695,10 +1695,15 @@ mod tests {
             .mqtt_version(MqttVersion::V5)
             .send_while_disconnected(true)
             .allow_disconnected_send_at_anytime(true)
-            .create_client()
+            .create_async_client()
             .unwrap();
-        let res =
-            client.try_publish(MessageBuilder::new().topic("test").payload([]).finalize());
+        let res = client.try_publish(
+            MessageBuilder::new()
+                .topic("test")
+                .payload([])
+                .qos(1)
+                .finalize(),
+        );
         assert!(res.is_ok(), "Failed to publish message before connecting");
     }
 }

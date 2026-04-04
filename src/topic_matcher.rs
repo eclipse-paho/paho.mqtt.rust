@@ -621,6 +621,6 @@ mod tests {
         assert_eq!(m, &[42]);
 
         let m: Vec<_> = tm.matches("some/bad/topic").map(|(_, v)| *v).collect();
-        assert_eq!(m, &[]);
+        assert!(m.is_empty());
     }
 }

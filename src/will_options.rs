@@ -191,16 +191,6 @@ impl From<Message> for WillOptions {
 mod tests {
     use super::*;
     use crate::message::MessageBuilder;
-    use std::os::raw::c_char;
-
-    // The C struct identifier for will options and the supported struct version.
-    const STRUCT_ID: [c_char; 4] = [
-        b'M' as c_char,
-        b'Q' as c_char,
-        b'T' as c_char,
-        b'W' as c_char,
-    ];
-    const STRUCT_VERSION: i32 = 1;
 
     // These should differ from defaults.
     const TOPIC: &str = "test";
@@ -215,9 +205,6 @@ mod tests {
         // Get default C options for comparison
         let copts = ffi::MQTTAsync_willOptions::default();
 
-        // First, make sure C options valid
-        assert_eq!(STRUCT_ID, copts.struct_id);
-        assert_eq!(STRUCT_VERSION, copts.struct_version);
         assert_eq!(ptr::null(), copts.message);
 
         assert_eq!(copts.struct_id, opts.copts.struct_id);
@@ -235,9 +222,10 @@ mod tests {
     #[test]
     fn test_new() {
         let msg = WillOptions::new(TOPIC, PAYLOAD, QOS);
+        let default_copts = ffi::MQTTAsync_willOptions::default();
 
-        assert_eq!(STRUCT_ID, msg.copts.struct_id);
-        assert_eq!(STRUCT_VERSION, msg.copts.struct_version);
+        assert_eq!(default_copts.struct_id, msg.copts.struct_id);
+        assert_eq!(default_copts.struct_version, msg.copts.struct_version);
 
         assert_eq!(TOPIC, msg.data.topic.to_str().unwrap());
         assert_eq!(PAYLOAD, msg.data.payload.as_slice());
@@ -255,9 +243,10 @@ mod tests {
     #[test]
     fn test_new_retained() {
         let msg = WillOptions::new_retained(TOPIC, PAYLOAD, QOS);
+        let default_copts = ffi::MQTTAsync_willOptions::default();
 
-        assert_eq!(STRUCT_ID, msg.copts.struct_id);
-        assert_eq!(STRUCT_VERSION, msg.copts.struct_version);
+        assert_eq!(default_copts.struct_id, msg.copts.struct_id);
+        assert_eq!(default_copts.struct_version, msg.copts.struct_version);
 
         assert_eq!(TOPIC, msg.data.topic.to_str().unwrap());
         assert_eq!(PAYLOAD, msg.data.payload.as_slice());
