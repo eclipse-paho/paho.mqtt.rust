@@ -26,7 +26,8 @@ use std::{borrow::Cow, os::raw::c_void, pin::Pin, ptr};
 
 use crate::{
     ffi,
-    message::{Message, MessageFfi, MessageFfiData},
+    ffi_utils::{MessageFfi, MessageFfiData},
+    message::Message,
 };
 
 /// The options for the Last Will and Testament (LWT).

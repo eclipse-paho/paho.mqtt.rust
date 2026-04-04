@@ -24,12 +24,8 @@
 //! This contains the structures to define the options for disconnecting from
 //! the MQTT broker/server.
 
-use crate::{
-    ffi,
-    properties::{Properties, PropertiesFfi},
-    reason_code::ReasonCode,
-};
-use std::{os::raw::c_int, time::Duration};
+use crate::{properties::Properties, reason_code::ReasonCode};
+use std::time::Duration;
 
 /// The collection of options for disconnecting from the client.
 #[derive(Debug, Default, Clone)]
@@ -57,37 +53,10 @@ impl DisconnectOptions {
         }
     }
 
-    /// Gets an FFI representation of the disconnect options.
-    pub(crate) fn to_ffi(&self) -> DisconnectOptionsFfi {
-        let props = PropertiesFfi::from(&self.props);
-        let copts = ffi::MQTTAsync_disconnectOptions {
-            timeout: self.timeout.as_millis() as c_int,
-            properties: props.cprops,
-            reasonCode: self.reason_code as ffi::MQTTReasonCodes,
-            ..ffi::MQTTAsync_disconnectOptions::default()
-        };
-        DisconnectOptionsFfi { copts, props }
-    }
-
     /// Gets the properties used to disconnect.
     pub fn properties(&self) -> &Properties {
         &self.props
     }
-}
-
-/////////////////////////////////////////////////////////////////////////////
-// DisconnectOptionsFfi
-
-/// The FFI representation of disconnect options.
-///
-/// This keeps the [`PropertiesFfi`] alive alongside the C struct so that
-/// `copts.properties.array` remains valid for the duration of the FFI call.
-pub(crate) struct DisconnectOptionsFfi {
-    /// The underlying C options struct.
-    pub(crate) copts: ffi::MQTTAsync_disconnectOptions,
-    /// The properties data cache. Must outlive `copts`.
-    #[allow(dead_code)]
-    props: PropertiesFfi,
 }
 
 /////////////////////////////////////////////////////////////////////////////
@@ -162,30 +131,6 @@ impl DisconnectOptionsBuilder {
 mod tests {
     use super::*;
     use crate::{Property, PropertyCode, ReasonCode};
-    use std::thread;
-
-    #[test]
-    fn test_new() {
-        let opts = DisconnectOptions::new();
-        let ffi = opts.to_ffi();
-        let default_copts = ffi::MQTTAsync_disconnectOptions::default();
-
-        assert_eq!(default_copts.struct_id, ffi.copts.struct_id);
-        assert_eq!(default_copts.struct_version, ffi.copts.struct_version);
-    }
-
-    #[test]
-    fn test_send() {
-        let opts = DisconnectOptions::new();
-
-        let thr = thread::spawn(move || {
-            let ffi = opts.to_ffi();
-            let default_copts = ffi::MQTTAsync_disconnectOptions::default();
-            assert_eq!(default_copts.struct_id, ffi.copts.struct_id);
-            assert_eq!(default_copts.struct_version, ffi.copts.struct_version);
-        });
-        thr.join().unwrap();
-    }
 
     #[test]
     fn test_reason_code() {
@@ -221,8 +166,6 @@ mod tests {
         );
 
         let opts = DisconnectOptionsBuilder::new().properties(props).finalize();
-        let _ffi = opts.to_ffi();
-
         let props = opts.properties();
 
         assert!(!props.is_empty());

@@ -24,7 +24,7 @@
 //! These are defined in section 3.8.3.1 of the MQTT v5 spec.
 //! The defaults use the behavior that was present in MQTT v3.1.1.
 
-use crate::{ffi, Error, Result};
+use crate::{Error, Result};
 use std::{convert::TryFrom, fmt};
 
 /// Receive our own publications when subscribed to the same topics.
@@ -205,94 +205,12 @@ impl SubscribeOptionsBuilder {
 }
 
 /////////////////////////////////////////////////////////////////////////////
-
-/// The MQTT v5 subscribe options.
-#[derive(Debug, Default, Copy, Clone)]
-pub(crate) struct SubscribeOptionsFfi {
-    pub copts: ffi::MQTTSubscribe_options,
-}
-
-impl From<SubscribeOptions> for SubscribeOptionsFfi {
-    fn from(opts: SubscribeOptions) -> Self {
-        Self {
-            copts: ffi::MQTTSubscribe_options {
-                noLocal: opts.no_local as u8,
-                retainAsPublished: opts.retain_as_published as u8,
-                retainHandling: opts.retain_handling as u8,
-                ..ffi::MQTTSubscribe_options::default()
-            },
-        }
-    }
-}
-
-/////////////////////////////////////////////////////////////////////////////
 //                              Unit Tests
 /////////////////////////////////////////////////////////////////////////////
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_default() {
-        let opts = SubscribeOptions::default();
-
-        assert!(!opts.no_local);
-        assert!(!opts.retain_as_published);
-        assert_eq!(opts.retain_handling, RetainHandling::default());
-
-        let opts = SubscribeOptionsFfi::from(opts);
-        assert!(opts.copts.noLocal == 0);
-        assert!(opts.copts.retainAsPublished == 0);
-        assert!(opts.copts.retainHandling == 0);
-    }
-
-    #[test]
-    fn test_new() {
-        let opts = SubscribeOptions::new(false, false, None);
-
-        assert!(!opts.no_local);
-        assert!(!opts.retain_as_published);
-        assert_eq!(opts.retain_handling, RetainHandling::default());
-
-        let opts = SubscribeOptionsFfi::from(opts);
-        assert!(opts.copts.noLocal == 0);
-        assert!(opts.copts.retainAsPublished == 0);
-        assert!(opts.copts.retainHandling == 0);
-
-        let opts = SubscribeOptions::new(true, false, None);
-
-        assert!(opts.no_local);
-        assert!(!opts.retain_as_published);
-        assert_eq!(opts.retain_handling, RetainHandling::default());
-
-        let opts = SubscribeOptionsFfi::from(opts);
-        assert!(opts.copts.noLocal != 0);
-        assert!(opts.copts.retainAsPublished == 0);
-        assert!(opts.copts.retainHandling == 0);
-
-        let opts = SubscribeOptions::new(true, true, None);
-
-        assert!(opts.no_local);
-        assert!(opts.retain_as_published);
-        assert_eq!(opts.retain_handling, RetainHandling::default());
-
-        let opts = SubscribeOptionsFfi::from(opts);
-        assert!(opts.copts.noLocal != 0);
-        assert!(opts.copts.retainAsPublished != 0);
-        assert!(opts.copts.retainHandling == 0);
-
-        let opts = SubscribeOptions::new(true, true, RetainHandling::SendRetainedOnNew);
-
-        assert!(opts.no_local);
-        assert!(opts.retain_as_published);
-        assert_eq!(opts.retain_handling, RetainHandling::SendRetainedOnNew);
-
-        let opts = SubscribeOptionsFfi::from(opts);
-        assert!(opts.copts.noLocal != 0);
-        assert!(opts.copts.retainAsPublished != 0);
-        assert!(opts.copts.retainHandling == RetainHandling::SendRetainedOnNew as u8);
-    }
 
     #[test]
     fn test_with() {

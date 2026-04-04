@@ -48,11 +48,13 @@ use crate::event::Event;
 use crate::{
     errors::{self, Error, Result},
     ffi,
-    string_collection::StringCollectionFfi,
+    ffi_utils::{
+        CallOptionsFfi, CallOptionsFfiBuilder, ConnectOptionsFfi, DisconnectOptionsFfi,
+        MessageFfi, StringCollectionFfi,
+    },
     types::*,
-    AsyncReceiver, CallOptionsFfi, CallOptionsFfiBuilder, ConnectOptions,
-    ConnectOptionsFfi, ConnectToken, CreateOptions, DeliveryToken, DisconnectOptions,
-    Message, MessageFfi, PersistenceType, Properties, ReasonCode, ServerRequest,
+    AsyncReceiver, ConnectOptions, ConnectToken, CreateOptions, DeliveryToken,
+    DisconnectOptions, Message, PersistenceType, Properties, ReasonCode, ServerRequest,
     SubscribeManyToken, SubscribeOptions, SubscribeToken, SyncReceiver, Token, TokenInner,
     UserData,
 };
@@ -634,7 +636,7 @@ impl AsyncClient {
         let opts = opts.into().unwrap_or_default();
         trace!("Disconnect options: {:?}", opts);
 
-        let mut ffi_opts = opts.to_ffi();
+        let mut ffi_opts = DisconnectOptionsFfi::from(&opts);
 
         let tok = Token::with_client(self, ServerRequest::Disconnect);
         ffi_opts.copts.context = tok.clone().into_raw();

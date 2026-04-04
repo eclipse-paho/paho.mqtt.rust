@@ -1,4 +1,4 @@
-// call_options.rs
+// call_options_ffi.rs
 //
 // The set of options for calls and responses to the MQTT C library.
 // This file is part of the Eclipse Paho MQTT Rust Client library.
@@ -35,8 +35,9 @@ use std::{os::raw::c_int, pin::Pin, ptr};
 
 use crate::{
     ffi,
+    ffi_utils::SubscribeOptionsFfi,
     properties::{Properties, PropertiesFfi},
-    subscribe_options::{SubscribeOptions, SubscribeOptionsFfi},
+    subscribe_options::SubscribeOptions,
     token::{Token, TokenInner},
     types::*,
 };

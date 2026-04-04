@@ -147,10 +147,6 @@ pub mod disconnect_options;
 /// Options for subscribing to topics
 pub mod subscribe_options;
 
-/// Options for call and response options for the C lib.
-use crate::call_options::*; //{CallOptionsFfi};
-mod call_options;
-
 /// Responses coming back from the server.
 pub mod server_response;
 
@@ -185,12 +181,8 @@ pub mod errors;
 /// Events emitted by the client
 pub mod event;
 
-/// Utility for creating string collections (to pass to the C library).
-mod string_collection;
-
-/// Utility for creating name/value string pair collections
-/// (to pass to the C library).
-mod name_value;
+/// Internal FFI utility types for bridging Rust data to the Paho C library.
+mod ffi_utils;
 
 // C log tracing pass-through
 mod c_trace;
