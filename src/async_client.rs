@@ -48,7 +48,7 @@ use crate::event::Event;
 use crate::{
     errors::{self, Error, Result},
     ffi,
-    string_collection::StringCollection,
+    string_collection::StringCollectionFfi,
     types::*,
     AsyncReceiver, CallOptionsFfi, CallOptionsFfiBuilder, ConnectOptions,
     ConnectOptionsFfi, ConnectToken, CreateOptions, DeliveryToken, DisconnectOptions,
@@ -1005,7 +1005,7 @@ impl AsyncClient {
         let ver = self.mqtt_version();
         let tok = Token::from_request(None, ServerRequest::SubscribeMany(n));
         let mut call_opts = CallOptionsFfi::new(ver, tok.clone());
-        let topics = StringCollection::new(topics);
+        let topics = StringCollectionFfi::new(topics);
         let qos: Vec<i32> = qos.iter().map(|q| (*q).into() as i32).collect();
 
         debug!("Subscribe to '{:?}' @ QOS {:?}", topics, qos);
@@ -1076,7 +1076,7 @@ impl AsyncClient {
             .properties(props.into().unwrap_or_default())
             .finalize();
 
-        let topics = StringCollection::new(topics);
+        let topics = StringCollectionFfi::new(topics);
         let qos: Vec<i32> = qos.iter().map(|q| (*q).into() as i32).collect();
 
         debug!(
@@ -1193,7 +1193,7 @@ impl AsyncClient {
         let n = topics.len();
         let tok = Token::from_request(None, ServerRequest::UnsubscribeMany(n));
         let mut call_opts = CallOptionsFfi::new(ver, tok.clone());
-        let topics = StringCollection::new(topics);
+        let topics = StringCollectionFfi::new(topics);
 
         debug!("Unsubscribe from '{:?}'", topics);
 
@@ -1235,7 +1235,7 @@ impl AsyncClient {
             .properties(props)
             .finalize();
 
-        let topics = StringCollection::new(topics);
+        let topics = StringCollectionFfi::new(topics);
 
         debug!("Unsubscribe from '{:?}'", topics);
 

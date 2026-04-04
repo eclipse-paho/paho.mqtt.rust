@@ -34,7 +34,7 @@ type CNameValue = ffi::MQTTAsync_nameValue;
 /// useful with C APIs that require an array of string pair pointers,
 /// normally specified as `const* MQTTAsync_nameValue`
 #[derive(Debug)]
-pub struct NameValueCollection {
+pub struct NameValueCollectionFfi {
     /// A vector of c-compatible pointers into the data collection.
     /// Note that this will have an addition entry at the end containing
     /// NULL name/value pointers to indicate the end-of-collection to
@@ -51,13 +51,14 @@ struct NameValueData {
     coll: Vec<(CString, CString)>,
 }
 
-impl NameValueCollection {
-    /// Creates a NameValueCollection from a vector of string pair references.
+impl NameValueCollectionFfi {
+    /// Creates a NameValueCollectionFfi from a vector of string pair references.
     ///
     /// # Arguments
     ///
     /// * `coll` A collection of string pair references.
     ///
+    #[allow(dead_code)]
     pub fn new<N, V>(coll: &[(N, V)]) -> Self
     where
         N: AsRef<str>,
@@ -116,6 +117,7 @@ impl NameValueCollection {
     }
 
     /// Gets the number of strings in the collection.
+    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.data.coll.len()
     }
@@ -134,19 +136,19 @@ impl NameValueCollection {
     }
 }
 
-impl Default for NameValueCollection {
+impl Default for NameValueCollectionFfi {
     fn default() -> Self {
         Self::from_data(NameValueData::default())
     }
 }
 
-impl Clone for NameValueCollection {
+impl Clone for NameValueCollectionFfi {
     fn clone(&self) -> Self {
         Self::from_data((*self.data).clone())
     }
 }
 
-impl From<HashMap<&str, &str>> for NameValueCollection {
+impl From<HashMap<&str, &str>> for NameValueCollectionFfi {
     fn from(hmap: HashMap<&str, &str>) -> Self {
         let v: Vec<(CString, CString)> = hmap
             .into_iter()
@@ -156,7 +158,7 @@ impl From<HashMap<&str, &str>> for NameValueCollection {
     }
 }
 
-impl From<HashMap<String, String>> for NameValueCollection {
+impl From<HashMap<String, String>> for NameValueCollectionFfi {
     fn from(hmap: HashMap<String, String>) -> Self {
         let v: Vec<(CString, CString)> = hmap
             .into_iter()
@@ -180,7 +182,7 @@ mod tests {
 
     #[test]
     fn test_default() {
-        let sc = NameValueCollection::default();
+        let sc = NameValueCollectionFfi::default();
         assert_eq!(0, sc.len());
     }
 
@@ -189,7 +191,7 @@ mod tests {
         let v = [("name0", "val0"), ("name1", "val1"), ("name2", "val2")];
         let n = v.len();
 
-        let sc = NameValueCollection::new(&v);
+        let sc = NameValueCollectionFfi::new(&v);
 
         assert_eq!(n, sc.len());
         assert_eq!(n + 1, sc.c_coll.len());
@@ -220,7 +222,7 @@ mod tests {
             vec_of_string_pairs![("name0", "val0"), ("name1", "val1"), ("name2", "val2")];
         let n = v.len();
 
-        let sc = NameValueCollection::new(&v);
+        let sc = NameValueCollectionFfi::new(&v);
 
         assert_eq!(n, sc.len());
         assert_eq!(n + 1, sc.c_coll.len());
@@ -254,7 +256,7 @@ mod tests {
 
         let n = hmap.len();
 
-        let sc: NameValueCollection = hmap.into();
+        let sc: NameValueCollectionFfi = hmap.into();
 
         assert_eq!(n, sc.len());
         assert_eq!(n + 1, sc.c_coll.len());
@@ -288,7 +290,7 @@ mod tests {
         let v = [("name0", "val0"), ("name1", "val1"), ("name2", "val2")];
         let n = v.len();
 
-        let org_sc = NameValueCollection::new(&v);
+        let org_sc = NameValueCollectionFfi::new(&v);
 
         let sc = org_sc;
 
@@ -321,7 +323,7 @@ mod tests {
         let n = v.len();
 
         let sc = {
-            let org_sc = NameValueCollection::new(&v);
+            let org_sc = NameValueCollectionFfi::new(&v);
             org_sc.clone()
         };
 

@@ -114,7 +114,6 @@ pub use crate::disconnect_options::*; //{DisconnectOptions, DisconnectOptionsBui
 pub use crate::errors::*;
 pub use crate::event::Event;
 pub use crate::message::*; //{Message, MessageBuilder};
-pub use crate::name_value::*; //{NameValueCollection};
 pub use crate::persistence::*;
 pub use crate::properties::*; //{Property, Properties};
 pub use crate::reason_code::*; //{ReasonCode}
@@ -187,11 +186,11 @@ pub mod errors;
 pub mod event;
 
 /// Utility for creating string collections (to pass to the C library).
-pub mod string_collection;
+mod string_collection;
 
 /// Utility for creating name/value string pair collections
 /// (to pass to the C library).
-pub mod name_value;
+mod name_value;
 
 // C log tracing pass-through
 mod c_trace;

@@ -26,9 +26,9 @@
 //! MQTT broker/server.
 
 use crate::{
-    ffi, name_value::NameValueCollection, string_collection::StringCollection, to_c_bool,
-    types::*, will_options::WillOptions, ConnectToken, Error, Message, Properties,
-    PropertiesFfi, Result, SslOptions, SslOptionsFfi, Token, TokenInner,
+    ffi, name_value::NameValueCollectionFfi, string_collection::StringCollectionFfi,
+    to_c_bool, types::*, will_options::WillOptions, ConnectToken, Error, Message,
+    Properties, PropertiesFfi, Result, SslOptions, SslOptionsFfi, Token, TokenInner,
 };
 use std::{
     collections::HashMap,
@@ -612,10 +612,10 @@ struct ConnectOptionsFfiData {
     ssl: Option<SslOptionsFfi>,
     user_name: Option<CString>,
     password: Option<Vec<u8>>,
-    server_uris: StringCollection,
+    server_uris: StringCollectionFfi,
     props: PropertiesFfi,
     will_props: PropertiesFfi,
-    http_headers: NameValueCollection,
+    http_headers: NameValueCollectionFfi,
     http_proxy: CString,
     https_proxy: CString,
 }
@@ -796,12 +796,12 @@ impl From<&ConnectOptions> for ConnectOptionsFfiData {
             data.password = Some(password.clone());
         }
         if !opts.server_uris.is_empty() {
-            data.server_uris = StringCollection::from(opts.server_uris.as_slice());
+            data.server_uris = StringCollectionFfi::from(opts.server_uris.as_slice());
         }
         data.props = PropertiesFfi::from(&opts.props);
 
         if !opts.http_headers.is_empty() {
-            data.http_headers = NameValueCollection::from(opts.http_headers.clone());
+            data.http_headers = NameValueCollectionFfi::from(opts.http_headers.clone());
         }
         if !opts.http_proxy.is_empty() {
             data.http_proxy = CString::new(opts.http_proxy.clone()).unwrap();

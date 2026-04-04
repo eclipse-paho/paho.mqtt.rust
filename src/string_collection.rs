@@ -31,7 +31,7 @@ use std::{ffi::CString, os::raw::c_char, pin::Pin};
 /// with C API's that require an array of strings, normally specified as:
 /// `const char* arr[]` or  `const char** arr`
 #[derive(Debug)]
-pub struct StringCollection {
+pub struct StringCollectionFfi {
     /// A vector cache of pointers into the data `coll`
     /// This must be updated any time the data is modified.
     c_coll: Vec<*const c_char>,
@@ -39,17 +39,17 @@ pub struct StringCollection {
     /// This must be updated any time the data is modified.
     c_mut_coll: Vec<*mut c_char>,
     /// The pinned data cache
-    data: Pin<Box<StringCollectionData>>,
+    data: Pin<Box<StringCollectionFfiData>>,
 }
 
 #[derive(Debug, Default, Clone)]
-struct StringCollectionData {
+struct StringCollectionFfiData {
     /// The owned NUL-terminated strings
     coll: Vec<CString>,
 }
 
-impl StringCollection {
-    /// Creates a StringCollection from a vector of string references.
+impl StringCollectionFfi {
+    /// Creates a StringCollectionFfi from a vector of string references.
     ///
     /// # Arguments
     ///
@@ -59,7 +59,7 @@ impl StringCollection {
     where
         T: AsRef<str>,
     {
-        let data = StringCollectionData {
+        let data = StringCollectionFfiData {
             coll: Self::to_cstring(coll),
         };
         Self::from_data(data)
@@ -92,7 +92,7 @@ impl StringCollection {
     }
 
     // Updates the cached vector to correspond to the string.
-    fn from_data(data: StringCollectionData) -> Self {
+    fn from_data(data: StringCollectionFfiData) -> Self {
         let data = Box::pin(data);
         let c_coll = Self::to_c_vec(&data.coll);
         let c_mut_coll = Self::to_c_mut_vec(&data.coll);
@@ -140,30 +140,30 @@ impl StringCollection {
     }
 }
 
-impl Default for StringCollection {
+impl Default for StringCollectionFfi {
     fn default() -> Self {
-        Self::from_data(StringCollectionData::default())
+        Self::from_data(StringCollectionFfiData::default())
     }
 }
 
-impl Clone for StringCollection {
+impl Clone for StringCollectionFfi {
     fn clone(&self) -> Self {
         Self::from_data((*self.data).clone())
     }
 }
 
-impl TryFrom<StringCollection> for Vec<String> {
+impl TryFrom<StringCollectionFfi> for Vec<String> {
     type Error = std::ffi::IntoStringError;
 
-    fn try_from(mut coll: StringCollection) -> std::result::Result<Self, Self::Error> {
+    fn try_from(mut coll: StringCollectionFfi) -> std::result::Result<Self, Self::Error> {
         coll.data.coll.drain(..).map(CString::into_string).collect()
     }
 }
 
-impl TryFrom<&StringCollection> for Vec<String> {
+impl TryFrom<&StringCollectionFfi> for Vec<String> {
     type Error = std::ffi::IntoStringError;
 
-    fn try_from(coll: &StringCollection) -> std::result::Result<Self, Self::Error> {
+    fn try_from(coll: &StringCollectionFfi) -> std::result::Result<Self, Self::Error> {
         coll.data
             .coll
             .iter()
@@ -174,13 +174,13 @@ impl TryFrom<&StringCollection> for Vec<String> {
 
 // TODO: Optimize these?
 
-impl From<&[&str]> for StringCollection {
+impl From<&[&str]> for StringCollectionFfi {
     fn from(coll: &[&str]) -> Self {
         Self::new(coll)
     }
 }
 
-impl From<&[String]> for StringCollection {
+impl From<&[String]> for StringCollectionFfi {
     fn from(coll: &[String]) -> Self {
         Self::new(coll)
     }
@@ -200,7 +200,7 @@ mod tests {
 
     #[test]
     fn test_default() {
-        let sc = StringCollection::default();
+        let sc = StringCollectionFfi::default();
         assert_eq!(0, sc.len());
     }
 
@@ -209,7 +209,7 @@ mod tests {
         let v = ["string0", "string1", "string2"];
         let n = v.len();
 
-        let sc = StringCollection::new(&v);
+        let sc = StringCollectionFfi::new(&v);
 
         assert_eq!(n, sc.len());
         assert_eq!(n, sc.c_coll.len());
@@ -230,7 +230,7 @@ mod tests {
         let v = vec_of_strings!["string0", "string1", "string2"];
         let n = v.len();
 
-        let sc = StringCollection::new(&v);
+        let sc = StringCollectionFfi::new(&v);
 
         assert_eq!(n, sc.len());
         assert_eq!(n, sc.c_coll.len());
@@ -251,7 +251,7 @@ mod tests {
         let v = ["string0", "string1", "string2"];
         let n = v.len();
 
-        let org_sc = StringCollection::new(&v);
+        let org_sc = StringCollectionFfi::new(&v);
 
         let sc = org_sc;
 
@@ -275,7 +275,7 @@ mod tests {
         let n = v.len();
 
         let sc = {
-            let org_sc = StringCollection::new(&v);
+            let org_sc = StringCollectionFfi::new(&v);
             org_sc.clone()
         };
 
