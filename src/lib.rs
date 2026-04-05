@@ -185,8 +185,7 @@ pub mod event;
 mod ffi_utils;
 
 // C log tracing pass-through
-mod c_trace;
-use c_trace::{c_trace_level, on_c_trace};
+use ffi_utils::{c_trace_level, on_c_trace};
 
 // --------------------------------------------------------------------------
 

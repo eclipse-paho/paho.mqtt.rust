@@ -28,10 +28,9 @@
 //!
 //! The synchronous calls use a default timeout
 
-use crate::event::Event;
 use crate::{
-    AsyncClient, ConnectOptions, CreateOptions, DisconnectOptions, Message, Properties,
-    QoS, Result, ServerResponse, SubscribeOptions, SyncReceiver,
+    AsyncClient, ConnectOptions, CreateOptions, DisconnectOptions, Event, Message,
+    Properties, QoS, Result, ServerResponse, SubscribeOptions, SyncReceiver,
 };
 use std::time::Duration;
 

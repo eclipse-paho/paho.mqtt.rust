@@ -28,7 +28,7 @@ use std::{
     pin::Pin,
 };
 
-use crate::{ffi, message::Message, properties::PropertiesFfi, Error, Result};
+use crate::{ffi, Error, Message, PropertiesFfi, Result};
 
 /// A `Message` in FFI form, ready to pass to the Paho C library.
 #[derive(Debug)]
@@ -99,9 +99,11 @@ impl TryFrom<Message> for MessageFfi {
             payload: msg.payload().to_vec(),
             props: msg.properties().into(),
         };
-        let mut cmsg = ffi::MQTTAsync_message::default();
-        cmsg.qos = msg.qos() as c_int;
-        cmsg.retained = msg.retain() as c_int;
+        let mut cmsg = ffi::MQTTAsync_message {
+            qos: msg.qos() as c_int,
+            retained: msg.retain() as c_int,
+            ..ffi::MQTTAsync_message::default()
+        };
         if let Some(id) = msg.msgid() {
             cmsg.msgid = id as c_int;
         }

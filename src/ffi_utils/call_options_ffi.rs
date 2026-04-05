@@ -34,12 +34,8 @@
 use std::{os::raw::c_int, pin::Pin, ptr};
 
 use crate::{
-    ffi,
-    ffi_utils::SubscribeOptionsFfi,
-    properties::{Properties, PropertiesFfi},
-    subscribe_options::SubscribeOptions,
-    token::{Token, TokenInner},
-    types::*,
+    ffi, ffi_utils::SubscribeOptionsFfi, types::*, Properties, PropertiesFfi,
+    SubscribeOptions, Token, TokenInner,
 };
 
 /// The collection of options for responses coming back to the client.

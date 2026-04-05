@@ -21,7 +21,7 @@
  *    Frank Pagliughi - initial implementation and documentation
  *******************************************************************************/
 
-use crate::{ffi, message::Message, properties::Properties, reason_code::ReasonCode};
+use crate::{ffi, Message, Properties, ReasonCode};
 use std::{fmt, io, result, str};
 use thiserror::Error;
 

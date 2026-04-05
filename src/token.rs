@@ -31,32 +31,25 @@
 //! combined with any other Rust futures.
 //!
 
-use {
-    crate::{
-        async_client::AsyncClient,
-        ffi,
-        message::Message,
-        properties::Properties,
-        server_response::{ServerRequest, ServerResponse},
-        Error, Result,
-    },
-    futures::{
-        executor::block_on,
-        future::FutureExt, // for `.fuse()`
-        pin_mut,
-        select,
-    },
-    futures_timer::Delay,
-    std::{
-        ffi::CStr,
-        future::Future,
-        os::raw::c_void,
-        pin::Pin,
-        ptr,
-        sync::{Arc, Mutex},
-        task::{Context, Poll, Waker},
-        time::Duration,
-    },
+use crate::{
+    ffi, AsyncClient, Error, Message, Properties, Result, ServerRequest, ServerResponse,
+};
+use futures::{
+    executor::block_on,
+    future::FutureExt, // for `.fuse()`
+    pin_mut,
+    select,
+};
+use futures_timer::Delay;
+use std::{
+    ffi::CStr,
+    future::Future,
+    os::raw::c_void,
+    pin::Pin,
+    ptr,
+    sync::{Arc, Mutex},
+    task::{Context, Poll, Waker},
+    time::Duration,
 };
 
 /////////////////////////////////////////////////////////////////////////////

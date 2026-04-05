@@ -324,7 +324,7 @@ impl AsyncClient {
             if let Some(ref mut cb) = cbctx.on_disconnected {
                 let reason_code = ReasonCode::from(reason);
                 // TODO: Handle error?
-                let props = Properties::try_from(&*cprops).unwrap_or_default();
+                let props = Properties::from(&*cprops);
                 trace!("Invoking disconnected callback");
                 cb(&cli, props, reason_code);
             }
@@ -360,7 +360,7 @@ impl AsyncClient {
         {
             let len = match topic_len {
                 // Zero-len topic means it's a NUL-terminated C string
-                0 => CStr::from_ptr(topic).count_bytes(),
+                0 => CStr::from_ptr(topic).to_bytes().len(),
                 len if len < 0 => 0,
                 _ => topic_len as usize,
             };
@@ -498,7 +498,7 @@ impl AsyncClient {
             self.inner.handle, opts
         );
 
-        if crate::is_secure_uri(&self.server_uri()) && !opts.has_ssl_options() {
+        if crate::is_secure_uri(self.server_uri()) && !opts.has_ssl_options() {
             return ConnectToken::from(Error::MissingSslOptions);
         }
 
@@ -556,7 +556,7 @@ impl AsyncClient {
             self.inner.handle, opts
         );
 
-        if crate::is_secure_uri(&self.server_uri()) && !opts.has_ssl_options() {
+        if crate::is_secure_uri(self.server_uri()) && !opts.has_ssl_options() {
             return ConnectToken::from(Error::MissingSslOptions);
         }
 

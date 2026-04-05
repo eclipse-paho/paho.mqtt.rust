@@ -24,7 +24,7 @@
 //! This contains the structures to define the options for disconnecting from
 //! the MQTT broker/server.
 
-use crate::{properties::Properties, reason_code::ReasonCode};
+use crate::{Properties, ReasonCode};
 use std::time::Duration;
 
 /// The collection of options for disconnecting from the client.

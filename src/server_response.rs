@@ -177,7 +177,7 @@ impl ServerResponse {
     ) -> Self {
         use ServerRequest::*;
 
-        let props = Properties::try_from(&rsp.properties).unwrap_or_default();
+        let props = Properties::from(&rsp.properties);
         //debug!("Properties: {:?}", props);
         let reason_code = ReasonCode::from(rsp.reasonCode);
 
@@ -250,7 +250,7 @@ impl ServerResponse {
     pub unsafe fn from_failure5(rsp: &ffi::MQTTAsync_failureData5) -> Self {
         Self {
             rsp: RequestResponse::default(),
-            props: Properties::try_from(&rsp.properties).unwrap_or_default(),
+            props: Properties::from(&rsp.properties),
             reason_code: rsp.reasonCode.into(),
         }
     }

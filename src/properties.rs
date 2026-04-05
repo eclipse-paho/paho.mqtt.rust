@@ -40,7 +40,7 @@ use std::{
 use crate::{ffi, Error, Result};
 
 #[cfg(feature = "serde")]
-use serde::{Deserialize, Serialize, Serializer};
+use serde::{ser::SerializeMap, Deserialize, Serialize, Serializer};
 
 /// Error code for property mismatches
 const INVALID_PROPERTY_ID: i32 = ffi::MQTT_INVALID_PROPERTY_ID;
@@ -1622,7 +1622,7 @@ impl PropertiesFfi {
         let ps = &self.cprops as *const _ as *mut ffi::MQTTProperties;
         unsafe {
             if idx < (*ps).count as usize {
-                let p = (*ps).array.offset(idx as isize);
+                let p = (*ps).array.add(idx);
                 PropertyFfi::from_c_property(&*p).ok()
             }
             else {
@@ -1830,19 +1830,19 @@ impl Serialize for PropertiesFfi {
     {
         use PropertyType::*;
 
-        let mut state = serializer.serialize_struct("Properties", self.len())?;
+        let mut map = serializer.serialize_map(Some(self.len()))?;
         for prop in self.iter() {
+            let name = prop.property_code().to_string();
             match prop.property_type() {
                 Byte | TwoByteInteger | FourByteInteger | VariableByteInteger => {
-                    let name = prop.property_code().to_string();
-                    state.serialize_field(&name, prop.get_int())?;
+                    map.serialize_entry(&name, &prop.get_int())?;
                 }
                 _ => {
-                    state.serialize_field("xxx", 0)?;
+                    map.serialize_entry(&name, &0)?;
                 }
             }
         }
-        state.end()
+        map.end()
     }
 }
 

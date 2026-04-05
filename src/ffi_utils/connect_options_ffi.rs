@@ -30,13 +30,12 @@ use std::{
 };
 
 use crate::{
-    connect_options::ConnectOptions,
     ffi,
     ffi_utils::{NameValueCollectionFfi, SslOptionsFfi, StringCollectionFfi},
     to_c_bool,
     types::*,
     will_options::WillOptions,
-    ConnectToken, PropertiesFfi, Token, TokenInner,
+    ConnectOptions, ConnectToken, PropertiesFfi, Token, TokenInner,
 };
 
 /// The collection of options for connecting to a broker through the Paho C

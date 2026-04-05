@@ -125,7 +125,7 @@ impl InMessage {
     ) -> Self {
         // TODO: Handle UTF-8 error(s) in the topic?
         unsafe {
-            let topic = str::from_utf8_unchecked(slice::from_raw_parts(
+            let topic = std::str::from_utf8_unchecked(slice::from_raw_parts(
                 topic_ptr as *const _ as *const u8,
                 topic_len,
             ));

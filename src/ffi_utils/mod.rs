@@ -23,6 +23,7 @@
 
 //! Internal FFI utility types for bridging Rust data to the Paho C library.
 
+pub(crate) mod c_trace;
 pub(crate) mod call_options_ffi;
 pub(crate) mod connect_options_ffi;
 pub(crate) mod disconnect_options_ffi;
@@ -32,6 +33,7 @@ pub(crate) mod ssl_options_ffi;
 pub(crate) mod string_collection;
 pub(crate) mod subscribe_options_ffi;
 
+pub(crate) use c_trace::{c_trace_level, on_c_trace};
 pub(crate) use call_options_ffi::{CallOptionsFfi, CallOptionsFfiBuilder};
 pub(crate) use connect_options_ffi::ConnectOptionsFfi;
 pub(crate) use disconnect_options_ffi::DisconnectOptionsFfi;
