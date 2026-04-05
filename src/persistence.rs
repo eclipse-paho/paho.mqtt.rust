@@ -174,7 +174,7 @@ pub trait ClientPersistence: Send {
 /////////////////////////////////////////////////////////////////////////////
 
 /// A struct to wrap the user-defined client persistence objects for the
-/// C library, including the callback funtions from the C library.
+/// C library, including the callback functions from the C library.
 /// These functions receive the persistence callbacks from the C library and
 /// then pass them on to the user-supplied struct which implements the
 /// ClientPersistence trait.

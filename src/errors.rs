@@ -118,7 +118,7 @@ pub enum Error {
     /// correct eyecatcher and version number.
     #[error("Bad structure")]
     BadStructure,
-    /// An invaid QoS value was used not 0, 1, or 2)
+    /// An invalid QoS value was used not 0, 1, or 2)
     #[error("Bad QoS")]
     BadQos,
     /// All 64k MQTT message ID are currently in use

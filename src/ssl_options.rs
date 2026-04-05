@@ -64,13 +64,13 @@ pub enum SslVersion {
 pub struct SslOptions {
     /// File name of the trust store.
     pub trust_store: PathBuf,
-    /// File name of the clien't public key store.
+    /// File name of the client't public key store.
     pub key_store: PathBuf,
     /// File name for the private key, if not in key store.
     pub private_key: PathBuf,
     /// Password for the private key, if any.
     pub private_key_password: String,
-    /// The list of cipher quites that the client presents to the server.
+    /// The list of cipher quotes that the client presents to the server.
     pub enabled_cipher_suites: String,
     /// Whether to enable verification of the server certificate **/
     pub enable_server_cert_auth: bool,
@@ -184,7 +184,7 @@ impl SslOptionsBuilder {
     /// OpenSSL on-line documentation:
     /// <http://www.openssl.org/docs/apps/ciphers.html#CIPHER_LIST_FORMAT>
     ///
-    /// If this setting is ommitted, its default value will be "ALL", that is,
+    /// If this setting is omitted, its default value will be "ALL", that is,
     /// all the cipher suites -excluding those offering no encryption- will
     /// be considered.
     pub fn enabled_cipher_suites<S>(&mut self, enabled_cipher_suites: S) -> &mut Self

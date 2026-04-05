@@ -253,9 +253,9 @@ impl<'a> Topic<'a> {
 
     /// Removes the alias, if any, from the topic.
     ///
-    /// After removing the alias, publshed messages contain the full string
+    /// After removing the alias, published messages contain the full string
     /// topic. The alias mapping remains on the server though. The alias
-    /// number cann  be reused by assigning to a different topic, but the
+    /// number can  be reused by assigning to a different topic, but the
     /// only way to remove it is to disconnect the client.
     pub fn remove_alias(&mut self) {
         self.alias = 0;
@@ -397,9 +397,9 @@ impl<'a> SyncTopic<'a> {
 
     /// Removes the alias, if any, from the topic.
     ///
-    /// After removing the alias, publshed messages contain the full string
+    /// After removing the alias, published messages contain the full string
     /// topic. The alias mapping remains on the server though. The alias
-    /// number cann  be reused by assigning to a different topic, but the
+    /// number can  be reused by assigning to a different topic, but the
     /// only way to remove it is to disconnect the client.
     pub fn remove_alias(&mut self) {
         self.topic.remove_alias();

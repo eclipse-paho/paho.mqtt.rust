@@ -3,7 +3,7 @@
 // This file is part of the Eclipse Paho MQTT Rust Client library.
 
 /*******************************************************************************
- * Copyright (c) 2017-2025 Frank Pagliughi <fpagliughi@mindspring.com>
+ * Copyright (c) 2017-2026 Frank Pagliughi <fpagliughi@mindspring.com>
  *
  * All rights reserved. This program and the accompanying materials
  * are made available under the terms of the Eclipse Public License v2.0
@@ -52,11 +52,11 @@ use crate::{
         CallOptionsFfi, CallOptionsFfiBuilder, ConnectOptionsFfi, DisconnectOptionsFfi,
         MessageFfi, StringCollectionFfi,
     },
+    token::TokenInner,
     types::*,
     AsyncReceiver, ConnectOptions, ConnectToken, CreateOptions, DeliveryToken,
     DisconnectOptions, Message, PersistenceType, Properties, ReasonCode, ServerRequest,
-    SubscribeManyToken, SubscribeOptions, SubscribeToken, SyncReceiver, Token, TokenInner,
-    UserData,
+    SubscribeManyToken, SubscribeOptions, SubscribeToken, SyncReceiver, Token, UserData,
 };
 use crossbeam_channel as sync_channel;
 use std::{
@@ -115,7 +115,6 @@ pub type MessageArrivedCallback = dyn FnMut(&AsyncClient, Option<Message>) + Sen
 
 /// User callback type for an SSL/TLS error
 pub type SslErrorCallback = dyn Fn(&AsyncClient, &str) + Send + Sync + 'static;
-//pub type SslErrorCallback = dyn Fn(&AsyncClient, String) + Send + Sync + 'static;
 
 // The context provided for the client callbacks.
 //
@@ -387,32 +386,20 @@ impl AsyncClient {
             warn!("on_ssl_error: null client context");
             return 0;
         }
+        if err.is_null() || len == 0 {
+            warn!("on_ssl_error: no error provided");
+            return 0;
+        }
 
         debug!("SSL Error for Client: {:?}", context);
         let cli = AsyncClient::from_raw(context);
         {
             if let Some(ref ssl) = cli.inner.conn_opts.read().unwrap().ssl {
                 if let Some(ref cb) = ssl.on_ssl_error {
-                    if !err.is_null() && len != 0 {
-                        let s = str::from_utf8(slice::from_raw_parts(err as *mut u8, len))
-                            .map(str::trim)
-                            .unwrap_or_default();
-                        cb(&cli, s);
-                    };
-                    /*
-                                if let Some(ref ssl) = cli.inner.conn_opts.lock().unwrap().ssl {
-                                    if let Some(ref cb) = ssl.on_ssl_error {
-                                        let err_str = if err.is_null() || len == 0 {
-                                            String::new()
-                                        }
-                                        else {
-                                            let s =
-                                                str::from_utf8(slice::from_raw_parts(err as *mut u8, len))
-                                            .unwrap_or_default();
-                                            s.to_string()
-                                        };
-                                        cb(&cli, err_str);
-                    */
+                    let s = str::from_utf8(slice::from_raw_parts(err as *mut u8, len))
+                        .map(str::trim)
+                        .unwrap_or_default();
+                    cb(&cli, s);
                 }
             }
         }
@@ -717,7 +704,7 @@ impl AsyncClient {
         }
     }
 
-    /// Removes the callback for when the conection is established
+    /// Removes the callback for when the connection is established
     pub fn remove_connected_callback(&self) {
         self.inner.callback_context.lock().unwrap().on_connected = None;
 
@@ -1070,7 +1057,7 @@ impl AsyncClient {
         debug_assert!(self.mqtt_version() >= MqttVersion::V5);
 
         let n = topics.len();
-        // TOOD: Make sure topics & qos are same length (or use min)
+        // TODO: Make sure topics & qos are same length (or use min)
         let tok = Token::from_request(None, ServerRequest::SubscribeMany(n));
         let mut call_opts = CallOptionsFfiBuilder::new()
             .token(tok.clone())
@@ -1264,7 +1251,7 @@ impl AsyncClient {
     /// channel. It returns the receiving-end of the channel for the
     /// application to get the messages.
     ///
-    /// This should normall be called before the client is connected,
+    /// This should normally be called before the client is connected,
     /// especially if the application is requesting a persistent session.
     /// With a clean session, this should be called before subscribing to
     /// ensure that messages are not lost.

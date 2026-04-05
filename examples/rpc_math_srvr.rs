@@ -64,7 +64,7 @@ type MathFn = fn(args: &[f64]) -> f64;
 // A table of names to functions.
 // The names are the supported public operations that come in on the
 // request topics:
-//     "requests/math/<operatio>"
+//     "requests/math/<operation>"
 lazy_static! {
     static ref FUNC_TBL: HashMap<&'static str, MathFn> = {
         let mut tbl = HashMap::new();

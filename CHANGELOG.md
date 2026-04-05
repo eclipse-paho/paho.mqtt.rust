@@ -17,7 +17,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 - Typeof Variable Byte Integer is u32 (not i32)
 - `PropertyType` enum now supports `Ord`, `PartialOrd`, and `Hash` traits
 - Added a _tokio_ build feature for cargo, and a few tokio example apps.
-  Enabing the feature simply builds the _tokio_ examples. (The library is still fully runtime agnostic).
+  Enabling the feature simply builds the _tokio_ examples. (The library is still fully runtime agnostic).
 - Removed _async-std_ from examples. Using _smol_ instead.
 - Properties::byte_len and Properties::get_at no longer cast *const MQTTProperties to *mut before calling C functions that are correctly declared const in the bindings.
 - [#244](https://github.com/eclipse-paho/paho.mqtt.rust/issues/244) Error handling for MQTT5 seems inconsistent
@@ -37,11 +37,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 ## [v0.13.4](https://github.com/eclipse/paho.mqtt.rust/compare/v0.13.3..v0.13.4) - (2025-09-02)
 
 - Fixed some elided lifetime warnings
-- Bumped depedencies:
+- Bumped dependencies:
     - thiserror to v2.0
     - toml to v0.9
 - [#227](https://github.com/eclipse-paho/paho.mqtt.rust/issues/227) Bump async-channel to v2
-- [#248](https://github.com/eclipse-paho/paho.mqtt.rust/pull/248) Imlement binary password support
+- [#248](https://github.com/eclipse-paho/paho.mqtt.rust/pull/248) Implement binary password support
 
 
 ## [v0.13.3](https://github.com/eclipse/paho.mqtt.rust/compare/v0.13.2..v0.13.3) - (2025-04-28)
@@ -132,13 +132,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 - Updated to Rust Edition 2021 w/ MSRV 1.63.0
 - Upgrade to Paho C v1.3.12
-    - Fixes a performance issue, particularily for receiving messages.
+    - Fixes a performance issue, particularly for receiving messages.
     - New URI protocol schemes: "mqtt://" for TCP and "mqtts://" for encrypted SSL/TLS.
 - [**Breaking**] Updated `CreateOptions` and `ConnectOptions` behavior:
     - The `CreateOptions` default is for a "universal" client that can connect using v3.x or v5. (This was previously specified as the v5 option).
         - Can use `CreateOptions::new_v3()` for a client that can only connect using v3.x
         - Defaults to no message persistence (i.e. persistence is opt-in).
-    - The v3.x vs v5 devision is made when connecting.
+    - The v3.x vs v5 division is made when connecting.
     - `ConnectOptions::new()` still defaults to v3.x
     - New constructors for specific protocol version, `ConnectOptions::new_v5()`, `new_ws()`, and `new_ws_v5()`, for v5, websocket,  and v5 over websockets, respectively.
     - Connect options default to clean session/state, as appropriate for the constructed protocol version.
@@ -217,7 +217,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 - [#92] Vendored SSL with _openssl-sys_ crate (optional)
 - New example apps:
     - _sync_consume_v5.rs_ - An MQTT v5 consumer that uses Subscription ID's to handle incoming messages.
-    - _ws_publish.rs_ - Simeple websocket example with optional proxy.
+    - _ws_publish.rs_ - Simple websocket example with optional proxy.
 
 
 ## [v0.8.0](https://github.com/eclipse/paho.mqtt.rust/compare/v0.7.1..v0.8.0) - 2020-11-20

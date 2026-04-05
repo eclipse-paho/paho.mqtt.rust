@@ -95,35 +95,49 @@ pub use crossbeam_channel::{self as sync_channel, Receiver as SyncReceiver};
 /// The asynchronous API
 pub mod async_client;
 pub use crate::async_client::{
-    AsyncClient,
-    //AsyncClientBuilder,
-    ConnectedCallback,
-    ConnectionLostCallback,
-    DisconnectedCallback,
-    MessageArrivedCallback,
-    SslErrorCallback,
+    AsyncClient, ConnectedCallback, ConnectionLostCallback, DisconnectedCallback,
+    MessageArrivedCallback, SslErrorCallback,
 };
 
 /// The synchronous API
 pub mod client;
-pub use crate::client::Client; //ClientBuilder};
+pub use crate::client::Client;
 
-pub use crate::connect_options::*; //{ConnectOptions, ConnectOptionsBuilder, MQTT_VERSION_3_1_1, ...};
-pub use crate::create_options::*; //{CreateOptions, CreateOptionsBuilder};
-pub use crate::disconnect_options::*; //{DisconnectOptions, DisconnectOptionsBuilder};
-pub use crate::errors::*;
+pub use crate::connect_options::{ConnectOptions, ConnectOptionsBuilder};
+pub use crate::create_options::{CreateOptions, CreateOptionsBuilder};
+pub use crate::disconnect_options::{DisconnectOptions, DisconnectOptionsBuilder};
+pub use crate::errors::{
+    error_message, error_message_opt, ConnectReturnCode, Error, Result,
+};
 pub use crate::event::Event;
-pub use crate::message::*; //{Message, MessageBuilder};
-pub use crate::persistence::*;
-pub use crate::properties::*; //{Property, Properties};
-pub use crate::reason_code::*; //{ReasonCode}
-pub use crate::server_response::*; //{ServerResponse, CommandResponse};
-pub use crate::ssl_options::*; //{SslOptions, SslOptionsBuilder};
-pub use crate::subscribe_options::*; //{SubscribeOptions};
-pub use crate::token::*; //{Token}
-pub use crate::topic::*; //{Topic, TopicFilter, TopicMatcher};
+pub use crate::message::{InMessage, Message, MessageBuilder, OutMessage};
+pub use crate::persistence::{
+    ClientPersistence, ClientPersistenceBox, PersistenceType, UserPersistence,
+    PERSISTENCE_ERROR, PERSISTENCE_SUCCESS,
+};
+pub use crate::properties::{
+    Binary, Properties, PropertiesFfi, Property, PropertyCode, PropertyFfi,
+    PropertyIterator, PropertyType, StringPairIterator, Value, VbiU32,
+};
+pub use crate::reason_code::ReasonCode;
+pub use crate::server_response::{
+    ConnectResponse, RequestResponse, ServerRequest, ServerResponse,
+};
+pub use crate::ssl_options::{path_to_cstring, SslOptions, SslOptionsBuilder, SslVersion};
+pub use crate::subscribe_options::{
+    RetainHandling, SubscribeOptions, SubscribeOptionsBuilder, NO_RETAIN_AS_PUBLISHED,
+    RETAIN_AS_PUBLISHED, SUBSCRIBE_LOCAL, SUBSCRIBE_NO_LOCAL,
+};
+pub use crate::token::{
+    ConnectToken, DeliveryToken, FailureCallback, SubscribeManyToken, SubscribeToken,
+    SuccessCallback, Token, UnsubscribeManyToken, UnsubscribeToken,
+};
+pub use crate::topic::{is_topic_filter_valid, SyncTopic, Topic, TopicFilter};
 pub use crate::topic_matcher::TopicMatcher;
-pub use crate::types::*; //...
+pub use crate::types::{
+    MqttVersion, QoS, MQTT_VERSION_3_1, MQTT_VERSION_3_1_1, MQTT_VERSION_5,
+    MQTT_VERSION_DEFAULT, QOS_0, QOS_1, QOS_2,
+};
 
 use std::{any::Any, os::raw::c_int};
 
@@ -169,7 +183,7 @@ pub mod topic_matcher;
 /// MQTT v5 Reason Codes
 pub mod reason_code;
 
-/// Miscelaneous types
+/// Miscellaneous types
 pub mod types;
 
 /// Message persistence for the client.

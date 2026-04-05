@@ -101,7 +101,7 @@ impl CreateOptions {
     /// So we don't need a separate FFI data struct to cache values.
     /// This is sufficuent.
     ///
-    /// We also always tell the C lib that we want to support the v5 proocol.
+    /// We also always tell the C lib that we want to support the v5 protocol.
     /// The lib will then create a persistence store that supports either v3x
     /// or v5. So it's universal.
     pub(crate) fn c_struct(&self) -> ffi::MQTTAsync_createOptions {

@@ -159,7 +159,7 @@ pub enum PropertyCode {
     SessionExpiryInterval = 17,
     /// \[String\] The ClientID assigned by the server when it receives a
     /// zero-length ClientID in the CONNECT message.
-    AssignedClientIdentifer = 18,
+    AssignedClientIdentifier = 18,
     /// \[TwoByteInteger, u16\] The Keep Alive duration that the server requires.
     ServerKeepAlive = 19,
     /// \[String\] The name of the authentication method.
@@ -249,7 +249,7 @@ impl TryFrom<u8> for PropertyCode {
             9 => Ok(CorrelationData),
             11 => Ok(SubscriptionIdentifier),
             17 => Ok(SessionExpiryInterval),
-            18 => Ok(AssignedClientIdentifer),
+            18 => Ok(AssignedClientIdentifier),
             19 => Ok(ServerKeepAlive),
             21 => Ok(AuthenticationMethod),
             22 => Ok(AuthenticationData),
@@ -316,7 +316,7 @@ pub enum Property {
     CorrelationData(Vec<u8>) = 9,
     SubscriptionIdentifier(VbiU32) = 11,
     SessionExpiryInterval(u32) = 17,
-    AssignedClientIdentifer(String) = 18,
+    AssignedClientIdentifier(String) = 18,
     ServerKeepAlive(u16) = 19,
     AuthenticationMethod(String) = 21,
     AuthenticationData(Vec<u8>) = 22,
@@ -382,11 +382,11 @@ impl Property {
                 .downcast_ref::<u32>()
                 .copied()
                 .map(Self::SessionExpiryInterval),
-            AssignedClientIdentifer => rval
+            AssignedClientIdentifier => rval
                 .downcast_ref::<&str>()
                 .map(|s| (*s).to_string())
                 .or_else(|| rval.downcast_ref::<String>().map(|s| s.into()))
-                .map(Self::AssignedClientIdentifer),
+                .map(Self::AssignedClientIdentifier),
             ServerKeepAlive => rval
                 .downcast_ref::<u16>()
                 .copied()
@@ -482,7 +482,7 @@ impl Property {
         unsafe { *(self as *const Self as *const u8) }
     }
 
-    /// Gets the property code corresponging to the property.
+    /// Gets the property code corresponding to the property.
     pub fn property_code(&self) -> PropertyCode {
         PropertyCode::try_from(self.property_code_raw()).unwrap()
     }
@@ -573,7 +573,7 @@ impl Property {
         match self {
             ContentType(s) => Some(s.as_str()),
             ResponseTopic(s) => Some(s.as_str()),
-            AssignedClientIdentifer(s) => Some(s.as_str()),
+            AssignedClientIdentifier(s) => Some(s.as_str()),
             AuthenticationMethod(s) => Some(s.as_str()),
             ResponseInformation(s) => Some(s.as_str()),
             ServerReference(s) => Some(s.as_str()),
@@ -588,7 +588,7 @@ impl Property {
         match self {
             ContentType(s) => Some(s),
             ResponseTopic(s) => Some(s),
-            AssignedClientIdentifer(s) => Some(s),
+            AssignedClientIdentifier(s) => Some(s),
             AuthenticationMethod(s) => Some(s),
             ResponseInformation(s) => Some(s),
             ServerReference(s) => Some(s),
@@ -697,7 +697,7 @@ impl Properties {
         self.0.as_slice()
     }
 
-    /// Determines if the collection of properies is empty.
+    /// Determines if the collection of properties is empty.
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
@@ -1551,7 +1551,7 @@ impl PropertiesFfi {
         self.cprops = ffi::MQTTProperties::default();
     }
 
-    /// Adds a property to the colletion.
+    /// Adds a property to the collection.
     pub fn push(&mut self, prop: PropertyFfi) -> Result<()> {
         match unsafe { ffi::MQTTProperties_add(&mut self.cprops, &prop.cprop) } {
             0 => Ok(()),
@@ -1785,7 +1785,7 @@ impl From<&ffi::MQTTProperties> for PropertiesFfi {
     }
 }
 
-/// Iterator over the values for a speciifc property
+/// Iterator over the values for a specific property
 pub struct PropertyIterator<'a> {
     props: &'a PropertiesFfi,
     code: Option<PropertyCode>,
@@ -1805,7 +1805,7 @@ impl<'a> Iterator for PropertyIterator<'a> {
     }
 }
 
-/// Iterator over the values for a speciifc property
+/// Iterator over the values for a specific property
 pub struct StringPairIterator<'a> {
     props: &'a PropertiesFfi,
     code: PropertyCode,

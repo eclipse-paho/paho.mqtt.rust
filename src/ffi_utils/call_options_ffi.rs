@@ -34,8 +34,8 @@
 use std::{os::raw::c_int, pin::Pin, ptr};
 
 use crate::{
-    ffi, ffi_utils::SubscribeOptionsFfi, types::*, Properties, PropertiesFfi,
-    SubscribeOptions, Token, TokenInner,
+    ffi, ffi_utils::SubscribeOptionsFfi, token::TokenInner, types::*, Properties,
+    PropertiesFfi, SubscribeOptions, Token,
 };
 
 /// The collection of options for responses coming back to the client.
@@ -59,7 +59,7 @@ struct CallOptionsFfiData {
 }
 
 impl CallOptionsFfi {
-    /// Creates a `CallOptionsFfi` intance for the provided token.
+    /// Creates a `CallOptionsFfi` instance for the provided token.
     /// The option's `copts` can be passed to one of the C library's
     /// asynchronous functions to set the callbacks to complete the token.
     ///

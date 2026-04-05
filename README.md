@@ -42,7 +42,7 @@ To keep up with the latest announcements for this project, follow:
 
 ### What's New in v0.14
 
-Version v0.14.0 now wraps Paho C v0.3.16, which was mainly concerned with internal performance improvements. For may aplications, there is a noticable decrease in latency for a number of operations.
+Version v0.14.0 now wraps Paho C v0.3.16, which was mainly concerned with internal performance improvements. For may applications, there is a noticeable decrease in latency for a number of operations.
 
 Some additional updates:
 

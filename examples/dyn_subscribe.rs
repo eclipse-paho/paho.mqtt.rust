@@ -80,7 +80,7 @@ fn on_connect_success(cli: &mqtt::AsyncClient, _msgid: u16) {
 //
 // Note that normally we don't want to do a blocking operation or sleep
 // from  within a callback. But in this case, we know that the client is
-// *not* conected, and thus not doing anything important. So we don't worry
+// *not* connected, and thus not doing anything important. So we don't worry
 // too much about stopping its callback thread.
 fn on_connect_failure(cli: &mqtt::AsyncClient, _msgid: u16, rc: i32) {
     println!("Connection attempt failed with error code {}.\n", rc);

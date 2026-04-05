@@ -1,0 +1,10 @@
+
+[default.extend-identifiers]
+#pn = "pn"
+mosquitto = "mosquitto"
+thr = "thr"
+typ = "typ"
+
+[files]
+extend-exclude = ["paho-mqtt-sys/", "*.crt", "*.crt.*"]
+

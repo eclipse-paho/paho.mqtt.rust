@@ -176,7 +176,7 @@ type NodeIterMut<'a, T> = Box<dyn Iterator<Item = (&'a str, &'a mut T)> + 'a>;
 /// This can be used to get an iterator to all items that have a filter that
 /// matches a topic. To test against a single filter, see
 /// [`TopicFilter`](crate::TopicFilter). This collection is more commonly used
-/// when there are a nuber of filters and each needs to be associated with a
+/// when there are a number of filters and each needs to be associated with a
 /// particular action or piece of data. Note, though, that a single incoming
 /// topic could match against several items in the collection. For example,
 /// the topic:
@@ -189,7 +189,7 @@ type NodeIterMut<'a, T> = Box<dyn Iterator<Item = (&'a str, &'a mut T)> + 'a>;
 ///
 /// Thus, the collection gives an iterator for the items matching a topic.
 ///
-/// A common use for this would be to store callbacks to proces incoming
+/// A common use for this would be to store callbacks to process incoming
 /// messages based on topics.
 ///
 /// This code was adapted from the Eclipse Python `MQTTMatcher` class:
@@ -290,7 +290,7 @@ impl<T> TopicMatcher<T> {
         self.root.prune()
     }
 
-    /// Removes ampty nodes and shrinks the capacity of the collection as
+    /// Removes empty nodes and shrinks the capacity of the collection as
     /// much as possible.
     pub fn shrink_to_fit(&mut self) {
         self.root.shrink_to_fit()

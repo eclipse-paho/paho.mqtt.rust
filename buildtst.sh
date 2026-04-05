@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 # This tests building the Paho MQTT Rust crate with various features enabled and
-# disabled. This should be run before any pull request of new fetures.
+# disabled. This should be run before any pull request of new features.
 
 # Extract MSRV from Cargo.toml and ensure it's the full version triplet
 # The value is stored in the variable `MSRV`

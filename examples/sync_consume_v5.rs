@@ -14,7 +14,7 @@
 //!   - Subscribing to multiple topics
 //!   - MQTT v5 subscription identifiers
 //!   - Receiving messages through the queueing consumer API
-//!   - Recieving and acting upon commands via MQTT topics
+//!   - Receiving and acting upon commands via MQTT topics
 //!   - Manual reconnects
 //!   - Using a persistent (non-clean) session
 //!   - Last will and testament
@@ -86,7 +86,7 @@ fn try_reconnect(cli: &mqtt::Client) -> bool {
     false
 }
 
-// Create a set of poperties with a single Subscription ID
+// Create a set of properties with a single Subscription ID
 fn sub_id(id: u32) -> mqtt::Properties {
     mqtt::properties![SubscriptionIdentifier(id)]
 }

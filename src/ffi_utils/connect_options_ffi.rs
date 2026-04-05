@@ -33,9 +33,10 @@ use crate::{
     ffi,
     ffi_utils::{NameValueCollectionFfi, SslOptionsFfi, StringCollectionFfi},
     to_c_bool,
+    token::TokenInner,
     types::*,
     will_options::WillOptions,
-    ConnectOptions, ConnectToken, PropertiesFfi, Token, TokenInner,
+    ConnectOptions, ConnectToken, PropertiesFfi, Token,
 };
 
 /// The collection of options for connecting to a broker through the Paho C
