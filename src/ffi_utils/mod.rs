@@ -32,6 +32,7 @@ pub(crate) mod name_value_ffi;
 pub(crate) mod ssl_options_ffi;
 pub(crate) mod string_collection_ffi;
 pub(crate) mod subscribe_options_ffi;
+pub(crate) mod will_options_ffi;
 
 pub(crate) use c_trace::{c_trace_level, on_c_trace};
 pub(crate) use call_options_ffi::{CallOptionsFfi, CallOptionsFfiBuilder};
@@ -42,3 +43,4 @@ pub(crate) use name_value_ffi::NameValueCollectionFfi;
 pub(crate) use ssl_options_ffi::SslOptionsFfi;
 pub(crate) use string_collection_ffi::StringCollectionFfi;
 pub(crate) use subscribe_options_ffi::SubscribeOptionsFfi;
+pub(crate) use will_options_ffi::WillOptionsFfi;

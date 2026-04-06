@@ -1,4 +1,4 @@
-// will_options.rs
+// will_options_ffi.rs
 //
 // This file is part of the Eclipse Paho MQTT Rust Client library.
 //
@@ -19,85 +19,29 @@
  *    Frank Pagliughi - initial implementation and documentation
  *******************************************************************************/
 
-//! Last Will and Testament (LWT) options for the Paho MQTT Rust client library.
-//!
+//! FFI representation of the Last Will and Testament (LWT) options for the
+//! Paho C library.
 
-use std::{borrow::Cow, os::raw::c_void, pin::Pin, ptr};
+use std::{os::raw::c_void, pin::Pin, ptr};
 
 use crate::{
     ffi,
     ffi_utils::{MessageFfi, MessageFfiData},
-    message::Message,
+    Message,
 };
 
-/// The options for the Last Will and Testament (LWT).
-/// This defines a message that is registered with the the server at the time
-/// of connection. Then if the connection is lost unexpectedly, the message
-/// is published by the server.
-///
-/// The will options are somewhat redundant in that they simply represent a
-/// message, albeit a special one, that is included in the connect options.
-/// This structure may eventually be phased out, and therefore users are
-/// encouraged to just create a `Message` object and use it when building
-/// `ConnectOptions`:
-/// ```
-/// use paho_mqtt as mqtt;
-///
-/// let lwt = mqtt::Message::new("lwt", "disconnected", 1);
-/// let opts = mqtt::ConnectOptionsBuilder::new().will_message(lwt).finalize();
-/// ```
-///
+/// The FFI representation of the Last Will and Testament (LWT) options.
 #[derive(Debug)]
-pub struct WillOptions {
+pub(crate) struct WillOptionsFfi {
     /// The underlying C options struct
     pub(crate) copts: ffi::MQTTAsync_willOptions,
     /// The local data cache for the C options
     data: Pin<Box<MessageFfiData>>,
 }
 
-impl WillOptions {
-    /// Creates a new WillOptions message.
-    ///
-    /// # Arguments
-    ///
-    /// * `topic` The topic on which the LWT message is to be published.
-    /// * `payload` The binary payload of the LWT message
-    /// * `qos` The quality of service for message delivery (0, 1, or 2)
-    pub fn new<S, V>(topic: S, payload: V, qos: i32) -> WillOptions
-    where
-        S: Into<String>,
-        V: Into<Vec<u8>>,
-    {
-        let copts = ffi::MQTTAsync_willOptions {
-            qos,
-            ..ffi::MQTTAsync_willOptions::default()
-        };
-        Self::from_data(copts, MessageFfiData::new(topic, payload))
-    }
-
-    /// Creates a new WillOptions message with the 'retain' flag set.
-    ///
-    /// # Arguments
-    ///
-    /// * `topic` The topic on which the LWT message is to be published.
-    /// * `payload` The binary payload of the LWT message
-    /// * `qos` The quality of service for message delivery (0, 1, or 2)
-    pub fn new_retained<S, V>(topic: S, payload: V, qos: i32) -> WillOptions
-    where
-        S: Into<String>,
-        V: Into<Vec<u8>>,
-    {
-        let mut opts = Self::new(topic, payload, qos);
-        opts.copts.retained = 1;
-        opts
-    }
-
-    // Updates the C struct from the cached topic and payload vars
-    fn from_data(copts: ffi::MQTTAsync_willOptions, data: MessageFfiData) -> Self {
-        Self::from_pinned_data(copts, Box::pin(data))
-    }
-
-    // Updates the C struct from the cached topic and payload vars
+impl WillOptionsFfi {
+    // Creates options from a C struct and pinned data cache.
+    // Fixes up the C struct pointers to point into the pinned data.
     fn from_pinned_data(
         mut copts: ffi::MQTTAsync_willOptions,
         data: Pin<Box<MessageFfiData>>,
@@ -119,58 +63,30 @@ impl WillOptions {
         //   They're in the connect options
         Self { copts, data }
     }
-
-    /// Gets the topic string for the LWT
-    pub fn topic(&self) -> &str {
-        self.data.topic.to_str().unwrap()
-    }
-
-    /// Gets the payload of the LWT
-    pub fn payload(&self) -> &[u8] {
-        &self.data.payload
-    }
-
-    /// Gets the payload of the message as a string.
-    /// Note that this clones the payload.
-    pub fn payload_str(&self) -> Cow<'_, str> {
-        String::from_utf8_lossy(&self.data.payload)
-    }
-
-    /// Returns the Quality of Service (QOS) for the message.
-    pub fn qos(&self) -> i32 {
-        self.copts.qos
-    }
-
-    /// Gets the 'retained' flag for the message.
-    pub fn retained(&self) -> bool {
-        self.copts.retained != 0
-    }
 }
 
-impl Default for WillOptions {
-    /// Creates a WillOptions struct with default options
+impl Default for WillOptionsFfi {
     fn default() -> Self {
-        Self::from_data(
-            ffi::MQTTAsync_willOptions::default(),
-            MessageFfiData::default(),
-        )
+        let data = Box::pin(MessageFfiData::default());
+        Self::from_pinned_data(ffi::MQTTAsync_willOptions::default(), data)
     }
 }
 
-impl Clone for WillOptions {
-    /// Creates a clone of the WillOptions struct.
+impl Clone for WillOptionsFfi {
+    /// Creates a clone of the WillOptionsFfi struct.
     /// This clones the cached values and updates the C struct to refer
     /// to them.
     fn clone(&self) -> Self {
-        Self::from_data(self.copts, (*self.data).clone())
+        let data = Box::pin((*self.data).clone());
+        Self::from_pinned_data(self.copts, data)
     }
 }
 
-unsafe impl Send for WillOptions {}
-unsafe impl Sync for WillOptions {}
+unsafe impl Send for WillOptionsFfi {}
+unsafe impl Sync for WillOptionsFfi {}
 
-impl From<Message> for WillOptions {
-    /// Create `WillOptions` from a `Message`
+impl From<Message> for WillOptionsFfi {
+    /// Create `WillOptionsFfi` from a `Message`
     fn from(msg: Message) -> Self {
         // TODO: Convert to try_from()
         let msg = MessageFfi::try_from(msg).unwrap();
@@ -202,7 +118,7 @@ mod tests {
     // By convention our defaults should match the defaults of the C library
     #[test]
     fn test_default() {
-        let opts = WillOptions::default();
+        let opts = WillOptionsFfi::default();
         // Get default C options for comparison
         let copts = ffi::MQTTAsync_willOptions::default();
 
@@ -220,48 +136,6 @@ mod tests {
         assert_eq!(&[] as &[u8], opts.data.payload.as_slice());
     }
 
-    #[test]
-    fn test_new() {
-        let msg = WillOptions::new(TOPIC, PAYLOAD, QOS);
-        let default_copts = ffi::MQTTAsync_willOptions::default();
-
-        assert_eq!(default_copts.struct_id, msg.copts.struct_id);
-        assert_eq!(default_copts.struct_version, msg.copts.struct_version);
-
-        assert_eq!(TOPIC, msg.data.topic.to_str().unwrap());
-        assert_eq!(PAYLOAD, msg.data.payload.as_slice());
-
-        assert_eq!(msg.data.payload.len() as i32, msg.copts.payload.len);
-        assert_eq!(
-            msg.data.payload.as_ptr() as *const c_void,
-            msg.copts.payload.data
-        );
-
-        assert_eq!(QOS, msg.copts.qos);
-        assert!(msg.copts.retained == 0);
-    }
-
-    #[test]
-    fn test_new_retained() {
-        let msg = WillOptions::new_retained(TOPIC, PAYLOAD, QOS);
-        let default_copts = ffi::MQTTAsync_willOptions::default();
-
-        assert_eq!(default_copts.struct_id, msg.copts.struct_id);
-        assert_eq!(default_copts.struct_version, msg.copts.struct_version);
-
-        assert_eq!(TOPIC, msg.data.topic.to_str().unwrap());
-        assert_eq!(PAYLOAD, msg.data.payload.as_slice());
-
-        assert_eq!(msg.data.payload.len() as i32, msg.copts.payload.len);
-        assert_eq!(
-            msg.data.payload.as_ptr() as *const c_void,
-            msg.copts.payload.data
-        );
-
-        assert_eq!(QOS, msg.copts.qos);
-        assert!(msg.copts.retained != 0);
-    }
-
     // Test creating will options from a message
     #[test]
     fn test_from_message() {
@@ -272,7 +146,7 @@ mod tests {
             .retained(RETAINED)
             .finalize();
 
-        let opts = WillOptions::from(msg);
+        let opts = WillOptionsFfi::from(msg);
 
         assert_eq!(TOPIC, opts.data.topic.to_str().unwrap());
         assert_eq!(PAYLOAD, opts.data.payload.as_slice());
@@ -288,8 +162,6 @@ mod tests {
     }
 
     // Make sure assignment works properly
-    // This primarily ensures that C pointers stay fixed to cached values,
-    // and/or that the cached buffers don't move due to assignment.
     #[test]
     fn test_assign() {
         let msg = MessageBuilder::new()
@@ -299,7 +171,7 @@ mod tests {
             .retained(RETAINED)
             .finalize();
 
-        let org_opts = WillOptions::from(msg);
+        let org_opts = WillOptionsFfi::from(msg);
         let opts = org_opts;
 
         assert_eq!(TOPIC, opts.data.topic.to_str().unwrap());
@@ -316,8 +188,6 @@ mod tests {
     }
 
     // Test that a clone works properly.
-    // This ensures that the cached values are cloned and that the C pointers
-    // in the new object point to those clones.
     #[test]
     fn test_clone() {
         let opts = {
@@ -328,7 +198,7 @@ mod tests {
                 .retained(RETAINED)
                 .finalize();
 
-            let org_opts = WillOptions::from(msg);
+            let org_opts = WillOptionsFfi::from(msg);
             org_opts.clone()
         };
 

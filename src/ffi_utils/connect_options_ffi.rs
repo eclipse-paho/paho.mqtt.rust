@@ -35,7 +35,7 @@ use crate::{
     to_c_bool,
     token::TokenInner,
     types::*,
-    will_options::WillOptions,
+    ffi_utils::WillOptionsFfi,
     ConnectOptions, ConnectToken, PropertiesFfi, Token,
 };
 
@@ -57,7 +57,7 @@ pub(crate) struct ConnectOptionsFfi {
 /// Cached data for the connect options.
 #[derive(Debug, Default)]
 pub(crate) struct ConnectOptionsFfiData {
-    pub(crate) will: Option<WillOptions>,
+    pub(crate) will: Option<WillOptionsFfi>,
     pub(crate) ssl: Option<SslOptionsFfi>,
     pub(crate) user_name: Option<CString>,
     pub(crate) password: Option<Vec<u8>>,
@@ -229,7 +229,7 @@ impl From<&ConnectOptions> for ConnectOptionsFfiData {
         let mut data = ConnectOptionsFfiData::default();
 
         if let Some(msg) = &opts.will {
-            data.will = Some(WillOptions::from(msg.clone()));
+            data.will = Some(WillOptionsFfi::from(msg.clone()));
             data.will_props = PropertiesFfi::from(msg.properties());
         }
         if let Some(ssl) = &opts.ssl {

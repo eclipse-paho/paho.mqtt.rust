@@ -149,9 +149,6 @@ pub mod create_options;
 /// Options for connecting to the server.
 pub mod connect_options;
 
-/// Connect options for the Last Will and Testament (LWT) message.
-pub mod will_options;
-
 /// Connect options for creating secure connections to the server.
 pub mod ssl_options;
 

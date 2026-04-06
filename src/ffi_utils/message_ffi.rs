@@ -45,20 +45,6 @@ pub(crate) struct MessageFfiData {
     pub(crate) props: PropertiesFfi,
 }
 
-impl MessageFfiData {
-    /// Creates new message data from the topic and payload.
-    pub(crate) fn new<S, V>(topic: S, payload: V) -> Self
-    where
-        S: Into<String>,
-        V: Into<Vec<u8>>,
-    {
-        Self {
-            topic: CString::new(topic.into()).unwrap(),
-            payload: payload.into(),
-            props: PropertiesFfi::default(),
-        }
-    }
-}
 
 impl MessageFfi {
     /// Gets the C struct to pass to the underlying library.
