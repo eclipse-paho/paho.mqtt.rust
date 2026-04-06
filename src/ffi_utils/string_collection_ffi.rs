@@ -1,4 +1,4 @@
-// string_collection.rs
+// string_collection_ffi.rs
 //
 // This file is part of the Eclipse Paho MQTT Rust Client library.
 //
