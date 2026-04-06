@@ -166,7 +166,7 @@ impl AsyncClient {
 
         let mut cli = InnerAsyncClient {
             handle: ptr::null_mut(),
-            mqtt_version: AtomicU32::new(MqttVersion::V5 as u32),
+            mqtt_version: AtomicU32::new(opts.mqtt_version as u32),
             opts,
             conn_opts: RwLock::new(ConnectOptions::new()),
             callback_context: Mutex::new(CallbackContext::default()),
@@ -493,7 +493,9 @@ impl AsyncClient {
             return ConnectToken::from(err);
         }
 
-        self.set_mqtt_version(opts.mqtt_version());
+        if opts.mqtt_version() != MqttVersion::Default {
+            self.set_mqtt_version(opts.mqtt_version());
+        }
 
         let tok = Token::from_request(self, ServerRequest::Connect);
 
@@ -551,7 +553,9 @@ impl AsyncClient {
             return ConnectToken::from(err);
         }
 
-        self.set_mqtt_version(opts.mqtt_version());
+        if opts.mqtt_version() != MqttVersion::Default {
+            self.set_mqtt_version(opts.mqtt_version());
+        }
 
         let tok = Token::with_client_callbacks(
             self,
