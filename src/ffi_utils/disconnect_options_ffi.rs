@@ -25,7 +25,7 @@
 
 use std::os::raw::c_int;
 
-use crate::{ffi, DisconnectOptions, PropertiesFfi};
+use crate::{DisconnectOptions, PropertiesFfi, ffi};
 
 /// The FFI representation of disconnect options.
 ///

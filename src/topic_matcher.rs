@@ -426,7 +426,7 @@ impl<'a, 'b, T> Iterator for MatchIter<'a, 'b, T> {
                                 .and_then(|child| child.value_ref())
                                 .or_else(|| self.next())
                         },
-                    )
+                    );
                 }
             };
 

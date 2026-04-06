@@ -30,7 +30,7 @@ use std::{
     ptr,
 };
 
-use crate::{ffi, ssl_options::path_to_cstring, to_c_bool, Error, Result, SslOptions};
+use crate::{Error, Result, SslOptions, ffi, ssl_options::path_to_cstring, to_c_bool};
 
 /// The options for SSL socket connections to the broker.
 // Implementation note:

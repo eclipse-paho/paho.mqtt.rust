@@ -25,7 +25,7 @@ use std::{
     fmt, slice,
 };
 
-use crate::{ffi, properties::Properties, QoS};
+use crate::{QoS, ffi, properties::Properties};
 
 /// An "outbound" MQTT message.
 ///

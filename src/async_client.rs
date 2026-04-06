@@ -46,6 +46,9 @@
 
 use crate::event::Event;
 use crate::{
+    AsyncReceiver, ConnectOptions, ConnectToken, CreateOptions, DeliveryToken,
+    DisconnectOptions, Message, PersistenceType, Properties, ReasonCode, ServerRequest,
+    SubscribeManyToken, SubscribeOptions, SubscribeToken, SyncReceiver, Token, UserData,
     errors::{self, Error, Result},
     ffi,
     ffi_utils::{
@@ -54,9 +57,6 @@ use crate::{
     },
     token::TokenInner,
     types::*,
-    AsyncReceiver, ConnectOptions, ConnectToken, CreateOptions, DeliveryToken,
-    DisconnectOptions, Message, PersistenceType, Properties, ReasonCode, ServerRequest,
-    SubscribeManyToken, SubscribeOptions, SubscribeToken, SyncReceiver, Token, UserData,
 };
 use crossbeam_channel as sync_channel;
 use std::{
@@ -67,8 +67,8 @@ use std::{
     result::Result as StdResult,
     slice, str,
     sync::{
-        atomic::{AtomicU32, Ordering},
         Arc, Mutex, Once, RwLock,
+        atomic::{AtomicU32, Ordering},
     },
     time::Duration,
 };
@@ -232,7 +232,7 @@ impl AsyncClient {
     /// a context pointer coming back from the C lib.
     pub(crate) unsafe fn from_raw(ptr: *mut c_void) -> AsyncClient {
         AsyncClient {
-            inner: Arc::from_raw(ptr as *mut InnerAsyncClient),
+            inner: unsafe { Arc::from_raw(ptr as *mut InnerAsyncClient) },
         }
     }
 
@@ -256,7 +256,7 @@ impl AsyncClient {
         }
 
         debug!("Connected! Client {:?}", context);
-        let cli = AsyncClient::from_raw(context);
+        let cli = unsafe { AsyncClient::from_raw(context) };
 
         if let Some(ref mut cb) = cli.inner.callback_context.lock().unwrap().on_connected {
             trace!("Invoking connected callback");
@@ -275,7 +275,7 @@ impl AsyncClient {
         }
 
         warn!("Connection lost. Client: {:?}", context);
-        let cli = AsyncClient::from_raw(context);
+        let cli = unsafe { AsyncClient::from_raw(context) };
         {
             let mut cbctx = cli.inner.callback_context.lock().unwrap();
 
@@ -309,7 +309,7 @@ impl AsyncClient {
             reason, context
         );
 
-        let cli = AsyncClient::from_raw(context);
+        let cli = unsafe { AsyncClient::from_raw(context) };
         {
             let mut cbctx = cli.inner.callback_context.lock().unwrap();
 
@@ -323,7 +323,7 @@ impl AsyncClient {
             if let Some(ref mut cb) = cbctx.on_disconnected {
                 let reason_code = ReasonCode::from(reason);
                 // TODO: Handle error?
-                let props = Properties::from(&*cprops);
+                let props = unsafe { Properties::from(&*cprops) };
                 trace!("Invoking disconnected callback");
                 cb(&cli, props, reason_code);
             }
@@ -344,11 +344,14 @@ impl AsyncClient {
             return 1;
         }
         debug!(
-            "Message arrived. Client: {:?}, topic: {:?} len {:?} cmsg: {:?}: {:?}",
-            context, topic, topic_len, cmsg, *cmsg
+            "Message arrived. Client: {:?}, topic: {:?} len {:?} cmsg: {:?}",
+            context,
+            topic,
+            topic_len,
+            unsafe { *cmsg }
         );
 
-        let cli = AsyncClient::from_raw(context);
+        let cli = unsafe { AsyncClient::from_raw(context) };
 
         if let Some(ref mut cb) = cli
             .inner
@@ -359,7 +362,7 @@ impl AsyncClient {
         {
             let len = match topic_len {
                 // Zero-len topic means it's a NUL-terminated C string
-                0 => CStr::from_ptr(topic).to_bytes().len(),
+                0 => unsafe { CStr::from_ptr(topic).to_bytes().len() },
                 len if len < 0 => 0,
                 _ => topic_len as usize,
             };
@@ -392,13 +395,15 @@ impl AsyncClient {
         }
 
         debug!("SSL Error for Client: {:?}", context);
-        let cli = AsyncClient::from_raw(context);
+        let cli = unsafe { AsyncClient::from_raw(context) };
         {
             if let Some(ref ssl) = cli.inner.conn_opts.read().unwrap().ssl {
                 if let Some(ref cb) = ssl.on_ssl_error {
-                    let s = str::from_utf8(slice::from_raw_parts(err as *mut u8, len))
-                        .map(str::trim)
-                        .unwrap_or_default();
+                    let s = str::from_utf8(unsafe {
+                        slice::from_raw_parts(err as *mut u8, len)
+                    })
+                    .map(str::trim)
+                    .unwrap_or_default();
                     cb(&cli, s);
                 }
             }
@@ -1492,8 +1497,8 @@ fn log_stream_err<T>(res: StdResult<(), async_channel::TrySendError<T>>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::create_options::CreateOptionsBuilder;
     use crate::MessageBuilder;
+    use crate::create_options::CreateOptionsBuilder;
     use std::sync::{Arc, Mutex, RwLock};
     use std::thread;
 
@@ -1526,7 +1531,10 @@ mod tests {
     #[test]
     fn test_create() {
         let cli = AsyncClient::new("tcp://localhost:1883");
-        assert!(cli.is_ok(), "Error in creating simple async client, do you have a running MQTT server on localhost:1883?");
+        assert!(
+            cli.is_ok(),
+            "Error in creating simple async client, do you have a running MQTT server on localhost:1883?"
+        );
     }
 
     #[test]

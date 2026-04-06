@@ -24,19 +24,18 @@
 //! FFI representation of the connect options for the Paho C library.
 
 use std::{
-    ffi::{c_int, c_void, CString},
+    ffi::{CString, c_int, c_void},
     pin::Pin,
     ptr,
 };
 
 use crate::{
-    ffi,
+    ConnectOptions, ConnectToken, PropertiesFfi, Token, ffi,
+    ffi_utils::WillOptionsFfi,
     ffi_utils::{NameValueCollectionFfi, SslOptionsFfi, StringCollectionFfi},
     to_c_bool,
     token::TokenInner,
     types::*,
-    ffi_utils::WillOptionsFfi,
-    ConnectOptions, ConnectToken, PropertiesFfi, Token,
 };
 
 /// The collection of options for connecting to a broker through the Paho C

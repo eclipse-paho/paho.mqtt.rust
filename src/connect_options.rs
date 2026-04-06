@@ -25,7 +25,7 @@
 //! This contains the structures to define the options for connecting to the
 //! MQTT broker/server.
 
-use crate::{types::*, Error, Message, Properties, Result, SslOptions};
+use crate::{Error, Message, Properties, Result, SslOptions, types::*};
 use std::{collections::HashMap, time::Duration};
 
 /// The default keep alive interval for MQTT (TCP) & MQTTS (TLS) connections.

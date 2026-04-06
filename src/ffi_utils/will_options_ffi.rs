@@ -25,9 +25,8 @@
 use std::{os::raw::c_void, pin::Pin, ptr};
 
 use crate::{
-    ffi,
+    Message, ffi,
     ffi_utils::{MessageFfi, MessageFfiData},
-    Message,
 };
 
 /// The FFI representation of the Last Will and Testament (LWT) options.

@@ -231,13 +231,13 @@ impl UserPersistence {
             && !server_uri.is_null()
             && !context.is_null()
         {
-            let client_id = CStr::from_ptr(client_id).to_str().unwrap();
-            let server_uri = CStr::from_ptr(server_uri).to_str().unwrap();
+            let client_id = unsafe { CStr::from_ptr(client_id).to_str().unwrap() };
+            let server_uri = unsafe { CStr::from_ptr(server_uri).to_str().unwrap() };
 
-            let persist = &mut *(context as *mut ClientPersistenceBox);
+            let persist = unsafe { &mut *(context as *mut ClientPersistenceBox) };
 
             if persist.open(client_id, server_uri).is_ok() {
-                *handle = context;
+                unsafe { *handle = context };
                 return PERSISTENCE_SUCCESS;
             }
         }
@@ -257,7 +257,7 @@ impl UserPersistence {
             return PERSISTENCE_ERROR;
         }
 
-        let persist = &mut *(handle as *mut ClientPersistenceBox);
+        let persist = unsafe { &mut *(handle as *mut ClientPersistenceBox) };
 
         match persist.close() {
             Ok(_) => PERSISTENCE_SUCCESS,
@@ -286,16 +286,18 @@ impl UserPersistence {
         if bufcount == 0 {
             return PERSISTENCE_SUCCESS;
         }
-        let persist = &mut *(handle as *mut ClientPersistenceBox);
-        let key = CStr::from_ptr(key).to_str().unwrap();
+        let persist = unsafe { &mut *(handle as *mut ClientPersistenceBox) };
+        let key = unsafe { CStr::from_ptr(key).to_str().unwrap() };
 
         let mut bufs: Vec<&[u8]> = Vec::new();
 
         for i in 0..bufcount as isize {
-            let buf = slice::from_raw_parts_mut(
-                *buffers.offset(i) as *mut u8,
-                *buflens.offset(i) as usize,
-            );
+            let buf = unsafe {
+                slice::from_raw_parts_mut(
+                    *buffers.offset(i) as *mut u8,
+                    *buflens.offset(i) as usize,
+                )
+            };
             bufs.push(buf);
         }
         match persist.put(key, bufs) {
@@ -322,17 +324,19 @@ impl UserPersistence {
         if handle.is_null() || key.is_null() || buffer.is_null() || buflen.is_null() {
             return PERSISTENCE_ERROR;
         }
-        let persist = &mut *(handle as *mut ClientPersistenceBox);
-        let key = CStr::from_ptr(key).to_str().unwrap();
+        let persist = unsafe { &mut *(handle as *mut ClientPersistenceBox) };
+        let key = unsafe { CStr::from_ptr(key).to_str().unwrap() };
 
         match persist.get(key) {
             Ok(buf) => {
                 // buf: Vec<u8>
                 let n = buf.len();
-                let cbuf = libc::malloc(n) as *mut u8;
-                ptr::copy(buf.as_ptr(), cbuf, n);
-                *buffer = cbuf as *mut c_char;
-                *buflen = n as c_int;
+                unsafe {
+                    let cbuf = libc::malloc(n) as *mut u8;
+                    ptr::copy(buf.as_ptr(), cbuf, n);
+                    *buffer = cbuf as *mut c_char;
+                    *buflen = n as c_int;
+                }
                 PERSISTENCE_SUCCESS
             }
             Err(_) => PERSISTENCE_ERROR,
@@ -355,8 +359,8 @@ impl UserPersistence {
         if handle.is_null() || key.is_null() {
             return PERSISTENCE_ERROR;
         }
-        let persist = &mut *(handle as *mut ClientPersistenceBox);
-        let key = CStr::from_ptr(key).to_str().unwrap();
+        let persist = unsafe { &mut *(handle as *mut ClientPersistenceBox) };
+        let key = unsafe { CStr::from_ptr(key).to_str().unwrap() };
 
         match persist.remove(key) {
             Ok(_) => PERSISTENCE_SUCCESS,
@@ -382,10 +386,12 @@ impl UserPersistence {
             return PERSISTENCE_ERROR;
         }
 
-        let persist = &mut *(handle as *mut ClientPersistenceBox);
+        let persist = unsafe { &mut *(handle as *mut ClientPersistenceBox) };
 
-        *keys = ptr::null_mut();
-        *nkeys = 0;
+        unsafe {
+            *keys = ptr::null_mut();
+            *nkeys = 0;
+        }
 
         match persist.keys() {
             Ok(k) => {
@@ -393,19 +399,23 @@ impl UserPersistence {
                 let n = k.len();
                 if n != 0 {
                     // TODO OPTIMIZE: This does a lot of copying
-                    let ckeys =
-                        libc::malloc(n * mem::size_of::<usize>()) as *mut *mut c_char;
+                    let ckeys = unsafe {
+                        libc::malloc(n * mem::size_of::<usize>()) as *mut *mut c_char
+                    };
                     for (i, s) in k.into_iter().enumerate() {
                         let s = CString::new(s).unwrap();
                         let sb = s.as_bytes_with_nul();
                         let sn = sb.len();
-                        let cbuf = libc::malloc(sn) as *mut c_char;
-                        ptr::copy(sb.as_ptr(), cbuf as *mut u8, sn);
-
-                        *ckeys.add(i) = cbuf;
+                        unsafe {
+                            let cbuf = libc::malloc(sn) as *mut c_char;
+                            ptr::copy(sb.as_ptr(), cbuf as *mut u8, sn);
+                            *ckeys.add(i) = cbuf;
+                        }
                     }
-                    *keys = ckeys;
-                    *nkeys = n as c_int;
+                    unsafe {
+                        *keys = ckeys;
+                        *nkeys = n as c_int;
+                    }
                 }
                 PERSISTENCE_SUCCESS
             }
@@ -426,7 +436,7 @@ impl UserPersistence {
         if handle.is_null() {
             return PERSISTENCE_ERROR;
         }
-        let persist = &mut *(handle as *mut ClientPersistenceBox);
+        let persist = unsafe { &mut *(handle as *mut ClientPersistenceBox) };
 
         match persist.clear() {
             Ok(_) => PERSISTENCE_SUCCESS,
@@ -451,9 +461,9 @@ impl UserPersistence {
             return PERSISTENCE_ERROR;
         }
 
-        match CStr::from_ptr(key).to_str() {
+        match unsafe { CStr::from_ptr(key).to_str() } {
             Ok(key) => {
-                let persist = &mut *(handle as *mut ClientPersistenceBox);
+                let persist = unsafe { &mut *(handle as *mut ClientPersistenceBox) };
                 to_c_bool(persist.contains_key(key))
             }
             Err(_) => PERSISTENCE_ERROR,

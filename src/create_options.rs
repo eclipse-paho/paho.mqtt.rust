@@ -21,8 +21,8 @@
  *******************************************************************************/
 
 use crate::{
-    ffi, AsyncClient, Client, ClientPersistence, MqttVersion, PersistenceType, Result,
-    UserData, UserPersistence,
+    AsyncClient, Client, ClientPersistence, MqttVersion, PersistenceType, Result, UserData,
+    UserPersistence, ffi,
 };
 use std::{cmp, os::raw::c_int};
 

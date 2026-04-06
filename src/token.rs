@@ -32,7 +32,7 @@
 //!
 
 use crate::{
-    ffi, AsyncClient, Error, Message, Properties, Result, ServerRequest, ServerResponse,
+    AsyncClient, Error, Message, Properties, Result, ServerRequest, ServerResponse, ffi,
 };
 use futures::{
     executor::block_on,
@@ -228,12 +228,12 @@ impl TokenInner {
         }
 
         debug!("Token success! Token: {:?}, Response: {:?}", context, rsp);
-        let tok = Token::from_raw(context);
+        let tok = unsafe { Token::from_raw(context) };
 
         // TODO: Maybe compare this msgid to the one in the token?
         let msgid = match rsp.is_null() {
             true => 0,
-            false => (*rsp).token as u16,
+            false => unsafe { (*rsp).token as u16 },
         };
         tok.inner.on_complete(msgid, 0, None, rsp);
     }
@@ -249,18 +249,18 @@ impl TokenInner {
         }
 
         debug!("Token failure! Token: {:?}, Response: {:?}", context, rsp);
-        let tok = Token::from_raw(context);
+        let tok = unsafe { Token::from_raw(context) };
 
         let mut msgid = 0;
         let mut rc = -1;
         let mut err_msg = None;
 
-        if let Some(rsp) = rsp.as_ref() {
+        if let Some(rsp) = unsafe { rsp.as_ref() } {
             msgid = rsp.token as u16;
             rc = if rsp.code == 0 { -1 } else { rsp.code as i32 };
 
             if !rsp.message.is_null() {
-                if let Ok(cmsg) = CStr::from_ptr(rsp.message).to_str() {
+                if let Ok(cmsg) = unsafe { CStr::from_ptr(rsp.message).to_str() } {
                     debug!("Token failure message: {:?}", cmsg);
                     err_msg = Some(cmsg.to_string());
                 }
@@ -284,17 +284,18 @@ impl TokenInner {
             "Token v5 success! Token: {:?}, Response: {:?}",
             context, rsp
         );
-        let tok = Token::from_raw(context);
+        let tok = unsafe { Token::from_raw(context) };
 
         // TODO: Maybe compare this msgid to the one in the token?
-        let msgid = rsp.as_ref().map(|rsp| rsp.token as u16).unwrap_or(0);
+        let msgid = unsafe { rsp.as_ref() }
+            .map(|rsp| rsp.token as u16)
+            .unwrap_or(0);
 
         // Get the response from the server, if any.
         debug!("Expecting server response for: {:?}", tok.inner.req);
 
-        let rsp = rsp
-            .as_ref()
-            .map(|rsp| ServerResponse::from_success5(tok.inner.req, rsp))
+        let rsp = unsafe { rsp.as_ref() }
+            .map(|rsp| unsafe { ServerResponse::from_success5(tok.inner.req, rsp) })
             .unwrap_or_default();
         debug!("Got response: {rsp:?}");
 
@@ -321,14 +322,14 @@ impl TokenInner {
             "Token v5 failure! Token: {:?}, Response: {:?}",
             context, rsp
         );
-        let tok = Token::from_raw(context);
+        let tok = unsafe { Token::from_raw(context) };
 
         let mut msgid = 0;
         let mut rc = -1;
         let mut err_msg = None;
         let mut props = Properties::default();
 
-        if let Some(rsp) = rsp.as_ref() {
+        if let Some(rsp) = unsafe { rsp.as_ref() } {
             msgid = rsp.token as u16;
             rc = if rsp.reasonCode >= 0x80 {
                 debug!(
@@ -349,7 +350,7 @@ impl TokenInner {
             };
 
             if !rsp.message.is_null() {
-                if let Ok(cmsg) = CStr::from_ptr(rsp.message).to_str() {
+                if let Ok(cmsg) = unsafe { CStr::from_ptr(rsp.message).to_str() } {
                     debug!("Token failure message: {:?}", cmsg);
                     err_msg = Some(cmsg.to_string());
                 }
@@ -587,7 +588,7 @@ impl Token {
     /// pointer coming back from the C lib.
     pub(crate) unsafe fn from_raw(ptr: *mut c_void) -> Self {
         Self {
-            inner: Arc::from_raw(ptr as *mut TokenInner),
+            inner: unsafe { Arc::from_raw(ptr as *mut TokenInner) },
         }
     }
 

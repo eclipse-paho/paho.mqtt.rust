@@ -31,7 +31,7 @@
 //! combined with any other Rust futures.
 //!
 
-use crate::{ffi, from_c_bool, Properties, ReasonCode};
+use crate::{Properties, ReasonCode, ffi, from_c_bool};
 use std::ffi::CStr;
 
 /////////////////////////////////////////////////////////////////////////////
@@ -127,33 +127,35 @@ impl ServerResponse {
     ) -> Self {
         use ServerRequest::*;
 
-        let rsp = match req {
-            Connect => {
-                let conn_rsp = ConnectResponse {
-                    server_uri: CStr::from_ptr(rsp.alt.connect.serverURI)
-                        .to_string_lossy()
-                        .to_string(),
-                    mqtt_version: rsp.alt.connect.MQTTVersion as u32,
-                    session_present: from_c_bool(rsp.alt.connect.sessionPresent),
-                };
-                RequestResponse::Connect(conn_rsp)
-            }
-            Subscribe => RequestResponse::Subscribe(rsp.alt.qos),
-            SubscribeMany(n) => {
-                let mut qosv = Vec::new();
-                if n == 1 {
-                    qosv.push(rsp.alt.qos);
+        let rsp = unsafe {
+            match req {
+                Connect => {
+                    let conn_rsp = ConnectResponse {
+                        server_uri: CStr::from_ptr(rsp.alt.connect.serverURI)
+                            .to_string_lossy()
+                            .to_string(),
+                        mqtt_version: rsp.alt.connect.MQTTVersion as u32,
+                        session_present: from_c_bool(rsp.alt.connect.sessionPresent),
+                    };
+                    RequestResponse::Connect(conn_rsp)
                 }
-                else if !rsp.alt.qosList.is_null() {
-                    for i in 0..n {
-                        qosv.push(*rsp.alt.qosList.add(i));
+                Subscribe => RequestResponse::Subscribe(rsp.alt.qos),
+                SubscribeMany(n) => {
+                    let mut qosv = Vec::new();
+                    if n == 1 {
+                        qosv.push(rsp.alt.qos);
                     }
+                    else if !rsp.alt.qosList.is_null() {
+                        for i in 0..n {
+                            qosv.push(*rsp.alt.qosList.add(i));
+                        }
+                    }
+                    debug!("Subscribed to {} topics w/ QoS: {:?}", qosv.len(), qosv);
+                    RequestResponse::SubscribeMany(qosv)
                 }
-                debug!("Subscribed to {} topics w/ QoS: {:?}", qosv.len(), qosv);
-                RequestResponse::SubscribeMany(qosv)
+                // TODO: Anything for Disconnect?
+                _ => RequestResponse::None,
             }
-            // TODO: Anything for Disconnect?
-            _ => RequestResponse::None,
         };
         Self {
             rsp,
@@ -181,55 +183,57 @@ impl ServerResponse {
         //debug!("Properties: {:?}", props);
         let reason_code = ReasonCode::from(rsp.reasonCode);
 
-        let rsp = match req {
-            Connect => {
-                let conn_rsp = ConnectResponse {
-                    server_uri: CStr::from_ptr(rsp.alt.connect.serverURI)
-                        .to_string_lossy()
-                        .to_string(),
-                    mqtt_version: rsp.alt.connect.MQTTVersion as u32,
-                    session_present: from_c_bool(rsp.alt.connect.sessionPresent),
-                };
-                RequestResponse::Connect(conn_rsp)
-            }
-            Subscribe => RequestResponse::Subscribe(rsp.reasonCode as i32),
-            SubscribeMany(n) => {
-                let ncode = rsp.alt.sub.reasonCodeCount as usize;
-                debug_assert!(n == ncode);
-                let n = std::cmp::min(n, ncode);
+        let rsp = unsafe {
+            match req {
+                Connect => {
+                    let conn_rsp = ConnectResponse {
+                        server_uri: CStr::from_ptr(rsp.alt.connect.serverURI)
+                            .to_string_lossy()
+                            .to_string(),
+                        mqtt_version: rsp.alt.connect.MQTTVersion as u32,
+                        session_present: from_c_bool(rsp.alt.connect.sessionPresent),
+                    };
+                    RequestResponse::Connect(conn_rsp)
+                }
+                Subscribe => RequestResponse::Subscribe(rsp.reasonCode as i32),
+                SubscribeMany(n) => {
+                    let ncode = rsp.alt.sub.reasonCodeCount as usize;
+                    debug_assert!(n == ncode);
+                    let n = std::cmp::min(n, ncode);
 
-                let mut qosv = Vec::new();
-                if n == 1 {
-                    qosv.push(rsp.reasonCode as i32);
-                }
-                else if !rsp.alt.sub.reasonCodes.is_null() {
-                    for i in 0..n {
-                        qosv.push(*rsp.alt.sub.reasonCodes.add(i) as i32);
+                    let mut qosv = Vec::new();
+                    if n == 1 {
+                        qosv.push(rsp.reasonCode as i32);
                     }
+                    else if !rsp.alt.sub.reasonCodes.is_null() {
+                        for i in 0..n {
+                            qosv.push(*rsp.alt.sub.reasonCodes.add(i) as i32);
+                        }
+                    }
+                    debug!("Subscribed to {} topics w/ QoS: {:?}", qosv.len(), qosv);
+                    RequestResponse::SubscribeMany(qosv)
                 }
-                debug!("Subscribed to {} topics w/ QoS: {:?}", qosv.len(), qosv);
-                RequestResponse::SubscribeMany(qosv)
-            }
-            Unsubscribe => RequestResponse::Unsubscribe(rsp.reasonCode as i32),
-            UnsubscribeMany(n) => {
-                let ncode = rsp.alt.unsub.reasonCodeCount as usize;
-                debug!("Server returned {} unsubscribe codes", ncode);
-                debug_assert!(n == ncode);
-                let n = std::cmp::min(n, ncode);
+                Unsubscribe => RequestResponse::Unsubscribe(rsp.reasonCode as i32),
+                UnsubscribeMany(n) => {
+                    let ncode = rsp.alt.unsub.reasonCodeCount as usize;
+                    debug!("Server returned {} unsubscribe codes", ncode);
+                    debug_assert!(n == ncode);
+                    let n = std::cmp::min(n, ncode);
 
-                let mut qosv = Vec::new();
-                if n == 1 {
-                    qosv.push(rsp.reasonCode as i32);
-                }
-                else if !rsp.alt.sub.reasonCodes.is_null() {
-                    for i in 0..n {
-                        qosv.push(*rsp.alt.unsub.reasonCodes.add(i) as i32);
+                    let mut qosv = Vec::new();
+                    if n == 1 {
+                        qosv.push(rsp.reasonCode as i32);
                     }
+                    else if !rsp.alt.sub.reasonCodes.is_null() {
+                        for i in 0..n {
+                            qosv.push(*rsp.alt.unsub.reasonCodes.add(i) as i32);
+                        }
+                    }
+                    debug!("Subscribed to {} topics w/ Qos: {:?}", qosv.len(), qosv);
+                    RequestResponse::SubscribeMany(qosv)
                 }
-                debug!("Subscribed to {} topics w/ Qos: {:?}", qosv.len(), qosv);
-                RequestResponse::SubscribeMany(qosv)
+                _ => RequestResponse::None,
             }
-            _ => RequestResponse::None,
         };
         Self {
             rsp,

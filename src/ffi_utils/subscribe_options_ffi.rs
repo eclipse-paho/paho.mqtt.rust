@@ -23,7 +23,7 @@
 
 //! FFI representation of the MQTT v5 subscribe options for the Paho C library.
 
-use crate::{ffi, SubscribeOptions};
+use crate::{SubscribeOptions, ffi};
 
 /// The MQTT v5 subscribe options in FFI form.
 #[derive(Debug, Default, Copy, Clone)]

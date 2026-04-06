@@ -41,7 +41,7 @@ pub(crate) unsafe extern "C" fn on_c_trace(
         return;
     }
 
-    let cmsg = CStr::from_ptr(msg);
+    let cmsg = unsafe { CStr::from_ptr(msg) };
     let msg = match cmsg.to_str() {
         Ok(s) => s,
         Err(_) => return,

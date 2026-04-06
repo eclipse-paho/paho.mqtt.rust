@@ -37,10 +37,10 @@ use std::{
     slice::{Iter, IterMut},
 };
 
-use crate::{ffi, Error, Result};
+use crate::{Error, Result, ffi};
 
 #[cfg(feature = "serde")]
-use serde::{ser::SerializeMap, Deserialize, Serialize, Serializer};
+use serde::{Deserialize, Serialize, Serializer, ser::SerializeMap};
 
 /// Error code for property mismatches
 const INVALID_PROPERTY_ID: i32 = ffi::MQTT_INVALID_PROPERTY_ID;
@@ -621,7 +621,7 @@ impl Property {
     pub fn get_string_pair(&self) -> Option<&(String, String)> {
         use Property::*;
         match self {
-            User(ref val) => Some(val),
+            User(val) => Some(val),
             _ => None,
         }
     }
@@ -774,14 +774,7 @@ impl Properties {
     /// Find the user value for the requested user key, if any
     pub fn find_user_property(&self, key: &str) -> Option<&str> {
         property_values!(self.0, Property::User)
-            .filter_map(|(k, v)| {
-                if k == key {
-                    Some(v.as_str())
-                }
-                else {
-                    None
-                }
-            })
+            .filter_map(|(k, v)| if k == key { Some(v.as_str()) } else { None })
             .next()
     }
 

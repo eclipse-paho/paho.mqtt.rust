@@ -24,11 +24,11 @@
 //! FFI representation of an MQTT message for the Paho C library.
 
 use std::{
-    ffi::{c_int, c_void, CString},
+    ffi::{CString, c_int, c_void},
     pin::Pin,
 };
 
-use crate::{ffi, Error, Message, PropertiesFfi, Result};
+use crate::{Error, Message, PropertiesFfi, Result, ffi};
 
 /// A `Message` in FFI form, ready to pass to the Paho C library.
 #[derive(Debug)]
@@ -44,7 +44,6 @@ pub(crate) struct MessageFfiData {
     pub(crate) payload: Vec<u8>,
     pub(crate) props: PropertiesFfi,
 }
-
 
 impl MessageFfi {
     /// Gets the C struct to pass to the underlying library.
@@ -105,8 +104,8 @@ impl TryFrom<Message> for MessageFfi {
 mod tests {
     use super::*;
     use crate::{
-        message::{Message, MessageBuilder},
         QoS,
+        message::{Message, MessageBuilder},
     };
     use std::os::raw::{c_int, c_void};
 

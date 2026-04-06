@@ -1,8 +1,8 @@
 [package]
 name = "paho-mqtt"
-version = "0.14.1-pre.0"
-edition = "2021"
-rust-version = "1.75.0"
+version = "0.15.0-pre.0"
+edition = "2024"
+rust-version = "1.89.0"
 authors = ["Frank Pagliughi <fpagliughi@mindspring.com>"]
 homepage = "https://github.com/eclipse/paho.mqtt.rust"
 repository = "https://github.com/eclipse/paho.mqtt.rust"
