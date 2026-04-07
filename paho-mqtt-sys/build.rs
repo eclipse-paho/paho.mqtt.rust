@@ -304,7 +304,8 @@ mod build {
         }
 
         if let Some(ssl_dir) = openssl_root_dir() {
-            cmk_cfg.define("OPENSSL_ROOT_DIR", ssl_dir);
+            cmk_cfg.define("OPENSSL_ROOT_DIR", &ssl_dir);
+            cmk_cfg.define("CMAKE_PREFIX_PATH", &ssl_dir);
         }
 
         // 'cmk_install_dir' is a PathBuf to the cmake install directory
