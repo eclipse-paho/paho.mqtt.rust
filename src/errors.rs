@@ -178,6 +178,9 @@ pub enum Error {
     ReceivedDisconnect(i32),
 
     // ----- Errors from the Rust layer & libraries -----
+    /// An error from the MQTT codec.
+    #[error("{0}")]
+    Protocol(#[from] paho_mqtt_codec::Error),
     /// A synchronous error when publishing creating or queuing the message.
     #[error("{}", error_message(*.0))]
     Publish(i32, Message),
@@ -258,7 +261,7 @@ impl Error {
 
     /// Create an error from an MQTT v5 Reason Code and properties
     pub fn from_reason_code(code: u8, props: Properties) -> Self {
-        Error::ReasonCode(ReasonCode::from(code as ffi::MQTTReasonCodes), props)
+        Error::ReasonCode(ReasonCode::from(code), props)
     }
 }
 
@@ -331,7 +334,7 @@ impl From<Error> for io::Error {
         match err {
             Error::Io(e) => e,
             Error::Timeout => io::Error::new(io::ErrorKind::TimedOut, err),
-            _ => io::Error::new(io::ErrorKind::Other, err),
+            _ => io::Error::other(err),
         }
     }
 }

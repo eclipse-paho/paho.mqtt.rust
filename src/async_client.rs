@@ -397,15 +397,14 @@ impl AsyncClient {
         debug!("SSL Error for Client: {:?}", context);
         let cli = unsafe { AsyncClient::from_raw(context) };
         {
-            if let Some(ref ssl) = cli.inner.conn_opts.read().unwrap().ssl {
-                if let Some(ref cb) = ssl.on_ssl_error {
-                    let s = str::from_utf8(unsafe {
-                        slice::from_raw_parts(err as *mut u8, len)
-                    })
-                    .map(str::trim)
-                    .unwrap_or_default();
-                    cb(&cli, s);
-                }
+            if let Some(ref ssl) = cli.inner.conn_opts.read().unwrap().ssl
+                && let Some(ref cb) = ssl.on_ssl_error
+            {
+                let s =
+                    str::from_utf8(unsafe { slice::from_raw_parts(err as *mut u8, len) })
+                        .map(str::trim)
+                        .unwrap_or_default();
+                cb(&cli, s);
             }
         }
         let _ = cli.into_raw();

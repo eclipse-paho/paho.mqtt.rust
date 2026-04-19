@@ -362,17 +362,17 @@ impl Property {
             ContentType => rval
                 .downcast_ref::<&str>()
                 .map(|s| (*s).to_string())
-                .or_else(|| rval.downcast_ref::<String>().map(String::clone))
+                .or_else(|| rval.downcast_ref::<String>().cloned())
                 .map(Self::ContentType),
             ResponseTopic => rval
                 .downcast_ref::<&str>()
                 .map(|s| (*s).to_string())
-                .or_else(|| rval.downcast_ref::<String>().map(String::clone))
+                .or_else(|| rval.downcast_ref::<String>().cloned())
                 .map(Self::ResponseTopic),
             CorrelationData => rval
                 .downcast_ref::<&[u8]>()
                 .map(|v| (*v).to_vec())
-                .or_else(|| rval.downcast_ref::<Vec<u8>>().map(Vec::clone))
+                .or_else(|| rval.downcast_ref::<Vec<u8>>().cloned())
                 .map(Self::CorrelationData),
             SubscriptionIdentifier => rval
                 .downcast_ref::<u32>()
@@ -394,12 +394,12 @@ impl Property {
             AuthenticationMethod => rval
                 .downcast_ref::<&str>()
                 .map(|s| (*s).to_string())
-                .or_else(|| rval.downcast_ref::<String>().map(String::clone))
+                .or_else(|| rval.downcast_ref::<String>().cloned())
                 .map(Self::AuthenticationMethod),
             AuthenticationData => rval
                 .downcast_ref::<&[u8]>()
                 .map(|v| (*v).to_vec())
-                .or_else(|| rval.downcast_ref::<Vec<u8>>().map(Vec::clone))
+                .or_else(|| rval.downcast_ref::<Vec<u8>>().cloned())
                 .map(Self::AuthenticationData),
             RequestProblemInformation => rval
                 .downcast_ref::<u8>()
@@ -416,17 +416,17 @@ impl Property {
             ResponseInformation => rval
                 .downcast_ref::<&str>()
                 .map(|s| (*s).to_string())
-                .or_else(|| rval.downcast_ref::<String>().map(String::clone))
+                .or_else(|| rval.downcast_ref::<String>().cloned())
                 .map(Self::ResponseInformation),
             ServerReference => rval
                 .downcast_ref::<&str>()
                 .map(|s| (*s).to_string())
-                .or_else(|| rval.downcast_ref::<String>().map(String::clone))
+                .or_else(|| rval.downcast_ref::<String>().cloned())
                 .map(Self::ServerReference),
             ReasonString => rval
                 .downcast_ref::<&str>()
                 .map(|s| (*s).to_string())
-                .or_else(|| rval.downcast_ref::<String>().map(String::clone))
+                .or_else(|| rval.downcast_ref::<String>().cloned())
                 .map(Self::ReasonString),
             ReceiveMaximum => rval
                 .downcast_ref::<u16>()
@@ -1314,11 +1314,11 @@ impl PropertyFfi {
                 return Some(v);
             }
         }
-        else if let Some(val) = x.downcast_mut::<(String, String)>() {
-            if let Some(n) = self.get_string_pair() {
-                *val = n;
-                return Some(v);
-            }
+        else if let Some(val) = x.downcast_mut::<(String, String)>()
+            && let Some(n) = self.get_string_pair()
+        {
+            *val = n;
+            return Some(v);
         }
         None
     }

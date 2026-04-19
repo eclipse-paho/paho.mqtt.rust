@@ -223,11 +223,10 @@ fn main() -> mqtt::Result<()> {
     if let Some(mqtt::ConnectResponse {
         session_present, ..
     }) = rsp.connect_response()
+        && !session_present
     {
-        if !session_present {
-            println!("Subscribing to math requests");
-            cli.subscribe(REQ_TOPIC_HDR, QOS).wait()?;
-        }
+        println!("Subscribing to math requests");
+        cli.subscribe(REQ_TOPIC_HDR, QOS).wait()?;
     }
 
     // For any reconnects we maintain the session by turning off

@@ -33,7 +33,7 @@ pub fn path_to_cstring<P: AsRef<Path>>(path: P) -> Result<CString> {
     let s = CString::new(
         path.as_ref()
             .to_str()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "Path string error"))?,
+            .ok_or_else(|| io::Error::other("Path string error"))?,
     )?;
     Ok(s)
 }

@@ -259,11 +259,11 @@ impl TokenInner {
             msgid = rsp.token as u16;
             rc = if rsp.code == 0 { -1 } else { rsp.code as i32 };
 
-            if !rsp.message.is_null() {
-                if let Ok(cmsg) = unsafe { CStr::from_ptr(rsp.message).to_str() } {
-                    debug!("Token failure message: {:?}", cmsg);
-                    err_msg = Some(cmsg.to_string());
-                }
+            if !rsp.message.is_null()
+                && let Ok(cmsg) = unsafe { CStr::from_ptr(rsp.message).to_str() }
+            {
+                debug!("Token failure message: {:?}", cmsg);
+                err_msg = Some(cmsg.to_string());
             }
         }
 
@@ -299,10 +299,10 @@ impl TokenInner {
             .unwrap_or_default();
         debug!("Got response: {rsp:?}");
 
-        if let Some(rsp) = rsp.connect_response() {
-            if let Some(cli) = tok.inner.cli.as_ref() {
-                cli.set_mqtt_version(rsp.mqtt_version);
-            }
+        if let Some(rsp) = rsp.connect_response()
+            && let Some(cli) = tok.inner.cli.as_ref()
+        {
+            cli.set_mqtt_version(rsp.mqtt_version);
         }
 
         tok.inner.on_complete5(msgid, 0, Ok(rsp));
@@ -349,11 +349,11 @@ impl TokenInner {
                 rsp.code as i32
             };
 
-            if !rsp.message.is_null() {
-                if let Ok(cmsg) = unsafe { CStr::from_ptr(rsp.message).to_str() } {
-                    debug!("Token failure message: {:?}", cmsg);
-                    err_msg = Some(cmsg.to_string());
-                }
+            if !rsp.message.is_null()
+                && let Ok(cmsg) = unsafe { CStr::from_ptr(rsp.message).to_str() }
+            {
+                debug!("Token failure message: {:?}", cmsg);
+                err_msg = Some(cmsg.to_string());
             }
         }
 
@@ -418,10 +418,10 @@ impl TokenInner {
                     };
                     debug!("Got response: {:?}", rsp);
 
-                    if let Some(rsp) = rsp.connect_response() {
-                        if let Some(cli) = &self.cli {
-                            cli.set_mqtt_version(rsp.mqtt_version);
-                        }
+                    if let Some(rsp) = rsp.connect_response()
+                        && let Some(cli) = &self.cli
+                    {
+                        cli.set_mqtt_version(rsp.mqtt_version);
                     }
                     Ok(rsp)
                 }

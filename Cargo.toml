@@ -1,6 +1,10 @@
+[workspace]
+members = ["paho-mqtt-sys", "paho-mqtt-codec"]
+resolver = "2"
+
 [package]
 name = "paho-mqtt"
-version = "0.15.0-pre.0"
+version = "2.0.0-pre.0"
 edition = "2024"
 rust-version = "1.89.0"
 authors = ["Frank Pagliughi <fpagliughi@mindspring.com>"]
@@ -23,6 +27,7 @@ serde = ["dep:serde"]
 
 [dependencies]
 paho-mqtt-sys = { version = "0.11", path = "paho-mqtt-sys", default-features=false }
+paho-mqtt-codec = { path = "paho-mqtt-codec" }
 libc = "0.2"
 futures = "0.3"
 futures-timer = "3.0"

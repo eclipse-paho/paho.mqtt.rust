@@ -73,7 +73,7 @@ impl Client {
     /// ## Arguments
     ///
     /// * `timeout` The timeout to use for synchronous calls, like
-    ///     connect(), disconnect(), publish(), etc.
+    ///   connect(), disconnect(), publish(), etc.
     ///
     pub fn set_timeout(&mut self, timeout: Duration) {
         self.timeout = timeout
