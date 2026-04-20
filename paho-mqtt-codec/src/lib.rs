@@ -29,6 +29,9 @@
 /// Codec error and result types.
 pub mod error;
 
+/// Variable-byte integer encoding and decoding.
+pub mod varlen;
+
 /// MQTT support types: [`QoS`], [`MqttVersion`], and related constants.
 pub mod types;
 

@@ -28,6 +28,12 @@ pub enum Error {
     /// An invalid QoS byte value was encountered.
     #[error("invalid QoS value")]
     BadQoS,
+    /// A variable-byte integer exceeded the maximum allowed value (268,435,455).
+    #[error("variable-length integer overflow")]
+    VarLenOverflow,
+    /// A variable-byte integer had a continuation bit set on the fourth byte.
+    #[error("malformed variable-length integer")]
+    MalformedVarLen,
 }
 
 /// The result type for codec operations.
