@@ -35,7 +35,7 @@ use crate::{
 };
 use bytes::{Buf, BufMut, Bytes};
 
-// ---- PropertyType -------------------------------------------------------
+/////////////////////////////////////////////////////////////////////////////
 
 /// The wire encoding type of an MQTT v5 property value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,7 +56,7 @@ pub enum PropertyType {
     StringPair,
 }
 
-// ---- PropertyId ---------------------------------------------------------
+///////////////////////////////////////////////////////////////////
 
 /// MQTT v5 property identifiers.
 ///
@@ -172,7 +172,7 @@ impl TryFrom<u8> for PropertyId {
     }
 }
 
-// ---- PropertyValue ------------------------------------------------------
+/////////////////////////////////////////////////////////////////////////////
 
 /// The typed value of an MQTT v5 property.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -261,7 +261,7 @@ impl PropertyValue {
     }
 }
 
-// ---- Property -----------------------------------------------------------
+/////////////////////////////////////////////////////////////////////////////
 
 /// A single MQTT v5 property: an identifier paired with its typed value.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -298,7 +298,7 @@ impl Property {
     }
 }
 
-// ---- Properties ---------------------------------------------------------
+/////////////////////////////////////////////////////////////////////////////
 
 /// MQTT v5 properties: an ordered list of [`Property`] pairs.
 ///

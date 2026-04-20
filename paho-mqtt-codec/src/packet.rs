@@ -212,20 +212,21 @@ impl Packet {
 
     /// Encodes this packet into `dst`.
     pub fn encode(&self, dst: &mut BytesMut, version: MqttVersion) -> Result<()> {
+        use Packet::*;
         match self {
-            Packet::Connect(conn) => {
+            Connect(conn) => {
                 let remaining = conn.encoded_size(version);
                 dst.put_u8(HDR_CONNECT);
                 varlen::encode(remaining as u32, dst)?;
                 conn.encode(dst, version)?;
             }
-            Packet::ConnAck(ack) => {
+            ConnAck(ack) => {
                 let remaining = ack.encoded_size(version);
                 dst.put_u8(HDR_CONNACK);
                 varlen::encode(remaining as u32, dst)?;
                 ack.encode(dst, version)?;
             }
-            Packet::Publish(pub_) => {
+            Publish(pub_) => {
                 let remaining = pub_.encoded_size(version);
                 let mut hdr = PKT_PUBLISH << 4;
                 if pub_.dup {
@@ -239,60 +240,60 @@ impl Packet {
                 varlen::encode(remaining as u32, dst)?;
                 pub_.encode(dst, version)?;
             }
-            Packet::PubAck(ack) => {
+            PubAck(ack) => {
                 dst.put_u8(HDR_PUBACK);
                 varlen::encode(ack.encoded_size(version) as u32, dst)?;
                 ack.encode(dst, version)?;
             }
-            Packet::PubRec(ack) => {
+            PubRec(ack) => {
                 dst.put_u8(HDR_PUBREC);
                 varlen::encode(ack.encoded_size(version) as u32, dst)?;
                 ack.encode(dst, version)?;
             }
-            Packet::PubRel(ack) => {
+            PubRel(ack) => {
                 dst.put_u8(HDR_PUBREL);
                 varlen::encode(ack.encoded_size(version) as u32, dst)?;
                 ack.encode(dst, version)?;
             }
-            Packet::PubComp(ack) => {
+            PubComp(ack) => {
                 dst.put_u8(HDR_PUBCOMP);
                 varlen::encode(ack.encoded_size(version) as u32, dst)?;
                 ack.encode(dst, version)?;
             }
-            Packet::Subscribe(s) => {
+            Subscribe(s) => {
                 dst.put_u8(HDR_SUBSCRIBE);
                 varlen::encode(s.encoded_size(version) as u32, dst)?;
                 s.encode(dst, version)?;
             }
-            Packet::SubAck(sa) => {
+            SubAck(sa) => {
                 dst.put_u8(HDR_SUBACK);
                 varlen::encode(sa.encoded_size(version) as u32, dst)?;
                 sa.encode(dst, version)?;
             }
-            Packet::Unsubscribe(u) => {
+            Unsubscribe(u) => {
                 dst.put_u8(HDR_UNSUBSCRIBE);
                 varlen::encode(u.encoded_size(version) as u32, dst)?;
                 u.encode(dst, version)?;
             }
-            Packet::UnsubAck(ua) => {
+            UnsubAck(ua) => {
                 dst.put_u8(HDR_UNSUBACK);
                 varlen::encode(ua.encoded_size(version) as u32, dst)?;
                 ua.encode(dst, version)?;
             }
-            Packet::PingReq => {
+            PingReq => {
                 dst.put_u8(HDR_PINGREQ);
                 varlen::encode(0, dst)?;
             }
-            Packet::PingResp => {
+            PingResp => {
                 dst.put_u8(HDR_PINGRESP);
                 varlen::encode(0, dst)?;
             }
-            Packet::Disconnect(d) => {
+            Disconnect(d) => {
                 dst.put_u8(HDR_DISCONNECT);
                 varlen::encode(d.encoded_size(version) as u32, dst)?;
                 d.encode(dst, version)?;
             }
-            Packet::Auth(a) => {
+            Auth(a) => {
                 dst.put_u8(HDR_AUTH);
                 varlen::encode(a.encoded_size() as u32, dst)?;
                 a.encode(dst)?;

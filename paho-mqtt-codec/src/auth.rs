@@ -96,9 +96,6 @@ impl Auth {
         if payload.is_empty() {
             return Ok(Auth::default());
         }
-        if payload.remaining() < 1 {
-            return Err(Error::PacketTooShort);
-        }
         let reason_code = ReasonCode::from(payload.get_u8());
         let properties = Properties::decode(&mut payload)?;
         Ok(Auth {

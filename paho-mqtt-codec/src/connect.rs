@@ -30,7 +30,7 @@ use crate::{
 };
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
-// ---- Will ---------------------------------------------------------------
+/////////////////////////////////////////////////////////////////////////////
 
 /// The Will message carried in a CONNECT packet.
 ///
@@ -67,7 +67,7 @@ impl Will {
     }
 }
 
-// ---- Connect ------------------------------------------------------------
+/////////////////////////////////////////////////////////////////////////////
 
 /// A CONNECT packet, unified across MQTT v3.1.1 and v5.
 ///
@@ -286,8 +286,8 @@ impl Connect {
     }
 }
 
-// ---- v3.1.1 connect return codes ----------------------------------------
-//
+// --------------------------------------------------------------------------
+
 // MQTT v3.1.1 §3.2.2.3: six defined return codes (0–5). On decode we map
 // them to the nearest v5 ReasonCode; on encode we reverse the mapping.
 // Unknown return codes are treated as malformed.
@@ -316,7 +316,7 @@ fn reason_to_v311_code(rc: ReasonCode) -> Result<u8> {
     }
 }
 
-// ---- ConnAck -------------------------------------------------------------
+/////////////////////////////////////////////////////////////////////////////
 
 /// A CONNACK packet, unified across MQTT v3.1.1 and v5.
 ///
@@ -400,6 +400,11 @@ impl ConnAck {
                 (rc, Properties::new())
             }
         };
+
+        // MQTT §3.2.2.1: session_present MUST be 0 when the connection is refused.
+        if session_present && reason_code != ReasonCode::Success {
+            return Err(Error::MalformedPacket);
+        }
 
         Ok(ConnAck {
             session_present,
@@ -551,6 +556,23 @@ mod tests {
         assert_eq!(ConnAck::decode(payload, v311()), Err(Error::PacketTooShort));
     }
 
+    #[test]
+    fn test_decode_session_present_with_nonzero_code_errors() {
+        // session_present=1 combined with a refused reason code is malformed.
+        let payload = Bytes::from_static(&[0x01, 0x05]); // session_present=1, NotAuthorized
+        assert_eq!(
+            ConnAck::decode(payload, v311()),
+            Err(Error::MalformedPacket)
+        );
+    }
+
+    #[test]
+    fn test_decode_v5_session_present_with_refused_errors() {
+        // Same rule applies on v5.
+        let payload = Bytes::from_static(&[0x01, 0x87, 0x00]); // session_present=1, NotAuthorized
+        assert_eq!(ConnAck::decode(payload, v5()), Err(Error::MalformedPacket));
+    }
+
     // ---- v5 decode ----
 
     #[test]
@@ -595,12 +617,13 @@ mod tests {
 
     #[test]
     fn test_round_trip_v311_refused() {
+        use ReasonCode::*;
         for rc in [
-            ReasonCode::UnsupportedProtocolVersion,
-            ReasonCode::ClientIdentifierNotValid,
-            ReasonCode::ServerUnavailable,
-            ReasonCode::BadUserNameOrPassword,
-            ReasonCode::NotAuthorized,
+            UnsupportedProtocolVersion,
+            ClientIdentifierNotValid,
+            ServerUnavailable,
+            BadUserNameOrPassword,
+            NotAuthorized,
         ] {
             round_trip(ConnAck::new(false, rc), v311());
         }

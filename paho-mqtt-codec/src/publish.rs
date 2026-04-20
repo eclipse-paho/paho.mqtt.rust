@@ -29,7 +29,7 @@ use crate::{
     properties::Properties,
     reason_code::ReasonCode,
     types::{MqttVersion, QoS},
-    wire::{get_utf8, utf8_wire_size},
+    wire::{get_utf8, put_utf8, utf8_wire_size},
 };
 use bytes::{Buf, BufMut, Bytes};
 
@@ -87,8 +87,7 @@ impl Publish {
     /// Returns [`Error::MalformedPacket`] if `qos > 0` but `packet_id` is `None`.
     pub fn encode<B: BufMut>(&self, dst: &mut B, version: MqttVersion) -> Result<()> {
         // Topic
-        dst.put_u16(self.topic.len() as u16);
-        dst.put_slice(self.topic.as_bytes());
+        put_utf8(&self.topic, dst);
         // Packet ID (QoS 1 and 2 only)
         if self.qos != QoS::AtMostOnce {
             let id = self.packet_id.ok_or(Error::MalformedPacket)?;
