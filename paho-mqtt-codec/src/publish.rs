@@ -74,9 +74,7 @@ impl Publish {
         if self.qos != QoS::QoS0 {
             size += 2; // packet ID
         }
-        if ver == MqttVersion::V5 {
-            size += self.properties.encoded_size();
-        }
+        size += self.properties.encoded_size(ver);
         size += self.payload.len();
         size
     }
@@ -93,9 +91,7 @@ impl Publish {
             dst.put_u16(id);
         }
         // v5 properties
-        if ver == MqttVersion::V5 {
-            self.properties.encode(dst)?;
-        }
+        self.properties.encode(dst, ver)?;
         // Payload
         dst.put_slice(&self.payload);
         Ok(())
@@ -123,10 +119,7 @@ impl Publish {
         };
 
         // v5 properties
-        let properties = match ver {
-            MqttVersion::V5 => Properties::decode(&mut payload)?,
-            _ => Properties::new(),
-        };
+        let properties = Properties::decode(&mut payload, ver)?;
 
         // Remainder is the application payload
         let msg_payload = payload;
@@ -196,7 +189,7 @@ impl PubAck {
                     2 // shorthand: omit reason code + properties
                 }
                 else {
-                    2 + 1 + self.properties.encoded_size()
+                    2 + 1 + self.properties.encoded_size(ver)
                 }
             }
             _ => 2,
@@ -210,7 +203,7 @@ impl PubAck {
             && (self.reason_code != ReasonCode::Success || !self.properties.is_empty())
         {
             dst.put_u8(self.reason_code as u8);
-            self.properties.encode(dst)?;
+            self.properties.encode(dst, ver)?;
         }
         Ok(())
     }
@@ -230,7 +223,7 @@ impl PubAck {
                 }
                 else {
                     let rc = ReasonCode::from(payload.get_u8());
-                    let props = Properties::decode(&mut payload)?;
+                    let props = Properties::decode(&mut payload, ver)?;
                     (rc, props)
                 }
             }

@@ -101,15 +101,11 @@ impl Connect {
     pub fn encoded_size(&self, ver: MqttVersion) -> usize {
         // Variable header: 2+4 (proto name) + 1 (level) + 1 (flags) + 2 (keep-alive)
         let mut size = 10;
-        if ver == MqttVersion::V5 {
-            size += self.properties.encoded_size();
-        }
+        size += self.properties.encoded_size(ver);
         // Payload
         size += utf8_wire_size(&self.client_id);
         if let Some(will) = &self.will {
-            if ver == MqttVersion::V5 {
-                size += will.properties.encoded_size();
-            }
+            size += will.properties.encoded_size(ver);
             size += utf8_wire_size(&will.topic);
             size += binary_wire_size(&will.payload);
         }
@@ -153,16 +149,12 @@ impl Connect {
         dst.put_u8(flags);
         dst.put_u16(self.keep_alive);
         // v5 connect properties
-        if ver == MqttVersion::V5 {
-            self.properties.encode(dst)?;
-        }
+        self.properties.encode(dst, ver)?;
         // Payload: client ID
         put_utf8(&self.client_id, dst);
         // Will
         if let Some(will) = &self.will {
-            if ver == MqttVersion::V5 {
-                will.properties.encode(dst)?;
-            }
+            will.properties.encode(dst, ver)?;
             put_utf8(&will.topic, dst);
             dst.put_u16(will.payload.len() as u16);
             dst.put_slice(&will.payload);
@@ -228,18 +220,12 @@ impl Connect {
         let will_qos = QoS::try_from(will_qos_bits)?;
         let keep_alive = payload.get_u16();
         // v5 connect properties
-        let properties = match ver {
-            MqttVersion::V5 => Properties::decode(&mut payload)?,
-            _ => Properties::new(),
-        };
+        let properties = Properties::decode(&mut payload, ver)?;
         // Payload: client ID
         let client_id = get_utf8(&mut payload)?;
         // Will
         let will = if will_flag {
-            let will_props = match ver {
-                MqttVersion::V5 => Properties::decode(&mut payload)?,
-                _ => Properties::new(),
-            };
+            let will_props = Properties::decode(&mut payload, ver)?;
             let topic = get_utf8(&mut payload)?;
             let will_payload = get_binary(&mut payload)?;
             Some(Will {
@@ -343,11 +329,7 @@ impl ConnAck {
     /// the remaining-length VBI).
     pub fn encoded_size(&self, ver: MqttVersion) -> usize {
         // 1 (ack flags) + 1 (return/reason code)
-        let base = 2;
-        match ver {
-            MqttVersion::V5 => base + self.properties.encoded_size(),
-            _ => base,
-        }
+        2 + self.properties.encoded_size(ver)
     }
 
     /// Encodes the CONNACK variable header and payload into `dst`.
@@ -357,14 +339,10 @@ impl ConnAck {
 
         // Byte 2: return/reason code
         match ver {
-            MqttVersion::V5 => {
-                dst.put_u8(self.reason_code as u8);
-                self.properties.encode(dst)?;
-            }
-            _ => {
-                dst.put_u8(reason_to_v311_code(self.reason_code)?);
-            }
+            MqttVersion::V5 => dst.put_u8(self.reason_code as u8),
+            _ => dst.put_u8(reason_to_v311_code(self.reason_code)?),
         }
+        self.properties.encode(dst, ver)?;
         Ok(())
     }
 
@@ -383,28 +361,18 @@ impl ConnAck {
         let session_present = flags & 0x01 != 0;
 
         let code_byte = payload.get_u8();
-        let (reason_code, properties) = match ver {
-            MqttVersion::V5 => {
-                let rc = ReasonCode::from(code_byte);
-                let props = Properties::decode(&mut payload)?;
-                (rc, props)
-            }
-            _ => {
-                let rc = v311_code_to_reason(code_byte)?;
-                (rc, Properties::new())
-            }
+        let reason_code = match ver {
+            MqttVersion::V5 => ReasonCode::from(code_byte),
+            _ => v311_code_to_reason(code_byte)?,
         };
+        let properties = Properties::decode(&mut payload, ver)?;
 
         // MQTT §3.2.2.1: session_present MUST be 0 when the connection is refused.
         if session_present && reason_code != ReasonCode::Success {
             return Err(Error::MalformedPacket);
         }
 
-<<<<<<< HEAD
-        Ok(ConnAck {
-=======
         Ok(Self {
->>>>>>> refs/remotes/origin/v2
             session_present,
             reason_code,
             properties,

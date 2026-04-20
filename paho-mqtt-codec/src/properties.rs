@@ -29,7 +29,7 @@
 //! or read from the wire.
 
 use crate::{
-    Error, Result, varlen,
+    Error, MqttVersion, Result, varlen,
     wire::{get_binary, get_utf8, put_utf8},
 };
 use bytes::{Buf, BufMut, Bytes};
@@ -342,23 +342,40 @@ impl Properties {
     }
 
     /// Number of bytes this encodes to on the wire, including the VBI length prefix.
-    pub fn encoded_size(&self) -> usize {
-        let data_len = self.payload_size();
-        varlen::encoded_size(data_len as u32) + data_len
+    ///
+    /// Returns 0 for v3.1.1 connections — properties are not present on the wire.
+    pub fn encoded_size(&self, ver: MqttVersion) -> usize {
+        if ver < MqttVersion::V5 {
+            0
+        }
+        else {
+            let data_len = self.payload_size();
+            varlen::encoded_size(data_len as u32) + data_len
+        }
     }
 
-    /// Encodes: VBI(payload_len) followed by each property.
-    pub fn encode<B: BufMut>(&self, dst: &mut B) -> Result<()> {
-        varlen::encode(self.payload_size() as u32, dst)?;
-        for prop in &self.0 {
-            prop.encode(dst)?;
+    /// Encodes the properties to the wire: VBI(payload_len) followed by each property.
+    ///
+    /// No bytes are written for v3.1.1 connections.
+    pub fn encode<B: BufMut>(&self, dst: &mut B, ver: MqttVersion) -> Result<()> {
+        if ver >= MqttVersion::V5 {
+            varlen::encode(self.payload_size() as u32, dst)?;
+            for prop in &self.0 {
+                prop.encode(dst)?;
+            }
         }
         Ok(())
     }
 
-    /// Decodes: reads the VBI length prefix, then parses each property from
-    /// exactly that many bytes.
-    pub fn decode<B: Buf>(src: &mut B) -> Result<Self> {
+    /// Decodes the properties from the wire: reads the VBI length prefix, then
+    /// parses each property from exactly that many bytes.
+    ///
+    /// Returns an empty collection for v3.1.1 connections without consuming any bytes.
+    pub fn decode<B: Buf>(src: &mut B, ver: MqttVersion) -> Result<Self> {
+        if ver < MqttVersion::V5 {
+            return Ok(Self::new());
+        }
+
         let len = varlen::decode(src)?.ok_or(Error::PacketTooShort)? as usize;
         if src.remaining() < len {
             return Err(Error::PacketTooShort);
@@ -368,7 +385,7 @@ impl Properties {
         while payload.has_remaining() {
             props.push(Property::decode(&mut payload)?);
         }
-        Ok(Properties(props))
+        Ok(Self(props))
     }
 }
 
@@ -379,13 +396,18 @@ impl Properties {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::MQTT_VERSION_5;
     use bytes::BytesMut;
+
+    fn v5() -> MqttVersion {
+        MqttVersion::from(MQTT_VERSION_5)
+    }
 
     fn round_trip(props: &Properties) {
         let mut dst = BytesMut::new();
-        props.encode(&mut dst).unwrap();
-        assert_eq!(dst.len(), props.encoded_size());
-        let decoded = Properties::decode(&mut dst.freeze()).unwrap();
+        props.encode(&mut dst, v5()).unwrap();
+        assert_eq!(dst.len(), props.encoded_size(v5()));
+        let decoded = Properties::decode(&mut dst.freeze(), v5()).unwrap();
         assert_eq!(&decoded, props);
     }
 
@@ -399,20 +421,20 @@ mod tests {
     fn test_empty_properties() {
         let props = Properties::new();
         assert!(props.is_empty());
-        assert_eq!(props.encoded_size(), 1); // just the 0x00 VBI
+        assert_eq!(props.encoded_size(v5()), 1); // just the 0x00 VBI
     }
 
     #[test]
     fn test_encode_empty() {
         let mut dst = BytesMut::new();
-        Properties::new().encode(&mut dst).unwrap();
+        Properties::new().encode(&mut dst, v5()).unwrap();
         assert_eq!(&dst[..], &[0x00]);
     }
 
     #[test]
     fn test_decode_empty() {
         let src = Bytes::from_static(&[0x00]);
-        let props = Properties::decode(&mut src.clone()).unwrap();
+        let props = Properties::decode(&mut src.clone(), v5()).unwrap();
         assert!(props.is_empty());
     }
 
@@ -459,7 +481,7 @@ mod tests {
         let mut props = Properties::new();
         props.push(prop(PropertyId::ReceiveMaximum, PropertyValue::U16(0x0064)));
         let mut dst = BytesMut::new();
-        props.encode(&mut dst).unwrap();
+        props.encode(&mut dst, v5()).unwrap();
         // VBI(3), id=0x21, value=0x00 0x64
         assert_eq!(&dst[..], &[0x03, 0x21, 0x00, 0x64]);
     }
@@ -645,8 +667,8 @@ mod tests {
     fn test_encoded_size_matches_encode_empty() {
         let props = Properties::new();
         let mut dst = BytesMut::new();
-        props.encode(&mut dst).unwrap();
-        assert_eq!(dst.len(), props.encoded_size());
+        props.encode(&mut dst, v5()).unwrap();
+        assert_eq!(dst.len(), props.encoded_size(v5()));
     }
 
     #[test]
@@ -658,8 +680,8 @@ mod tests {
         ));
         props.push(prop(PropertyId::TopicAliasMaximum, PropertyValue::U16(10)));
         let mut dst = BytesMut::new();
-        props.encode(&mut dst).unwrap();
-        assert_eq!(dst.len(), props.encoded_size());
+        props.encode(&mut dst, v5()).unwrap();
+        assert_eq!(dst.len(), props.encoded_size(v5()));
     }
 
     // ---- error cases ----
@@ -669,7 +691,7 @@ mod tests {
         // length prefix says 5 bytes but only 2 follow
         let src = Bytes::from_static(&[0x05, 0x01, 0x02]);
         assert_eq!(
-            Properties::decode(&mut src.clone()),
+            Properties::decode(&mut src.clone(), v5()),
             Err(Error::PacketTooShort)
         );
     }
@@ -679,7 +701,7 @@ mod tests {
         // length=1, id=0xFF (unknown)
         let src = Bytes::from_static(&[0x01, 0xFF]);
         assert_eq!(
-            Properties::decode(&mut src.clone()),
+            Properties::decode(&mut src.clone(), v5()),
             Err(Error::MalformedPacket)
         );
     }

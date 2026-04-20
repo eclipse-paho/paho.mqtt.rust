@@ -58,10 +58,7 @@ impl Unsubscribe {
 
     /// Returns the remaining-length byte count for version, `ver`.
     pub fn encoded_size(&self, ver: MqttVersion) -> usize {
-        let mut size = 2; // packet_id
-        if ver == MqttVersion::V5 {
-            size += self.properties.encoded_size();
-        }
+        let mut size = 2 + self.properties.encoded_size(ver);
         for filter in &self.topic_filters {
             size += utf8_wire_size(filter);
         }
@@ -71,9 +68,7 @@ impl Unsubscribe {
     /// Encodes the variable header and payload into `dst`.
     pub fn encode<B: BufMut>(&self, dst: &mut B, ver: MqttVersion) -> Result<()> {
         dst.put_u16(self.packet_id);
-        if ver == MqttVersion::V5 {
-            self.properties.encode(dst)?;
-        }
+        self.properties.encode(dst, ver)?;
         for filter in &self.topic_filters {
             put_utf8(filter, dst);
         }
@@ -86,12 +81,7 @@ impl Unsubscribe {
             return Err(Error::PacketTooShort);
         }
         let packet_id = payload.get_u16();
-
-        let properties = match ver {
-            MqttVersion::V5 => Properties::decode(&mut payload)?,
-            _ => Properties::new(),
-        };
-
+        let properties = Properties::decode(&mut payload, ver)?;
         let mut topic_filters = Vec::new();
         while payload.has_remaining() {
             topic_filters.push(get_utf8(&mut payload)?);
@@ -138,17 +128,20 @@ impl UnsubAck {
 
     /// Returns the remaining-length byte count for version, `ver`.
     pub fn encoded_size(&self, ver: MqttVersion) -> usize {
-        match ver {
-            MqttVersion::V5 => 2 + self.properties.encoded_size() + self.reason_codes.len(),
-            _ => 2, // v3.1.1: packet ID only
+        let rc_len = if ver == MqttVersion::V5 {
+            self.reason_codes.len()
         }
+        else {
+            0
+        };
+        2 + self.properties.encoded_size(ver) + rc_len
     }
 
     /// Encodes the variable header and payload into `dst`.
     pub fn encode<B: BufMut>(&self, dst: &mut B, ver: MqttVersion) -> Result<()> {
         dst.put_u16(self.packet_id);
+        self.properties.encode(dst, ver)?;
         if ver == MqttVersion::V5 {
-            self.properties.encode(dst)?;
             for &rc in &self.reason_codes {
                 dst.put_u8(rc as u8);
             }
@@ -162,14 +155,12 @@ impl UnsubAck {
             return Err(Error::PacketTooShort);
         }
         let packet_id = payload.get_u16();
-
-        let (properties, reason_codes) = match ver {
-            MqttVersion::V5 => {
-                let props = Properties::decode(&mut payload)?;
-                let codes = payload.iter().copied().map(ReasonCode::from).collect();
-                (props, codes)
-            }
-            _ => (Properties::new(), Vec::new()),
+        let properties = Properties::decode(&mut payload, ver)?;
+        let reason_codes = if ver == MqttVersion::V5 {
+            payload.iter().copied().map(ReasonCode::from).collect()
+        }
+        else {
+            Vec::new()
         };
 
         Ok(UnsubAck {

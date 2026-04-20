@@ -77,7 +77,7 @@ impl Disconnect {
         {
             return 0;
         }
-        1 + self.properties.encoded_size()
+        1 + self.properties.encoded_size(ver)
     }
 
     /// Encodes the variable header and payload into `dst`.
@@ -87,7 +87,7 @@ impl Disconnect {
                 && self.properties.is_empty())
         {
             dst.put_u8(self.reason_code as u8);
-            self.properties.encode(dst)?;
+            self.properties.encode(dst, ver)?;
         }
         Ok(())
     }
@@ -100,7 +100,7 @@ impl Disconnect {
         }
 
         let reason_code = ReasonCode::from(payload.get_u8());
-        let properties = Properties::decode(&mut payload)?;
+        let properties = Properties::decode(&mut payload, ver)?;
 
         Ok(Disconnect {
             reason_code,

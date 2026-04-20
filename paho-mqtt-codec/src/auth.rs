@@ -33,7 +33,7 @@
 //! `properties` is empty, `remaining_length` is 0 and the payload is
 //! omitted entirely.
 
-use crate::{Properties, ReasonCode, Result};
+use crate::{MqttVersion, Properties, ReasonCode, Result};
 use bytes::{Buf, BufMut, Bytes};
 
 /////////////////////////////////////////////////////////////////////////////
@@ -66,7 +66,7 @@ impl Auth {
             0
         }
         else {
-            1 + self.properties.encoded_size()
+            1 + self.properties.encoded_size(MqttVersion::V5)
         }
     }
 
@@ -74,7 +74,7 @@ impl Auth {
     pub fn encode<B: BufMut>(&self, dst: &mut B) -> Result<()> {
         if !(self.reason_code == ReasonCode::Success && self.properties.is_empty()) {
             dst.put_u8(self.reason_code as u8);
-            self.properties.encode(dst)?;
+            self.properties.encode(dst, MqttVersion::V5)?;
         }
         Ok(())
     }
@@ -85,7 +85,7 @@ impl Auth {
             return Ok(Auth::default());
         }
         let reason_code = ReasonCode::from(payload.get_u8());
-        let properties = Properties::decode(&mut payload)?;
+        let properties = Properties::decode(&mut payload, MqttVersion::V5)?;
         Ok(Self {
             reason_code,
             properties,
