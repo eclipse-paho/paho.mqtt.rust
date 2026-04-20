@@ -22,7 +22,7 @@
 
 use thiserror::Error;
 
-/// Errors that can occur during MQTT packet encoding and decoding.
+/// MQTT encoding and protocol errors.
 #[derive(Error, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
     /// An invalid QoS byte value was encountered.

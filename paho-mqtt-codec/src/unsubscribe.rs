@@ -28,15 +28,12 @@
 //! both — `reason_codes` is an empty `Vec` on v3.1.1 connections.
 
 use crate::{
-    error::{Error, Result},
-    properties::Properties,
-    reason_code::ReasonCode,
-    types::MqttVersion,
+    Error, MqttVersion, Properties, ReasonCode, Result,
     wire::{get_utf8, put_utf8, utf8_wire_size},
 };
 use bytes::{Buf, BufMut, Bytes};
 
-// ---- Unsubscribe --------------------------------------------------------
+/////////////////////////////////////////////////////////////////////////////
 
 /// An UNSUBSCRIBE packet, unified across MQTT v3.1.1 and v5.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,10 +56,10 @@ impl Unsubscribe {
         }
     }
 
-    /// Returns the remaining-length byte count for `version`.
-    pub fn encoded_size(&self, version: MqttVersion) -> usize {
+    /// Returns the remaining-length byte count for version, `ver`.
+    pub fn encoded_size(&self, ver: MqttVersion) -> usize {
         let mut size = 2; // packet_id
-        if version == MqttVersion::V5 {
+        if ver == MqttVersion::V5 {
             size += self.properties.encoded_size();
         }
         for filter in &self.topic_filters {
@@ -72,9 +69,9 @@ impl Unsubscribe {
     }
 
     /// Encodes the variable header and payload into `dst`.
-    pub fn encode<B: BufMut>(&self, dst: &mut B, version: MqttVersion) -> Result<()> {
+    pub fn encode<B: BufMut>(&self, dst: &mut B, ver: MqttVersion) -> Result<()> {
         dst.put_u16(self.packet_id);
-        if version == MqttVersion::V5 {
+        if ver == MqttVersion::V5 {
             self.properties.encode(dst)?;
         }
         for filter in &self.topic_filters {
@@ -83,14 +80,14 @@ impl Unsubscribe {
         Ok(())
     }
 
-    /// Decodes from the raw `payload` bytes for the given `version`.
-    pub fn decode(mut payload: Bytes, version: MqttVersion) -> Result<Self> {
+    /// Decodes from the raw `payload` bytes for the given version, `ver`.
+    pub fn decode(mut payload: Bytes, ver: MqttVersion) -> Result<Self> {
         if payload.remaining() < 2 {
             return Err(Error::PacketTooShort);
         }
         let packet_id = payload.get_u16();
 
-        let properties = match version {
+        let properties = match ver {
             MqttVersion::V5 => Properties::decode(&mut payload)?,
             _ => Properties::new(),
         };
@@ -104,7 +101,7 @@ impl Unsubscribe {
             return Err(Error::MalformedPacket); // UNSUBSCRIBE must have ≥1 filter
         }
 
-        Ok(Unsubscribe {
+        Ok(Self {
             packet_id,
             topic_filters,
             properties,
@@ -112,7 +109,7 @@ impl Unsubscribe {
     }
 }
 
-// ---- UnsubAck -----------------------------------------------------------
+/////////////////////////////////////////////////////////////////////////////
 
 /// An UNSUBACK packet, unified across MQTT v3.1.1 and v5.
 ///
@@ -139,18 +136,18 @@ impl UnsubAck {
         }
     }
 
-    /// Returns the remaining-length byte count for `version`.
-    pub fn encoded_size(&self, version: MqttVersion) -> usize {
-        match version {
+    /// Returns the remaining-length byte count for version, `ver`.
+    pub fn encoded_size(&self, ver: MqttVersion) -> usize {
+        match ver {
             MqttVersion::V5 => 2 + self.properties.encoded_size() + self.reason_codes.len(),
             _ => 2, // v3.1.1: packet ID only
         }
     }
 
     /// Encodes the variable header and payload into `dst`.
-    pub fn encode<B: BufMut>(&self, dst: &mut B, version: MqttVersion) -> Result<()> {
+    pub fn encode<B: BufMut>(&self, dst: &mut B, ver: MqttVersion) -> Result<()> {
         dst.put_u16(self.packet_id);
-        if version == MqttVersion::V5 {
+        if ver == MqttVersion::V5 {
             self.properties.encode(dst)?;
             for &rc in &self.reason_codes {
                 dst.put_u8(rc as u8);
@@ -159,14 +156,14 @@ impl UnsubAck {
         Ok(())
     }
 
-    /// Decodes from the raw `payload` bytes for the given `version`.
-    pub fn decode(mut payload: Bytes, version: MqttVersion) -> Result<Self> {
+    /// Decodes from the raw `payload` bytes for the given version, `ver`.
+    pub fn decode(mut payload: Bytes, ver: MqttVersion) -> Result<Self> {
         if payload.remaining() < 2 {
             return Err(Error::PacketTooShort);
         }
         let packet_id = payload.get_u16();
 
-        let (properties, reason_codes) = match version {
+        let (properties, reason_codes) = match ver {
             MqttVersion::V5 => {
                 let props = Properties::decode(&mut payload)?;
                 let codes = payload.iter().copied().map(ReasonCode::from).collect();
@@ -209,10 +206,10 @@ mod tests {
     // Unsubscribe
     // ======================================================================
 
-    fn round_trip_unsub(u: Unsubscribe, version: MqttVersion) {
+    fn round_trip_unsub(u: Unsubscribe, ver: MqttVersion) {
         let mut dst = BytesMut::new();
-        u.encode(&mut dst, version).unwrap();
-        let decoded = Unsubscribe::decode(dst.freeze(), version).unwrap();
+        u.encode(&mut dst, ver).unwrap();
+        let decoded = Unsubscribe::decode(dst.freeze(), ver).unwrap();
         assert_eq!(decoded, u);
     }
 
@@ -273,10 +270,10 @@ mod tests {
     #[test]
     fn test_unsubscribe_encoded_size_matches_encode() {
         let u = Unsubscribe::new(7, filters(&["a/b", "c/#"]));
-        for version in [v311(), v5()] {
+        for ver in [v311(), v5()] {
             let mut dst = BytesMut::new();
-            u.encode(&mut dst, version).unwrap();
-            assert_eq!(dst.len(), u.encoded_size(version));
+            u.encode(&mut dst, ver).unwrap();
+            assert_eq!(dst.len(), u.encoded_size(ver));
         }
     }
 
@@ -301,10 +298,10 @@ mod tests {
     // UnsubAck
     // ======================================================================
 
-    fn round_trip_unsuback(ua: UnsubAck, version: MqttVersion) {
+    fn round_trip_unsuback(ua: UnsubAck, ver: MqttVersion) {
         let mut dst = BytesMut::new();
-        ua.encode(&mut dst, version).unwrap();
-        let decoded = UnsubAck::decode(dst.freeze(), version).unwrap();
+        ua.encode(&mut dst, ver).unwrap();
+        let decoded = UnsubAck::decode(dst.freeze(), ver).unwrap();
         assert_eq!(decoded, ua);
     }
 
@@ -400,10 +397,10 @@ mod tests {
     #[test]
     fn test_unsuback_encoded_size_matches_encode() {
         let ua = UnsubAck::new(3, vec![ReasonCode::Success, ReasonCode::NotAuthorized]);
-        for version in [v311(), v5()] {
+        for ver in [v311(), v5()] {
             let mut dst = BytesMut::new();
-            ua.encode(&mut dst, version).unwrap();
-            assert_eq!(dst.len(), ua.encoded_size(version));
+            ua.encode(&mut dst, ver).unwrap();
+            assert_eq!(dst.len(), ua.encoded_size(ver));
         }
     }
 

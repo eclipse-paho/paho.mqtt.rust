@@ -29,8 +29,7 @@
 //! or read from the wire.
 
 use crate::{
-    error::{Error, Result},
-    varlen,
+    Error, Result, varlen,
     wire::{get_binary, get_utf8, put_utf8},
 };
 use bytes::{Buf, BufMut, Bytes};
@@ -314,7 +313,7 @@ pub struct Properties(Vec<Property>);
 impl Properties {
     /// Creates an empty property list.
     pub fn new() -> Self {
-        Properties(Vec::new())
+        Self::default()
     }
 
     /// Returns `true` if there are no properties.

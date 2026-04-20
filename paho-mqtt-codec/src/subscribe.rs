@@ -27,15 +27,12 @@
 //! the QoS bits and v3.1.1 decode leaves the v5 fields at their defaults.
 
 use crate::{
-    error::{Error, Result},
-    properties::Properties,
-    reason_code::ReasonCode,
-    types::{MqttVersion, QoS},
+    Error, MqttVersion, Properties, QoS, ReasonCode, Result,
     wire::{get_utf8, put_utf8, utf8_wire_size},
 };
 use bytes::{Buf, BufMut, Bytes};
 
-// ---- RetainHandling -----------------------------------------------------
+/////////////////////////////////////////////////////////////////////////////
 
 /// How the broker should send retained messages when a subscription is created.
 ///
@@ -52,7 +49,7 @@ pub enum RetainHandling {
     DoNotSend = 2,
 }
 
-// ---- Subscription -------------------------------------------------------
+/////////////////////////////////////////////////////////////////////////////
 
 /// A single topic-filter entry inside a SUBSCRIBE packet.
 ///
@@ -85,10 +82,10 @@ impl Subscription {
         }
     }
 
-    /// Returns the encoded options byte for the given `version`.
-    fn options_byte(&self, version: MqttVersion) -> u8 {
+    /// Returns the encoded options byte for the given version, `ver`.
+    fn options_byte(&self, ver: MqttVersion) -> u8 {
         let mut byte = self.qos as u8;
-        if version == MqttVersion::V5 {
+        if ver == MqttVersion::V5 {
             if self.no_local {
                 byte |= 0x04;
             }
@@ -101,7 +98,7 @@ impl Subscription {
     }
 }
 
-// ---- Subscribe ----------------------------------------------------------
+/////////////////////////////////////////////////////////////////////////////
 
 /// A SUBSCRIBE packet, unified across MQTT v3.1.1 and v5.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -124,10 +121,10 @@ impl Subscribe {
         }
     }
 
-    /// Returns the remaining-length byte count for `version`.
-    pub fn encoded_size(&self, version: MqttVersion) -> usize {
+    /// Returns the remaining-length byte count for version, `ver`.
+    pub fn encoded_size(&self, ver: MqttVersion) -> usize {
         let mut size = 2; // packet_id
-        if version == MqttVersion::V5 {
+        if ver == MqttVersion::V5 {
             size += self.properties.encoded_size();
         }
         for sub in &self.subscriptions {
@@ -137,26 +134,26 @@ impl Subscribe {
     }
 
     /// Encodes the variable header and payload into `dst`.
-    pub fn encode<B: BufMut>(&self, dst: &mut B, version: MqttVersion) -> Result<()> {
+    pub fn encode<B: BufMut>(&self, dst: &mut B, ver: MqttVersion) -> Result<()> {
         dst.put_u16(self.packet_id);
-        if version == MqttVersion::V5 {
+        if ver == MqttVersion::V5 {
             self.properties.encode(dst)?;
         }
         for sub in &self.subscriptions {
             put_utf8(&sub.topic_filter, dst);
-            dst.put_u8(sub.options_byte(version));
+            dst.put_u8(sub.options_byte(ver));
         }
         Ok(())
     }
 
-    /// Decodes from the raw `payload` bytes for the given `version`.
-    pub fn decode(mut payload: Bytes, version: MqttVersion) -> Result<Self> {
+    /// Decodes from the raw `payload` bytes for the given version, `ver`.
+    pub fn decode(mut payload: Bytes, ver: MqttVersion) -> Result<Self> {
         if payload.remaining() < 2 {
             return Err(Error::PacketTooShort);
         }
         let packet_id = payload.get_u16();
 
-        let properties = match version {
+        let properties = match ver {
             MqttVersion::V5 => Properties::decode(&mut payload)?,
             _ => Properties::new(),
         };
@@ -170,7 +167,7 @@ impl Subscribe {
             let options = payload.get_u8();
             let qos = QoS::try_from(options & 0x03)?;
 
-            let (no_local, retain_as_published, retain_handling) = match version {
+            let (no_local, retain_as_published, retain_handling) = match ver {
                 MqttVersion::V5 => {
                     if options & 0xC0 != 0 {
                         return Err(Error::MalformedPacket); // reserved bits must be 0
@@ -207,7 +204,7 @@ impl Subscribe {
     }
 }
 
-// ---- SubAck -------------------------------------------------------------
+/////////////////////////////////////////////////////////////////////////////
 
 /// A SUBACK packet, unified across MQTT v3.1.1 and v5.
 ///
@@ -235,10 +232,10 @@ impl SubAck {
         }
     }
 
-    /// Returns the remaining-length byte count for `version`.
-    pub fn encoded_size(&self, version: MqttVersion) -> usize {
+    /// Returns the remaining-length byte count for version, `ver`.
+    pub fn encoded_size(&self, ver: MqttVersion) -> usize {
         let mut size = 2; // packet_id
-        if version == MqttVersion::V5 {
+        if ver == MqttVersion::V5 {
             size += self.properties.encoded_size();
         }
         size += self.reason_codes.len();
@@ -246,9 +243,9 @@ impl SubAck {
     }
 
     /// Encodes the variable header and payload into `dst`.
-    pub fn encode<B: BufMut>(&self, dst: &mut B, version: MqttVersion) -> Result<()> {
+    pub fn encode<B: BufMut>(&self, dst: &mut B, ver: MqttVersion) -> Result<()> {
         dst.put_u16(self.packet_id);
-        if version == MqttVersion::V5 {
+        if ver == MqttVersion::V5 {
             self.properties.encode(dst)?;
         }
         for &rc in &self.reason_codes {
@@ -257,14 +254,14 @@ impl SubAck {
         Ok(())
     }
 
-    /// Decodes from the raw `payload` bytes for the given `version`.
-    pub fn decode(mut payload: Bytes, version: MqttVersion) -> Result<Self> {
+    /// Decodes from the raw `payload` bytes for the given version, `ver`.
+    pub fn decode(mut payload: Bytes, ver: MqttVersion) -> Result<Self> {
         if payload.remaining() < 2 {
             return Err(Error::PacketTooShort);
         }
         let packet_id = payload.get_u16();
 
-        let properties = match version {
+        let properties = match ver {
             MqttVersion::V5 => Properties::decode(&mut payload)?,
             _ => Properties::new(),
         };
@@ -305,10 +302,10 @@ mod tests {
     // Subscribe
     // ======================================================================
 
-    fn round_trip_subscribe(s: Subscribe, version: MqttVersion) {
+    fn round_trip_subscribe(s: Subscribe, ver: MqttVersion) {
         let mut dst = BytesMut::new();
-        s.encode(&mut dst, version).unwrap();
-        let decoded = Subscribe::decode(dst.freeze(), version).unwrap();
+        s.encode(&mut dst, ver).unwrap();
+        let decoded = Subscribe::decode(dst.freeze(), ver).unwrap();
         assert_eq!(decoded, s);
     }
 
@@ -437,10 +434,10 @@ mod tests {
             7,
             vec![sub("a/b", QoS::AtMostOnce), sub("c/#", QoS::ExactlyOnce)],
         );
-        for version in [v311(), v5()] {
+        for ver in [v311(), v5()] {
             let mut dst = BytesMut::new();
-            s.encode(&mut dst, version).unwrap();
-            assert_eq!(dst.len(), s.encoded_size(version));
+            s.encode(&mut dst, ver).unwrap();
+            assert_eq!(dst.len(), s.encoded_size(ver));
         }
     }
 
@@ -483,10 +480,10 @@ mod tests {
     // SubAck
     // ======================================================================
 
-    fn round_trip_suback(sa: SubAck, version: MqttVersion) {
+    fn round_trip_suback(sa: SubAck, ver: MqttVersion) {
         let mut dst = BytesMut::new();
-        sa.encode(&mut dst, version).unwrap();
-        let decoded = SubAck::decode(dst.freeze(), version).unwrap();
+        sa.encode(&mut dst, ver).unwrap();
+        let decoded = SubAck::decode(dst.freeze(), ver).unwrap();
         assert_eq!(decoded, sa);
     }
 
@@ -542,10 +539,10 @@ mod tests {
             9,
             vec![ReasonCode::GrantedQos2, ReasonCode::UnspecifiedError],
         );
-        for version in [v311(), v5()] {
+        for ver in [v311(), v5()] {
             let mut dst = BytesMut::new();
-            sa.encode(&mut dst, version).unwrap();
-            assert_eq!(dst.len(), sa.encoded_size(version));
+            sa.encode(&mut dst, ver).unwrap();
+            assert_eq!(dst.len(), sa.encoded_size(ver));
         }
     }
 

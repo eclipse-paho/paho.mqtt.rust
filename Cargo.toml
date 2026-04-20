@@ -13,8 +13,7 @@ repository = "https://github.com/eclipse/paho.mqtt.rust"
 keywords = [ "MQTT", "IoT", "Paho", "messaging" ]
 license = "EPL-2.0"
 description = """
-The Official Eclipse Paho MQTT Rust Client Library.
-This is a wrapper around the Paho C library.
+The Eclipse Paho MQTT Rust client library.
 """
 
 [features]

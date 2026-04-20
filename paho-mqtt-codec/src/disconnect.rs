@@ -29,15 +29,10 @@
 //! v3.1.1 DISCONNECT and a v5 normal-disconnect are byte-identical on the
 //! wire.
 
-use crate::{
-    error::{Error, Result},
-    properties::Properties,
-    reason_code::ReasonCode,
-    types::MqttVersion,
-};
+use crate::{MqttVersion, Properties, ReasonCode, Result};
 use bytes::{Buf, BufMut, Bytes};
 
-// ---- Disconnect ---------------------------------------------------------
+/////////////////////////////////////////////////////////////////////////////
 
 /// A DISCONNECT packet, unified across MQTT v3.1.1 and v5.
 ///
@@ -71,12 +66,12 @@ impl Disconnect {
         }
     }
 
-    /// Returns the remaining-length byte count for `version`.
+    /// Returns the remaining-length byte count for version, `ver`.
     ///
     /// When `reason_code` is `NormalDisconnection` and `properties` is empty,
     /// returns 0 regardless of version (shorthand form).
-    pub fn encoded_size(&self, version: MqttVersion) -> usize {
-        if version != MqttVersion::V5
+    pub fn encoded_size(&self, ver: MqttVersion) -> usize {
+        if ver != MqttVersion::V5
             || (self.reason_code == ReasonCode::NormalDisconnection
                 && self.properties.is_empty())
         {
@@ -86,8 +81,8 @@ impl Disconnect {
     }
 
     /// Encodes the variable header and payload into `dst`.
-    pub fn encode<B: BufMut>(&self, dst: &mut B, version: MqttVersion) -> Result<()> {
-        if version == MqttVersion::V5
+    pub fn encode<B: BufMut>(&self, dst: &mut B, ver: MqttVersion) -> Result<()> {
+        if ver == MqttVersion::V5
             && !(self.reason_code == ReasonCode::NormalDisconnection
                 && self.properties.is_empty())
         {
@@ -97,10 +92,10 @@ impl Disconnect {
         Ok(())
     }
 
-    /// Decodes from the raw `payload` bytes for the given `version`.
-    pub fn decode(mut payload: Bytes, version: MqttVersion) -> Result<Self> {
+    /// Decodes from the raw `payload` bytes for the given version, `ver`.
+    pub fn decode(mut payload: Bytes, ver: MqttVersion) -> Result<Self> {
         // Empty payload (shorthand or v3.1.1) → NormalDisconnection, no props.
-        if payload.is_empty() || version != MqttVersion::V5 {
+        if payload.is_empty() || ver != MqttVersion::V5 {
             return Ok(Disconnect::default());
         }
 
@@ -132,10 +127,10 @@ mod tests {
         MqttVersion::from(MQTT_VERSION_5)
     }
 
-    fn round_trip(d: Disconnect, version: MqttVersion) {
+    fn round_trip(d: Disconnect, ver: MqttVersion) {
         let mut dst = BytesMut::new();
-        d.encode(&mut dst, version).unwrap();
-        let decoded = Disconnect::decode(dst.freeze(), version).unwrap();
+        d.encode(&mut dst, ver).unwrap();
+        let decoded = Disconnect::decode(dst.freeze(), ver).unwrap();
         assert_eq!(decoded, d);
     }
 

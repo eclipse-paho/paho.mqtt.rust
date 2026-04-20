@@ -33,39 +33,27 @@
 //! `properties` is empty, `remaining_length` is 0 and the payload is
 //! omitted entirely.
 
-use crate::{
-    error::{Error, Result},
-    properties::Properties,
-    reason_code::ReasonCode,
-};
+use crate::{Properties, ReasonCode, Result};
 use bytes::{Buf, BufMut, Bytes};
 
-// ---- Auth ---------------------------------------------------------------
+/////////////////////////////////////////////////////////////////////////////
 
 /// An AUTH packet (MQTT v5 only).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Auth {
     /// Authentication reason code.
     pub reason_code: ReasonCode,
-    /// MQTT v5 properties (typically carries AuthenticationMethod and AuthenticationData).
+    /// MQTT v5 properties
+    /// (typically carries AuthenticationMethod and AuthenticationData).
     pub properties: Properties,
-}
-
-impl Default for Auth {
-    fn default() -> Self {
-        Auth {
-            reason_code: ReasonCode::Success,
-            properties: Properties::new(),
-        }
-    }
 }
 
 impl Auth {
     /// Creates an AUTH with no properties.
     pub fn new(reason_code: ReasonCode) -> Self {
-        Auth {
+        Self {
             reason_code,
-            properties: Properties::new(),
+            ..Self::default()
         }
     }
 
@@ -98,7 +86,7 @@ impl Auth {
         }
         let reason_code = ReasonCode::from(payload.get_u8());
         let properties = Properties::decode(&mut payload)?;
-        Ok(Auth {
+        Ok(Self {
             reason_code,
             properties,
         })
