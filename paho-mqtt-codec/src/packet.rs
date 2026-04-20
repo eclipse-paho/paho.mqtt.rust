@@ -31,8 +31,9 @@
 //!    payload given the negotiated [`MqttVersion`].
 
 use crate::{
-    connect::ConnAck,
+    connect::{ConnAck, Connect},
     error::{Error, Result},
+    publish::{PubAck, Publish},
     types::MqttVersion,
     varlen,
 };
@@ -40,13 +41,24 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 // ---- packet type nibbles (upper 4 bits of fixed header) ----
 
+const PKT_CONNECT: u8 = 1;
 const PKT_CONNACK: u8 = 2;
+const PKT_PUBLISH: u8 = 3;
+const PKT_PUBACK: u8 = 4;
+const PKT_PUBREC: u8 = 5;
+const PKT_PUBREL: u8 = 6;
+const PKT_PUBCOMP: u8 = 7;
 const PKT_PINGREQ: u8 = 12;
 const PKT_PINGRESP: u8 = 13;
 
 // ---- fixed header bytes ----
 
+const HDR_CONNECT: u8 = PKT_CONNECT << 4; // 0x10
 const HDR_CONNACK: u8 = PKT_CONNACK << 4; // 0x20
+const HDR_PUBACK: u8 = PKT_PUBACK << 4; // 0x40
+const HDR_PUBREC: u8 = PKT_PUBREC << 4; // 0x50
+const HDR_PUBREL: u8 = (PKT_PUBREL << 4) | 0x02; // 0x62  (reserved flags = 0b0010)
+const HDR_PUBCOMP: u8 = PKT_PUBCOMP << 4; // 0x70
 const HDR_PINGREQ: u8 = PKT_PINGREQ << 4;
 const HDR_PINGRESP: u8 = PKT_PINGRESP << 4;
 
@@ -102,8 +114,20 @@ impl RawPacket {
 /// applicable structs and default to empty/success on v3.1.1 connections.
 #[derive(Debug, PartialEq)]
 pub enum Packet {
+    /// `CONNECT` — connection request from client to broker.
+    Connect(Connect),
     /// `CONNACK` — connection acknowledgement from broker to client.
     ConnAck(ConnAck),
+    /// `PUBLISH` — application message from client or broker.
+    Publish(Publish),
+    /// `PUBACK` — QoS 1 publish acknowledgement.
+    PubAck(PubAck),
+    /// `PUBREC` — QoS 2 publish received (first ack).
+    PubRec(PubAck),
+    /// `PUBREL` — QoS 2 publish release (second ack).
+    PubRel(PubAck),
+    /// `PUBCOMP` — QoS 2 publish complete (third ack).
+    PubComp(PubAck),
     /// `PINGREQ` — keep-alive ping from client to broker.
     PingReq,
     /// `PINGRESP` — keep-alive response from broker to client.
@@ -113,30 +137,83 @@ pub enum Packet {
 impl Packet {
     /// Parses a [`RawPacket`] into a typed [`Packet`] given `version`.
     pub fn from_raw(raw: RawPacket, version: MqttVersion) -> Result<Self> {
-        use Packet::*;
         match raw.header >> 4 {
-            PKT_CONNACK => Ok(ConnAck(ConnAck::decode(raw.payload, version)?)),
-            PKT_PINGREQ => Ok(PingReq),
-            PKT_PINGRESP => Ok(PingResp),
+            PKT_CONNECT => Ok(Packet::Connect(Connect::decode(raw.payload, version)?)),
+            PKT_CONNACK => Ok(Packet::ConnAck(ConnAck::decode(raw.payload, version)?)),
+            PKT_PUBLISH => Ok(Packet::Publish(Publish::decode(
+                raw.header & 0x0F,
+                raw.payload,
+                version,
+            )?)),
+            PKT_PUBACK => Ok(Packet::PubAck(PubAck::decode(raw.payload, version)?)),
+            PKT_PUBREC => Ok(Packet::PubRec(PubAck::decode(raw.payload, version)?)),
+            PKT_PUBREL => {
+                if raw.header & 0x0F != 0x02 {
+                    return Err(Error::MalformedPacket);
+                }
+                Ok(Packet::PubRel(PubAck::decode(raw.payload, version)?))
+            }
+            PKT_PUBCOMP => Ok(Packet::PubComp(PubAck::decode(raw.payload, version)?)),
+            PKT_PINGREQ => Ok(Packet::PingReq),
+            PKT_PINGRESP => Ok(Packet::PingResp),
             t => Err(Error::UnknownPacketType(t)),
         }
     }
 
     /// Encodes this packet into `dst`.
     pub fn encode(&self, dst: &mut BytesMut, version: MqttVersion) -> Result<()> {
-        use Packet::*;
         match self {
-            ConnAck(ack) => {
+            Packet::Connect(conn) => {
+                let remaining = conn.encoded_size(version);
+                dst.put_u8(HDR_CONNECT);
+                varlen::encode(remaining as u32, dst)?;
+                conn.encode(dst, version)?;
+            }
+            Packet::ConnAck(ack) => {
                 let remaining = ack.encoded_size(version);
                 dst.put_u8(HDR_CONNACK);
                 varlen::encode(remaining as u32, dst)?;
                 ack.encode(dst, version)?;
             }
-            PingReq => {
+            Packet::Publish(pub_) => {
+                let remaining = pub_.encoded_size(version);
+                let mut hdr = PKT_PUBLISH << 4;
+                if pub_.dup {
+                    hdr |= 0x08;
+                }
+                hdr |= (pub_.qos as u8) << 1;
+                if pub_.retain {
+                    hdr |= 0x01;
+                }
+                dst.put_u8(hdr);
+                varlen::encode(remaining as u32, dst)?;
+                pub_.encode(dst, version)?;
+            }
+            Packet::PubAck(ack) => {
+                dst.put_u8(HDR_PUBACK);
+                varlen::encode(ack.encoded_size(version) as u32, dst)?;
+                ack.encode(dst, version)?;
+            }
+            Packet::PubRec(ack) => {
+                dst.put_u8(HDR_PUBREC);
+                varlen::encode(ack.encoded_size(version) as u32, dst)?;
+                ack.encode(dst, version)?;
+            }
+            Packet::PubRel(ack) => {
+                dst.put_u8(HDR_PUBREL);
+                varlen::encode(ack.encoded_size(version) as u32, dst)?;
+                ack.encode(dst, version)?;
+            }
+            Packet::PubComp(ack) => {
+                dst.put_u8(HDR_PUBCOMP);
+                varlen::encode(ack.encoded_size(version) as u32, dst)?;
+                ack.encode(dst, version)?;
+            }
+            Packet::PingReq => {
                 dst.put_u8(HDR_PINGREQ);
                 varlen::encode(0, dst)?;
             }
-            PingResp => {
+            Packet::PingResp => {
                 dst.put_u8(HDR_PINGRESP);
                 varlen::encode(0, dst)?;
             }

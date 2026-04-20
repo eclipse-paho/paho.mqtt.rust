@@ -32,6 +32,8 @@ pub mod error;
 /// Variable-byte integer encoding and decoding.
 pub mod varlen;
 
+pub(crate) mod wire;
+
 /// MQTT v5 properties.
 pub mod properties;
 
@@ -47,9 +49,13 @@ pub mod reason_code;
 /// CONNECT and CONNACK packets.
 pub mod connect;
 
-pub use connect::ConnAck;
+/// PUBLISH packet.
+pub mod publish;
+
+pub use connect::{ConnAck, Connect, Will};
 pub use error::{Error, Result};
 pub use properties::Properties;
+pub use publish::{PubAck, PubComp, PubRec, PubRel, Publish};
 pub use reason_code::ReasonCode;
 pub use types::{
     MQTT_VERSION_3_1, MQTT_VERSION_3_1_1, MQTT_VERSION_5, MQTT_VERSION_DEFAULT,
