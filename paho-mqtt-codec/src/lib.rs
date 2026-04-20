@@ -58,7 +58,11 @@ pub mod subscribe;
 /// UNSUBSCRIBE and UNSUBACK packets.
 pub mod unsubscribe;
 
+/// DISCONNECT packet.
+pub mod disconnect;
+
 pub use connect::{ConnAck, Connect, Will};
+pub use disconnect::Disconnect;
 pub use error::{Error, Result};
 pub use properties::Properties;
 pub use publish::{PubAck, PubComp, PubRec, PubRel, Publish};

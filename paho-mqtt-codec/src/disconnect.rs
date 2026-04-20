@@ -1,0 +1,232 @@
+// paho-mqtt-codec/src/disconnect.rs
+//
+// This file is part of the Eclipse Paho MQTT Rust Client library.
+
+/*******************************************************************************
+ * Copyright (c) 2026 Frank Pagliughi <fpagliughi@mindspring.com>
+ *
+ * All rights reserved. This program and the accompanying materials
+ * are made available under the terms of the Eclipse Public License v2.0
+ * and Eclipse Distribution License v1.0 which accompany this distribution.
+ *
+ * The Eclipse Public License is available at
+ *    http://www.eclipse.org/legal/epl-v20.html
+ * and the Eclipse Distribution License is available at
+ *   http://www.eclipse.org/org/documents/edl-v10.php.
+ *
+ * Contributors:
+ *    Frank Pagliughi - initial implementation and documentation
+ *******************************************************************************/
+
+//! MQTT DISCONNECT packet.
+//!
+//! DISCONNECT is sent by either the client or the broker to signal a clean
+//! session end.
+//!
+//! Wire format has an important shorthand shared by both versions: when the
+//! reason code is `NormalDisconnection` (0x00) and there are no properties,
+//! the remaining_length is 0 (the payload is omitted entirely). This means a
+//! v3.1.1 DISCONNECT and a v5 normal-disconnect are byte-identical on the
+//! wire.
+
+use crate::{
+    error::{Error, Result},
+    properties::Properties,
+    reason_code::ReasonCode,
+    types::MqttVersion,
+};
+use bytes::{Buf, BufMut, Bytes};
+
+// ---- Disconnect ---------------------------------------------------------
+
+/// A DISCONNECT packet, unified across MQTT v3.1.1 and v5.
+///
+/// In v3.1.1, DISCONNECT carries no payload at all — `reason_code` is always
+/// `NormalDisconnection` and `properties` is always empty on the wire.
+/// In v5, a reason code and optional properties may be present, but if both
+/// are absent the wire form is identical to v3.1.1.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Disconnect {
+    /// Disconnect reason code (v5 only; always `NormalDisconnection` for v3.1.1).
+    pub reason_code: ReasonCode,
+    /// MQTT v5 properties; empty on v3.1.1 connections.
+    pub properties: Properties,
+}
+
+impl Default for Disconnect {
+    fn default() -> Self {
+        Disconnect {
+            reason_code: ReasonCode::NormalDisconnection,
+            properties: Properties::new(),
+        }
+    }
+}
+
+impl Disconnect {
+    /// Creates a DISCONNECT with no properties.
+    pub fn new(reason_code: ReasonCode) -> Self {
+        Disconnect {
+            reason_code,
+            properties: Properties::new(),
+        }
+    }
+
+    /// Returns the remaining-length byte count for `version`.
+    ///
+    /// When `reason_code` is `NormalDisconnection` and `properties` is empty,
+    /// returns 0 regardless of version (shorthand form).
+    pub fn encoded_size(&self, version: MqttVersion) -> usize {
+        if version != MqttVersion::V5
+            || (self.reason_code == ReasonCode::NormalDisconnection
+                && self.properties.is_empty())
+        {
+            return 0;
+        }
+        1 + self.properties.encoded_size()
+    }
+
+    /// Encodes the variable header and payload into `dst`.
+    pub fn encode<B: BufMut>(&self, dst: &mut B, version: MqttVersion) -> Result<()> {
+        if version == MqttVersion::V5
+            && !(self.reason_code == ReasonCode::NormalDisconnection
+                && self.properties.is_empty())
+        {
+            dst.put_u8(self.reason_code as u8);
+            self.properties.encode(dst)?;
+        }
+        Ok(())
+    }
+
+    /// Decodes from the raw `payload` bytes for the given `version`.
+    pub fn decode(mut payload: Bytes, version: MqttVersion) -> Result<Self> {
+        // Empty payload (shorthand or v3.1.1) → NormalDisconnection, no props.
+        if payload.is_empty() || version != MqttVersion::V5 {
+            return Ok(Disconnect::default());
+        }
+
+        if payload.remaining() < 1 {
+            return Err(Error::PacketTooShort);
+        }
+        let reason_code = ReasonCode::from(payload.get_u8());
+        let properties = Properties::decode(&mut payload)?;
+
+        Ok(Disconnect {
+            reason_code,
+            properties,
+        })
+    }
+}
+
+/////////////////////////////////////////////////////////////////////////////
+//                              Unit Tests
+/////////////////////////////////////////////////////////////////////////////
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{MQTT_VERSION_3_1_1, MQTT_VERSION_5};
+    use bytes::BytesMut;
+
+    fn v311() -> MqttVersion {
+        MqttVersion::from(MQTT_VERSION_3_1_1)
+    }
+
+    fn v5() -> MqttVersion {
+        MqttVersion::from(MQTT_VERSION_5)
+    }
+
+    fn round_trip(d: Disconnect, version: MqttVersion) {
+        let mut dst = BytesMut::new();
+        d.encode(&mut dst, version).unwrap();
+        let decoded = Disconnect::decode(dst.freeze(), version).unwrap();
+        assert_eq!(decoded, d);
+    }
+
+    // ---- v3.1.1 ----
+
+    #[test]
+    fn test_disconnect_v311_encodes_empty() {
+        let d = Disconnect::default();
+        let mut dst = BytesMut::new();
+        d.encode(&mut dst, v311()).unwrap();
+        assert!(dst.is_empty());
+    }
+
+    #[test]
+    fn test_disconnect_v311_encoded_size_zero() {
+        assert_eq!(Disconnect::default().encoded_size(v311()), 0);
+    }
+
+    #[test]
+    fn test_disconnect_v311_round_trip() {
+        round_trip(Disconnect::default(), v311());
+    }
+
+    #[test]
+    fn test_disconnect_v311_ignores_reason_code() {
+        // Non-normal reason code is not written on v3.1.1 wire; round-trip
+        // decodes as NormalDisconnection.
+        let d = Disconnect::new(ReasonCode::NotAuthorized);
+        let mut dst = BytesMut::new();
+        d.encode(&mut dst, v311()).unwrap();
+        assert!(dst.is_empty());
+        let decoded = Disconnect::decode(dst.freeze(), v311()).unwrap();
+        assert_eq!(decoded.reason_code, ReasonCode::NormalDisconnection);
+    }
+
+    // ---- v5 shorthand (reason=Normal, no props) ----
+
+    #[test]
+    fn test_disconnect_v5_normal_encodes_empty() {
+        let d = Disconnect::default();
+        let mut dst = BytesMut::new();
+        d.encode(&mut dst, v5()).unwrap();
+        assert!(dst.is_empty());
+    }
+
+    #[test]
+    fn test_disconnect_v5_normal_encoded_size_zero() {
+        assert_eq!(Disconnect::default().encoded_size(v5()), 0);
+    }
+
+    #[test]
+    fn test_disconnect_v5_normal_round_trip() {
+        round_trip(Disconnect::default(), v5());
+    }
+
+    // ---- v5 full form ----
+
+    #[test]
+    fn test_disconnect_v5_reason_code_encoded() {
+        let d = Disconnect::new(ReasonCode::SessionTakenOver);
+        let mut dst = BytesMut::new();
+        d.encode(&mut dst, v5()).unwrap();
+        // reason_code byte + empty props VBI
+        assert_eq!(&dst[..], &[ReasonCode::SessionTakenOver as u8, 0x00]);
+    }
+
+    #[test]
+    fn test_disconnect_v5_encoded_size_with_reason() {
+        let d = Disconnect::new(ReasonCode::SessionTakenOver);
+        // 1 (reason) + 1 (props VBI=0) = 2
+        assert_eq!(d.encoded_size(v5()), 2);
+    }
+
+    #[test]
+    fn test_disconnect_v5_round_trip_reason() {
+        round_trip(Disconnect::new(ReasonCode::SessionTakenOver), v5());
+    }
+
+    #[test]
+    fn test_disconnect_v5_round_trip_not_authorized() {
+        round_trip(Disconnect::new(ReasonCode::NotAuthorized), v5());
+    }
+
+    #[test]
+    fn test_disconnect_v5_encoded_size_matches_encode() {
+        let d = Disconnect::new(ReasonCode::ServerBusy);
+        let mut dst = BytesMut::new();
+        d.encode(&mut dst, v5()).unwrap();
+        assert_eq!(dst.len(), d.encoded_size(v5()));
+    }
+}

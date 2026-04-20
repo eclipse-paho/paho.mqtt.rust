@@ -32,6 +32,7 @@
 
 use crate::{
     connect::{ConnAck, Connect},
+    disconnect::Disconnect,
     error::{Error, Result},
     publish::{PubAck, Publish},
     subscribe::{SubAck, Subscribe},
@@ -56,6 +57,7 @@ const PKT_UNSUBSCRIBE: u8 = 10;
 const PKT_UNSUBACK: u8 = 11;
 const PKT_PINGREQ: u8 = 12;
 const PKT_PINGRESP: u8 = 13;
+const PKT_DISCONNECT: u8 = 14;
 
 // ---- fixed header bytes ----
 
@@ -71,6 +73,7 @@ const HDR_UNSUBSCRIBE: u8 = (PKT_UNSUBSCRIBE << 4) | 0x02; // 0xA2 (reserved fla
 const HDR_UNSUBACK: u8 = PKT_UNSUBACK << 4; // 0xB0
 const HDR_PINGREQ: u8 = PKT_PINGREQ << 4;
 const HDR_PINGRESP: u8 = PKT_PINGRESP << 4;
+const HDR_DISCONNECT: u8 = PKT_DISCONNECT << 4; // 0xE0
 
 /// A raw, uninterpreted MQTT packet produced by the framing layer.
 ///
@@ -150,6 +153,8 @@ pub enum Packet {
     PingReq,
     /// `PINGRESP` — keep-alive response from broker to client.
     PingResp,
+    /// `DISCONNECT` — connection teardown, sent by either side.
+    Disconnect(Disconnect),
 }
 
 impl Packet {
@@ -191,6 +196,10 @@ impl Packet {
             PKT_UNSUBACK => Ok(Packet::UnsubAck(UnsubAck::decode(raw.payload, version)?)),
             PKT_PINGREQ => Ok(Packet::PingReq),
             PKT_PINGRESP => Ok(Packet::PingResp),
+            PKT_DISCONNECT => Ok(Packet::Disconnect(Disconnect::decode(
+                raw.payload,
+                version,
+            )?)),
             t => Err(Error::UnknownPacketType(t)),
         }
     }
@@ -271,6 +280,11 @@ impl Packet {
             Packet::PingResp => {
                 dst.put_u8(HDR_PINGRESP);
                 varlen::encode(0, dst)?;
+            }
+            Packet::Disconnect(d) => {
+                dst.put_u8(HDR_DISCONNECT);
+                varlen::encode(d.encoded_size(version) as u32, dst)?;
+                d.encode(dst, version)?;
             }
         }
         Ok(())
