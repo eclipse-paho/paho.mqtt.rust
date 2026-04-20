@@ -25,13 +25,12 @@
 //! a separate parameter extracted from [`crate::packet::RawPacket::header`].
 
 use crate::{
-    error::{Error, Result},
-    properties::Properties,
-    reason_code::ReasonCode,
-    types::{MqttVersion, QoS},
-    wire::{get_utf8, utf8_wire_size},
+    Error, MqttVersion, Properties, QoS, ReasonCode, Result,
+    wire::{get_utf8, put_utf8, utf8_wire_size},
 };
 use bytes::{Buf, BufMut, Bytes};
+
+/////////////////////////////////////////////////////////////////////////////
 
 /// A PUBLISH packet, unified across MQTT v3.1.1 and v5.
 ///
@@ -56,11 +55,11 @@ pub struct Publish {
 }
 
 impl Publish {
-    /// Creates a QoS-0 PUBLISH with no DUP, no retain, and no properties.
+    /// Creates a QoS 0 PUBLISH with no DUP, no retain, and no properties.
     pub fn new(topic: impl Into<String>, payload: impl Into<Bytes>) -> Self {
         Publish {
             dup: false,
-            qos: QoS::AtMostOnce,
+            qos: QoS::QoS0,
             retain: false,
             topic: topic.into(),
             packet_id: None,
@@ -69,13 +68,13 @@ impl Publish {
         }
     }
 
-    /// Returns the number of variable-header + payload bytes for `version`.
-    pub fn encoded_size(&self, version: MqttVersion) -> usize {
+    /// Returns the number of variable-header + payload bytes for version, `ver`.
+    pub fn encoded_size(&self, ver: MqttVersion) -> usize {
         let mut size = utf8_wire_size(&self.topic);
-        if self.qos != QoS::AtMostOnce {
+        if self.qos != QoS::QoS0 {
             size += 2; // packet ID
         }
-        if version == MqttVersion::V5 {
+        if ver == MqttVersion::V5 {
             size += self.properties.encoded_size();
         }
         size += self.payload.len();
@@ -85,17 +84,16 @@ impl Publish {
     /// Encodes the PUBLISH variable header and payload into `dst`.
     ///
     /// Returns [`Error::MalformedPacket`] if `qos > 0` but `packet_id` is `None`.
-    pub fn encode<B: BufMut>(&self, dst: &mut B, version: MqttVersion) -> Result<()> {
+    pub fn encode<B: BufMut>(&self, dst: &mut B, ver: MqttVersion) -> Result<()> {
         // Topic
-        dst.put_u16(self.topic.len() as u16);
-        dst.put_slice(self.topic.as_bytes());
+        put_utf8(&self.topic, dst);
         // Packet ID (QoS 1 and 2 only)
-        if self.qos != QoS::AtMostOnce {
+        if self.qos != QoS::QoS0 {
             let id = self.packet_id.ok_or(Error::MalformedPacket)?;
             dst.put_u16(id);
         }
         // v5 properties
-        if version == MqttVersion::V5 {
+        if ver == MqttVersion::V5 {
             self.properties.encode(dst)?;
         }
         // Payload
@@ -104,8 +102,8 @@ impl Publish {
     }
 
     /// Decodes a PUBLISH from the fixed-header `flags` (lower 4 bits of the
-    /// first header byte) and the raw `payload` bytes for the given `version`.
-    pub fn decode(flags: u8, mut payload: Bytes, version: MqttVersion) -> Result<Self> {
+    /// first header byte) and the raw `payload` bytes for the given version, `ver`.
+    pub fn decode(flags: u8, mut payload: Bytes, ver: MqttVersion) -> Result<Self> {
         let dup = flags & 0x08 != 0;
         let qos = QoS::try_from((flags >> 1) & 0x03)?;
         let retain = flags & 0x01 != 0;
@@ -114,7 +112,7 @@ impl Publish {
         let topic = get_utf8(&mut payload)?;
 
         // Packet ID (QoS 1 and 2 only)
-        let packet_id = if qos != QoS::AtMostOnce {
+        let packet_id = if qos != QoS::QoS0 {
             if payload.remaining() < 2 {
                 return Err(Error::PacketTooShort);
             }
@@ -125,7 +123,7 @@ impl Publish {
         };
 
         // v5 properties
-        let properties = match version {
+        let properties = match ver {
             MqttVersion::V5 => Properties::decode(&mut payload)?,
             _ => Properties::new(),
         };
@@ -145,7 +143,7 @@ impl Publish {
     }
 }
 
-// ---- PubAck / PubRec / PubRel / PubComp ---------------------------------
+/////////////////////////////////////////////////////////////////////////////
 
 /// PUBACK, PUBREC, PUBREL, or PUBCOMP packet.
 ///
@@ -188,11 +186,11 @@ impl PubAck {
         }
     }
 
-    /// Returns the remaining-length byte count for `version`.
+    /// Returns the remaining-length byte count for version, `ver`.
     ///
     /// Uses the v5 shorthand (2 bytes, packet ID only) when possible.
-    pub fn encoded_size(&self, version: MqttVersion) -> usize {
-        match version {
+    pub fn encoded_size(&self, ver: MqttVersion) -> usize {
+        match ver {
             MqttVersion::V5 => {
                 if self.reason_code == ReasonCode::Success && self.properties.is_empty() {
                     2 // shorthand: omit reason code + properties
@@ -206,9 +204,9 @@ impl PubAck {
     }
 
     /// Encodes the variable header into `dst`.
-    pub fn encode<B: BufMut>(&self, dst: &mut B, version: MqttVersion) -> Result<()> {
+    pub fn encode<B: BufMut>(&self, dst: &mut B, ver: MqttVersion) -> Result<()> {
         dst.put_u16(self.packet_id);
-        if version == MqttVersion::V5
+        if ver == MqttVersion::V5
             && (self.reason_code != ReasonCode::Success || !self.properties.is_empty())
         {
             dst.put_u8(self.reason_code as u8);
@@ -217,14 +215,14 @@ impl PubAck {
         Ok(())
     }
 
-    /// Decodes from the raw `payload` bytes for the given `version`.
-    pub fn decode(mut payload: Bytes, version: MqttVersion) -> Result<Self> {
+    /// Decodes from the raw `payload` bytes for the given version, `ver`.
+    pub fn decode(mut payload: Bytes, ver: MqttVersion) -> Result<Self> {
         if payload.remaining() < 2 {
             return Err(Error::PacketTooShort);
         }
         let packet_id = payload.get_u16();
 
-        let (reason_code, properties) = match version {
+        let (reason_code, properties) = match ver {
             MqttVersion::V5 => {
                 if payload.is_empty() {
                     // Shorthand: no reason code byte → implicit Success
@@ -267,7 +265,7 @@ mod tests {
 
     // Encode a Publish to bytes, extracting the flags byte separately (as
     // packet.rs would when building the full fixed header).
-    fn encode_with_flags(pub_: &Publish, version: MqttVersion) -> (u8, BytesMut) {
+    fn encode_with_flags(pub_: &Publish, ver: MqttVersion) -> (u8, BytesMut) {
         let mut flags: u8 = 0x30; // PUBLISH type nibble
         if pub_.dup {
             flags |= 0x08;
@@ -277,14 +275,13 @@ mod tests {
             flags |= 0x01;
         }
         let mut dst = BytesMut::new();
-        pub_.encode(&mut dst, version).unwrap();
+        pub_.encode(&mut dst, ver).unwrap();
         (flags, dst)
     }
 
-    fn round_trip(pub_: Publish, version: MqttVersion) {
-        let (flags_byte, encoded) = encode_with_flags(&pub_, version);
-        let decoded =
-            Publish::decode(flags_byte & 0x0F, encoded.freeze(), version).unwrap();
+    fn round_trip(pub_: Publish, ver: MqttVersion) {
+        let (flags_byte, encoded) = encode_with_flags(&pub_, ver);
+        let decoded = Publish::decode(flags_byte & 0x0F, encoded.freeze(), ver).unwrap();
         assert_eq!(decoded, pub_);
     }
 
@@ -452,14 +449,10 @@ mod tests {
             payload: Bytes::from_static(b"23.4"),
             properties: Properties::new(),
         };
-        for version in [v311(), v5()] {
+        for ver in [v311(), v5()] {
             let mut dst = BytesMut::new();
-            pub_.encode(&mut dst, version).unwrap();
-            assert_eq!(
-                dst.len(),
-                pub_.encoded_size(version),
-                "mismatch for {version:?}"
-            );
+            pub_.encode(&mut dst, ver).unwrap();
+            assert_eq!(dst.len(), pub_.encoded_size(ver), "mismatch for {ver:?}");
         }
     }
 
@@ -498,10 +491,10 @@ mod tests {
     // PubAck / PubRec / PubRel / PubComp tests
     // ======================================================================
 
-    fn round_trip_puback(ack: PubAck, version: MqttVersion) {
+    fn round_trip_puback(ack: PubAck, ver: MqttVersion) {
         let mut dst = BytesMut::new();
-        ack.encode(&mut dst, version).unwrap();
-        let decoded = PubAck::decode(dst.freeze(), version).unwrap();
+        ack.encode(&mut dst, ver).unwrap();
+        let decoded = PubAck::decode(dst.freeze(), ver).unwrap();
         assert_eq!(decoded, ack);
     }
 
@@ -623,10 +616,10 @@ mod tests {
             },
         ];
         for ack in &cases {
-            for version in [v311(), v5()] {
+            for ver in [v311(), v5()] {
                 let mut dst = BytesMut::new();
-                ack.encode(&mut dst, version).unwrap();
-                assert_eq!(dst.len(), ack.encoded_size(version));
+                ack.encode(&mut dst, ver).unwrap();
+                assert_eq!(dst.len(), ack.encoded_size(ver));
             }
         }
     }

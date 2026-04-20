@@ -21,16 +21,12 @@
 //! MQTT CONNECT and CONNACK packets.
 
 use crate::{
-    error::{Error, Result},
-    properties::Properties,
-    reason_code::ReasonCode,
-    types::{MqttVersion, QoS},
-    varlen,
+    Error, MqttVersion, Properties, QoS, ReasonCode, Result, varlen,
     wire::{binary_wire_size, get_binary, get_utf8, put_utf8, utf8_wire_size},
 };
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
-// ---- Will ---------------------------------------------------------------
+/////////////////////////////////////////////////////////////////////////////
 
 /// The Will message carried in a CONNECT packet.
 ///
@@ -67,7 +63,7 @@ impl Will {
     }
 }
 
-// ---- Connect ------------------------------------------------------------
+/////////////////////////////////////////////////////////////////////////////
 
 /// A CONNECT packet, unified across MQTT v3.1.1 and v5.
 ///
@@ -94,28 +90,24 @@ pub struct Connect {
 impl Connect {
     /// Creates a minimal `Connect` (no will, no credentials, keep-alive 0).
     pub fn new(clean_start: bool, client_id: impl Into<String>) -> Self {
-        Connect {
+        Self {
             clean_start,
-            keep_alive: 0,
             client_id: client_id.into(),
-            username: None,
-            password: None,
-            will: None,
-            properties: Properties::new(),
+            ..Self::default()
         }
     }
 
-    /// Returns the number of variable-header + payload bytes for `version`.
-    pub fn encoded_size(&self, version: MqttVersion) -> usize {
+    /// Returns the number of variable-header + payload bytes for version, `ver`.
+    pub fn encoded_size(&self, ver: MqttVersion) -> usize {
         // Variable header: 2+4 (proto name) + 1 (level) + 1 (flags) + 2 (keep-alive)
         let mut size = 10;
-        if version == MqttVersion::V5 {
+        if ver == MqttVersion::V5 {
             size += self.properties.encoded_size();
         }
         // Payload
         size += utf8_wire_size(&self.client_id);
         if let Some(will) = &self.will {
-            if version == MqttVersion::V5 {
+            if ver == MqttVersion::V5 {
                 size += will.properties.encoded_size();
             }
             size += utf8_wire_size(&will.topic);
@@ -131,12 +123,12 @@ impl Connect {
     }
 
     /// Encodes the CONNECT variable header and payload into `dst`.
-    pub fn encode<B: BufMut>(&self, dst: &mut B, version: MqttVersion) -> Result<()> {
+    pub fn encode<B: BufMut>(&self, dst: &mut B, ver: MqttVersion) -> Result<()> {
         // Protocol name
         dst.put_u16(4);
         dst.put_slice(b"MQTT");
         // Protocol level
-        dst.put_u8(match version {
+        dst.put_u8(match ver {
             MqttVersion::V5 => 5,
             _ => 4,
         });
@@ -161,14 +153,14 @@ impl Connect {
         dst.put_u8(flags);
         dst.put_u16(self.keep_alive);
         // v5 connect properties
-        if version == MqttVersion::V5 {
+        if ver == MqttVersion::V5 {
             self.properties.encode(dst)?;
         }
         // Payload: client ID
         put_utf8(&self.client_id, dst);
         // Will
         if let Some(will) = &self.will {
-            if version == MqttVersion::V5 {
+            if ver == MqttVersion::V5 {
                 will.properties.encode(dst)?;
             }
             put_utf8(&will.topic, dst);
@@ -186,8 +178,8 @@ impl Connect {
         Ok(())
     }
 
-    /// Decodes a CONNECT from the raw `payload` bytes for the given `version`.
-    pub fn decode(mut payload: Bytes, version: MqttVersion) -> Result<Self> {
+    /// Decodes a CONNECT from the raw `payload` bytes for the given version, `ver`.
+    pub fn decode(mut payload: Bytes, ver: MqttVersion) -> Result<Self> {
         // Protocol name
         if payload.remaining() < 2 {
             return Err(Error::PacketTooShort);
@@ -208,7 +200,7 @@ impl Connect {
             return Err(Error::PacketTooShort);
         }
         let level = payload.get_u8();
-        let expected = match version {
+        let expected = match ver {
             MqttVersion::V5 => 5,
             _ => 4,
         };
@@ -236,7 +228,7 @@ impl Connect {
         let will_qos = QoS::try_from(will_qos_bits)?;
         let keep_alive = payload.get_u16();
         // v5 connect properties
-        let properties = match version {
+        let properties = match ver {
             MqttVersion::V5 => Properties::decode(&mut payload)?,
             _ => Properties::new(),
         };
@@ -244,7 +236,7 @@ impl Connect {
         let client_id = get_utf8(&mut payload)?;
         // Will
         let will = if will_flag {
-            let will_props = match version {
+            let will_props = match ver {
                 MqttVersion::V5 => Properties::decode(&mut payload)?,
                 _ => Properties::new(),
             };
@@ -274,7 +266,7 @@ impl Connect {
         else {
             None
         };
-        Ok(Connect {
+        Ok(Self {
             clean_start,
             keep_alive,
             client_id,
@@ -286,37 +278,39 @@ impl Connect {
     }
 }
 
-// ---- v3.1.1 connect return codes ----------------------------------------
-//
+// --------------------------------------------------------------------------
+
 // MQTT v3.1.1 §3.2.2.3: six defined return codes (0–5). On decode we map
 // them to the nearest v5 ReasonCode; on encode we reverse the mapping.
 // Unknown return codes are treated as malformed.
 
 fn v311_code_to_reason(code: u8) -> Result<ReasonCode> {
+    use ReasonCode::*;
     match code {
-        0 => Ok(ReasonCode::Success),
-        1 => Ok(ReasonCode::UnsupportedProtocolVersion),
-        2 => Ok(ReasonCode::ClientIdentifierNotValid),
-        3 => Ok(ReasonCode::ServerUnavailable),
-        4 => Ok(ReasonCode::BadUserNameOrPassword),
-        5 => Ok(ReasonCode::NotAuthorized),
+        0 => Ok(Success),
+        1 => Ok(UnsupportedProtocolVersion),
+        2 => Ok(ClientIdentifierNotValid),
+        3 => Ok(ServerUnavailable),
+        4 => Ok(BadUserNameOrPassword),
+        5 => Ok(NotAuthorized),
         _ => Err(Error::MalformedPacket),
     }
 }
 
 fn reason_to_v311_code(rc: ReasonCode) -> Result<u8> {
+    use ReasonCode::*;
     match rc {
-        ReasonCode::Success => Ok(0),
-        ReasonCode::UnsupportedProtocolVersion => Ok(1),
-        ReasonCode::ClientIdentifierNotValid => Ok(2),
-        ReasonCode::ServerUnavailable => Ok(3),
-        ReasonCode::BadUserNameOrPassword => Ok(4),
-        ReasonCode::NotAuthorized => Ok(5),
+        Success => Ok(0),
+        UnsupportedProtocolVersion => Ok(1),
+        ClientIdentifierNotValid => Ok(2),
+        ServerUnavailable => Ok(3),
+        BadUserNameOrPassword => Ok(4),
+        NotAuthorized => Ok(5),
         _ => Err(Error::MalformedPacket),
     }
 }
 
-// ---- ConnAck -------------------------------------------------------------
+/////////////////////////////////////////////////////////////////////////////
 
 /// A CONNACK packet, unified across MQTT v3.1.1 and v5.
 ///
@@ -337,32 +331,32 @@ pub struct ConnAck {
 impl ConnAck {
     /// Creates a `ConnAck` with no properties (suitable for either version).
     pub fn new(session_present: bool, reason_code: ReasonCode) -> Self {
-        ConnAck {
+        Self {
             session_present,
             reason_code,
-            properties: Properties::new(),
+            ..Self::default()
         }
     }
 
     /// Returns the number of variable-header bytes this packet encodes to
-    /// for the given `version` (does **not** include the fixed header or
+    /// for the given version, `ver` (does **not** include the fixed header or
     /// the remaining-length VBI).
-    pub fn encoded_size(&self, version: MqttVersion) -> usize {
+    pub fn encoded_size(&self, ver: MqttVersion) -> usize {
         // 1 (ack flags) + 1 (return/reason code)
         let base = 2;
-        match version {
+        match ver {
             MqttVersion::V5 => base + self.properties.encoded_size(),
             _ => base,
         }
     }
 
     /// Encodes the CONNACK variable header and payload into `dst`.
-    pub fn encode<B: BufMut>(&self, dst: &mut B, version: MqttVersion) -> Result<()> {
+    pub fn encode<B: BufMut>(&self, dst: &mut B, ver: MqttVersion) -> Result<()> {
         // Byte 1: connect acknowledge flags (bit 0 = session_present)
         dst.put_u8(if self.session_present { 0x01 } else { 0x00 });
 
         // Byte 2: return/reason code
-        match version {
+        match ver {
             MqttVersion::V5 => {
                 dst.put_u8(self.reason_code as u8);
                 self.properties.encode(dst)?;
@@ -375,8 +369,8 @@ impl ConnAck {
     }
 
     /// Decodes a CONNACK from the raw `payload` bytes (i.e. the bytes after
-    /// the remaining-length field) for the given `version`.
-    pub fn decode(mut payload: Bytes, version: MqttVersion) -> Result<Self> {
+    /// the remaining-length field) for the given version, `ver`.
+    pub fn decode(mut payload: Bytes, ver: MqttVersion) -> Result<Self> {
         if payload.remaining() < 2 {
             return Err(Error::PacketTooShort);
         }
@@ -389,7 +383,7 @@ impl ConnAck {
         let session_present = flags & 0x01 != 0;
 
         let code_byte = payload.get_u8();
-        let (reason_code, properties) = match version {
+        let (reason_code, properties) = match ver {
             MqttVersion::V5 => {
                 let rc = ReasonCode::from(code_byte);
                 let props = Properties::decode(&mut payload)?;
@@ -401,7 +395,12 @@ impl ConnAck {
             }
         };
 
-        Ok(ConnAck {
+        // MQTT §3.2.2.1: session_present MUST be 0 when the connection is refused.
+        if session_present && reason_code != ReasonCode::Success {
+            return Err(Error::MalformedPacket);
+        }
+
+        Ok(Self {
             session_present,
             reason_code,
             properties,
@@ -410,15 +409,11 @@ impl ConnAck {
 }
 
 /// Encodes a complete CONNACK packet (fixed header + remaining-length + variable header).
-pub fn encode_connack(
-    ack: &ConnAck,
-    dst: &mut BytesMut,
-    version: MqttVersion,
-) -> Result<()> {
-    let remaining = ack.encoded_size(version);
+pub fn encode_connack(ack: &ConnAck, dst: &mut BytesMut, ver: MqttVersion) -> Result<()> {
+    let remaining = ack.encoded_size(ver);
     dst.put_u8(0x20); // fixed header: CONNACK, flags=0
     varlen::encode(remaining as u32, dst)?;
-    ack.encode(dst, version)
+    ack.encode(dst, ver)
 }
 
 /////////////////////////////////////////////////////////////////////////////
@@ -551,6 +546,23 @@ mod tests {
         assert_eq!(ConnAck::decode(payload, v311()), Err(Error::PacketTooShort));
     }
 
+    #[test]
+    fn test_decode_session_present_with_nonzero_code_errors() {
+        // session_present=1 combined with a refused reason code is malformed.
+        let payload = Bytes::from_static(&[0x01, 0x05]); // session_present=1, NotAuthorized
+        assert_eq!(
+            ConnAck::decode(payload, v311()),
+            Err(Error::MalformedPacket)
+        );
+    }
+
+    #[test]
+    fn test_decode_v5_session_present_with_refused_errors() {
+        // Same rule applies on v5.
+        let payload = Bytes::from_static(&[0x01, 0x87, 0x00]); // session_present=1, NotAuthorized
+        assert_eq!(ConnAck::decode(payload, v5()), Err(Error::MalformedPacket));
+    }
+
     // ---- v5 decode ----
 
     #[test]
@@ -580,10 +592,10 @@ mod tests {
 
     // ---- round-trip ----
 
-    fn round_trip(ack: ConnAck, version: MqttVersion) {
+    fn round_trip(ack: ConnAck, ver: MqttVersion) {
         let mut dst = BytesMut::new();
-        ack.encode(&mut dst, version).unwrap();
-        let decoded = ConnAck::decode(dst.freeze(), version).unwrap();
+        ack.encode(&mut dst, ver).unwrap();
+        let decoded = ConnAck::decode(dst.freeze(), ver).unwrap();
         assert_eq!(decoded, ack);
     }
 
@@ -595,12 +607,13 @@ mod tests {
 
     #[test]
     fn test_round_trip_v311_refused() {
+        use ReasonCode::*;
         for rc in [
-            ReasonCode::UnsupportedProtocolVersion,
-            ReasonCode::ClientIdentifierNotValid,
-            ReasonCode::ServerUnavailable,
-            ReasonCode::BadUserNameOrPassword,
-            ReasonCode::NotAuthorized,
+            UnsupportedProtocolVersion,
+            ClientIdentifierNotValid,
+            ServerUnavailable,
+            BadUserNameOrPassword,
+            NotAuthorized,
         ] {
             round_trip(ConnAck::new(false, rc), v311());
         }
@@ -663,10 +676,10 @@ mod tests {
     // Connect tests
     // ======================================================================
 
-    fn round_trip_connect(conn: Connect, version: MqttVersion) {
+    fn round_trip_connect(conn: Connect, ver: MqttVersion) {
         let mut dst = BytesMut::new();
-        conn.encode(&mut dst, version).unwrap();
-        let decoded = Connect::decode(dst.freeze(), version).unwrap();
+        conn.encode(&mut dst, ver).unwrap();
+        let decoded = Connect::decode(dst.freeze(), ver).unwrap();
         assert_eq!(decoded, conn);
     }
 
@@ -845,13 +858,13 @@ mod tests {
             false,
         ));
 
-        for version in [v311(), v5()] {
+        for ver in [v311(), v5()] {
             let mut dst = BytesMut::new();
-            conn.encode(&mut dst, version).unwrap();
+            conn.encode(&mut dst, ver).unwrap();
             assert_eq!(
                 dst.len(),
-                conn.encoded_size(version),
-                "encoded_size mismatch for {version:?}"
+                conn.encoded_size(ver),
+                "encoded_size mismatch for {ver:?}"
             );
         }
     }

@@ -31,15 +31,8 @@
 //!    payload given the negotiated [`MqttVersion`].
 
 use crate::{
-    auth::Auth,
-    connect::{ConnAck, Connect},
-    disconnect::Disconnect,
-    error::{Error, Result},
-    publish::{PubAck, Publish},
-    subscribe::{SubAck, Subscribe},
-    types::MqttVersion,
-    unsubscribe::{UnsubAck, Unsubscribe},
-    varlen,
+    Auth, ConnAck, Connect, Disconnect, Error, MqttVersion, PubAck, Publish, Result,
+    SubAck, Subscribe, UnsubAck, Unsubscribe, varlen,
 };
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
@@ -122,6 +115,8 @@ impl RawPacket {
     }
 }
 
+/////////////////////////////////////////////////////////////////////////////
+
 /// A typed MQTT packet.
 ///
 /// This enum covers all packet types for both MQTT v3.1.1 and v5. v5-only
@@ -130,7 +125,7 @@ impl RawPacket {
 /// applicable structs and default to empty/success on v3.1.1 connections.
 #[derive(Debug, PartialEq)]
 pub enum Packet {
-    /// `CONNECT` — connection request from client to broker.
+    /// `CONNECT` — client connection request.
     Connect(Connect),
     /// `CONNACK` — connection acknowledgement from broker to client.
     ConnAck(ConnAck),
@@ -146,87 +141,82 @@ pub enum Packet {
     PubComp(PubAck),
     /// `SUBSCRIBE` — subscription request from client to broker.
     Subscribe(Subscribe),
-    /// `SUBACK` — subscription acknowledgement from broker to client.
+    /// `SUBACK` — subscription acknowledgement.
     SubAck(SubAck),
-    /// `UNSUBSCRIBE` — unsubscription request from client to broker.
+    /// `UNSUBSCRIBE` — unsubscription request.
     Unsubscribe(Unsubscribe),
-    /// `UNSUBACK` — unsubscription acknowledgement from broker to client.
+    /// `UNSUBACK` — unsubscription acknowledgement.
     UnsubAck(UnsubAck),
-    /// `PINGREQ` — keep-alive ping from client to broker.
+    /// `PINGREQ` — keep-alive ping.
     PingReq,
-    /// `PINGRESP` — keep-alive response from broker to client.
+    /// `PINGRESP` — keep-alive ping response.
     PingResp,
-    /// `DISCONNECT` — connection teardown, sent by either side.
+    /// `DISCONNECT` — connection shutdown.
     Disconnect(Disconnect),
     /// `AUTH` — extended authentication exchange (v5 only).
     Auth(Auth),
 }
 
 impl Packet {
-    /// Parses a [`RawPacket`] into a typed [`Packet`] given `version`.
-    pub fn from_raw(raw: RawPacket, version: MqttVersion) -> Result<Self> {
+    /// Parses a [`RawPacket`] into a typed [`Packet`] given `ver`.
+    pub fn from_raw(raw: RawPacket, ver: MqttVersion) -> Result<Self> {
         match raw.header >> 4 {
-            PKT_CONNECT => Ok(Packet::Connect(Connect::decode(raw.payload, version)?)),
-            PKT_CONNACK => Ok(Packet::ConnAck(ConnAck::decode(raw.payload, version)?)),
+            PKT_CONNECT => Ok(Packet::Connect(Connect::decode(raw.payload, ver)?)),
+            PKT_CONNACK => Ok(Packet::ConnAck(ConnAck::decode(raw.payload, ver)?)),
             PKT_PUBLISH => Ok(Packet::Publish(Publish::decode(
                 raw.header & 0x0F,
                 raw.payload,
-                version,
+                ver,
             )?)),
-            PKT_PUBACK => Ok(Packet::PubAck(PubAck::decode(raw.payload, version)?)),
-            PKT_PUBREC => Ok(Packet::PubRec(PubAck::decode(raw.payload, version)?)),
+            PKT_PUBACK => Ok(Packet::PubAck(PubAck::decode(raw.payload, ver)?)),
+            PKT_PUBREC => Ok(Packet::PubRec(PubAck::decode(raw.payload, ver)?)),
             PKT_PUBREL => {
                 if raw.header & 0x0F != 0x02 {
                     return Err(Error::MalformedPacket);
                 }
-                Ok(Packet::PubRel(PubAck::decode(raw.payload, version)?))
+                Ok(Packet::PubRel(PubAck::decode(raw.payload, ver)?))
             }
-            PKT_PUBCOMP => Ok(Packet::PubComp(PubAck::decode(raw.payload, version)?)),
+            PKT_PUBCOMP => Ok(Packet::PubComp(PubAck::decode(raw.payload, ver)?)),
             PKT_SUBSCRIBE => {
                 if raw.header & 0x0F != 0x02 {
                     return Err(Error::MalformedPacket);
                 }
-                Ok(Packet::Subscribe(Subscribe::decode(raw.payload, version)?))
+                Ok(Packet::Subscribe(Subscribe::decode(raw.payload, ver)?))
             }
-            PKT_SUBACK => Ok(Packet::SubAck(SubAck::decode(raw.payload, version)?)),
+            PKT_SUBACK => Ok(Packet::SubAck(SubAck::decode(raw.payload, ver)?)),
             PKT_UNSUBSCRIBE => {
                 if raw.header & 0x0F != 0x02 {
                     return Err(Error::MalformedPacket);
                 }
-                Ok(Packet::Unsubscribe(Unsubscribe::decode(
-                    raw.payload,
-                    version,
-                )?))
+                Ok(Packet::Unsubscribe(Unsubscribe::decode(raw.payload, ver)?))
             }
-            PKT_UNSUBACK => Ok(Packet::UnsubAck(UnsubAck::decode(raw.payload, version)?)),
+            PKT_UNSUBACK => Ok(Packet::UnsubAck(UnsubAck::decode(raw.payload, ver)?)),
             PKT_PINGREQ => Ok(Packet::PingReq),
             PKT_PINGRESP => Ok(Packet::PingResp),
-            PKT_DISCONNECT => Ok(Packet::Disconnect(Disconnect::decode(
-                raw.payload,
-                version,
-            )?)),
+            PKT_DISCONNECT => Ok(Packet::Disconnect(Disconnect::decode(raw.payload, ver)?)),
             PKT_AUTH => Ok(Packet::Auth(Auth::decode(raw.payload)?)),
             t => Err(Error::UnknownPacketType(t)),
         }
     }
 
     /// Encodes this packet into `dst`.
-    pub fn encode(&self, dst: &mut BytesMut, version: MqttVersion) -> Result<()> {
+    pub fn encode(&self, dst: &mut BytesMut, ver: MqttVersion) -> Result<()> {
+        use Packet::*;
         match self {
-            Packet::Connect(conn) => {
-                let remaining = conn.encoded_size(version);
+            Connect(conn) => {
+                let remaining = conn.encoded_size(ver);
                 dst.put_u8(HDR_CONNECT);
                 varlen::encode(remaining as u32, dst)?;
-                conn.encode(dst, version)?;
+                conn.encode(dst, ver)?;
             }
-            Packet::ConnAck(ack) => {
-                let remaining = ack.encoded_size(version);
+            ConnAck(ack) => {
+                let remaining = ack.encoded_size(ver);
                 dst.put_u8(HDR_CONNACK);
                 varlen::encode(remaining as u32, dst)?;
-                ack.encode(dst, version)?;
+                ack.encode(dst, ver)?;
             }
-            Packet::Publish(pub_) => {
-                let remaining = pub_.encoded_size(version);
+            Publish(pub_) => {
+                let remaining = pub_.encoded_size(ver);
                 let mut hdr = PKT_PUBLISH << 4;
                 if pub_.dup {
                     hdr |= 0x08;
@@ -237,62 +227,62 @@ impl Packet {
                 }
                 dst.put_u8(hdr);
                 varlen::encode(remaining as u32, dst)?;
-                pub_.encode(dst, version)?;
+                pub_.encode(dst, ver)?;
             }
-            Packet::PubAck(ack) => {
+            PubAck(ack) => {
                 dst.put_u8(HDR_PUBACK);
-                varlen::encode(ack.encoded_size(version) as u32, dst)?;
-                ack.encode(dst, version)?;
+                varlen::encode(ack.encoded_size(ver) as u32, dst)?;
+                ack.encode(dst, ver)?;
             }
-            Packet::PubRec(ack) => {
+            PubRec(ack) => {
                 dst.put_u8(HDR_PUBREC);
-                varlen::encode(ack.encoded_size(version) as u32, dst)?;
-                ack.encode(dst, version)?;
+                varlen::encode(ack.encoded_size(ver) as u32, dst)?;
+                ack.encode(dst, ver)?;
             }
-            Packet::PubRel(ack) => {
+            PubRel(ack) => {
                 dst.put_u8(HDR_PUBREL);
-                varlen::encode(ack.encoded_size(version) as u32, dst)?;
-                ack.encode(dst, version)?;
+                varlen::encode(ack.encoded_size(ver) as u32, dst)?;
+                ack.encode(dst, ver)?;
             }
-            Packet::PubComp(ack) => {
+            PubComp(ack) => {
                 dst.put_u8(HDR_PUBCOMP);
-                varlen::encode(ack.encoded_size(version) as u32, dst)?;
-                ack.encode(dst, version)?;
+                varlen::encode(ack.encoded_size(ver) as u32, dst)?;
+                ack.encode(dst, ver)?;
             }
-            Packet::Subscribe(s) => {
+            Subscribe(s) => {
                 dst.put_u8(HDR_SUBSCRIBE);
-                varlen::encode(s.encoded_size(version) as u32, dst)?;
-                s.encode(dst, version)?;
+                varlen::encode(s.encoded_size(ver) as u32, dst)?;
+                s.encode(dst, ver)?;
             }
-            Packet::SubAck(sa) => {
+            SubAck(sa) => {
                 dst.put_u8(HDR_SUBACK);
-                varlen::encode(sa.encoded_size(version) as u32, dst)?;
-                sa.encode(dst, version)?;
+                varlen::encode(sa.encoded_size(ver) as u32, dst)?;
+                sa.encode(dst, ver)?;
             }
-            Packet::Unsubscribe(u) => {
+            Unsubscribe(u) => {
                 dst.put_u8(HDR_UNSUBSCRIBE);
-                varlen::encode(u.encoded_size(version) as u32, dst)?;
-                u.encode(dst, version)?;
+                varlen::encode(u.encoded_size(ver) as u32, dst)?;
+                u.encode(dst, ver)?;
             }
-            Packet::UnsubAck(ua) => {
+            UnsubAck(ua) => {
                 dst.put_u8(HDR_UNSUBACK);
-                varlen::encode(ua.encoded_size(version) as u32, dst)?;
-                ua.encode(dst, version)?;
+                varlen::encode(ua.encoded_size(ver) as u32, dst)?;
+                ua.encode(dst, ver)?;
             }
-            Packet::PingReq => {
+            PingReq => {
                 dst.put_u8(HDR_PINGREQ);
                 varlen::encode(0, dst)?;
             }
-            Packet::PingResp => {
+            PingResp => {
                 dst.put_u8(HDR_PINGRESP);
                 varlen::encode(0, dst)?;
             }
-            Packet::Disconnect(d) => {
+            Disconnect(d) => {
                 dst.put_u8(HDR_DISCONNECT);
-                varlen::encode(d.encoded_size(version) as u32, dst)?;
-                d.encode(dst, version)?;
+                varlen::encode(d.encoded_size(ver) as u32, dst)?;
+                d.encode(dst, ver)?;
             }
-            Packet::Auth(a) => {
+            Auth(a) => {
                 dst.put_u8(HDR_AUTH);
                 varlen::encode(a.encoded_size() as u32, dst)?;
                 a.encode(dst)?;
@@ -426,12 +416,12 @@ mod tests {
 
     // ---- round-trip ----
 
-    fn round_trip(pkt: Packet, version: MqttVersion) {
+    fn round_trip(pkt: Packet, ver: MqttVersion) {
         let mut dst = BytesMut::new();
-        pkt.encode(&mut dst, version).unwrap();
+        pkt.encode(&mut dst, ver).unwrap();
         let raw = RawPacket::decode(&mut dst).unwrap().unwrap();
         // from_raw must not error for these known-good packets
-        Packet::from_raw(raw, version).unwrap();
+        Packet::from_raw(raw, ver).unwrap();
     }
 
     #[test]
