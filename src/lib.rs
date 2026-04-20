@@ -199,6 +199,9 @@ pub mod event;
 /// Internal FFI utility types for bridging Rust data to the Paho C library.
 mod ffi_utils;
 
+/// Internal async runtime and transport abstractions.
+mod runtime;
+
 // C log tracing pass-through
 use ffi_utils::{c_trace_level, on_c_trace};
 

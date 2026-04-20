@@ -31,4 +31,4 @@
 pub(crate) mod tokio_rt;
 
 #[cfg(feature = "tokio")]
-pub(crate) use tokio_rt::TcpConnection;
+pub(crate) use tokio_rt::{Connection, TcpConnection};
