@@ -34,7 +34,9 @@ use crate::{
     connect::{ConnAck, Connect},
     error::{Error, Result},
     publish::{PubAck, Publish},
+    subscribe::{SubAck, Subscribe},
     types::MqttVersion,
+    unsubscribe::{UnsubAck, Unsubscribe},
     varlen,
 };
 use bytes::{Buf, BufMut, Bytes, BytesMut};
@@ -48,6 +50,10 @@ const PKT_PUBACK: u8 = 4;
 const PKT_PUBREC: u8 = 5;
 const PKT_PUBREL: u8 = 6;
 const PKT_PUBCOMP: u8 = 7;
+const PKT_SUBSCRIBE: u8 = 8;
+const PKT_SUBACK: u8 = 9;
+const PKT_UNSUBSCRIBE: u8 = 10;
+const PKT_UNSUBACK: u8 = 11;
 const PKT_PINGREQ: u8 = 12;
 const PKT_PINGRESP: u8 = 13;
 
@@ -59,6 +65,10 @@ const HDR_PUBACK: u8 = PKT_PUBACK << 4; // 0x40
 const HDR_PUBREC: u8 = PKT_PUBREC << 4; // 0x50
 const HDR_PUBREL: u8 = (PKT_PUBREL << 4) | 0x02; // 0x62  (reserved flags = 0b0010)
 const HDR_PUBCOMP: u8 = PKT_PUBCOMP << 4; // 0x70
+const HDR_SUBSCRIBE: u8 = (PKT_SUBSCRIBE << 4) | 0x02; // 0x82 (reserved flags = 0b0010)
+const HDR_SUBACK: u8 = PKT_SUBACK << 4; // 0x90
+const HDR_UNSUBSCRIBE: u8 = (PKT_UNSUBSCRIBE << 4) | 0x02; // 0xA2 (reserved flags = 0b0010)
+const HDR_UNSUBACK: u8 = PKT_UNSUBACK << 4; // 0xB0
 const HDR_PINGREQ: u8 = PKT_PINGREQ << 4;
 const HDR_PINGRESP: u8 = PKT_PINGRESP << 4;
 
@@ -128,6 +138,14 @@ pub enum Packet {
     PubRel(PubAck),
     /// `PUBCOMP` — QoS 2 publish complete (third ack).
     PubComp(PubAck),
+    /// `SUBSCRIBE` — subscription request from client to broker.
+    Subscribe(Subscribe),
+    /// `SUBACK` — subscription acknowledgement from broker to client.
+    SubAck(SubAck),
+    /// `UNSUBSCRIBE` — unsubscription request from client to broker.
+    Unsubscribe(Unsubscribe),
+    /// `UNSUBACK` — unsubscription acknowledgement from broker to client.
+    UnsubAck(UnsubAck),
     /// `PINGREQ` — keep-alive ping from client to broker.
     PingReq,
     /// `PINGRESP` — keep-alive response from broker to client.
@@ -154,6 +172,23 @@ impl Packet {
                 Ok(Packet::PubRel(PubAck::decode(raw.payload, version)?))
             }
             PKT_PUBCOMP => Ok(Packet::PubComp(PubAck::decode(raw.payload, version)?)),
+            PKT_SUBSCRIBE => {
+                if raw.header & 0x0F != 0x02 {
+                    return Err(Error::MalformedPacket);
+                }
+                Ok(Packet::Subscribe(Subscribe::decode(raw.payload, version)?))
+            }
+            PKT_SUBACK => Ok(Packet::SubAck(SubAck::decode(raw.payload, version)?)),
+            PKT_UNSUBSCRIBE => {
+                if raw.header & 0x0F != 0x02 {
+                    return Err(Error::MalformedPacket);
+                }
+                Ok(Packet::Unsubscribe(Unsubscribe::decode(
+                    raw.payload,
+                    version,
+                )?))
+            }
+            PKT_UNSUBACK => Ok(Packet::UnsubAck(UnsubAck::decode(raw.payload, version)?)),
             PKT_PINGREQ => Ok(Packet::PingReq),
             PKT_PINGRESP => Ok(Packet::PingResp),
             t => Err(Error::UnknownPacketType(t)),
@@ -208,6 +243,26 @@ impl Packet {
                 dst.put_u8(HDR_PUBCOMP);
                 varlen::encode(ack.encoded_size(version) as u32, dst)?;
                 ack.encode(dst, version)?;
+            }
+            Packet::Subscribe(s) => {
+                dst.put_u8(HDR_SUBSCRIBE);
+                varlen::encode(s.encoded_size(version) as u32, dst)?;
+                s.encode(dst, version)?;
+            }
+            Packet::SubAck(sa) => {
+                dst.put_u8(HDR_SUBACK);
+                varlen::encode(sa.encoded_size(version) as u32, dst)?;
+                sa.encode(dst, version)?;
+            }
+            Packet::Unsubscribe(u) => {
+                dst.put_u8(HDR_UNSUBSCRIBE);
+                varlen::encode(u.encoded_size(version) as u32, dst)?;
+                u.encode(dst, version)?;
+            }
+            Packet::UnsubAck(ua) => {
+                dst.put_u8(HDR_UNSUBACK);
+                varlen::encode(ua.encoded_size(version) as u32, dst)?;
+                ua.encode(dst, version)?;
             }
             Packet::PingReq => {
                 dst.put_u8(HDR_PINGREQ);

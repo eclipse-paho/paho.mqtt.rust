@@ -49,15 +49,23 @@ pub mod reason_code;
 /// CONNECT and CONNACK packets.
 pub mod connect;
 
-/// PUBLISH packet.
+/// PUBLISH packet and its acknowledgements.
 pub mod publish;
+
+/// SUBSCRIBE and SUBACK packets.
+pub mod subscribe;
+
+/// UNSUBSCRIBE and UNSUBACK packets.
+pub mod unsubscribe;
 
 pub use connect::{ConnAck, Connect, Will};
 pub use error::{Error, Result};
 pub use properties::Properties;
 pub use publish::{PubAck, PubComp, PubRec, PubRel, Publish};
 pub use reason_code::ReasonCode;
+pub use subscribe::{RetainHandling, SubAck, Subscribe, Subscription};
 pub use types::{
     MQTT_VERSION_3_1, MQTT_VERSION_3_1_1, MQTT_VERSION_5, MQTT_VERSION_DEFAULT,
     MqttVersion, QOS_0, QOS_1, QOS_2, QoS,
 };
+pub use unsubscribe::{UnsubAck, Unsubscribe};
