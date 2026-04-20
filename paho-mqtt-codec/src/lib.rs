@@ -61,10 +61,14 @@ pub mod unsubscribe;
 /// DISCONNECT packet.
 pub mod disconnect;
 
+/// AUTH packet (MQTT v5 only).
+pub mod auth;
+
+pub use auth::Auth;
 pub use connect::{ConnAck, Connect, Will};
 pub use disconnect::Disconnect;
 pub use error::{Error, Result};
-pub use properties::Properties;
+pub use properties::{Properties, Property, PropertyId, PropertyType, PropertyValue};
 pub use publish::{PubAck, PubComp, PubRec, PubRel, Publish};
 pub use reason_code::ReasonCode;
 pub use subscribe::{RetainHandling, SubAck, Subscribe, Subscription};

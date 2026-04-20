@@ -31,6 +31,7 @@
 //!    payload given the negotiated [`MqttVersion`].
 
 use crate::{
+    auth::Auth,
     connect::{ConnAck, Connect},
     disconnect::Disconnect,
     error::{Error, Result},
@@ -58,6 +59,7 @@ const PKT_UNSUBACK: u8 = 11;
 const PKT_PINGREQ: u8 = 12;
 const PKT_PINGRESP: u8 = 13;
 const PKT_DISCONNECT: u8 = 14;
+const PKT_AUTH: u8 = 15;
 
 // ---- fixed header bytes ----
 
@@ -74,6 +76,7 @@ const HDR_UNSUBACK: u8 = PKT_UNSUBACK << 4; // 0xB0
 const HDR_PINGREQ: u8 = PKT_PINGREQ << 4;
 const HDR_PINGRESP: u8 = PKT_PINGRESP << 4;
 const HDR_DISCONNECT: u8 = PKT_DISCONNECT << 4; // 0xE0
+const HDR_AUTH: u8 = PKT_AUTH << 4; // 0xF0
 
 /// A raw, uninterpreted MQTT packet produced by the framing layer.
 ///
@@ -155,6 +158,8 @@ pub enum Packet {
     PingResp,
     /// `DISCONNECT` — connection teardown, sent by either side.
     Disconnect(Disconnect),
+    /// `AUTH` — extended authentication exchange (v5 only).
+    Auth(Auth),
 }
 
 impl Packet {
@@ -200,6 +205,7 @@ impl Packet {
                 raw.payload,
                 version,
             )?)),
+            PKT_AUTH => Ok(Packet::Auth(Auth::decode(raw.payload)?)),
             t => Err(Error::UnknownPacketType(t)),
         }
     }
@@ -285,6 +291,11 @@ impl Packet {
                 dst.put_u8(HDR_DISCONNECT);
                 varlen::encode(d.encoded_size(version) as u32, dst)?;
                 d.encode(dst, version)?;
+            }
+            Packet::Auth(a) => {
+                dst.put_u8(HDR_AUTH);
+                varlen::encode(a.encoded_size() as u32, dst)?;
+                a.encode(dst)?;
             }
         }
         Ok(())

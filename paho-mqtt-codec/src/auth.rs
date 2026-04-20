@@ -1,0 +1,245 @@
+// paho-mqtt-codec/src/auth.rs
+//
+// This file is part of the Eclipse Paho MQTT Rust Client library.
+
+/*******************************************************************************
+ * Copyright (c) 2026 Frank Pagliughi <fpagliughi@mindspring.com>
+ *
+ * All rights reserved. This program and the accompanying materials
+ * are made available under the terms of the Eclipse Public License v2.0
+ * and Eclipse Distribution License v1.0 which accompany this distribution.
+ *
+ * The Eclipse Public License is available at
+ *    http://www.eclipse.org/legal/epl-v20.html
+ * and the Eclipse Distribution License is available at
+ *   http://www.eclipse.org/org/documents/edl-v10.php.
+ *
+ * Contributors:
+ *    Frank Pagliughi - initial implementation and documentation
+ *******************************************************************************/
+
+//! MQTT v5 AUTH packet.
+//!
+//! AUTH is a v5-only packet used for extended authentication exchanges
+//! (e.g. SASL). It flows in both directions during and after the
+//! CONNECT handshake.
+//!
+//! Valid reason codes for AUTH are:
+//! - `Success` (0x00) — authentication exchange complete
+//! - `ContinueAuthentication` (0x18) — another step follows
+//! - `ReAuthenticate` (0x19) — client requests re-authentication
+//!
+//! Shorthand encoding: when `reason_code` is `Success` (0x00) and
+//! `properties` is empty, `remaining_length` is 0 and the payload is
+//! omitted entirely.
+
+use crate::{
+    error::{Error, Result},
+    properties::Properties,
+    reason_code::ReasonCode,
+};
+use bytes::{Buf, BufMut, Bytes};
+
+// ---- Auth ---------------------------------------------------------------
+
+/// An AUTH packet (MQTT v5 only).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Auth {
+    /// Authentication reason code.
+    pub reason_code: ReasonCode,
+    /// MQTT v5 properties (typically carries AuthenticationMethod and AuthenticationData).
+    pub properties: Properties,
+}
+
+impl Default for Auth {
+    fn default() -> Self {
+        Auth {
+            reason_code: ReasonCode::Success,
+            properties: Properties::new(),
+        }
+    }
+}
+
+impl Auth {
+    /// Creates an AUTH with no properties.
+    pub fn new(reason_code: ReasonCode) -> Self {
+        Auth {
+            reason_code,
+            properties: Properties::new(),
+        }
+    }
+
+    /// Returns the remaining-length byte count.
+    ///
+    /// Uses the shorthand form (0) when `reason_code` is `Success` and
+    /// `properties` is empty.
+    pub fn encoded_size(&self) -> usize {
+        if self.reason_code == ReasonCode::Success && self.properties.is_empty() {
+            0
+        }
+        else {
+            1 + self.properties.encoded_size()
+        }
+    }
+
+    /// Encodes the variable header and payload into `dst`.
+    pub fn encode<B: BufMut>(&self, dst: &mut B) -> Result<()> {
+        if !(self.reason_code == ReasonCode::Success && self.properties.is_empty()) {
+            dst.put_u8(self.reason_code as u8);
+            self.properties.encode(dst)?;
+        }
+        Ok(())
+    }
+
+    /// Decodes from the raw `payload` bytes.
+    pub fn decode(mut payload: Bytes) -> Result<Self> {
+        if payload.is_empty() {
+            return Ok(Auth::default());
+        }
+        if payload.remaining() < 1 {
+            return Err(Error::PacketTooShort);
+        }
+        let reason_code = ReasonCode::from(payload.get_u8());
+        let properties = Properties::decode(&mut payload)?;
+        Ok(Auth {
+            reason_code,
+            properties,
+        })
+    }
+}
+
+/////////////////////////////////////////////////////////////////////////////
+//                              Unit Tests
+/////////////////////////////////////////////////////////////////////////////
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::properties::{Property, PropertyId, PropertyValue};
+    use bytes::BytesMut;
+
+    fn round_trip(a: Auth) {
+        let mut dst = BytesMut::new();
+        a.encode(&mut dst).unwrap();
+        assert_eq!(dst.len(), a.encoded_size());
+        let decoded = Auth::decode(dst.freeze()).unwrap();
+        assert_eq!(decoded, a);
+    }
+
+    // ---- shorthand (Success + no props) ----
+
+    #[test]
+    fn test_auth_success_encodes_empty() {
+        let a = Auth::default();
+        let mut dst = BytesMut::new();
+        a.encode(&mut dst).unwrap();
+        assert!(dst.is_empty());
+    }
+
+    #[test]
+    fn test_auth_success_encoded_size_zero() {
+        assert_eq!(Auth::default().encoded_size(), 0);
+    }
+
+    #[test]
+    fn test_auth_success_round_trip() {
+        round_trip(Auth::default());
+    }
+
+    // ---- ContinueAuthentication ----
+
+    #[test]
+    fn test_auth_continue_encoded_size() {
+        let a = Auth::new(ReasonCode::ContinueAuthentication);
+        // 1 (reason) + 1 (empty props VBI) = 2
+        assert_eq!(a.encoded_size(), 2);
+    }
+
+    #[test]
+    fn test_auth_continue_wire_bytes() {
+        let a = Auth::new(ReasonCode::ContinueAuthentication);
+        let mut dst = BytesMut::new();
+        a.encode(&mut dst).unwrap();
+        assert_eq!(&dst[..], &[0x18, 0x00]);
+    }
+
+    #[test]
+    fn test_auth_continue_round_trip() {
+        round_trip(Auth::new(ReasonCode::ContinueAuthentication));
+    }
+
+    // ---- ReAuthenticate ----
+
+    #[test]
+    fn test_auth_reauthenticate_round_trip() {
+        round_trip(Auth::new(ReasonCode::ReAuthenticate));
+    }
+
+    #[test]
+    fn test_auth_reauthenticate_wire_bytes() {
+        let a = Auth::new(ReasonCode::ReAuthenticate);
+        let mut dst = BytesMut::new();
+        a.encode(&mut dst).unwrap();
+        assert_eq!(&dst[..], &[0x19, 0x00]);
+    }
+
+    // ---- with properties ----
+
+    #[test]
+    fn test_auth_with_method_property_round_trip() {
+        let mut props = Properties::new();
+        props.push(Property::new(
+            PropertyId::AuthenticationMethod,
+            PropertyValue::String("SCRAM-SHA-256".to_string()),
+        ));
+        let a = Auth {
+            reason_code: ReasonCode::ContinueAuthentication,
+            properties: props,
+        };
+        round_trip(a);
+    }
+
+    #[test]
+    fn test_auth_with_method_and_data_round_trip() {
+        let mut props = Properties::new();
+        props.push(Property::new(
+            PropertyId::AuthenticationMethod,
+            PropertyValue::String("GSSAPI".to_string()),
+        ));
+        props.push(Property::new(
+            PropertyId::AuthenticationData,
+            PropertyValue::Binary(bytes::Bytes::from_static(b"\x01\x02\x03\x04")),
+        ));
+        let a = Auth {
+            reason_code: ReasonCode::ContinueAuthentication,
+            properties: props,
+        };
+        round_trip(a);
+    }
+
+    // ---- encoded_size matches encode ----
+
+    #[test]
+    fn test_encoded_size_matches_encode_continue() {
+        let a = Auth::new(ReasonCode::ContinueAuthentication);
+        let mut dst = BytesMut::new();
+        a.encode(&mut dst).unwrap();
+        assert_eq!(dst.len(), a.encoded_size());
+    }
+
+    #[test]
+    fn test_encoded_size_matches_encode_with_props() {
+        let mut props = Properties::new();
+        props.push(Property::new(
+            PropertyId::AuthenticationMethod,
+            PropertyValue::String("plain".to_string()),
+        ));
+        let a = Auth {
+            reason_code: ReasonCode::Success,
+            properties: props,
+        };
+        let mut dst = BytesMut::new();
+        a.encode(&mut dst).unwrap();
+        assert_eq!(dst.len(), a.encoded_size());
+    }
+}
