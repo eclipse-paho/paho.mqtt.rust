@@ -34,6 +34,15 @@ pub enum Error {
     /// A variable-byte integer had a continuation bit set on the fourth byte.
     #[error("malformed variable-length integer")]
     MalformedVarLen,
+    /// An unrecognized MQTT packet type nibble was encountered.
+    #[error("unknown packet type: {0:#x}")]
+    UnknownPacketType(u8),
+    /// The packet payload was shorter than expected.
+    #[error("packet payload too short")]
+    PacketTooShort,
+    /// A packet field contained an invalid or reserved value.
+    #[error("malformed packet")]
+    MalformedPacket,
 }
 
 /// The result type for codec operations.

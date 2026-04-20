@@ -32,13 +32,24 @@ pub mod error;
 /// Variable-byte integer encoding and decoding.
 pub mod varlen;
 
+/// MQTT v5 properties.
+pub mod properties;
+
+/// MQTT packet framing and typed packet representation.
+pub mod packet;
+
 /// MQTT support types: [`QoS`], [`MqttVersion`], and related constants.
 pub mod types;
 
 /// MQTT v5 reason codes.
 pub mod reason_code;
 
+/// CONNECT and CONNACK packets.
+pub mod connect;
+
+pub use connect::ConnAck;
 pub use error::{Error, Result};
+pub use properties::Properties;
 pub use reason_code::ReasonCode;
 pub use types::{
     MQTT_VERSION_3_1, MQTT_VERSION_3_1_1, MQTT_VERSION_5, MQTT_VERSION_DEFAULT,
