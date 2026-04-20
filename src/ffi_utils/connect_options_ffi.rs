@@ -30,7 +30,7 @@ use std::{
 };
 
 use crate::{
-    ConnectOptions, ConnectToken, PropertiesFfi, Token, ffi,
+    ConnectOptions, ConnectToken, PropertiesFfi, ffi,
     ffi_utils::WillOptionsFfi,
     ffi_utils::{NameValueCollectionFfi, SslOptionsFfi, StringCollectionFfi},
     to_c_bool,
@@ -175,7 +175,6 @@ impl ConnectOptionsFfi {
     /// done with it, we must recover and drop it (i.e. in the completion
     /// callback).
     pub fn set_token(&mut self, tok: ConnectToken) {
-        let tok: Token = tok;
         self.copts.context = tok.into_raw();
         self.fix_callbacks();
     }

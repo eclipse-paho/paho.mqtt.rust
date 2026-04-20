@@ -70,7 +70,7 @@ fn main() -> mqtt::Result<()> {
     });
 
     match rsp
-        .properties()
+        .properties
         .get_u16(mqtt::PropertyCode::TopicAliasMaximum)
     {
         None | Some(0) => {

@@ -48,14 +48,19 @@ use crate::event::Event;
 use crate::{
     AsyncReceiver, ConnectOptions, ConnectToken, CreateOptions, DeliveryToken,
     DisconnectOptions, Message, PersistenceType, Properties, ReasonCode, ServerRequest,
-    SubscribeManyToken, SubscribeOptions, SubscribeToken, SyncReceiver, Token, UserData,
+    SubscribeManyToken, SubscribeOptions, SubscribeToken, SyncReceiver,
+    UnsubscribeManyToken, UnsubscribeToken, UserData,
     errors::{self, Error, Result},
     ffi,
     ffi_utils::{
         CallOptionsFfi, CallOptionsFfiBuilder, ConnectOptionsFfi, DisconnectOptionsFfi,
         MessageFfi, StringCollectionFfi,
     },
-    token::TokenInner,
+    responses::{
+        connect_convert, publish_convert, subscribe_convert, unit_convert,
+        unsubscribe_convert,
+    },
+    token::{Token, TokenInner},
     types::*,
 };
 use crossbeam_channel as sync_channel;
@@ -501,7 +506,7 @@ impl AsyncClient {
             self.set_mqtt_version(opts.mqtt_version());
         }
 
-        let tok = Token::from_request(self, ServerRequest::Connect);
+        let tok = ConnectToken::from_request(self, ServerRequest::Connect, connect_convert);
 
         let mut ffi_opts = ConnectOptionsFfi::from(&opts);
         ffi_opts.set_token(tok.clone());
@@ -520,8 +525,8 @@ impl AsyncClient {
         let rc = unsafe { ffi::MQTTAsync_connect(self.inner.handle, &ffi_opts.copts) };
 
         if rc != 0 {
-            mem::drop(unsafe { Token::from_raw(ffi_opts.copts.context) });
-            return ConnectToken::from_error(rc);
+            mem::drop(unsafe { TokenInner::from_raw(ffi_opts.copts.context) });
+            return ConnectToken::from_error(rc, connect_convert);
         }
 
         tok
@@ -561,9 +566,10 @@ impl AsyncClient {
             self.set_mqtt_version(opts.mqtt_version());
         }
 
-        let tok = Token::with_client_callbacks(
+        let tok = ConnectToken::with_client_callbacks(
             self,
             ServerRequest::Connect,
+            connect_convert,
             success_cb,
             failure_cb,
         );
@@ -576,8 +582,8 @@ impl AsyncClient {
         let rc = unsafe { ffi::MQTTAsync_connect(self.inner.handle, &ffi_opts.copts) };
 
         if rc != 0 {
-            mem::drop(unsafe { Token::from_raw(ffi_opts.copts.context) });
-            return ConnectToken::from_error(rc);
+            mem::drop(unsafe { TokenInner::from_raw(ffi_opts.copts.context) });
+            return ConnectToken::from_error(rc, connect_convert);
         }
 
         tok
@@ -622,7 +628,7 @@ impl AsyncClient {
     /// `opts` Optional disconnect options. Specifying `None` will use
     ///        default of immediate (zero timeout) disconnect.
     ///
-    pub fn disconnect<T>(&self, opts: T) -> Token
+    pub fn disconnect<T>(&self, opts: T) -> Token<()>
     where
         T: Into<Option<DisconnectOptions>>,
     {
@@ -633,7 +639,7 @@ impl AsyncClient {
 
         let mut ffi_opts = DisconnectOptionsFfi::from(&opts);
 
-        let tok = Token::with_client(self, ServerRequest::Disconnect);
+        let tok = Token::<()>::with_client(self, ServerRequest::Disconnect, unit_convert);
         ffi_opts.copts.context = tok.clone().into_raw();
 
         if self.mqtt_version() < MqttVersion::V5 {
@@ -648,8 +654,8 @@ impl AsyncClient {
         let rc = unsafe { ffi::MQTTAsync_disconnect(self.inner.handle, &ffi_opts.copts) };
 
         if rc != 0 {
-            mem::drop(unsafe { Token::from_raw(ffi_opts.copts.context) });
-            return Token::from_error(rc);
+            mem::drop(unsafe { TokenInner::from_raw(ffi_opts.copts.context) });
+            return Token::<()>::from_error(rc, unit_convert);
         }
 
         // Push a None into the message stream to cleanly
@@ -678,7 +684,7 @@ impl AsyncClient {
     /// * `timeout` The amount of time to wait for the disconnect. This has
     ///   a resolution in milliseconds.
     ///
-    pub fn disconnect_after(&self, timeout: Duration) -> Token {
+    pub fn disconnect_after(&self, timeout: Duration) -> Token<()> {
         self.disconnect(DisconnectOptions::with_timeout(timeout))
     }
 
@@ -854,22 +860,22 @@ impl AsyncClient {
         debug!("Publish: {:?}", msg);
 
         let ver = self.mqtt_version();
-        let tok = DeliveryToken::new(msg);
-        let mut call_opts = CallOptionsFfi::new(ver, tok.clone());
+        let ffi_msg = MessageFfi::try_from(msg.clone())?;
+
+        let tok = DeliveryToken::new_pending(publish_convert);
+        let mut call_opts = CallOptionsFfi::new(ver, tok.inner.clone());
 
         let rc = unsafe {
-            let msg = MessageFfi::try_from(tok.message().clone())?;
             ffi::MQTTAsync_sendMessage(
                 self.inner.handle,
-                msg.topic().as_ptr() as *const c_char,
-                msg.c_struct(),
+                ffi_msg.topic().as_ptr() as *const c_char,
+                ffi_msg.c_struct(),
                 &mut call_opts.copts,
             )
         };
 
         if rc != 0 {
-            mem::drop(unsafe { Token::from_raw(call_opts.copts.context) });
-            let msg: Message = tok.into();
+            mem::drop(unsafe { TokenInner::from_raw(call_opts.copts.context) });
             return Err(Error::Publish(rc, msg));
         }
 
@@ -884,8 +890,8 @@ impl AsyncClient {
     pub fn publish(&self, msg: Message) -> DeliveryToken {
         match self.try_publish(msg) {
             Ok(tok) => tok,
-            Err(Error::Publish(rc, msg)) => DeliveryToken::from_error(msg, rc),
-            _ => panic!("Unknown publish error"),
+            Err(Error::Publish(rc, _)) => DeliveryToken::from_error(rc, publish_convert),
+            Err(e) => DeliveryToken::new_err(e, publish_convert),
         }
     }
 
@@ -902,8 +908,9 @@ impl AsyncClient {
         Q: Into<QoS>,
     {
         let ver = self.mqtt_version();
-        let tok = Token::from_request(None, ServerRequest::Subscribe);
-        let mut call_opts = CallOptionsFfi::new(ver, tok.clone());
+        let tok =
+            SubscribeToken::from_request(None, ServerRequest::Subscribe, subscribe_convert);
+        let mut call_opts = CallOptionsFfi::new(ver, tok.inner.clone());
         let topic = CString::new(topic.into()).unwrap();
         let qos = qos.into() as i32;
 
@@ -919,8 +926,8 @@ impl AsyncClient {
         };
 
         if rc != 0 {
-            mem::drop(unsafe { Token::from_raw(call_opts.copts.context) });
-            return SubscribeToken::from_error(rc);
+            mem::drop(unsafe { TokenInner::from_raw(call_opts.copts.context) });
+            return SubscribeToken::from_error(rc, subscribe_convert);
         }
 
         tok
@@ -950,10 +957,11 @@ impl AsyncClient {
     {
         debug_assert!(self.mqtt_version() >= MqttVersion::V5);
 
-        let tok = Token::from_request(None, ServerRequest::Subscribe);
+        let tok =
+            SubscribeToken::from_request(None, ServerRequest::Subscribe, subscribe_convert);
 
         let mut call_opts = CallOptionsFfiBuilder::new()
-            .token(tok.clone())
+            .token(tok.inner.clone())
             .subscribe_options(opts.into())
             .properties(props.into().unwrap_or_default())
             .finalize();
@@ -973,8 +981,8 @@ impl AsyncClient {
         };
 
         if rc != 0 {
-            mem::drop(unsafe { Token::from_raw(call_opts.copts.context) });
-            return SubscribeToken::from_error(rc);
+            mem::drop(unsafe { TokenInner::from_raw(call_opts.copts.context) });
+            return SubscribeToken::from_error(rc, subscribe_convert);
         }
 
         tok
@@ -996,12 +1004,16 @@ impl AsyncClient {
 
         // The length of the slices must match
         if n != qos.len() {
-            return SubscribeManyToken::from_error(-1);
+            return SubscribeManyToken::from_error(-1, subscribe_convert);
         }
 
         let ver = self.mqtt_version();
-        let tok = Token::from_request(None, ServerRequest::SubscribeMany(n));
-        let mut call_opts = CallOptionsFfi::new(ver, tok.clone());
+        let tok = SubscribeManyToken::from_request(
+            None,
+            ServerRequest::SubscribeMany(n),
+            subscribe_convert,
+        );
+        let mut call_opts = CallOptionsFfi::new(ver, tok.inner.clone());
         let topics = StringCollectionFfi::new(topics);
         let qos: Vec<i32> = qos.iter().map(|q| (*q).into() as i32).collect();
 
@@ -1018,8 +1030,8 @@ impl AsyncClient {
         };
 
         if rc != 0 {
-            mem::drop(unsafe { Token::from_raw(call_opts.copts.context) });
-            return SubscribeManyToken::from_error(rc);
+            mem::drop(unsafe { TokenInner::from_raw(call_opts.copts.context) });
+            return SubscribeManyToken::from_error(rc, subscribe_convert);
         }
 
         tok
@@ -1066,9 +1078,13 @@ impl AsyncClient {
 
         let n = topics.len();
         // TODO: Make sure topics & qos are same length (or use min)
-        let tok = Token::from_request(None, ServerRequest::SubscribeMany(n));
+        let tok = SubscribeManyToken::from_request(
+            None,
+            ServerRequest::SubscribeMany(n),
+            subscribe_convert,
+        );
         let mut call_opts = CallOptionsFfiBuilder::new()
-            .token(tok.clone())
+            .token(tok.inner.clone())
             .subscribe_many_options(opts)
             .properties(props.into().unwrap_or_default())
             .finalize();
@@ -1093,8 +1109,8 @@ impl AsyncClient {
         };
 
         if rc != 0 {
-            mem::drop(unsafe { Token::from_raw(call_opts.copts.context) });
-            return SubscribeManyToken::from_error(rc);
+            mem::drop(unsafe { TokenInner::from_raw(call_opts.copts.context) });
+            return SubscribeManyToken::from_error(rc, subscribe_convert);
         }
 
         tok
@@ -1107,13 +1123,17 @@ impl AsyncClient {
     /// * `topic` The topic to unsubscribe. It must match a topic from a
     ///   previous subscribe.
     ///
-    pub fn unsubscribe<S>(&self, topic: S) -> Token
+    pub fn unsubscribe<S>(&self, topic: S) -> UnsubscribeToken
     where
         S: Into<String>,
     {
         let ver = self.mqtt_version();
-        let tok = Token::from_request(None, ServerRequest::Unsubscribe);
-        let mut call_opts = CallOptionsFfi::new(ver, tok.clone());
+        let tok = UnsubscribeToken::from_request(
+            None,
+            ServerRequest::Unsubscribe,
+            unsubscribe_convert,
+        );
+        let mut call_opts = CallOptionsFfi::new(ver, tok.inner.clone());
         let topic = CString::new(topic.into()).unwrap();
 
         debug!("Unsubscribe from '{:?}'", topic);
@@ -1127,8 +1147,8 @@ impl AsyncClient {
         };
 
         if rc != 0 {
-            mem::drop(unsafe { Token::from_raw(call_opts.copts.context) });
-            return Token::from_error(rc);
+            mem::drop(unsafe { TokenInner::from_raw(call_opts.copts.context) });
+            return UnsubscribeToken::from_error(rc, unsubscribe_convert);
         }
 
         tok
@@ -1142,15 +1162,23 @@ impl AsyncClient {
     ///   previous subscribe.
     /// * `props` MQTT v5 properties for the unsubscribe.
     ///
-    pub fn unsubscribe_with_options<S>(&self, topic: S, props: Properties) -> Token
+    pub fn unsubscribe_with_options<S>(
+        &self,
+        topic: S,
+        props: Properties,
+    ) -> UnsubscribeToken
     where
         S: Into<String>,
     {
         debug_assert!(self.mqtt_version() >= MqttVersion::V5);
 
-        let tok = Token::from_request(None, ServerRequest::Unsubscribe);
+        let tok = UnsubscribeToken::from_request(
+            None,
+            ServerRequest::Unsubscribe,
+            unsubscribe_convert,
+        );
         let mut call_opts = CallOptionsFfiBuilder::new()
-            .token(tok.clone())
+            .token(tok.inner.clone())
             .properties(props)
             .finalize();
 
@@ -1167,8 +1195,8 @@ impl AsyncClient {
         };
 
         if rc != 0 {
-            mem::drop(unsafe { Token::from_raw(call_opts.copts.context) });
-            return Token::from_error(rc);
+            mem::drop(unsafe { TokenInner::from_raw(call_opts.copts.context) });
+            return UnsubscribeToken::from_error(rc, unsubscribe_convert);
         }
 
         tok
@@ -1181,15 +1209,19 @@ impl AsyncClient {
     /// * `topic` The topics to unsubscribe. Each must match a topic from a
     ///   previous subscribe.
     ///
-    pub fn unsubscribe_many<T>(&self, topics: &[T]) -> Token
+    pub fn unsubscribe_many<T>(&self, topics: &[T]) -> UnsubscribeManyToken
     where
         T: AsRef<str>,
     {
         let ver = self.mqtt_version();
 
         let n = topics.len();
-        let tok = Token::from_request(None, ServerRequest::UnsubscribeMany(n));
-        let mut call_opts = CallOptionsFfi::new(ver, tok.clone());
+        let tok = UnsubscribeManyToken::from_request(
+            None,
+            ServerRequest::UnsubscribeMany(n),
+            unsubscribe_convert,
+        );
+        let mut call_opts = CallOptionsFfi::new(ver, tok.inner.clone());
         let topics = StringCollectionFfi::new(topics);
 
         debug!("Unsubscribe from '{:?}'", topics);
@@ -1204,8 +1236,8 @@ impl AsyncClient {
         };
 
         if rc != 0 {
-            mem::drop(unsafe { Token::from_raw(call_opts.copts.context) });
-            return Token::from_error(rc);
+            mem::drop(unsafe { TokenInner::from_raw(call_opts.copts.context) });
+            return UnsubscribeManyToken::from_error(rc, unsubscribe_convert);
         }
 
         tok
@@ -1219,16 +1251,24 @@ impl AsyncClient {
     ///   previous subscribe.
     /// * `props` MQTT v5 properties for the unsubscribe.
     ///
-    pub fn unsubscribe_many_with_options<T>(&self, topics: &[T], props: Properties) -> Token
+    pub fn unsubscribe_many_with_options<T>(
+        &self,
+        topics: &[T],
+        props: Properties,
+    ) -> UnsubscribeManyToken
     where
         T: AsRef<str>,
     {
         debug_assert!(self.mqtt_version() >= MqttVersion::V5);
 
         let n = topics.len();
-        let tok = Token::from_request(None, ServerRequest::UnsubscribeMany(n));
+        let tok = UnsubscribeManyToken::from_request(
+            None,
+            ServerRequest::UnsubscribeMany(n),
+            unsubscribe_convert,
+        );
         let mut call_opts = CallOptionsFfiBuilder::new()
-            .token(tok.clone())
+            .token(tok.inner.clone())
             .properties(props)
             .finalize();
 
@@ -1246,8 +1286,8 @@ impl AsyncClient {
         };
 
         if rc != 0 {
-            mem::drop(unsafe { Token::from_raw(call_opts.copts.context) });
-            return Token::from_error(rc);
+            mem::drop(unsafe { TokenInner::from_raw(call_opts.copts.context) });
+            return UnsubscribeManyToken::from_error(rc, unsubscribe_convert);
         }
 
         tok

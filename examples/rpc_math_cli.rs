@@ -88,7 +88,7 @@ fn main() -> mqtt::Result<()> {
     // for us.
 
     let client_id = rsp
-        .properties()
+        .properties
         .get_string(mqtt::PropertyCode::AssignedClientIdentifier)
         .unwrap_or_else(|| {
             eprintln!("Unable to retrieve Client ID");

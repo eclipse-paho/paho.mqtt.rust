@@ -21,18 +21,39 @@
 
 //! The Token module for the Paho MQTT Rust client library.
 //!
-//! Asynchronous operations return a `Token` that is a type of future. It
+//! Asynchronous operations return a `Token<T>` that is a type of future. It
 //! can be used to determine if an operation has completed, block and wait
 //! for the operation to complete, and obtain the final result.
-//! For example, you can start a connection, do something else, and then
-//! wait for the connection to complete.
 //!
-//! The Token object implements the Future trait, and thus can be used and
-//! combined with any other Rust futures.
+//! Tokens are _eagerly started_: the underlying MQTT operation begins at the
+//! point the `AsyncClient` method is called, not when the token is `.await`-ed.
+//! Both `.await` (async) and `.wait()` / `.wait_for(dur)` (blocking) work on
+//! the same token.
 //!
+//! ```no_run
+//! use paho_mqtt as mqtt;
+//!
+//! # async fn run() -> mqtt::Result<()> {
+//! let cli = mqtt::AsyncClient::new("mqtt://localhost:1883").unwrap();
+//!
+//! // Start the async operation and get a typed token.
+//! let tok = cli.connect(mqtt::ConnectOptions::new());
+//!
+//! // ...do other work...
+//!
+//! // Wait for the connection to complete.
+//! let rsp: mqtt::ConnectResponse = tok.await?;
+//! # Ok(())
+//! # }
+//! ```
 
 use crate::{
-    AsyncClient, Error, Message, Properties, Result, ServerRequest, ServerResponse, ffi,
+    AsyncClient, Error, Properties, Result, ServerRequest, ServerResponse, ffi,
+    responses::{
+        ConnectResponse, PublishResponse, SubscribeResponse, UnsubscribeResponse,
+        connect_convert, publish_convert, subscribe_convert, unit_convert,
+        unsubscribe_convert,
+    },
 };
 use futures::{
     executor::block_on,
@@ -61,30 +82,20 @@ pub type SuccessCallback = dyn Fn(&AsyncClient, u16) + 'static;
 /// Callback for the token on failed completion
 pub type FailureCallback = dyn Fn(&AsyncClient, u16, i32) + 'static;
 
-/// The result data for the token.
-/// This contains the guarded elements in the token which are updated by
-/// the C library callback when the asynchronous operation completes.
+/// The result data for the token, protected by a mutex and updated by the
+/// C library callback when the asynchronous operation completes.
 #[derive(Debug, Default)]
 pub(crate) struct TokenData {
     /// The MQTT Message ID
-    msg_id: i16,
-    /// When Some, the result of the operation, response or error.
-    /// None means not complete yet.
+    pub(crate) msg_id: i16,
+    /// When `Some`, the raw result of the operation (success or error).
+    /// `None` means the operation is still in progress.
     res: Option<Result<ServerResponse>>,
-    /// To wake the future on completion
+    /// Waker to notify the executor when the operation completes.
     waker: Option<Waker>,
 }
 
 impl TokenData {
-    /// Creates token data for a specific message
-    pub fn from_message_id(msg_id: i16) -> Self {
-        Self {
-            msg_id,
-            ..Self::default()
-        }
-    }
-
-    /// Creates a new token that is already signaled with an error.
     pub fn from_error(rc: i32) -> Self {
         Self {
             res: Some(Err(Error::from(rc))),
@@ -92,8 +103,6 @@ impl TokenData {
         }
     }
 
-    /// Creates a new token that is already signaled with an error.
-    // TODO: Use this!
     #[allow(dead_code)]
     pub fn from_error_descr(rc: i32, descr: &str) -> Self {
         Self {
@@ -115,34 +124,30 @@ impl From<Error> for TokenData {
 /////////////////////////////////////////////////////////////////////////////
 // TokenInner
 
-/// The actual data structure for an asynchronous token.
-/// Instances of this are passed as the context pointer to the C library
-/// to track asynchronous operations. They are kept on the heap, via Arc
-/// pointers so that their addresses don't change in memory. The internal
-/// `TokenData` is thread-protected by a mutex as it is updated by the
-/// async callback in a thread originating in the C lib. The other fields
-/// are set at creation and remain static.
-//#[derive(Debug)]
+/// The shared, heap-allocated core of a token.
+///
+/// Passed as the `context` pointer to the C library so the callback can
+/// locate and resolve the right token. Kept alive by `Arc` reference
+/// counting; the C library holds one count via `Arc::into_raw` /
+/// `Arc::from_raw`.
 pub(crate) struct TokenInner {
-    /// Mutex guards: (done, ret, msgid)
-    lock: Mutex<TokenData>,
-    /// The client that created the token.
-    cli: Option<AsyncClient>,
+    /// Mutex-protected result and waker
+    pub(crate) lock: Mutex<TokenData>,
+    /// The client that created the token (used to invoke user callbacks)
+    pub(crate) cli: Option<AsyncClient>,
     /// The type of request the token is tracking
-    req: ServerRequest,
-    /// User callback for successful completion of the async action
+    pub(crate) req: ServerRequest,
+    /// User callback for successful completion
     on_success: Option<Box<SuccessCallback>>,
-    /// User callback for failed completion of the async action
+    /// User callback for failed completion
     on_failure: Option<Box<FailureCallback>>,
 }
 
 impl TokenInner {
-    /// Creates a new, unsignaled Token.
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())
     }
 
-    /// Creates a new, un-signaled Token.
     pub fn with_client(cli: &AsyncClient, req: ServerRequest) -> Arc<Self> {
         Arc::new(Self {
             cli: Some(cli.clone()),
@@ -151,7 +156,6 @@ impl TokenInner {
         })
     }
 
-    /// Creates a new, un-signaled Token with callbacks.
     pub fn with_client_callbacks<FS, FF>(
         cli: &AsyncClient,
         req: ServerRequest,
@@ -171,7 +175,6 @@ impl TokenInner {
         })
     }
 
-    /// Creates a token for a specific request type
     pub fn from_request<'a, C>(cli: C, req: ServerRequest) -> Arc<Self>
     where
         C: Into<Option<&'a AsyncClient>>,
@@ -184,32 +187,6 @@ impl TokenInner {
         })
     }
 
-    /// Creates a new, un-signaled delivery Token.
-    /// This is a token which tracks delivery of a message.
-    pub fn from_message(msg: &Message) -> Arc<Self> {
-        let msgid = msg.msgid().unwrap_or_default();
-        Arc::new(Self {
-            lock: Mutex::new(TokenData::from_message_id(msgid as i16)),
-            ..Self::default()
-        })
-    }
-
-    // TODO: Get rid of this one
-    /// Creates a new, un-signaled Token with callbacks.
-    pub fn from_client<FS, FF>(
-        cli: &AsyncClient,
-        req: ServerRequest,
-        success_cb: FS,
-        failure_cb: FF,
-    ) -> Arc<Self>
-    where
-        FS: Fn(&AsyncClient, u16) + 'static,
-        FF: Fn(&AsyncClient, u16, i32) + 'static,
-    {
-        Self::with_client_callbacks(cli, req, success_cb, failure_cb)
-    }
-
-    /// Creates a new Token signaled with a return code.
     pub fn from_error(rc: i32) -> Arc<TokenInner> {
         Arc::new(Self {
             lock: Mutex::new(TokenData::from_error(rc)),
@@ -217,7 +194,18 @@ impl TokenInner {
         })
     }
 
-    // Callback from the C library for when an MQTT v3.x operation succeeds.
+    /// Reconstructs an `Arc<TokenInner>` from a raw context pointer.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must be a pointer previously produced by `Arc::into_raw` on an
+    /// `Arc<TokenInner>`.
+    pub(crate) unsafe fn from_raw(ptr: *mut c_void) -> Arc<Self> {
+        unsafe { Arc::from_raw(ptr as *const Self) }
+    }
+
+    // ---- C callbacks ----
+
     pub(crate) unsafe extern "C" fn on_success(
         context: *mut c_void,
         rsp: *mut ffi::MQTTAsync_successData,
@@ -228,17 +216,15 @@ impl TokenInner {
         }
 
         debug!("Token success! Token: {:?}, Response: {:?}", context, rsp);
-        let tok = unsafe { Token::from_raw(context) };
+        let inner = unsafe { TokenInner::from_raw(context) };
 
-        // TODO: Maybe compare this msgid to the one in the token?
         let msgid = match rsp.is_null() {
             true => 0,
             false => unsafe { (*rsp).token as u16 },
         };
-        tok.inner.on_complete(msgid, 0, None, rsp);
+        inner.on_complete(msgid, 0, None, rsp);
     }
 
-    // Callback from the C library when an MQTT v3.x operation fails.
     pub(crate) unsafe extern "C" fn on_failure(
         context: *mut c_void,
         rsp: *mut ffi::MQTTAsync_failureData,
@@ -249,7 +235,7 @@ impl TokenInner {
         }
 
         debug!("Token failure! Token: {:?}, Response: {:?}", context, rsp);
-        let tok = unsafe { Token::from_raw(context) };
+        let inner = unsafe { TokenInner::from_raw(context) };
 
         let mut msgid = 0;
         let mut rc = -1;
@@ -267,10 +253,9 @@ impl TokenInner {
             }
         }
 
-        tok.inner.on_complete(msgid, rc, err_msg, ptr::null_mut());
+        inner.on_complete(msgid, rc, err_msg, ptr::null_mut());
     }
 
-    // Callback from the C library for when an MQTT v5 async operation succeeds.
     pub(crate) unsafe extern "C" fn on_success5(
         context: *mut c_void,
         rsp: *mut ffi::MQTTAsync_successData5,
@@ -284,31 +269,28 @@ impl TokenInner {
             "Token v5 success! Token: {:?}, Response: {:?}",
             context, rsp
         );
-        let tok = unsafe { Token::from_raw(context) };
+        let inner = unsafe { TokenInner::from_raw(context) };
 
-        // TODO: Maybe compare this msgid to the one in the token?
         let msgid = unsafe { rsp.as_ref() }
             .map(|rsp| rsp.token as u16)
             .unwrap_or(0);
 
-        // Get the response from the server, if any.
-        debug!("Expecting server response for: {:?}", tok.inner.req);
+        debug!("Expecting server response for: {:?}", inner.req);
 
         let rsp = unsafe { rsp.as_ref() }
-            .map(|rsp| unsafe { ServerResponse::from_success5(tok.inner.req, rsp) })
+            .map(|rsp| unsafe { ServerResponse::from_success5(inner.req, rsp) })
             .unwrap_or_default();
         debug!("Got response: {rsp:?}");
 
-        if let Some(rsp) = rsp.connect_response()
-            && let Some(cli) = tok.inner.cli.as_ref()
+        if let Some(data) = rsp.connect_data()
+            && let Some(cli) = inner.cli.as_ref()
         {
-            cli.set_mqtt_version(rsp.mqtt_version);
+            cli.set_mqtt_version(data.mqtt_version);
         }
 
-        tok.inner.on_complete5(msgid, 0, Ok(rsp));
+        inner.on_complete5(msgid, 0, Ok(rsp));
     }
 
-    // Callback from the C library when an MQTT v5 async operation fails.
     pub(crate) unsafe extern "C" fn on_failure5(
         context: *mut c_void,
         rsp: *mut ffi::MQTTAsync_failureData5,
@@ -322,7 +304,7 @@ impl TokenInner {
             "Token v5 failure! Token: {:?}, Response: {:?}",
             context, rsp
         );
-        let tok = unsafe { Token::from_raw(context) };
+        let inner = unsafe { TokenInner::from_raw(context) };
 
         let mut msgid = 0;
         let mut rc = -1;
@@ -340,7 +322,6 @@ impl TokenInner {
                 rsp.reasonCode as i32
             }
             else if rsp.code == 0 {
-                // This shouldn't happen, but if so, treat as a general failure
                 warn!("Token w ID {} failed with no reported error", msgid);
                 ffi::MQTTASYNC_FAILURE
             }
@@ -365,11 +346,12 @@ impl TokenInner {
             Err(Error::from((rc, err_msg)))
         };
 
-        tok.inner.on_complete5(msgid, rc, err);
+        inner.on_complete5(msgid, rc, err);
     }
 
-    // Callback function to update the token when the action completes.
-    fn on_complete(
+    // ---- completion helpers ----
+
+    pub(crate) fn on_complete(
         &self,
         msgid: u16,
         rc: i32,
@@ -377,8 +359,6 @@ impl TokenInner {
         rsp: *mut ffi::MQTTAsync_successData,
     ) {
         debug!("Completing Token w ID {} and code: {}", msgid, rc);
-
-        // Fire off any user callbacks
 
         if let Some(ref cli) = self.cli {
             if rc == 0 {
@@ -399,8 +379,6 @@ impl TokenInner {
             }
         }
 
-        // Signal completion of the token
-
         let mut data = self.lock.lock().unwrap();
 
         let res = unsafe {
@@ -408,7 +386,6 @@ impl TokenInner {
 
             match rc.cmp(&0) {
                 Ordering::Equal => {
-                    // Get the response from the server, if any.
                     debug!("Expecting server response for: {:?}", self.req);
                     let rsp = if let Some(rsp) = rsp.as_ref() {
                         ServerResponse::from_success(self.req, rsp)
@@ -418,10 +395,10 @@ impl TokenInner {
                     };
                     debug!("Got response: {:?}", rsp);
 
-                    if let Some(rsp) = rsp.connect_response()
+                    if let Some(data) = rsp.connect_data()
                         && let Some(cli) = &self.cli
                     {
-                        cli.set_mqtt_version(rsp.mqtt_version);
+                        cli.set_mqtt_version(data.mqtt_version);
                     }
                     Ok(rsp)
                 }
@@ -440,18 +417,13 @@ impl TokenInner {
 
         data.res = Some(res);
 
-        // If this is none, it means that no one is waiting on
-        // the future yet, so we don't need to wake it.
         if let Some(waker) = data.waker.take() {
             waker.wake()
         }
     }
 
-    // Callback function to update the token when the action completes.
-    fn on_complete5(&self, msgid: u16, rc: i32, res: Result<ServerResponse>) {
+    pub(crate) fn on_complete5(&self, msgid: u16, rc: i32, res: Result<ServerResponse>) {
         debug!("Completing v5 Token w ID {} and code: {}", msgid, rc);
-
-        // Fire off any user callbacks
 
         if let Some(ref cli) = self.cli {
             if rc == 0 {
@@ -472,13 +444,9 @@ impl TokenInner {
             }
         }
 
-        // Signal completion of the token
-
         let mut data = self.lock.lock().unwrap();
         data.res = Some(res);
 
-        // If this is none, it means that no one is waiting on
-        // the future yet, so we don't need to wake it.
         if let Some(waker) = data.waker.take() {
             waker.wake()
         }
@@ -510,60 +478,77 @@ unsafe impl Send for TokenInner {}
 unsafe impl Sync for TokenInner {}
 
 /////////////////////////////////////////////////////////////////////////////
-// Token
+// Token<T>
 
-/// A `Token` is a mechanism for tracking the progress of an asynchronous
-/// operation.
-#[derive(Clone)]
-pub struct Token {
+/// A `Token<T>` is a future that tracks an in-progress asynchronous MQTT
+/// operation and resolves to `Result<T>` on completion.
+///
+/// Tokens are _eagerly started_: the operation begins when the `AsyncClient`
+/// method is called, not when the token is polled or `.await`-ed.
+pub struct Token<T: 'static + Send> {
     pub(crate) inner: Arc<TokenInner>,
+    /// Converts the raw [`ServerResponse`] into the typed result `T`.
+    convert: fn(ServerResponse) -> Result<T>,
 }
 
-impl Token {
-    /// Creates a new, unsignaled Token.
-    pub fn new() -> Self {
+impl<T: 'static + Send> Token<T> {
+    /// Creates a new, pending token with the given convert function.
+    pub(crate) fn new_pending(convert: fn(ServerResponse) -> Result<T>) -> Self {
         Self {
             inner: TokenInner::new(),
+            convert,
         }
     }
 
-    /// Creates a new, un-signaled Token with callbacks.
-    pub fn with_client(cli: &AsyncClient, req: ServerRequest) -> Self {
+    /// Creates a token that is already resolved with an error.
+    pub(crate) fn new_err(err: Error, convert: fn(ServerResponse) -> Result<T>) -> Self {
         Self {
-            inner: TokenInner::with_client(cli, req),
+            inner: Arc::new(TokenInner::from(err)),
+            convert,
         }
     }
 
-    /// Creates a new, un-signaled Token with callbacks.
-    pub fn with_client_callbacks<FS, FF>(
+    /// Creates a token pre-resolved with a C return-code error.
+    pub(crate) fn from_error(rc: i32, convert: fn(ServerResponse) -> Result<T>) -> Self {
+        Self {
+            inner: TokenInner::from_error(rc),
+            convert,
+        }
+    }
+
+    /// Creates an unsignaled token associated with a client and request type.
+    pub(crate) fn with_client(
         cli: &AsyncClient,
         req: ServerRequest,
-        success_cb: FS,
-        failure_cb: FF,
-    ) -> Self
-    where
-        FS: Fn(&AsyncClient, u16) + 'static,
-        FF: Fn(&AsyncClient, u16, i32) + 'static,
-    {
+        convert: fn(ServerResponse) -> Result<T>,
+    ) -> Self {
         Self {
-            inner: TokenInner::from_client(cli, req, success_cb, failure_cb),
+            inner: TokenInner::with_client(cli, req),
+            convert,
         }
     }
 
-    /// Creates a token for a specific request type
-    pub fn from_request<'a, C>(cli: C, req: ServerRequest) -> Self
+    /// Creates an unsignaled token for the given request, optionally associated
+    /// with a client.
+    pub(crate) fn from_request<'a, C>(
+        cli: C,
+        req: ServerRequest,
+        convert: fn(ServerResponse) -> Result<T>,
+    ) -> Self
     where
         C: Into<Option<&'a AsyncClient>>,
     {
         Self {
             inner: TokenInner::from_request(cli, req),
+            convert,
         }
     }
 
-    /// Creates a new, un-signaled Token with callbacks.
-    pub fn from_client<FS, FF>(
+    /// Creates an unsignaled token with success and failure user callbacks.
+    pub(crate) fn with_client_callbacks<FS, FF>(
         cli: &AsyncClient,
         req: ServerRequest,
+        convert: fn(ServerResponse) -> Result<T>,
         success_cb: FS,
         failure_cb: FF,
     ) -> Self
@@ -572,50 +557,36 @@ impl Token {
         FF: Fn(&AsyncClient, u16, i32) + 'static,
     {
         Self {
-            inner: TokenInner::from_client(cli, req, success_cb, failure_cb),
+            inner: TokenInner::with_client_callbacks(cli, req, success_cb, failure_cb),
+            convert,
         }
     }
 
-    /// Creates a new Token signaled with an error code.
-    pub fn from_error(rc: i32) -> Self {
-        Self {
-            inner: TokenInner::from_error(rc),
-        }
-    }
-
-    /// Constructs a Token from a raw pointer to the inner structure.
-    /// This is how a token is normally reconstructed from a context
-    /// pointer coming back from the C lib.
-    pub(crate) unsafe fn from_raw(ptr: *mut c_void) -> Self {
-        Self {
-            inner: unsafe { Arc::from_raw(ptr as *mut TokenInner) },
-        }
-    }
-
-    /// Consumes the `Token`, returning the inner wrapped value.
+    /// Leaks the inner `Arc<TokenInner>` into a raw `*mut c_void` context
+    /// pointer for the C library.
     pub(crate) fn into_raw(self) -> *mut c_void {
         Arc::into_raw(self.inner) as *mut c_void
     }
 
+    /// Sets the MQTT message ID on the token.
+    pub(crate) fn set_msgid(&self, msg_id: i16) {
+        self.inner.lock.lock().unwrap().msg_id = msg_id;
+    }
+
     /// Blocks the caller until the asynchronous operation completes.
-    pub fn wait(self) -> Result<ServerResponse> {
+    pub fn wait(self) -> Result<T> {
         block_on(self)
     }
 
-    /// Non-blocking check to see if the token is complete.
-    ///
-    /// Returns `None` if the operation is still in progress, otherwise
-    /// returns the result of the operation which can be an error or,
-    /// on success, the response from the server.
-    pub fn try_wait(&mut self) -> Option<Result<ServerResponse>> {
+    /// Non-blocking check — returns `Some(result)` if complete, `None` if still
+    /// pending.
+    pub fn try_wait(&mut self) -> Option<Result<T>> {
         self.now_or_never()
     }
 
-    /// Blocks the caller a limited amount of time waiting for the
-    /// asynchronous operation to complete.
-    // TODO: We probably shouldn't consume the token if it's not complete.
-    //      Maybe take '&mut self'?
-    pub fn wait_for(self, dur: Duration) -> Result<ServerResponse> {
+    /// Blocks the caller for at most `dur`, returning `Err(Error::Timeout)` if
+    /// the operation does not complete in time.
+    pub fn wait_for(self, dur: Duration) -> Result<T> {
         block_on(async move {
             let f = self.fuse();
             let to = Delay::new(dur).fuse();
@@ -630,150 +601,85 @@ impl Token {
     }
 }
 
-impl Default for Token {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl From<Error> for Token {
-    /// Creates a new token that is already signaled with an error.
-    fn from(err: Error) -> Self {
-        Self {
-            inner: Arc::new(TokenInner::from(err)),
+impl<T: 'static + Send> Clone for Token<T> {
+    fn clone(&self) -> Self {
+        Token {
+            inner: self.inner.clone(),
+            convert: self.convert,
         }
     }
 }
 
-unsafe impl Send for Token {}
+unsafe impl<T: 'static + Send> Send for Token<T> {}
 
-impl Future for Token {
-    type Output = Result<ServerResponse>;
+impl<T: 'static + Send> Future for Token<T> {
+    type Output = Result<T>;
 
-    /// Poll the token to see if the request has completed yet.
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let mut data = self.inner.lock.lock().unwrap();
 
         match data.res.take() {
-            Some(res) => Poll::Ready(res),
+            Some(Ok(rsp)) => Poll::Ready((self.convert)(rsp)),
+            Some(Err(e)) => Poll::Ready(Err(e)),
             None => {
-                // Set waker so that the C callback can wake up the current task
-                // when the operation has completed.
                 data.waker = Some(cx.waker().clone());
                 Poll::Pending
             }
         }
     }
 }
-
-/// A token for a Connect request.
-pub type ConnectToken = Token;
-
-/// A token for a Subscribe request.
-pub type SubscribeToken = Token;
-
-/// A token for a Subscribe Many request.
-pub type SubscribeManyToken = Token;
-
-/// A token for an Unsubscribe request.
-pub type UnsubscribeToken = Token;
-
-/// A token for an Unsubscribe Many request.
-pub type UnsubscribeManyToken = Token;
 
 /////////////////////////////////////////////////////////////////////////////
-// DeliveryToken
+// Type aliases
 
-/// A `DeliveryToken` is a mechanism for tracking the progress of an
-/// asynchronous message publish operation.
-#[derive(Clone)]
-pub struct DeliveryToken {
-    pub(crate) inner: Arc<TokenInner>,
-    msg: Message,
-}
+/// A token for a connect operation — resolves to [`ConnectResponse`].
+pub type ConnectToken = Token<ConnectResponse>;
 
-impl DeliveryToken {
-    /// Creates a new, un-signaled delivery Token.
-    /// This is a token which tracks delivery of a message.
-    pub fn new(msg: Message) -> DeliveryToken {
-        DeliveryToken {
-            inner: TokenInner::from_message(&msg),
-            msg,
-        }
-    }
+/// A token for a publish (delivery) operation — resolves to [`PublishResponse`].
+pub type DeliveryToken = Token<PublishResponse>;
 
-    /// Creates a new Token signaled with a return code.
-    pub fn from_error(msg: Message, rc: i32) -> DeliveryToken {
-        DeliveryToken {
-            inner: TokenInner::from_error(rc),
-            msg,
-        }
-    }
+/// A token for a single-topic subscribe — resolves to [`SubscribeResponse`].
+pub type SubscribeToken = Token<SubscribeResponse>;
 
-    /// Sets the message ID for the token
-    pub(crate) fn set_msgid(&self, msg_id: i16) {
-        let mut data = self.inner.lock.lock().unwrap();
-        data.msg_id = msg_id;
-    }
+/// A token for a multi-topic subscribe — resolves to [`SubscribeResponse`].
+pub type SubscribeManyToken = Token<SubscribeResponse>;
 
-    /// Gets the message associated with the publish token.
-    pub fn message(&self) -> &Message {
-        &self.msg
-    }
+/// A token for a single-topic unsubscribe — resolves to [`UnsubscribeResponse`].
+pub type UnsubscribeToken = Token<UnsubscribeResponse>;
 
-    /// Blocks the caller until the asynchronous operation completes.
-    pub fn wait(self) -> Result<()> {
-        block_on(self)
-    }
+/// A token for a multi-topic unsubscribe — resolves to [`UnsubscribeResponse`].
+pub type UnsubscribeManyToken = Token<UnsubscribeResponse>;
 
-    /// Blocks the caller a limited amount of time waiting for the
-    /// asynchronous operation to complete.
-    pub fn wait_for(self, dur: Duration) -> Result<()> {
-        block_on(async move {
-            let f = self.fuse();
-            let to = Delay::new(dur).fuse();
+/////////////////////////////////////////////////////////////////////////////
+// From<Error> for concrete token types
 
-            pin_mut!(f, to);
-
-            select! {
-                val = f => val,
-                _ = to => Err(Error::Timeout),
-            }
-        })
+impl From<Error> for ConnectToken {
+    fn from(err: Error) -> Self {
+        Token::new_err(err, connect_convert)
     }
 }
 
-unsafe impl Send for DeliveryToken {}
-
-impl From<DeliveryToken> for Message {
-    fn from(v: DeliveryToken) -> Message {
-        v.msg
+impl From<Error> for DeliveryToken {
+    fn from(err: Error) -> Self {
+        Token::new_err(err, publish_convert)
     }
 }
 
-impl From<DeliveryToken> for Token {
-    /// Converts the delivery token into a Token
-    fn from(v: DeliveryToken) -> Token {
-        Token { inner: v.inner }
+impl From<Error> for SubscribeToken {
+    fn from(err: Error) -> Self {
+        Token::new_err(err, subscribe_convert)
     }
 }
 
-impl Future for DeliveryToken {
-    type Output = Result<()>;
+impl From<Error> for UnsubscribeToken {
+    fn from(err: Error) -> Self {
+        Token::new_err(err, unsubscribe_convert)
+    }
+}
 
-    /// Poll the token to see if the request has completed yet.
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let mut data = self.inner.lock.lock().unwrap();
-
-        match data.res.take() {
-            Some(res) => Poll::Ready(res.map(|_| ())),
-            None => {
-                // Set waker so that the C callback can wake up the current task
-                // when the operation has completed.
-                data.waker = Some(cx.waker().clone());
-                Poll::Pending
-            }
-        }
+impl From<Error> for Token<()> {
+    fn from(err: Error) -> Self {
+        Token::new_err(err, unit_convert)
     }
 }
 
@@ -782,12 +688,11 @@ impl Future for DeliveryToken {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ConnectReturnCode, ReasonCode};
-    use std::thread;
+    use crate::{ConnectReturnCode, ReasonCode, ServerRequest};
 
     #[test]
     fn test_new() {
-        let tok = Token::new();
+        let tok = ConnectToken::new_pending(connect_convert);
         let data = tok.inner.lock.lock().unwrap();
         assert!(data.res.is_none());
     }
@@ -795,56 +700,48 @@ mod tests {
     #[test]
     fn test_from_message() {
         const MSG_ID: i16 = 42;
-        let mut msg = Message::new("hello", "Hi there", 1);
-        if let Message::Out(ref mut out) = msg {
-            out.msgid = Some(MSG_ID as u16);
-        }
-
-        let tok = DeliveryToken::new(msg);
+        let tok = DeliveryToken::new_pending(publish_convert);
+        tok.set_msgid(MSG_ID);
         let data = tok.inner.lock.lock().unwrap();
         assert!(data.res.is_none());
         assert_eq!(MSG_ID, data.msg_id);
     }
 
-    // Created from an error code, should be complete with the right return code.
     #[test]
     fn test_from_error() {
         const ERR_CODE: i32 = ffi::MQTTASYNC_BAD_QOS;
 
-        let tok = Token::from_error(ERR_CODE);
+        let tok = ConnectToken::from_error(ERR_CODE, connect_convert);
         let data = tok.inner.lock.lock().unwrap();
 
         assert!(data.res.is_some());
         assert!(matches!(data.res, Some(Err(Error::BadQos))));
     }
 
-    // Cloned tokens should have the same (inner) raw address.
     #[test]
     fn test_token_clones() {
-        let tok1 = Token::new();
+        let tok1 = ConnectToken::new_pending(connect_convert);
         tok1.inner.lock.lock().unwrap().msg_id = 42;
 
         let tok2 = tok1.clone();
 
-        let p1 = Token::into_raw(tok1);
-        let p2 = Token::into_raw(tok2);
+        let p1 = tok1.into_raw();
+        let p2 = tok2.into_raw();
 
         assert_eq!(p1, p2);
 
-        let (tok1, tok2) = unsafe { (Token::from_raw(p1), Token::from_raw(p2)) };
+        let inner1 = unsafe { TokenInner::from_raw(p1) };
+        let inner2 = unsafe { TokenInner::from_raw(p2) };
 
-        assert_eq!(42, tok1.inner.lock.lock().unwrap().msg_id);
-        assert_eq!(42, tok2.inner.lock.lock().unwrap().msg_id);
+        assert_eq!(42, inner1.lock.lock().unwrap().msg_id);
+        assert_eq!(42, inner2.lock.lock().unwrap().msg_id);
     }
 
-    // Determine that a token can be sent across threads and signaled.
-    // As long as it compiles, this indicates that Token implements the Send
-    // trait.
-    // TODO: This would likely deadlock on an error. Consider something that
-    // would timeout on error, instead of hanging forever.
     #[test]
     fn test_token_send() {
-        let tok = Token::new();
+        use std::thread;
+
+        let tok = ConnectToken::new_pending(connect_convert);
         let tok2 = tok.clone();
 
         let thr = thread::spawn(move || tok.wait());
@@ -853,14 +750,11 @@ mod tests {
         let _ = thr.join().unwrap();
     }
 
-    // A v3 connect token signaled with a positive rc should return
-    // Error::ConnectReturn.
     #[test]
     fn test_v3_connect_error() {
         use ConnectReturnCode::*;
 
-        // Unacceptable Protocol Version (1)
-        let tok = Token::from_request(None, ServerRequest::Connect);
+        let tok = ConnectToken::from_request(None, ServerRequest::Connect, connect_convert);
         tok.inner.on_complete(0, 1, None, ptr::null_mut());
         let res = tok.wait();
         assert!(matches!(
@@ -868,17 +762,16 @@ mod tests {
             Err(Error::ConnectReturn(UnacceptableProtocolVersion))
         ));
 
-        // Server Unavailable (3)
-        let tok = Token::from_request(None, ServerRequest::Connect);
+        let tok = ConnectToken::from_request(None, ServerRequest::Connect, connect_convert);
         tok.inner.on_complete(0, 3, None, ptr::null_mut());
         let res = tok.wait();
         assert!(matches!(res, Err(Error::ConnectReturn(ServerUnavailable))));
     }
 
-    // A v5 operation that succeeds should resolve to Ok.
     #[test]
     fn test_on_success5() {
-        let tok = Token::from_request(None, ServerRequest::Subscribe);
+        let tok =
+            SubscribeToken::from_request(None, ServerRequest::Subscribe, subscribe_convert);
         let tok_wait = tok.clone();
         let ctx = tok.into_raw();
 
@@ -891,15 +784,13 @@ mod tests {
         assert!(res.is_ok());
     }
 
-    // A v5 failure with a negative Paho C return code should map to the
-    // corresponding Error variant.
     #[test]
     fn test_on_failure5_c_error() {
-        let tok = Token::from_request(None, ServerRequest::Subscribe);
+        let tok =
+            SubscribeToken::from_request(None, ServerRequest::Subscribe, subscribe_convert);
         let tok_wait = tok.clone();
         let ctx = tok.into_raw();
 
-        // reasonCode is 0 (< 0x80), so the C library code field drives the error.
         let mut rsp = unsafe { std::mem::zeroed::<ffi::MQTTAsync_failureData5>() };
         rsp.token = 2;
         rsp.code = ffi::MQTTASYNC_DISCONNECTED;
@@ -912,10 +803,8 @@ mod tests {
 
     #[test]
     fn test_on_failure5_reason_code() {
-        // A v5 failure with reason code 0x80 (UnspecifiedError) should
-        // map to Error::ReasonCode(ReasonCode::UnspecifiedError).
-
-        let tok = Token::from_request(None, ServerRequest::Subscribe);
+        let tok =
+            SubscribeToken::from_request(None, ServerRequest::Subscribe, subscribe_convert);
         let tok_wait = tok.clone();
         let ctx = tok.into_raw();
 
@@ -931,10 +820,8 @@ mod tests {
             Err(Error::ReasonCode(ReasonCode::UnspecifiedError, _))
         ));
 
-        // A v5 failure with reason code 0x87 (NotAuthorized) should map to
-        // Error::ReasonCode(ReasonCode::NotAuthorized).
-
-        let tok = Token::from_request(None, ServerRequest::Subscribe);
+        let tok =
+            SubscribeToken::from_request(None, ServerRequest::Subscribe, subscribe_convert);
         let tok_wait = tok.clone();
         let ctx = tok.into_raw();
 
@@ -954,7 +841,7 @@ mod tests {
     #[test]
     fn test_try_wait() {
         const ERR_CODE: i32 = ffi::MQTTASYNC_BAD_QOS;
-        let mut tok = Token::from_error(ERR_CODE);
+        let mut tok = ConnectToken::from_error(ERR_CODE, connect_convert);
 
         match tok.try_wait() {
             Some(Err(Error::BadQos)) => {}
@@ -963,21 +850,17 @@ mod tests {
             None => panic!("Should be complete"),
         }
 
-        // An unsignaled token
-        let mut tok = Token::new();
+        let mut tok = ConnectToken::new_pending(connect_convert);
 
-        // If it's not done, we should get None
         if tok.try_wait().is_some() {
             panic!("Should not be complete");
         }
 
-        // Complete the token
         {
             let mut data = tok.inner.lock.lock().unwrap();
             data.res = Some(Err(Error::BadQos));
         }
 
-        // Now it should resolve to Some(Err(...))
         match tok.try_wait() {
             Some(Err(Error::BadQos)) => (),
             Some(Err(err)) => panic!("Wrong error: {}", err),

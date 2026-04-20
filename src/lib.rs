@@ -120,9 +120,10 @@ pub use crate::properties::{
     PropertyIterator, PropertyType, StringPairIterator, Value, VbiU32,
 };
 pub use crate::reason_code::ReasonCode;
-pub use crate::server_response::{
-    ConnectResponse, RequestResponse, ServerRequest, ServerResponse,
+pub use crate::responses::{
+    ConnectResponse, PublishResponse, SubscribeResponse, UnsubscribeResponse,
 };
+pub use crate::server_response::{RequestResponse, ServerRequest, ServerResponse};
 pub use crate::ssl_options::{SslOptions, SslOptionsBuilder, SslVersion, path_to_cstring};
 pub use crate::subscribe_options::{
     NO_RETAIN_AS_PUBLISHED, RETAIN_AS_PUBLISHED, RetainHandling, SUBSCRIBE_LOCAL,
@@ -160,6 +161,9 @@ pub mod subscribe_options;
 
 /// Responses coming back from the server.
 pub mod server_response;
+
+/// Typed response types for MQTT operations.
+pub mod responses;
 
 /// MQTT 5v properties.
 pub mod properties;

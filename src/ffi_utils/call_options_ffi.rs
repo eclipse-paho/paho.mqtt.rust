@@ -34,9 +34,10 @@
 use std::{os::raw::c_int, pin::Pin, ptr};
 
 use crate::{
-    Properties, PropertiesFfi, SubscribeOptions, Token, ffi,
-    ffi_utils::SubscribeOptionsFfi, token::TokenInner, types::*,
+    Properties, PropertiesFfi, SubscribeOptions, ffi, ffi_utils::SubscribeOptionsFfi,
+    token::TokenInner, types::*,
 };
+use std::sync::Arc;
 
 /// The collection of options for responses coming back to the client.
 #[derive(Debug)]
@@ -67,13 +68,12 @@ impl CallOptionsFfi {
     /// structure to act as the context pointer for the callback. It is
     /// up to the callback (or calling function) to recapture and release
     /// this token.
-    pub(crate) fn new<V, T>(ver: V, tok: T) -> Self
+    pub(crate) fn new<V>(ver: V, inner: Arc<TokenInner>) -> Self
     where
         V: Into<MqttVersion>,
-        T: Into<Token>,
     {
         let mut copts = Self::c_options(ver.into());
-        copts.context = tok.into().into_raw();
+        copts.context = Arc::into_raw(inner) as *mut std::os::raw::c_void;
 
         Self::from_data(copts, CallOptionsFfiData::default())
     }
@@ -150,11 +150,8 @@ impl CallOptionsFfiBuilder {
     }
 
     /// Sets the token for the response.
-    pub fn token<T>(&mut self, tok: T) -> &mut Self
-    where
-        T: Into<Token>,
-    {
-        self.copts.context = tok.into().into_raw();
+    pub fn token(&mut self, inner: Arc<TokenInner>) -> &mut Self {
+        self.copts.context = Arc::into_raw(inner) as *mut std::os::raw::c_void;
         self
     }
 
@@ -202,83 +199,71 @@ impl CallOptionsFfiBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::token::Token;
-
-    // The currently supported response options struct version
-    //const STRUCT_VERSION: i32 = ffi::RESPONSE_OPTIONS_STRUCT_VERSION;
 
     #[test]
     fn test_new_v3() {
-        let tok = Token::new();
-        let opts = CallOptionsFfi::new(MQTT_VERSION_3_1_1, tok.clone());
-
-        let inner = Token::into_raw(tok);
+        let inner = TokenInner::new();
+        let ctx = Arc::into_raw(inner.clone()) as *mut std::os::raw::c_void;
+        let opts = CallOptionsFfi::new(MQTT_VERSION_3_1_1, inner);
 
         assert!(opts.copts.onSuccess.is_some());
         assert!(opts.copts.onFailure.is_some());
-        // Check that the context is pointing to the right Token
-        assert_eq!(inner, opts.copts.context);
+        assert_eq!(ctx, opts.copts.context);
         assert!(opts.copts.onSuccess5.is_none());
         assert!(opts.copts.onFailure5.is_none());
 
-        unsafe { Token::from_raw(inner) };
+        unsafe { TokenInner::from_raw(ctx) };
     }
 
     #[test]
     fn test_new_v5() {
-        let tok = Token::new();
-        let opts = CallOptionsFfi::new(MQTT_VERSION_5, tok.clone());
-
-        let inner = Token::into_raw(tok);
+        let inner = TokenInner::new();
+        let ctx = Arc::into_raw(inner.clone()) as *mut std::os::raw::c_void;
+        let opts = CallOptionsFfi::new(MQTT_VERSION_5, inner);
 
         assert!(opts.copts.onSuccess.is_none());
         assert!(opts.copts.onFailure.is_none());
-        // Check that the context is pointing to the right Token
-        assert_eq!(inner, opts.copts.context);
+        assert_eq!(ctx, opts.copts.context);
         assert!(opts.copts.onSuccess5.is_some());
         assert!(opts.copts.onFailure5.is_some());
 
-        unsafe { Token::from_raw(inner) };
+        unsafe { TokenInner::from_raw(ctx) };
     }
 
     #[test]
     fn test_sub_opts() {
-        let tok = Token::new();
+        let inner = TokenInner::new();
+        let ctx = Arc::into_raw(inner.clone()) as *mut std::os::raw::c_void;
         let sub_opts = SubscribeOptions::with_no_local();
         let opts = CallOptionsFfiBuilder::new()
-            .token(tok.clone())
+            .token(inner)
             .subscribe_options(sub_opts)
             .finalize();
 
-        let inner = Token::into_raw(tok);
-
         assert!(opts.copts.onSuccess.is_none());
         assert!(opts.copts.onFailure.is_none());
-        // Check that the context is pointing to the right Token
-        assert_eq!(inner, opts.copts.context);
+        assert_eq!(ctx, opts.copts.context);
         assert!(opts.copts.onSuccess5.is_some());
         assert!(opts.copts.onFailure5.is_some());
 
         assert!(opts.copts.subscribeOptions.noLocal != 0);
 
-        unsafe { Token::from_raw(inner) };
+        unsafe { TokenInner::from_raw(ctx) };
     }
 
     #[test]
     fn test_sub_many_opts() {
-        let tok = Token::new();
+        let inner = TokenInner::new();
+        let ctx = Arc::into_raw(inner.clone()) as *mut std::os::raw::c_void;
         let sub_opts = vec![SubscribeOptions::with_no_local(); 4];
         let opts = CallOptionsFfiBuilder::new()
-            .token(tok.clone())
+            .token(inner)
             .subscribe_many_options(&sub_opts)
             .finalize();
 
-        let inner = Token::into_raw(tok);
-
         assert!(opts.copts.onSuccess.is_none());
         assert!(opts.copts.onFailure.is_none());
-        // Check that the context is pointing to the right Token
-        assert_eq!(inner, opts.copts.context);
+        assert_eq!(ctx, opts.copts.context);
         assert!(opts.copts.onSuccess5.is_some());
         assert!(opts.copts.onFailure5.is_some());
 
@@ -296,6 +281,6 @@ mod tests {
             assert!(sub_opts_list[3].noLocal != 0);
         }
 
-        unsafe { Token::from_raw(inner) };
+        unsafe { TokenInner::from_raw(ctx) };
     }
 }

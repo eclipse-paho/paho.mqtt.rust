@@ -29,8 +29,9 @@
 //! The synchronous calls use a default timeout
 
 use crate::{
-    AsyncClient, ConnectOptions, CreateOptions, DisconnectOptions, Event, Message,
-    Properties, QoS, Result, ServerResponse, SubscribeOptions, SyncReceiver,
+    AsyncClient, ConnectOptions, ConnectResponse, CreateOptions, DisconnectOptions, Event,
+    Message, Properties, PublishResponse, QoS, Result, SubscribeOptions, SubscribeResponse,
+    SyncReceiver,
 };
 use std::time::Duration;
 
@@ -80,7 +81,7 @@ impl Client {
     }
 
     /// Connects to an MQTT broker using the specified connect options.
-    pub fn connect<T>(&self, opt_opts: T) -> Result<ServerResponse>
+    pub fn connect<T>(&self, opt_opts: T) -> Result<ConnectResponse>
     where
         T: Into<Option<ConnectOptions>>,
     {
@@ -121,7 +122,7 @@ impl Client {
     /// Attempts to reconnect to the broker.
     /// This can only be called after a connection was initially made or
     /// attempted. It will retry with the same connect options.
-    pub fn reconnect(&self) -> Result<ServerResponse> {
+    pub fn reconnect(&self) -> Result<ConnectResponse> {
         self.cli.reconnect().wait_for(self.timeout)
     }
 
@@ -131,7 +132,7 @@ impl Client {
     }
 
     /// Publishes a message to an MQTT broker
-    pub fn publish(&self, msg: Message) -> Result<()> {
+    pub fn publish(&self, msg: Message) -> Result<PublishResponse> {
         self.cli.publish(msg).wait_for(self.timeout)
     }
 
@@ -142,7 +143,7 @@ impl Client {
     /// * `topic` The topic name
     /// * `qos` The quality of service requested for messages
     ///
-    pub fn subscribe<Q>(&self, topic: &str, qos: Q) -> Result<ServerResponse>
+    pub fn subscribe<Q>(&self, topic: &str, qos: Q) -> Result<SubscribeResponse>
     where
         Q: Into<QoS>,
     {
@@ -164,7 +165,7 @@ impl Client {
         qos: Q,
         opts: T,
         props: P,
-    ) -> Result<ServerResponse>
+    ) -> Result<SubscribeResponse>
     where
         S: Into<String>,
         Q: Into<QoS>,
@@ -183,7 +184,7 @@ impl Client {
     /// * `topic` The topic name
     /// * `qos` The quality of service requested for messages
     ///
-    pub fn subscribe_many<T, Q>(&self, topics: &[T], qos: &[Q]) -> Result<ServerResponse>
+    pub fn subscribe_many<T, Q>(&self, topics: &[T], qos: &[Q]) -> Result<SubscribeResponse>
     where
         T: AsRef<str>,
         Q: Into<QoS> + Copy,
@@ -203,7 +204,7 @@ impl Client {
         &self,
         topics: &[T],
         qos: i32,
-    ) -> Result<ServerResponse>
+    ) -> Result<SubscribeResponse>
     where
         T: AsRef<str>,
     {
@@ -227,7 +228,7 @@ impl Client {
         qos: &[Q],
         opts: &[SubscribeOptions],
         props: P,
-    ) -> Result<ServerResponse>
+    ) -> Result<SubscribeResponse>
     where
         T: AsRef<str>,
         Q: Into<QoS> + Copy,

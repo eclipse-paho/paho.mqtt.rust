@@ -102,39 +102,33 @@ fn main() {
     // Make the connection to the broker
     match cli.connect(conn_opts) {
         Ok(rsp) => {
-            if let Some(conn_rsp) = rsp.connect_response() {
+            println!(
+                "Connected to: '{}' with MQTT version {}",
+                rsp.server_uri, rsp.mqtt_version
+            );
+            if rsp.session_present {
+                // Since our persistent session is already on the broker
+                // we don't need to subscribe to the topics.
+                println!("  w/ client session already present on broker.");
+            }
+            else {
+                // The server doesn't have a persistent session already
+                // stored for us (1st connection?), so we need to subscribe
+                // to the topics we want to receive.
                 println!(
-                    "Connected to: '{}' with MQTT version {}",
-                    conn_rsp.server_uri, conn_rsp.mqtt_version
+                    "Subscribing to topics {:?} with requested QoS: {:?}...",
+                    subscriptions, qos
                 );
-                if conn_rsp.session_present {
-                    // Since our persistent session is already on the broker
-                    // we don't need to subscribe to the topics.
-                    println!("  w/ client session already present on broker.");
-                }
-                else {
-                    // The server doesn't have a persistent session already
-                    // stored for us (1st connection?), so we need to subscribe
-                    // to the topics we want to receive.
-                    println!(
-                        "Subscribing to topics {:?} with requested QoS: {:?}...",
-                        subscriptions, qos
-                    );
 
-                    cli.subscribe_many_same_qos(&subscriptions, qos)
-                        .and_then(|rsp| {
-                            rsp.subscribe_many_response()
-                                .ok_or(mqtt::Error::General("Bad response"))
-                        })
-                        .map(|vqos| {
-                            println!("QoS granted: {:?}", vqos);
-                        })
-                        .unwrap_or_else(|err| {
-                            println!("Error subscribing to topics: {:?}", err);
-                            cli.disconnect(None).unwrap();
-                            process::exit(1);
-                        });
-                }
+                cli.subscribe_many_same_qos(&subscriptions, qos)
+                    .map(|rsp| {
+                        println!("QoS granted: {:?}", rsp.reason_codes);
+                    })
+                    .unwrap_or_else(|err| {
+                        println!("Error subscribing to topics: {:?}", err);
+                        cli.disconnect(None).unwrap();
+                        process::exit(1);
+                    });
             }
         }
         Err(e) => {

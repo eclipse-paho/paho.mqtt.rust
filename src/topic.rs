@@ -24,7 +24,7 @@
 
 use crate::{
     AsyncClient, Client, DeliveryToken, Error, Message, MessageBuilder, Properties, QoS,
-    Result, ServerResponse, SubscribeOptions, Token,
+    Result, SubscribeOptions, SubscribeResponse, token::SubscribeToken,
 };
 use std::fmt;
 
@@ -134,12 +134,12 @@ impl<'a> Topic<'a> {
     }
 
     /// Subscribe to the topic.
-    pub fn subscribe(&self) -> Token {
+    pub fn subscribe(&self) -> SubscribeToken {
         self.cli.subscribe(self.topic.clone(), self.qos)
     }
 
     /// Subscribe to the topic with subscription options.
-    pub fn subscribe_with_options<T, P>(&self, opts: T, props: P) -> Token
+    pub fn subscribe_with_options<T, P>(&self, opts: T, props: P) -> SubscribeToken
     where
         T: Into<SubscribeOptions>,
         P: Into<Option<Properties>>,
@@ -323,12 +323,16 @@ impl<'a> SyncTopic<'a> {
     }
 
     /// Subscribe to the topic.
-    pub fn subscribe(&self) -> Result<ServerResponse> {
+    pub fn subscribe(&self) -> Result<SubscribeResponse> {
         self.cli.subscribe(&self.topic.topic, self.topic.qos)
     }
 
     /// Subscribe to the topic with subscription options.
-    pub fn subscribe_with_options<T, P>(&self, opts: T, props: P) -> Result<ServerResponse>
+    pub fn subscribe_with_options<T, P>(
+        &self,
+        opts: T,
+        props: P,
+    ) -> Result<SubscribeResponse>
     where
         T: Into<SubscribeOptions>,
         P: Into<Option<Properties>>,
@@ -352,7 +356,7 @@ impl<'a> SyncTopic<'a> {
         V: Into<Vec<u8>>,
     {
         let msg = self.create_message(payload);
-        self.cli.publish(msg)
+        self.cli.publish(msg).map(|_| ())
     }
 
     /// Publish a message with a topic alias.
@@ -387,7 +391,7 @@ impl<'a> SyncTopic<'a> {
         self.topic.alias = alias;
 
         let msg = self.topic.create_message_with_topic(payload, true);
-        self.cli.publish(msg)
+        self.cli.publish(msg).map(|_| ())
     }
 
     /// Gets the alias for the topic, if any.

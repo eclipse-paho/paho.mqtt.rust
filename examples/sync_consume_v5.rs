@@ -142,21 +142,19 @@ fn main() -> mqtt::Result<()> {
     // the server already knows about us and rembers our subscription(s).
     // If not, we subscribe for incoming requests.
 
-    if let Some(conn_rsp) = rsp.connect_response() {
-        println!(
-            "Connected to: '{}' with MQTT version {}",
-            conn_rsp.server_uri, conn_rsp.mqtt_version
-        );
+    println!(
+        "Connected to: '{}' with MQTT version {}",
+        rsp.server_uri, rsp.mqtt_version
+    );
 
-        if conn_rsp.session_present {
-            println!("  w/ client session already present on broker.");
-        }
-        else {
-            // Register subscriptions on the server, using Subscription ID's.
-            println!(r#"Subscribing to topics ["data/#", "command"]..."#);
-            cli.subscribe_with_options("data/#", 0, None, sub_id(1))?;
-            cli.subscribe_with_options("command", 1, None, sub_id(2))?;
-        }
+    if rsp.session_present {
+        println!("  w/ client session already present on broker.");
+    }
+    else {
+        // Register subscriptions on the server, using Subscription ID's.
+        println!(r#"Subscribing to topics ["data/#", "command"]..."#);
+        cli.subscribe_with_options("data/#", 0, None, sub_id(1))?;
+        cli.subscribe_with_options("command", 1, None, sub_id(2))?;
     }
 
     // ^C handler will stop the consumer, breaking us out of the loop, below
