@@ -47,11 +47,26 @@
 use crate::event::Event;
 use crate::{
     AsyncReceiver, ConnectOptions, ConnectToken, CreateOptions, DeliveryToken,
-    DisconnectOptions, Message, PersistenceType, Properties, ReasonCode, ServerRequest,
-    SubscribeManyToken, SubscribeOptions, SubscribeToken, SyncReceiver,
-    UnsubscribeManyToken, UnsubscribeToken, UserData,
-    errors::{self, Error, Result},
-    ffi,
+    DisconnectOptions, Message, Properties, ReasonCode, SyncReceiver, UserData,
+    errors::{Error, Result},
+    token::Token,
+    types::*,
+};
+use crossbeam_channel as sync_channel;
+use std::{
+    result::Result as StdResult,
+    sync::{
+        Arc, Mutex, RwLock,
+        atomic::{AtomicU32, Ordering},
+    },
+    time::Duration,
+};
+
+// C-library imports — only needed when the tokio runtime is not active.
+#[cfg(not(feature = "tokio"))]
+use crate::{
+    PersistenceType, ServerRequest, SubscribeManyToken, SubscribeOptions, SubscribeToken,
+    UnsubscribeManyToken, UnsubscribeToken, errors, ffi,
     ffi_utils::{
         CallOptionsFfi, CallOptionsFfiBuilder, ConnectOptionsFfi, DisconnectOptionsFfi,
         MessageFfi, StringCollectionFfi,
@@ -60,23 +75,27 @@ use crate::{
         connect_convert, publish_convert, subscribe_convert, unit_convert,
         unsubscribe_convert,
     },
-    token::{Token, TokenInner},
-    types::*,
+    token::TokenInner,
 };
-use crossbeam_channel as sync_channel;
+#[cfg(not(feature = "tokio"))]
 use std::{
     ffi::{CStr, CString},
     mem,
     os::raw::{c_char, c_int, c_void},
-    ptr,
-    result::Result as StdResult,
-    slice, str,
-    sync::{
-        Arc, Mutex, Once, RwLock,
-        atomic::{AtomicU32, Ordering},
-    },
-    time::Duration,
+    ptr, slice, str,
+    sync::Once,
+    sync::atomic::AtomicU32 as _AtomicU32,
 };
+
+// Runtime imports — only when the tokio feature is active.
+#[cfg(feature = "tokio")]
+use crate::{
+    SubscribeManyToken, SubscribeOptions, SubscribeToken, UnsubscribeManyToken,
+    UnsubscribeToken,
+    runtime::{Command, RuntimeHandle},
+};
+#[cfg(feature = "tokio")]
+use std::sync::atomic::AtomicBool;
 
 /////////////////////////////////////////////////////////////////////////////
 // AsynClient
@@ -89,15 +108,27 @@ pub struct AsyncClient {
 
 /// Implementation details for the asynchronous MQTT connection client.
 pub(crate) struct InnerAsyncClient {
-    // The handle to the Paho C client
+    // ---- Pure-Rust runtime fields (tokio feature) ----
+    /// Command sender to the internal event loop.
+    #[cfg(feature = "tokio")]
+    cmd_tx: async_channel::Sender<Command>,
+    /// Whether the client is currently connected.
+    #[cfg(feature = "tokio")]
+    connected: AtomicBool,
+
+    // ---- C-library handle (no tokio feature) ----
+    /// The handle to the Paho C client.
+    #[cfg(not(feature = "tokio"))]
     handle: ffi::MQTTAsync,
-    // The MQTT version of the connection
+
+    // ---- Common fields ----
+    /// The MQTT version of the connection.
     mqtt_version: AtomicU32,
-    /// The options used to create the client (URL, ClientID, persistence, etc)
+    /// The options used to create the client.
     opts: CreateOptions,
-    // The options for connecting to the broker
+    /// The options for the most recent connection attempt.
     conn_opts: RwLock<ConnectOptions>,
-    // The context to give to the C callbacks
+    /// User-registered event callbacks.
     callback_context: Mutex<CallbackContext>,
 }
 
@@ -121,28 +152,24 @@ pub type MessageArrivedCallback = dyn FnMut(&AsyncClient, Option<Message>) + Sen
 /// User callback type for an SSL/TLS error
 pub type SslErrorCallback = dyn Fn(&AsyncClient, &str) + Send + Sync + 'static;
 
-// The context provided for the client callbacks.
-//
-// Originally these needed to be kept together and managed with a single
-// context in the C lib. Now, we just keep them together to easily manage
-// for thread-protection with a Mutex.
-// These are now independent, so don't need to be kept inside a single mutex.
-// Even better, it would be nice to be able to run the callbacks lock-free.
 #[derive(Default)]
 struct CallbackContext {
-    /// Callback for when the client successfully connects.
     on_connected: Option<Box<ConnectedCallback>>,
-    /// Callback for when the client loses connection to the server.
     on_connection_lost: Option<Box<ConnectionLostCallback>>,
-    /// Callback for when the client receives a disconnect packet.
     on_disconnected: Option<Box<DisconnectedCallback>>,
-    /// Callback for when a message arrives from the server.
     on_message_arrived: Option<Box<MessageArrivedCallback>>,
 }
 
-// Runs code to initialize the underlying C library
+/////////////////////////////////////////////////////////////////////////////
+// C-library init guard — only used by the non-tokio path.
+#[cfg(not(feature = "tokio"))]
 static C_LIB_INIT: Once = Once::new();
 
+/////////////////////////////////////////////////////////////////////////////
+// Tokio (pure-Rust) path
+/////////////////////////////////////////////////////////////////////////////
+
+#[cfg(feature = "tokio")]
 impl AsyncClient {
     /// Creates a new MQTT client which can connect to an MQTT broker.
     ///
@@ -154,7 +181,458 @@ impl AsyncClient {
     where
         T: Into<CreateOptions>,
     {
-        // Do any initialization of the C lib
+        let opts = opts.into();
+        debug!("Create options: {:?}", opts);
+
+        let rt = RuntimeHandle::spawn();
+        let (cmd_tx, event_rx) = rt.into_parts();
+
+        let inner = Arc::new(InnerAsyncClient {
+            cmd_tx,
+            connected: AtomicBool::new(false),
+            mqtt_version: AtomicU32::new(opts.mqtt_version as u32),
+            opts,
+            conn_opts: RwLock::new(ConnectOptions::new()),
+            callback_context: Mutex::new(CallbackContext::default()),
+        });
+
+        // Spawn a thread to dispatch events from the runtime to callbacks.
+        let weak = Arc::downgrade(&inner);
+        std::thread::Builder::new()
+            .name("mqtt-events".into())
+            .spawn(move || {
+                while let Ok(ev) = event_rx.recv_blocking() {
+                    let Some(inner) = weak.upgrade()
+                    else {
+                        break;
+                    };
+                    let cli = AsyncClient { inner };
+                    cli.dispatch_event(ev);
+                }
+            })
+            .expect("spawn mqtt event thread");
+
+        Ok(AsyncClient { inner })
+    }
+
+    /// Connects to an MQTT broker using the specified connect options.
+    ///
+    /// # Arguments
+    ///
+    /// * `opts` The connect options. This can be `None`, in which case the
+    ///   default options are used.
+    ///
+    pub fn connect<T>(&self, opts: T) -> ConnectToken
+    where
+        T: Into<Option<ConnectOptions>>,
+    {
+        let opts = opts.into().unwrap_or_default();
+        debug!("Connecting with opts: {:?}", opts);
+
+        if let Err(err) = opts.check() {
+            return ConnectToken::from(err);
+        }
+
+        let ver = if opts.mqtt_version == MqttVersion::Default {
+            MqttVersion::V3_1_1
+        }
+        else {
+            opts.mqtt_version
+        };
+
+        let (host, port) = match parse_server_uri(&self.inner.opts.server_uri) {
+            Ok(v) => v,
+            Err(e) => return ConnectToken::from(e),
+        };
+
+        let keep_alive_secs =
+            opts.keep_alive_interval.as_secs().min(u16::MAX as u64) as u16;
+
+        let will = opts.will.as_ref().map(|msg| {
+            paho_mqtt_codec::Will::new(
+                msg.topic().to_string(),
+                msg.payload().to_vec(),
+                msg.qos(),
+                msg.retain(),
+            )
+        });
+
+        let (tok, comp) = ConnectToken::new();
+        self.set_mqtt_version(ver);
+        *self.inner.conn_opts.write().unwrap() = opts.clone();
+
+        let cmd = Command::Connect {
+            host,
+            port,
+            client_id: self.inner.opts.client_id.clone(),
+            clean_start: opts.clean_start,
+            keep_alive_secs,
+            user_name: opts.user_name,
+            password: opts.password,
+            will,
+            ver,
+            props: Default::default(),
+            tx: comp,
+        };
+
+        if self.inner.cmd_tx.send_blocking(cmd).is_err() {
+            return ConnectToken::from(Error::Disconnected);
+        }
+
+        tok
+    }
+
+    /// Disconnects from the MQTT broker.
+    ///
+    /// # Arguments
+    ///
+    /// `opts` Optional disconnect options. Specifying `None` will use
+    ///        default of immediate (zero timeout) disconnect.
+    ///
+    pub fn disconnect<T>(&self, opts: T) -> Token<()>
+    where
+        T: Into<Option<DisconnectOptions>>,
+    {
+        let _opts = opts.into().unwrap_or_default();
+        debug!("Disconnecting");
+
+        let (tok, comp) = Token::<()>::new();
+
+        let cmd = Command::Disconnect {
+            reason_code: paho_mqtt_codec::ReasonCode::NormalDisconnection,
+            props: Default::default(),
+            tx: comp,
+        };
+
+        if self.inner.cmd_tx.send_blocking(cmd).is_err() {
+            return Token::<()>::from_err(Error::Disconnected);
+        }
+
+        // Push a None into the message stream to cleanly shutdown consumers.
+        if let Some(ref mut cb) = self
+            .inner
+            .callback_context
+            .lock()
+            .unwrap()
+            .on_message_arrived
+        {
+            cb(self, None);
+        }
+
+        tok
+    }
+
+    /// Attempts to publish a message to the MQTT broker, but returns an
+    /// error immediately if there's a problem creating or queuing the
+    /// message.
+    ///
+    /// Returns a Publish Error on failure so that the original message
+    /// can be recovered and sent again.
+    pub fn try_publish(&self, msg: Message) -> Result<DeliveryToken> {
+        use bytes::Bytes;
+        debug!("Publish: {:?}", msg);
+
+        let qos = msg.qos();
+        let (tok, comp) = DeliveryToken::new();
+
+        let cmd = Command::Publish {
+            topic: msg.topic().to_string(),
+            payload: Bytes::copy_from_slice(msg.payload()),
+            qos,
+            retain: msg.retain(),
+            props: Default::default(),
+            tx: comp,
+        };
+
+        if self.inner.cmd_tx.send_blocking(cmd).is_err() {
+            return Err(Error::Disconnected);
+        }
+
+        Ok(tok)
+    }
+
+    /// Publishes a message to the MQTT broker.
+    ///
+    /// Returns a Delivery Token to track the progress of the operation.
+    ///
+    pub fn publish(&self, msg: Message) -> DeliveryToken {
+        match self.try_publish(msg) {
+            Ok(tok) => tok,
+            Err(e) => DeliveryToken::from_err(e),
+        }
+    }
+
+    /// Subscribes to a single topic.
+    ///
+    /// # Arguments
+    ///
+    /// * `topic` The topic name
+    /// * `qos` The quality of service requested for messages
+    ///
+    pub fn subscribe<S, Q>(&self, topic: S, qos: Q) -> SubscribeToken
+    where
+        S: Into<String>,
+        Q: Into<QoS>,
+    {
+        let (tok, comp) = SubscribeToken::new();
+        let cmd = Command::Subscribe {
+            filters: vec![(topic.into(), qos.into())],
+            props: Default::default(),
+            tx: comp,
+        };
+        if self.inner.cmd_tx.send_blocking(cmd).is_err() {
+            return SubscribeToken::from_err(Error::Disconnected);
+        }
+        tok
+    }
+
+    /// Subscribes to a single topic with v5 options.
+    ///
+    /// # Arguments
+    ///
+    /// * `topic` The topic name
+    /// * `qos` The quality of service requested for messages
+    /// * `opts` Options for the subscription
+    /// * `props` MQTT v5 properties
+    ///
+    pub fn subscribe_with_options<S, Q, T, P>(
+        &self,
+        topic: S,
+        qos: Q,
+        _opts: T,
+        _props: P,
+    ) -> SubscribeToken
+    where
+        S: Into<String>,
+        Q: Into<QoS>,
+        T: Into<SubscribeOptions>,
+        P: Into<Option<Properties>>,
+    {
+        self.subscribe(topic, qos)
+    }
+
+    /// Subscribes to multiple topics simultaneously.
+    ///
+    /// # Arguments
+    ///
+    /// * `topics` The collection of topic names
+    /// * `qos` The quality of service requested for messages
+    ///
+    pub fn subscribe_many<T, Q>(&self, topics: &[T], qos: &[Q]) -> SubscribeManyToken
+    where
+        T: AsRef<str>,
+        Q: Into<QoS> + Copy,
+    {
+        let n = topics.len();
+        if n != qos.len() {
+            return SubscribeManyToken::from_err(Error::General(
+                "topics/qos length mismatch",
+            ));
+        }
+
+        let (tok, comp) = SubscribeManyToken::new();
+        let filters = topics
+            .iter()
+            .zip(qos.iter())
+            .map(|(t, q)| (t.as_ref().to_string(), (*q).into()))
+            .collect();
+
+        let cmd = Command::Subscribe {
+            filters,
+            props: Default::default(),
+            tx: comp,
+        };
+        if self.inner.cmd_tx.send_blocking(cmd).is_err() {
+            return SubscribeManyToken::from_err(Error::Disconnected);
+        }
+        tok
+    }
+
+    /// Subscribes to multiple topics simultaneously using the same QoS
+    /// for all of them.
+    ///
+    /// # Arguments
+    ///
+    /// * `topics` The collection of topic names
+    /// * `qos` The quality of service requested for all messages
+    ///
+    pub fn subscribe_many_same_qos<T>(&self, topics: &[T], qos: i32) -> SubscribeManyToken
+    where
+        T: AsRef<str>,
+    {
+        let qos = vec![qos; topics.len()];
+        self.subscribe_many(topics, &qos)
+    }
+
+    /// Subscribes to multiple topics simultaneously with options.
+    ///
+    /// # Arguments
+    ///
+    /// * `topics` The collection of topic names
+    /// * `qos` The quality of service requested for messages
+    /// * `opts` Subscribe options (one per topic)
+    /// * `props` MQTT v5 properties
+    ///
+    pub fn subscribe_many_with_options<T, Q, P>(
+        &self,
+        topics: &[T],
+        qos: &[Q],
+        _opts: &[SubscribeOptions],
+        _props: P,
+    ) -> SubscribeManyToken
+    where
+        T: AsRef<str>,
+        Q: Into<QoS> + Copy,
+        P: Into<Option<Properties>>,
+    {
+        self.subscribe_many(topics, qos)
+    }
+
+    /// Unsubscribes from a single topic.
+    ///
+    /// # Arguments
+    ///
+    /// * `topic` The topic to unsubscribe. It must match a topic from a
+    ///   previous subscribe.
+    ///
+    pub fn unsubscribe<S>(&self, topic: S) -> UnsubscribeToken
+    where
+        S: Into<String>,
+    {
+        let (tok, comp) = UnsubscribeToken::new();
+        let cmd = Command::Unsubscribe {
+            filters: vec![topic.into()],
+            props: Default::default(),
+            tx: comp,
+        };
+        if self.inner.cmd_tx.send_blocking(cmd).is_err() {
+            return UnsubscribeToken::from_err(Error::Disconnected);
+        }
+        tok
+    }
+
+    /// Unsubscribes from a single topic with v5 options.
+    ///
+    /// # Arguments
+    ///
+    /// * `topic` The topic to unsubscribe.
+    /// * `props` MQTT v5 properties for the unsubscribe.
+    ///
+    pub fn unsubscribe_with_options<S>(
+        &self,
+        topic: S,
+        _props: Properties,
+    ) -> UnsubscribeToken
+    where
+        S: Into<String>,
+    {
+        self.unsubscribe(topic)
+    }
+
+    /// Unsubscribes from multiple topics simultaneously.
+    ///
+    /// # Arguments
+    ///
+    /// * `topics` The topics to unsubscribe. Each must match a topic from a
+    ///   previous subscribe.
+    ///
+    pub fn unsubscribe_many<T>(&self, topics: &[T]) -> UnsubscribeManyToken
+    where
+        T: AsRef<str>,
+    {
+        let (tok, comp) = UnsubscribeManyToken::new();
+        let filters = topics.iter().map(|t| t.as_ref().to_string()).collect();
+        let cmd = Command::Unsubscribe {
+            filters,
+            props: Default::default(),
+            tx: comp,
+        };
+        if self.inner.cmd_tx.send_blocking(cmd).is_err() {
+            return UnsubscribeManyToken::from_err(Error::Disconnected);
+        }
+        tok
+    }
+
+    /// Unsubscribes from multiple topics simultaneously with v5 options.
+    ///
+    /// # Arguments
+    ///
+    /// * `topics` The topics to unsubscribe.
+    /// * `props` MQTT v5 properties for the unsubscribe.
+    ///
+    pub fn unsubscribe_many_with_options<T>(
+        &self,
+        topics: &[T],
+        _props: Properties,
+    ) -> UnsubscribeManyToken
+    where
+        T: AsRef<str>,
+    {
+        self.unsubscribe_many(topics)
+    }
+
+    /// Determines if this client is currently connected to an MQTT broker.
+    pub fn is_connected(&self) -> bool {
+        self.inner.connected.load(Ordering::SeqCst)
+    }
+
+    /// Dispatches an event from the runtime to the registered callbacks.
+    fn dispatch_event(&self, ev: crate::runtime::Event) {
+        use crate::runtime::Event as Ev;
+        match ev {
+            Ev::Connected(_response) => {
+                self.inner.connected.store(true, Ordering::SeqCst);
+                let mut cbctx = self.inner.callback_context.lock().unwrap();
+                if let Some(ref mut cb) = cbctx.on_connected {
+                    cb(self);
+                }
+            }
+            Ev::ConnectionLost(_err) => {
+                self.inner.connected.store(false, Ordering::SeqCst);
+                let mut cbctx = self.inner.callback_context.lock().unwrap();
+                if let Some(ref mut cb) = cbctx.on_message_arrived {
+                    cb(self, None);
+                }
+                if let Some(ref mut cb) = cbctx.on_connection_lost {
+                    cb(self);
+                }
+            }
+            Ev::MessageArrived(recv) => {
+                use crate::message::OutMessage;
+                let msg = Message::Out(OutMessage {
+                    topic: recv.topic,
+                    payload: recv.payload.into(),
+                    qos: recv.qos,
+                    retain: recv.retain,
+                    dup: recv.dup,
+                    msgid: recv.packet_id,
+                    props: Properties::default(),
+                });
+                let mut cbctx = self.inner.callback_context.lock().unwrap();
+                if let Some(ref mut cb) = cbctx.on_message_arrived {
+                    cb(self, Some(msg));
+                }
+            }
+        }
+    }
+}
+
+/////////////////////////////////////////////////////////////////////////////
+// C-library path
+/////////////////////////////////////////////////////////////////////////////
+
+#[cfg(not(feature = "tokio"))]
+impl AsyncClient {
+    /// Creates a new MQTT client which can connect to an MQTT broker.
+    ///
+    /// # Arguments
+    ///
+    /// * `opts` The create options for the client.
+    ///
+    pub fn new<T>(opts: T) -> Result<AsyncClient>
+    where
+        T: Into<CreateOptions>,
+    {
         C_LIB_INIT.call_once(|| {
             if let Some(lvl) = crate::c_trace_level() {
                 debug!("Setting Paho C log level to {}", lvl);
@@ -165,7 +643,6 @@ impl AsyncClient {
             }
         });
 
-        // Create the client
         let opts = opts.into();
         debug!("Create options: {:?}", opts);
 
@@ -177,7 +654,6 @@ impl AsyncClient {
             callback_context: Mutex::new(CallbackContext::default()),
         };
 
-        // We might need this for file persistence path
         let file_path;
         let mut persist_copts;
 
@@ -199,7 +675,6 @@ impl AsyncClient {
 
         debug!("Creating client with persistence: {}", ptype);
 
-        // Get the FFI values & call the C lib creation
         let server_uri = CString::new(cli.opts.server_uri.clone())?;
         let client_id = CString::new(cli.opts.client_id.clone())?;
         let mut copts = cli.opts.c_struct();
@@ -233,8 +708,6 @@ impl AsyncClient {
     }
 
     /// Constructs a client from a raw pointer to the inner structure.
-    /// Internally, this is how the client is normally reconstructed from
-    /// a context pointer coming back from the C lib.
     pub(crate) unsafe fn from_raw(ptr: *mut c_void) -> AsyncClient {
         AsyncClient {
             inner: unsafe { Arc::from_raw(ptr as *mut InnerAsyncClient) },
@@ -242,55 +715,44 @@ impl AsyncClient {
     }
 
     /// Consumes the client, returning the inner wrapped value.
-    /// This is how a client can be passed to the C lib as a context pointer.
     pub(crate) fn into_raw(self) -> *mut c_void {
         Arc::into_raw(self.inner) as *mut c_void
     }
 
-    /// Gets the client "C" handle, normally for diagnostics
+    /// Gets the client "C" handle, normally for diagnostics.
     pub(crate) fn handle(&self) -> ffi::MQTTAsync {
         self.inner.handle
     }
 
-    // Low-level callback from the C library when the client is connected.
-    // We just pass the call on to the handler registered with the client, if any.
+    // C callback: client connected.
     unsafe extern "C" fn on_connected(context: *mut c_void, _cause: *mut c_char) {
         if context.is_null() {
             warn!("on_connected: null client context.");
             return;
         }
-
         debug!("Connected! Client {:?}", context);
         let cli = unsafe { AsyncClient::from_raw(context) };
-
         if let Some(ref mut cb) = cli.inner.callback_context.lock().unwrap().on_connected {
             trace!("Invoking connected callback");
             cb(&cli);
         }
-
         let _ = cli.into_raw();
     }
 
-    // Low-level callback from the C library when the connection is lost.
-    // We pass the call on to the handler registered with the client, if any.
+    // C callback: connection lost.
     unsafe extern "C" fn on_connection_lost(context: *mut c_void, _cause: *mut c_char) {
         if context.is_null() {
             warn!("on_connection_lost: null client context");
             return;
         }
-
         warn!("Connection lost. Client: {:?}", context);
         let cli = unsafe { AsyncClient::from_raw(context) };
         {
             let mut cbctx = cli.inner.callback_context.lock().unwrap();
-
-            // Push a None into the message stream to cleanly
-            // shutdown any consumers.
             if let Some(ref mut cb) = cbctx.on_message_arrived {
                 trace!("Invoking message callback with None");
                 cb(&cli, None);
             }
-
             if let Some(ref mut cb) = cbctx.on_connection_lost {
                 trace!("Invoking connection lost callback");
                 cb(&cli);
@@ -299,7 +761,7 @@ impl AsyncClient {
         let _ = cli.into_raw();
     }
 
-    // Low-level callback from the C library for when a disconnect packet arrives.
+    // C callback: DISCONNECT packet arrived.
     unsafe extern "C" fn on_disconnected(
         context: *mut c_void,
         cprops: *mut ffi::MQTTProperties,
@@ -313,21 +775,15 @@ impl AsyncClient {
             "Disconnected with reason code: {}. Client: {:?}",
             reason, context
         );
-
         let cli = unsafe { AsyncClient::from_raw(context) };
         {
             let mut cbctx = cli.inner.callback_context.lock().unwrap();
-
-            // Push a None into the message stream to cleanly
-            // shutdown any consumers.
             if let Some(ref mut cb) = cbctx.on_message_arrived {
                 trace!("Invoking message callback with None");
                 cb(&cli, None);
             }
-
             if let Some(ref mut cb) = cbctx.on_disconnected {
                 let reason_code = ReasonCode::from(reason);
-                // TODO: Handle error?
                 let props = unsafe { Properties::from(&*cprops) };
                 trace!("Invoking disconnected callback");
                 cb(&cli, props, reason_code);
@@ -336,8 +792,7 @@ impl AsyncClient {
         let _ = cli.into_raw();
     }
 
-    // Low-level callback from the C library when a message arrives from the broker.
-    // We pass the call on to the handler registered with the client, if any.
+    // C callback: message arrived.
     unsafe extern "C" fn on_message_arrived(
         context: *mut c_void,
         topic: *mut c_char,
@@ -355,9 +810,7 @@ impl AsyncClient {
             topic_len,
             unsafe { *cmsg }
         );
-
         let cli = unsafe { AsyncClient::from_raw(context) };
-
         if let Some(ref mut cb) = cli
             .inner
             .callback_context
@@ -366,25 +819,19 @@ impl AsyncClient {
             .on_message_arrived
         {
             let len = match topic_len {
-                // Zero-len topic means it's a NUL-terminated C string
                 0 => unsafe { CStr::from_ptr(topic).to_bytes().len() },
                 len if len < 0 => 0,
                 _ => topic_len as usize,
             };
-
             let msg = Message::from_c_parts(topic, len, cmsg);
-
             trace!("Invoking message callback");
             cb(&cli, Some(msg));
         }
-
         let _ = cli.into_raw();
         1
     }
 
-    // Low-level callback from the C library for an SSL/TLS error.
-    // This should only be called if the connect SSL options have a handler
-    // for an error callback.
+    // C callback: SSL error.
     unsafe extern "C" fn on_ssl_error(
         err: *const c_char,
         len: usize,
@@ -398,7 +845,6 @@ impl AsyncClient {
             warn!("on_ssl_error: no error provided");
             return 0;
         }
-
         debug!("SSL Error for Client: {:?}", context);
         let cli = unsafe { AsyncClient::from_raw(context) };
         {
@@ -416,11 +862,9 @@ impl AsyncClient {
         0
     }
 
-    // Set the disconnection callbacks, usually to prepare for creating
-    // an input channel/stream of messages.
+    // Registers the C-library disconnection callbacks.
     fn set_disconnection_callbacks(&self) {
         let inner: &InnerAsyncClient = &self.inner;
-
         unsafe {
             ffi::MQTTAsync_setConnectionLostCallback(
                 inner.handle,
@@ -435,48 +879,6 @@ impl AsyncClient {
         }
     }
 
-    /// Gets the most recent MQTT version for the client.
-    ///
-    /// This is the version of the current connection, or the most recent
-    /// connection if currently disconnected. Before an initial connection
-    /// is made, this will report MQTT_VERSION_DEFAULT (0).
-    pub fn mqtt_version(&self) -> MqttVersion {
-        MqttVersion::from(self.mqtt_version_raw())
-    }
-
-    /// The raw, integer value of the MQTT version
-    pub fn mqtt_version_raw(&self) -> u32 {
-        self.inner.mqtt_version.load(Ordering::SeqCst)
-    }
-
-    /// Sets the current MQTT version.
-    /// This is set when a connection is requested or established.
-    pub(crate) fn set_mqtt_version<V>(&self, ver: V)
-    where
-        V: Into<MqttVersion>,
-    {
-        let ver = ver.into() as u32;
-        trace!("Updating client MQTT version: {}", ver);
-        self.inner.mqtt_version.store(ver, Ordering::SeqCst);
-    }
-
-    /// Get access to the user-defined data in the client.
-    ///
-    /// This returns a reference to a read/write lock around the user data so
-    /// that the application can access the data, as needed from any outside
-    /// thread or a callback.
-    ///
-    /// Note that it's up to the application to ensure that it doesn't
-    /// deadlock the callback thread when accessing the user data.
-    pub fn user_data(&self) -> Option<&UserData> {
-        self.inner.opts.user_data.as_ref()
-    }
-
-    /// Gets a copy of the options used in the last connection attempt.
-    pub fn connect_options(&self) -> ConnectOptions {
-        self.inner.conn_opts.read().unwrap().clone()
-    }
-
     /// Connects to an MQTT broker using the specified connect options.
     ///
     /// # Arguments
@@ -486,7 +888,7 @@ impl AsyncClient {
     ///
     pub fn connect<T>(&self, opts: T) -> ConnectToken
     where
-        T: Into<Option<ConnectOptions>>, // + std::convert::From<ConnectOptions>,
+        T: Into<Option<ConnectOptions>>,
     {
         let opts = opts.into().unwrap_or_default();
         debug!(
@@ -507,38 +909,24 @@ impl AsyncClient {
         }
 
         let tok = ConnectToken::from_request(self, ServerRequest::Connect, connect_convert);
-
         let mut ffi_opts = ConnectOptionsFfi::from(&opts);
         ffi_opts.set_token(tok.clone());
 
-        // Set the SSL error callback, if needed
         if let Some(ssl) = unsafe { ffi_opts.copts.ssl.as_mut() } {
-            // A pointer to the inner client will serve as the SSL error callback context
             let inner: &InnerAsyncClient = &self.inner;
             ssl.ssl_error_cb = Some(AsyncClient::on_ssl_error);
             ssl.ssl_error_context = inner as *const _ as *mut c_void;
         }
 
-        // Cache the connect options
         *self.inner.conn_opts.write().unwrap() = opts;
 
         let rc = unsafe { ffi::MQTTAsync_connect(self.inner.handle, &ffi_opts.copts) };
-
         if rc != 0 {
             mem::drop(unsafe { TokenInner::from_raw(ffi_opts.copts.context) });
             return ConnectToken::from_error(rc, connect_convert);
         }
 
         tok
-    }
-
-    /// Attempts to reconnect to the broker.
-    /// This can only be called after a connection was initially made or
-    /// attempted. It will retry with the same connect options.
-    ///
-    pub fn reconnect(&self) -> ConnectToken {
-        let connopts = self.inner.conn_opts.read().unwrap().clone();
-        self.connect(connopts)
     }
 
     /// Disconnects from the MQTT broker.
@@ -558,7 +946,6 @@ impl AsyncClient {
         trace!("Disconnect options: {:?}", opts);
 
         let mut ffi_opts = DisconnectOptionsFfi::from(&opts);
-
         let tok = Token::<()>::with_client(self, ServerRequest::Disconnect, unit_convert);
         ffi_opts.copts.context = tok.clone().into_raw();
 
@@ -572,14 +959,11 @@ impl AsyncClient {
         }
 
         let rc = unsafe { ffi::MQTTAsync_disconnect(self.inner.handle, &ffi_opts.copts) };
-
         if rc != 0 {
             mem::drop(unsafe { TokenInner::from_raw(ffi_opts.copts.context) });
             return Token::<()>::from_error(rc, unit_convert);
         }
 
-        // Push a None into the message stream to cleanly
-        // shutdown any consumers.
         if let Some(ref mut cb) = self
             .inner
             .callback_context
@@ -591,183 +975,6 @@ impl AsyncClient {
             cb(self, None);
         }
         tok
-    }
-
-    /// Disconnect from the MQTT broker with a timeout.
-    /// This will delay the disconnect for up to the specified timeout to
-    /// allow in-flight messages to complete.
-    /// This is the same as calling disconnect with options specifying a
-    /// timeout.
-    ///
-    /// # Arguments
-    ///
-    /// * `timeout` The amount of time to wait for the disconnect. This has
-    ///   a resolution in milliseconds.
-    ///
-    pub fn disconnect_after(&self, timeout: Duration) -> Token<()> {
-        self.disconnect(DisconnectOptions::with_timeout(timeout))
-    }
-
-    /// Determines if this client is currently connected to an MQTT broker.
-    pub fn is_connected(&self) -> bool {
-        unsafe { ffi::MQTTAsync_isConnected(self.inner.handle) != 0 }
-    }
-
-    /// Sets the callback for when the connection is established with the broker.
-    ///
-    /// # Arguments
-    ///
-    /// * `cb` The callback to register with the library. This can be a
-    ///   function or a closure.
-    pub fn set_connected_callback<F>(&self, cb: F)
-    where
-        F: FnMut(&AsyncClient) + Send + 'static,
-    {
-        // A pointer to the inner client will serve as the callback context
-        let inner: &InnerAsyncClient = &self.inner;
-
-        // This should be protected by a mutex if we'll have a thread-safe client
-        inner.callback_context.lock().unwrap().on_connected = Some(Box::new(cb));
-
-        unsafe {
-            ffi::MQTTAsync_setConnected(
-                inner.handle,
-                inner as *const _ as *mut c_void,
-                Some(AsyncClient::on_connected),
-            );
-        }
-    }
-
-    /// Removes the callback for when the connection is established
-    pub fn remove_connected_callback(&self) {
-        self.inner.callback_context.lock().unwrap().on_connected = None;
-
-        unsafe {
-            ffi::MQTTAsync_setConnected(self.inner.handle, ptr::null_mut(), None);
-        }
-    }
-
-    /// Sets the callback for when the connection is lost with the broker.
-    ///
-    /// # Arguments
-    ///
-    /// * `cb` The callback to register with the library. This can be a
-    ///   function or a closure.
-    pub fn set_connection_lost_callback<F>(&self, cb: F)
-    where
-        F: FnMut(&AsyncClient) + Send + 'static,
-    {
-        // A pointer to the inner client will serve as the callback context
-        let inner: &InnerAsyncClient = &self.inner;
-
-        inner.callback_context.lock().unwrap().on_connection_lost = Some(Box::new(cb));
-
-        unsafe {
-            ffi::MQTTAsync_setConnectionLostCallback(
-                inner.handle,
-                inner as *const _ as *mut c_void,
-                Some(AsyncClient::on_connection_lost),
-            );
-        }
-    }
-
-    /// Removes the callback for when the connection is lost
-    pub fn remove_connection_lost_callback(&self) {
-        self.inner
-            .callback_context
-            .lock()
-            .unwrap()
-            .on_connection_lost = None;
-
-        // TODO: We should only remove the C handler if we know that
-        // we're not consuming or streaming. For now, keeping it is a
-        // very minor performance hit.
-        /*
-        unsafe {
-            ffi::MQTTAsync_setConnectionLostCallback(
-                self.inner.handle,
-                ptr::null_mut(),
-                None
-            );
-        }
-        */
-    }
-
-    /// Sets the callback for when a disconnect message arrives from the broker.
-    ///
-    /// # Arguments
-    ///
-    /// * `cb` The callback to register with the library. This can be a
-    ///   function or a closure.
-    pub fn set_disconnected_callback<F>(&self, cb: F)
-    where
-        F: FnMut(&AsyncClient, Properties, ReasonCode) + Send + 'static,
-    {
-        // A pointer to the inner client will serve as the callback context
-        let inner: &InnerAsyncClient = &self.inner;
-
-        // This should be protected by a mutex if we'll have a thread-safe client
-        inner.callback_context.lock().unwrap().on_disconnected = Some(Box::new(cb));
-
-        unsafe {
-            ffi::MQTTAsync_setDisconnected(
-                inner.handle,
-                inner as *const _ as *mut c_void,
-                Some(AsyncClient::on_disconnected),
-            );
-        }
-    }
-
-    /// Removes the callback for when a disconnect message is received from the broker.
-    pub fn remove_disconnected_callback(&self) {
-        self.inner.callback_context.lock().unwrap().on_disconnected = None;
-
-        unsafe {
-            ffi::MQTTAsync_setDisconnected(self.inner.handle, ptr::null_mut(), None);
-        }
-    }
-
-    /// Sets the callback for when a message arrives from the broker.
-    ///
-    /// # Arguments
-    ///
-    /// * `cb` The callback to register with the library. This can be a
-    ///   function or a closure.
-    ///
-    pub fn set_message_callback<F>(&self, cb: F)
-    where
-        F: FnMut(&AsyncClient, Option<Message>) + Send + 'static,
-    {
-        // A pointer to the inner client will serve as the callback context
-        let inner: &InnerAsyncClient = &self.inner;
-
-        // This should be protected by a mutex if we'll have a thread-safe client
-        inner.callback_context.lock().unwrap().on_message_arrived = Some(Box::new(cb));
-
-        unsafe {
-            ffi::MQTTAsync_setMessageArrivedCallback(
-                self.inner.handle,
-                inner as *const _ as *mut c_void,
-                Some(AsyncClient::on_message_arrived),
-            );
-        }
-    }
-
-    /// Removes the callback for when a message arrives from the broker.
-    pub fn remove_message_callback(&self) {
-        self.inner
-            .callback_context
-            .lock()
-            .unwrap()
-            .on_message_arrived = None;
-
-        unsafe {
-            ffi::MQTTAsync_setMessageArrivedCallback(
-                self.inner.handle,
-                ptr::null_mut(),
-                None,
-            );
-        }
     }
 
     /// Attempts to publish a message to the MQTT broker, but returns an
@@ -833,7 +1040,6 @@ impl AsyncClient {
         let mut call_opts = CallOptionsFfi::new(ver, tok.inner());
         let topic = CString::new(topic.into()).unwrap();
         let qos = qos.into() as i32;
-
         debug!("Subscribe to '{:?}' @ QOS {}", topic, qos);
 
         let rc = unsafe {
@@ -849,11 +1055,10 @@ impl AsyncClient {
             mem::drop(unsafe { TokenInner::from_raw(call_opts.copts.context) });
             return SubscribeToken::from_error(rc, subscribe_convert);
         }
-
         tok
     }
 
-    /// Subscribes to a single topic with v5 options
+    /// Subscribes to a single topic with v5 options.
     ///
     /// # Arguments
     ///
@@ -879,7 +1084,6 @@ impl AsyncClient {
 
         let tok =
             SubscribeToken::from_request(None, ServerRequest::Subscribe, subscribe_convert);
-
         let mut call_opts = CallOptionsFfiBuilder::new()
             .token(tok.inner())
             .subscribe_options(opts.into())
@@ -888,7 +1092,6 @@ impl AsyncClient {
 
         let topic = CString::new(topic.into()).unwrap();
         let qos = qos.into() as i32;
-
         debug!("Subscribe to '{:?}' @ QOS {}", topic, qos);
 
         let rc = unsafe {
@@ -904,7 +1107,6 @@ impl AsyncClient {
             mem::drop(unsafe { TokenInner::from_raw(call_opts.copts.context) });
             return SubscribeToken::from_error(rc, subscribe_convert);
         }
-
         tok
     }
 
@@ -921,8 +1123,6 @@ impl AsyncClient {
         Q: Into<QoS> + Copy,
     {
         let n = topics.len();
-
-        // The length of the slices must match
         if n != qos.len() {
             return SubscribeManyToken::from_error(-1, subscribe_convert);
         }
@@ -936,7 +1136,6 @@ impl AsyncClient {
         let mut call_opts = CallOptionsFfi::new(ver, tok.inner());
         let topics = StringCollectionFfi::new(topics);
         let qos: Vec<i32> = qos.iter().map(|q| (*q).into() as i32).collect();
-
         debug!("Subscribe to '{:?}' @ QOS {:?}", topics, qos);
 
         let rc = unsafe {
@@ -953,12 +1152,10 @@ impl AsyncClient {
             mem::drop(unsafe { TokenInner::from_raw(call_opts.copts.context) });
             return SubscribeManyToken::from_error(rc, subscribe_convert);
         }
-
         tok
     }
 
-    /// Subscribes to multiple topics simultaneously using the same QoS
-    /// for all of them.
+    /// Subscribes to multiple topics simultaneously using the same QoS.
     ///
     /// # Arguments
     ///
@@ -997,7 +1194,6 @@ impl AsyncClient {
         debug_assert!(self.mqtt_version() >= MqttVersion::V5);
 
         let n = topics.len();
-        // TODO: Make sure topics & qos are same length (or use min)
         let tok = SubscribeManyToken::from_request(
             None,
             ServerRequest::SubscribeMany(n),
@@ -1011,7 +1207,6 @@ impl AsyncClient {
 
         let topics = StringCollectionFfi::new(topics);
         let qos: Vec<i32> = qos.iter().map(|q| (*q).into() as i32).collect();
-
         debug!(
             "Subscribe to '{:?}' @ QOS {:?} w/ opts: {:?}",
             topics, qos, opts
@@ -1032,7 +1227,6 @@ impl AsyncClient {
             mem::drop(unsafe { TokenInner::from_raw(call_opts.copts.context) });
             return SubscribeManyToken::from_error(rc, subscribe_convert);
         }
-
         tok
     }
 
@@ -1055,7 +1249,6 @@ impl AsyncClient {
         );
         let mut call_opts = CallOptionsFfi::new(ver, tok.inner());
         let topic = CString::new(topic.into()).unwrap();
-
         debug!("Unsubscribe from '{:?}'", topic);
 
         let rc = unsafe {
@@ -1070,16 +1263,14 @@ impl AsyncClient {
             mem::drop(unsafe { TokenInner::from_raw(call_opts.copts.context) });
             return UnsubscribeToken::from_error(rc, unsubscribe_convert);
         }
-
         tok
     }
 
-    /// Unsubscribes from a single topic.
+    /// Unsubscribes from a single topic with v5 options.
     ///
     /// # Arguments
     ///
-    /// * `topic` The topic to unsubscribe. It must match a topic from a
-    ///   previous subscribe.
+    /// * `topic` The topic to unsubscribe.
     /// * `props` MQTT v5 properties for the unsubscribe.
     ///
     pub fn unsubscribe_with_options<S>(
@@ -1103,7 +1294,6 @@ impl AsyncClient {
             .finalize();
 
         let topic = CString::new(topic.into()).unwrap();
-
         debug!("Unsubscribe from '{:?}'", topic);
 
         let rc = unsafe {
@@ -1118,7 +1308,6 @@ impl AsyncClient {
             mem::drop(unsafe { TokenInner::from_raw(call_opts.copts.context) });
             return UnsubscribeToken::from_error(rc, unsubscribe_convert);
         }
-
         tok
     }
 
@@ -1126,7 +1315,7 @@ impl AsyncClient {
     ///
     /// # Arguments
     ///
-    /// * `topic` The topics to unsubscribe. Each must match a topic from a
+    /// * `topics` The topics to unsubscribe. Each must match a topic from a
     ///   previous subscribe.
     ///
     pub fn unsubscribe_many<T>(&self, topics: &[T]) -> UnsubscribeManyToken
@@ -1134,7 +1323,6 @@ impl AsyncClient {
         T: AsRef<str>,
     {
         let ver = self.mqtt_version();
-
         let n = topics.len();
         let tok = UnsubscribeManyToken::from_request(
             None,
@@ -1143,7 +1331,6 @@ impl AsyncClient {
         );
         let mut call_opts = CallOptionsFfi::new(ver, tok.inner());
         let topics = StringCollectionFfi::new(topics);
-
         debug!("Unsubscribe from '{:?}'", topics);
 
         let rc = unsafe {
@@ -1159,16 +1346,14 @@ impl AsyncClient {
             mem::drop(unsafe { TokenInner::from_raw(call_opts.copts.context) });
             return UnsubscribeManyToken::from_error(rc, unsubscribe_convert);
         }
-
         tok
     }
 
-    /// Unsubscribes from multiple topics simultaneously.
+    /// Unsubscribes from multiple topics simultaneously with v5 options.
     ///
     /// # Arguments
     ///
-    /// * `topic` The topics to unsubscribe. Each must match a topic from a
-    ///   previous subscribe.
+    /// * `topics` The topics to unsubscribe.
     /// * `props` MQTT v5 properties for the unsubscribe.
     ///
     pub fn unsubscribe_many_with_options<T>(
@@ -1193,7 +1378,6 @@ impl AsyncClient {
             .finalize();
 
         let topics = StringCollectionFfi::new(topics);
-
         debug!("Unsubscribe from '{:?}'", topics);
 
         let rc = unsafe {
@@ -1209,29 +1393,222 @@ impl AsyncClient {
             mem::drop(unsafe { TokenInner::from_raw(call_opts.copts.context) });
             return UnsubscribeManyToken::from_error(rc, unsubscribe_convert);
         }
-
         tok
+    }
+
+    /// Determines if this client is currently connected to an MQTT broker.
+    pub fn is_connected(&self) -> bool {
+        unsafe { ffi::MQTTAsync_isConnected(self.inner.handle) != 0 }
+    }
+}
+
+/////////////////////////////////////////////////////////////////////////////
+// Common API — works for both runtime paths
+/////////////////////////////////////////////////////////////////////////////
+
+impl AsyncClient {
+    /// Gets the most recent MQTT version for the client.
+    pub fn mqtt_version(&self) -> MqttVersion {
+        MqttVersion::from(self.mqtt_version_raw())
+    }
+
+    /// The raw, integer value of the MQTT version.
+    pub fn mqtt_version_raw(&self) -> u32 {
+        self.inner.mqtt_version.load(Ordering::SeqCst)
+    }
+
+    /// Sets the current MQTT version.
+    pub(crate) fn set_mqtt_version<V>(&self, ver: V)
+    where
+        V: Into<MqttVersion>,
+    {
+        let ver = ver.into() as u32;
+        trace!("Updating client MQTT version: {}", ver);
+        self.inner.mqtt_version.store(ver, Ordering::SeqCst);
+    }
+
+    /// Get access to the user-defined data in the client.
+    pub fn user_data(&self) -> Option<&UserData> {
+        self.inner.opts.user_data.as_ref()
+    }
+
+    /// Gets a copy of the options used in the last connection attempt.
+    pub fn connect_options(&self) -> ConnectOptions {
+        self.inner.conn_opts.read().unwrap().clone()
+    }
+
+    /// Attempts to reconnect to the broker.
+    /// This can only be called after a connection was initially made or
+    /// attempted. It will retry with the same connect options.
+    pub fn reconnect(&self) -> ConnectToken {
+        let connopts = self.inner.conn_opts.read().unwrap().clone();
+        self.connect(connopts)
+    }
+
+    /// Disconnect from the MQTT broker with a timeout.
+    ///
+    /// This will delay the disconnect for up to the specified timeout to
+    /// allow in-flight messages to complete.
+    ///
+    /// # Arguments
+    ///
+    /// * `timeout` The amount of time to wait for the disconnect. This has
+    ///   a resolution in milliseconds.
+    ///
+    pub fn disconnect_after(&self, timeout: Duration) -> Token<()> {
+        self.disconnect(DisconnectOptions::with_timeout(timeout))
+    }
+
+    /// Sets the callback for when the connection is established with the broker.
+    ///
+    /// # Arguments
+    ///
+    /// * `cb` The callback to register with the library. This can be a
+    ///   function or a closure.
+    pub fn set_connected_callback<F>(&self, cb: F)
+    where
+        F: FnMut(&AsyncClient) + Send + 'static,
+    {
+        let inner: &InnerAsyncClient = &self.inner;
+        inner.callback_context.lock().unwrap().on_connected = Some(Box::new(cb));
+
+        #[cfg(not(feature = "tokio"))]
+        unsafe {
+            ffi::MQTTAsync_setConnected(
+                inner.handle,
+                inner as *const _ as *mut c_void,
+                Some(AsyncClient::on_connected),
+            );
+        }
+    }
+
+    /// Removes the callback for when the connection is established.
+    pub fn remove_connected_callback(&self) {
+        self.inner.callback_context.lock().unwrap().on_connected = None;
+
+        #[cfg(not(feature = "tokio"))]
+        unsafe {
+            ffi::MQTTAsync_setConnected(self.inner.handle, ptr::null_mut(), None);
+        }
+    }
+
+    /// Sets the callback for when the connection is lost with the broker.
+    ///
+    /// # Arguments
+    ///
+    /// * `cb` The callback to register with the library. This can be a
+    ///   function or a closure.
+    pub fn set_connection_lost_callback<F>(&self, cb: F)
+    where
+        F: FnMut(&AsyncClient) + Send + 'static,
+    {
+        let inner: &InnerAsyncClient = &self.inner;
+        inner.callback_context.lock().unwrap().on_connection_lost = Some(Box::new(cb));
+
+        #[cfg(not(feature = "tokio"))]
+        unsafe {
+            ffi::MQTTAsync_setConnectionLostCallback(
+                inner.handle,
+                inner as *const _ as *mut c_void,
+                Some(AsyncClient::on_connection_lost),
+            );
+        }
+    }
+
+    /// Removes the callback for when the connection is lost.
+    pub fn remove_connection_lost_callback(&self) {
+        self.inner
+            .callback_context
+            .lock()
+            .unwrap()
+            .on_connection_lost = None;
+    }
+
+    /// Sets the callback for when a disconnect message arrives from the broker.
+    ///
+    /// # Arguments
+    ///
+    /// * `cb` The callback to register with the library. This can be a
+    ///   function or a closure.
+    pub fn set_disconnected_callback<F>(&self, cb: F)
+    where
+        F: FnMut(&AsyncClient, Properties, ReasonCode) + Send + 'static,
+    {
+        let inner: &InnerAsyncClient = &self.inner;
+        inner.callback_context.lock().unwrap().on_disconnected = Some(Box::new(cb));
+
+        #[cfg(not(feature = "tokio"))]
+        unsafe {
+            ffi::MQTTAsync_setDisconnected(
+                inner.handle,
+                inner as *const _ as *mut c_void,
+                Some(AsyncClient::on_disconnected),
+            );
+        }
+    }
+
+    /// Removes the callback for when a disconnect message is received.
+    pub fn remove_disconnected_callback(&self) {
+        self.inner.callback_context.lock().unwrap().on_disconnected = None;
+
+        #[cfg(not(feature = "tokio"))]
+        unsafe {
+            ffi::MQTTAsync_setDisconnected(self.inner.handle, ptr::null_mut(), None);
+        }
+    }
+
+    /// Sets the callback for when a message arrives from the broker.
+    ///
+    /// # Arguments
+    ///
+    /// * `cb` The callback to register with the library. This can be a
+    ///   function or a closure.
+    ///
+    pub fn set_message_callback<F>(&self, cb: F)
+    where
+        F: FnMut(&AsyncClient, Option<Message>) + Send + 'static,
+    {
+        let inner: &InnerAsyncClient = &self.inner;
+        inner.callback_context.lock().unwrap().on_message_arrived = Some(Box::new(cb));
+
+        #[cfg(not(feature = "tokio"))]
+        unsafe {
+            ffi::MQTTAsync_setMessageArrivedCallback(
+                self.inner.handle,
+                inner as *const _ as *mut c_void,
+                Some(AsyncClient::on_message_arrived),
+            );
+        }
+    }
+
+    /// Removes the callback for when a message arrives from the broker.
+    pub fn remove_message_callback(&self) {
+        self.inner
+            .callback_context
+            .lock()
+            .unwrap()
+            .on_message_arrived = None;
+
+        #[cfg(not(feature = "tokio"))]
+        unsafe {
+            ffi::MQTTAsync_setMessageArrivedCallback(
+                self.inner.handle,
+                ptr::null_mut(),
+                None,
+            );
+        }
     }
 
     /// Starts the client consuming messages for a blocking (non-async) app.
     ///
-    /// This starts the client receiving messages and placing them into a
-    /// channel. It returns the receiving-end of the channel for the
-    /// application to get the messages.
-    ///
-    /// This should normally be called before the client is connected,
-    /// especially if the application is requesting a persistent session.
-    /// With a clean session, this should be called before subscribing to
-    /// ensure that messages are not lost.
+    /// Returns the receiving-end of the channel for the application to
+    /// get the messages.
     pub fn start_consuming(&self) -> SyncReceiver<Option<Message>> {
         let (tx, rx) = sync_channel::unbounded();
 
-        // Make sure at least the low-level connection_lost handler is in
-        // place to notify us when the connection is lost (sends a 'None' to
-        // the receiver).
+        #[cfg(not(feature = "tokio"))]
         self.set_disconnection_callbacks();
 
-        // Message callback just queues incoming messages.
         self.set_message_callback(move |_, optmsg| {
             log_channel_err(tx.try_send(optmsg));
         });
@@ -1244,20 +1621,12 @@ impl AsyncClient {
         self.remove_message_callback();
     }
 
-    /// Creates a futures stream for consuming events.
+    /// Creates a synchronous event stream.
     ///
-    /// This will install an internal callback to receive the incoming
-    /// events from the client, and return the receive side of the channel.
-    /// The stream will stay open for the life of the client.
+    /// Returns the receive end of a channel that receives [`Event`] values.
     ///
     /// The stream will rely on a bounded channel with the given buffer
-    /// capacity if 'buffer_sz' is 'Some' or will rely on an unbounded channel
-    /// if 'buffer_sz' is 'None'.
-    ///
-    /// It's a best practice to open the stream _before_ connecting to the
-    /// server. When using persistent (non-clean) sessions, messages could
-    /// arriving as soon as the connection is made - even before the
-    /// connect() call returns.
+    /// capacity if `buffer_lim` is `Some`, or an unbounded channel if `None`.
     pub fn start_consuming_events<L>(&mut self, buffer_lim: L) -> SyncReceiver<Event>
     where
         L: Into<Option<usize>>,
@@ -1300,22 +1669,10 @@ impl AsyncClient {
         rx
     }
 
-    /// Creates a futures stream for consuming messages.
-    ///
-    /// This will install an internal callback to receive the incoming
-    /// messages from the client, and return the receive side of the channel.
-    /// The stream will stay open for the life of the client. If the client
-    /// gets disconnected, it will insert `None` into the channel to signal
-    /// the app about the disconnect.
+    /// Creates an async message stream.
     ///
     /// The stream will rely on a bounded channel with the given buffer
-    /// capacity if 'buffer_sz' is 'Some' or will rely on an unbounded channel
-    /// if 'buffer_sz' is 'None'.
-    ///
-    /// It's a best practice to open the stream _before_ connecting to the
-    /// server. When using persistent (non-clean) sessions, messages could
-    /// arriving as soon as the connection is made - even before the
-    /// connect() call returns.
+    /// capacity if `buffer_lim` is `Some`, or an unbounded channel if `None`.
     pub fn get_stream<L>(&mut self, buffer_lim: L) -> AsyncReceiver<Option<Message>>
     where
         L: Into<Option<usize>>,
@@ -1325,9 +1682,7 @@ impl AsyncClient {
             None => async_channel::unbounded(),
         };
 
-        // Make sure at least the low-level connection-lost handlers are in
-        // place to notify us when the connection is lost (sends a 'None' to
-        // the receiver).
+        #[cfg(not(feature = "tokio"))]
         self.set_disconnection_callbacks();
 
         self.set_message_callback(move |_, msg| match tx.try_send(msg) {
@@ -1339,20 +1694,10 @@ impl AsyncClient {
         rx
     }
 
-    /// Creates a futures stream for consuming events.
-    ///
-    /// This will install an internal callback to receive the incoming
-    /// events from the client, and return the receive side of the channel.
-    /// The stream will stay open for the life of the client.
+    /// Creates an async event stream.
     ///
     /// The stream will rely on a bounded channel with the given buffer
-    /// capacity if 'buffer_sz' is 'Some' or will rely on an unbounded channel
-    /// if 'buffer_sz' is 'None'.
-    ///
-    /// It's a best practice to open the stream _before_ connecting to the
-    /// server. When using persistent (non-clean) sessions, messages could
-    /// arriving as soon as the connection is made - even before the
-    /// connect() call returns.
+    /// capacity if `buffer_lim` is `Some`, or an unbounded channel if `None`.
     pub fn get_event_stream<L>(&mut self, buffer_lim: L) -> AsyncReceiver<Event>
     where
         L: Into<Option<usize>>,
@@ -1400,18 +1745,12 @@ impl AsyncClient {
         self.remove_message_callback();
     }
 
-    /// Returns client ID used for client instance
-    ///
-    /// Client ID is returned as a rust String as set in a
-    /// CreateOptionsBuilder for symmetry
+    /// Returns the client ID used for the client instance.
     pub fn client_id(&self) -> &str {
         &self.inner.opts.client_id
     }
 
-    /// Returns server URI used for connection
-    ///
-    /// Server URI is returned as a rust String as set in a
-    /// CreateOptionsBuilder for symmetry
+    /// Returns the server URI used for connection.
     pub fn server_uri(&self) -> &str {
         &self.inner.opts.server_uri
     }
@@ -1422,9 +1761,8 @@ unsafe impl Send for AsyncClient {}
 unsafe impl Sync for AsyncClient {}
 
 impl Drop for InnerAsyncClient {
-    /// Drops the client by closing dpen all the underlying, dependent objects
     fn drop(&mut self) {
-        // Destroy the underlying C client.
+        #[cfg(not(feature = "tokio"))]
         if !self.handle.is_null() {
             unsafe {
                 ffi::MQTTAsync_destroy(&mut self.handle as *mut *mut c_void);
@@ -1449,6 +1787,47 @@ fn log_stream_err<T>(res: StdResult<(), async_channel::TrySendError<T>>) {
     }
 }
 
+/// Parses an MQTT URI into (host, port).
+///
+/// Recognises the schemes `mqtt://`, `mqtts://`, `tcp://`, `ssl://`, `tls://`,
+/// `ws://`, `wss://`.  If no explicit port is present the default for the
+/// scheme is used (8883 for secure, 1883 otherwise).
+#[cfg(feature = "tokio")]
+fn parse_server_uri(uri: &str) -> Result<(String, u16)> {
+    let (default_port, rest) = if let Some(s) = uri
+        .strip_prefix("mqtts://")
+        .or_else(|| uri.strip_prefix("ssl://"))
+        .or_else(|| uri.strip_prefix("tls://"))
+        .or_else(|| uri.strip_prefix("wss://"))
+    {
+        (8883u16, s)
+    }
+    else if let Some(s) = uri
+        .strip_prefix("mqtt://")
+        .or_else(|| uri.strip_prefix("tcp://"))
+        .or_else(|| uri.strip_prefix("ws://"))
+    {
+        (1883u16, s)
+    }
+    else {
+        (1883u16, uri)
+    };
+
+    // Strip a trailing path component (e.g. WebSocket paths)
+    let authority = rest.split('/').next().unwrap_or(rest);
+
+    if let Some(colon) = authority.rfind(':') {
+        let host = authority[..colon].to_string();
+        let port = authority[colon + 1..]
+            .parse::<u16>()
+            .map_err(|_| Error::General("invalid port in server URI"))?;
+        Ok((host, port))
+    }
+    else {
+        Ok((authority.to_string(), default_port))
+    }
+}
+
 /////////////////////////////////////////////////////////////////////////////
 //                              Unit Tests
 /////////////////////////////////////////////////////////////////////////////
@@ -1461,39 +1840,33 @@ mod tests {
     use std::sync::{Arc, Mutex, RwLock};
     use std::thread;
 
-    // Makes sure than when a client is moved, the inner struct stayes at
+    // Makes sure than when a client is moved, the inner struct stays at
     // the same address (on the heap) since that inner struct is used as
-    // the context pointer for callbacks
+    // the context pointer for callbacks.
     // GitHub Issue #17
     #[test]
     fn test_context() {
         let cli = AsyncClient::new("tcp://localhost:1883").unwrap();
         cli.set_message_callback(|_, _| {});
 
-        // Get a context pointer to the inner struct
         let pctx = {
             let ctx: &InnerAsyncClient = &cli.inner;
-            ctx as *const _ as *mut c_void
+            ctx as *const _ as usize
         };
 
-        // Move the client, then get a context pointer to inner
         let new_cli = cli;
         let new_pctx = {
             let ctx: &InnerAsyncClient = &new_cli.inner;
-            ctx as *const _ as *mut c_void
+            ctx as *const _ as usize
         };
 
-        // They should match (inner didn't move)
         assert_eq!(pctx, new_pctx);
     }
 
     #[test]
     fn test_create() {
         let cli = AsyncClient::new("tcp://localhost:1883");
-        assert!(
-            cli.is_ok(),
-            "Error in creating simple async client, do you have a running MQTT server on localhost:1883?"
-        );
+        assert!(cli.is_ok(), "Error creating async client");
     }
 
     #[test]
@@ -1571,7 +1944,6 @@ mod tests {
         let data = data.unwrap();
 
         let lock = data.downcast_ref::<RwLock<Vec<&str>>>().unwrap();
-        // Try reading
         {
             let v = lock.read().unwrap();
             assert_eq!(3, v.len());
@@ -1579,8 +1951,6 @@ mod tests {
             assert_eq!("one", v[1]);
             assert_eq!("two", v[2]);
         }
-
-        // Now try writing
         {
             let mut v = lock.write().unwrap();
             v.push("three");
@@ -1590,8 +1960,6 @@ mod tests {
     }
 
     // Determine that a client can be sent across threads.
-    // As long as it compiles, this indicates that AsyncClient implements
-    // the Send trait.
     #[test]
     fn test_send() {
         let cli = AsyncClient::new("tcp://localhost:1883").unwrap();
@@ -1602,10 +1970,6 @@ mod tests {
     }
 
     // Determine that a client can be shared across threads using an Arc.
-    // As long as it compiles, this indicates that AsyncClient implements the
-    // Send trait.
-    // This is a bit redundant with the previous test, but explicitly
-    // addresses GitHub Issue #31.
     #[test]
     fn test_send_arc() {
         let cli = AsyncClient::new("tcp://localhost:1883").unwrap();
@@ -1646,7 +2010,9 @@ mod tests {
         assert_eq!(retrieved, server_uri);
     }
 
-    // See: <https://github.com/eclipse-paho/paho.mqtt.rust/pull/257>
+    // Test publish before connect only applies to the C-library path where
+    // `send_while_disconnected` can queue outbound messages.
+    #[cfg(not(feature = "tokio"))]
     #[test]
     fn test_publish_before_connect() {
         let server_uri = "tcp://localhost:1883";
@@ -1665,5 +2031,34 @@ mod tests {
                 .finalize(),
         );
         assert!(res.is_ok(), "Failed to publish message before connecting");
+    }
+
+    #[cfg(feature = "tokio")]
+    #[test]
+    fn test_parse_server_uri() {
+        assert_eq!(
+            parse_server_uri("mqtt://localhost:1883").unwrap(),
+            ("localhost".to_string(), 1883)
+        );
+        assert_eq!(
+            parse_server_uri("tcp://broker.example.com:1883").unwrap(),
+            ("broker.example.com".to_string(), 1883)
+        );
+        assert_eq!(
+            parse_server_uri("mqtts://broker.example.com:8883").unwrap(),
+            ("broker.example.com".to_string(), 8883)
+        );
+        assert_eq!(
+            parse_server_uri("mqtt://localhost").unwrap(),
+            ("localhost".to_string(), 1883)
+        );
+        assert_eq!(
+            parse_server_uri("mqtts://secure.broker.io").unwrap(),
+            ("secure.broker.io".to_string(), 8883)
+        );
+        assert_eq!(
+            parse_server_uri("ws://localhost:8080/mqtt").unwrap(),
+            ("localhost".to_string(), 8080)
+        );
     }
 }

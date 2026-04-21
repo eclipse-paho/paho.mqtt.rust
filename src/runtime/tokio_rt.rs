@@ -159,6 +159,16 @@ impl RuntimeHandle {
     pub(crate) fn event_rx(&self) -> &async_channel::Receiver<Event> {
         &self.event_rx
     }
+
+    /// Consumes the handle, returning the underlying sender and receiver.
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        async_channel::Sender<Command>,
+        async_channel::Receiver<Event>,
+    ) {
+        (self.cmd_tx, self.event_rx)
+    }
 }
 
 /////////////////////////////////////////////////////////////////////////////
@@ -664,6 +674,7 @@ pub(crate) async fn run_event_loop(
             reason_code: connack.reason_code,
             properties: Default::default(),
         };
+        let _ = event_tx.send(Event::Connected(response.clone())).await;
         tx.complete(Ok(response));
 
         // ---- Run the session ----

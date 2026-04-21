@@ -134,6 +134,8 @@ pub(crate) enum Command {
 
 /// Events emitted by the internal event loop to the public layer.
 pub(crate) enum Event {
+    /// A connection to the broker was successfully established (CONNACK received).
+    Connected(crate::responses::ConnectResponse),
     /// The network connection was lost unexpectedly.
     ConnectionLost(crate::Error),
     /// An application message arrived from the broker.
