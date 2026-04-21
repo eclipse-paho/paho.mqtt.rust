@@ -27,6 +27,7 @@ serde = ["dep:serde"]
 [dependencies]
 paho-mqtt-sys = { version = "0.11", path = "paho-mqtt-sys", default-features=false }
 paho-mqtt-codec = { path = "paho-mqtt-codec" }
+bytes = "1"
 libc = "0.2"
 futures = "0.3"
 futures-timer = "3.0"
