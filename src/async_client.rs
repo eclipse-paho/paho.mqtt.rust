@@ -51,7 +51,7 @@ use crate::{
     SubscribeOptions, SubscribeToken, SyncReceiver, UnsubscribeManyToken, UnsubscribeToken,
     UserData,
     errors::{Error, Result},
-    runtime::{Command, RuntimeHandle},
+    runtime::{Command, RuntimeHandle, ServerAddr},
     token::Token,
     types::*,
 };
@@ -191,7 +191,8 @@ impl AsyncClient {
             opts.mqtt_version
         };
 
-        let (host, port) = match parse_server_uri(&self.inner.opts.server_uri) {
+        let server_uri = self.inner.opts.server_uri.clone();
+        let addr = match parse_server_uri(&server_uri) {
             Ok(v) => v,
             Err(e) => return ConnectToken::from(e),
         };
@@ -213,8 +214,8 @@ impl AsyncClient {
         *self.inner.conn_opts.write().unwrap() = opts.clone();
 
         let cmd = Command::Connect {
-            host,
-            port,
+            addr,
+            server_uri,
             client_id: self.inner.opts.client_id.clone(),
             clean_start: opts.clean_start,
             keep_alive_secs,
@@ -890,12 +891,26 @@ fn log_stream_err<T>(res: StdResult<(), async_channel::TrySendError<T>>) {
     }
 }
 
-/// Parses an MQTT URI into (host, port).
+/// Parses an MQTT URI into a [`ServerAddr`].
 ///
-/// Recognises the schemes `mqtt://`, `mqtts://`, `tcp://`, `ssl://`, `tls://`,
-/// `ws://`, `wss://`.  If no explicit port is present the default for the
-/// scheme is used (8883 for secure, 1883 otherwise).
-fn parse_server_uri(uri: &str) -> Result<(String, u16)> {
+/// Recognises:
+/// - `unix://` or `unix:` — Unix-domain socket path
+/// - `mqtt://`, `tcp://`, `ws://` — plain TCP (default port 1883)
+/// - `mqtts://`, `ssl://`, `tls://`, `wss://` — TLS TCP (default port 8883)
+///
+/// If no explicit port is present the default for the scheme is used.
+fn parse_server_uri(uri: &str) -> Result<ServerAddr> {
+    // Unix-domain socket: unix:///path/to/sock or unix:/path/to/sock
+    #[cfg(unix)]
+    if let Some(rest) = uri
+        .strip_prefix("unix://")
+        .or_else(|| uri.strip_prefix("unix:"))
+    {
+        return Ok(ServerAddr::Unix {
+            path: rest.to_string(),
+        });
+    }
+
     let (default_port, rest) = if let Some(s) = uri
         .strip_prefix("mqtts://")
         .or_else(|| uri.strip_prefix("ssl://"))
@@ -917,16 +932,18 @@ fn parse_server_uri(uri: &str) -> Result<(String, u16)> {
 
     let authority = rest.split('/').next().unwrap_or(rest);
 
-    if let Some(colon) = authority.rfind(':') {
+    let (host, port) = if let Some(colon) = authority.rfind(':') {
         let host = authority[..colon].to_string();
         let port = authority[colon + 1..]
             .parse::<u16>()
             .map_err(|_| Error::General("invalid port in server URI"))?;
-        Ok((host, port))
+        (host, port)
     }
     else {
-        Ok((authority.to_string(), default_port))
-    }
+        (authority.to_string(), default_port)
+    };
+
+    Ok(ServerAddr::Tcp { host, port })
 }
 
 /////////////////////////////////////////////////////////////////////////////
@@ -1113,29 +1130,39 @@ mod tests {
 
     #[test]
     fn test_parse_server_uri() {
-        assert_eq!(
+        assert!(matches!(
             parse_server_uri("mqtt://localhost:1883").unwrap(),
-            ("localhost".to_string(), 1883)
-        );
-        assert_eq!(
+            ServerAddr::Tcp { host, port } if host == "localhost" && port == 1883
+        ));
+        assert!(matches!(
             parse_server_uri("tcp://broker.example.com:1883").unwrap(),
-            ("broker.example.com".to_string(), 1883)
-        );
-        assert_eq!(
+            ServerAddr::Tcp { host, port } if host == "broker.example.com" && port == 1883
+        ));
+        assert!(matches!(
             parse_server_uri("mqtts://broker.example.com:8883").unwrap(),
-            ("broker.example.com".to_string(), 8883)
-        );
-        assert_eq!(
+            ServerAddr::Tcp { host, port } if host == "broker.example.com" && port == 8883
+        ));
+        assert!(matches!(
             parse_server_uri("mqtt://localhost").unwrap(),
-            ("localhost".to_string(), 1883)
-        );
-        assert_eq!(
+            ServerAddr::Tcp { host, port } if host == "localhost" && port == 1883
+        ));
+        assert!(matches!(
             parse_server_uri("mqtts://secure.broker.io").unwrap(),
-            ("secure.broker.io".to_string(), 8883)
-        );
-        assert_eq!(
+            ServerAddr::Tcp { host, port } if host == "secure.broker.io" && port == 8883
+        ));
+        assert!(matches!(
             parse_server_uri("ws://localhost:8080/mqtt").unwrap(),
-            ("localhost".to_string(), 8080)
-        );
+            ServerAddr::Tcp { host, port } if host == "localhost" && port == 8080
+        ));
+        #[cfg(unix)]
+        assert!(matches!(
+            parse_server_uri("unix:///tmp/mqtt.sock").unwrap(),
+            ServerAddr::Unix { path } if path == "/tmp/mqtt.sock"
+        ));
+        #[cfg(unix)]
+        assert!(matches!(
+            parse_server_uri("unix:/tmp/mqtt.sock").unwrap(),
+            ServerAddr::Unix { path } if path == "/tmp/mqtt.sock"
+        ));
     }
 }

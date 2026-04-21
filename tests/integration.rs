@@ -3,11 +3,14 @@
 // Integration tests for the Eclipse Paho MQTT Rust client library.
 //
 // Requires a Mosquitto broker running on localhost:1883 with anonymous access.
+// For Unix socket tests: broker must also listen on /tmp/mosquitto.sock.
 
 use paho_mqtt as mqtt;
 use std::time::Duration;
 
 const HOST: &str = "tcp://localhost:1883";
+#[cfg(unix)]
+const UNIX_HOST: &str = "unix:///tmp/mosquitto.sock";
 const TIMEOUT: Duration = Duration::from_secs(5);
 
 // Returns a unique topic string to avoid cross-test interference.
@@ -389,6 +392,55 @@ fn test_v5_publish_subscribe() {
         .expect("v5 recv timed out")
         .expect("connection lost");
     assert_eq!(msg.payload_str(), "v5-payload");
+
+    pub_cli.disconnect(None).wait().ok();
+    sub.disconnect(None).wait().ok();
+}
+
+/////////////////////////////////////////////////////////////////////////////
+// Unix socket
+/////////////////////////////////////////////////////////////////////////////
+
+#[cfg(unix)]
+#[test]
+fn test_connect_unix_socket() {
+    let cli = mqtt::AsyncClient::new(UNIX_HOST).unwrap();
+    let rsp = cli.connect(None).wait().expect("unix connect failed");
+    assert_eq!(rsp.mqtt_version, 4);
+    assert!(!rsp.session_present);
+    assert!(cli.is_connected());
+    cli.disconnect(None).wait().expect("unix disconnect failed");
+    assert!(!cli.is_connected());
+}
+
+#[cfg(unix)]
+#[test]
+fn test_publish_subscribe_unix_socket() {
+    let topic = topic!("unix/pub_sub");
+
+    let sub = mqtt::AsyncClient::new(UNIX_HOST).unwrap();
+    sub.connect(None).wait().expect("unix sub connect failed");
+    let rx = sub.start_consuming();
+    sub.subscribe(topic, mqtt::QOS_1)
+        .wait()
+        .expect("unix subscribe failed");
+
+    let pub_cli = mqtt::AsyncClient::new(UNIX_HOST).unwrap();
+    pub_cli
+        .connect(None)
+        .wait()
+        .expect("unix pub connect failed");
+    pub_cli
+        .publish(mqtt::Message::new(topic, "unix-payload", mqtt::QOS_1))
+        .wait()
+        .expect("unix publish failed");
+
+    let msg = rx
+        .recv_timeout(TIMEOUT)
+        .expect("unix recv timed out")
+        .expect("connection lost");
+    assert_eq!(msg.topic(), topic);
+    assert_eq!(msg.payload_str(), "unix-payload");
 
     pub_cli.disconnect(None).wait().ok();
     sub.disconnect(None).wait().ok();

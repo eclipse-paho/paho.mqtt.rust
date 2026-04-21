@@ -35,6 +35,25 @@ use crate::{
 
 /////////////////////////////////////////////////////////////////////////////
 
+/// The resolved transport address for a connection attempt.
+pub(crate) enum ServerAddr {
+    /// Plain TCP connection.
+    Tcp {
+        /// Broker hostname or IP address.
+        host: String,
+        /// Broker TCP port.
+        port: u16,
+    },
+    /// Unix-domain socket connection (Unix/Linux/macOS only).
+    #[cfg(unix)]
+    Unix {
+        /// Filesystem path to the socket.
+        path: String,
+    },
+}
+
+/////////////////////////////////////////////////////////////////////////////
+
 /// An inbound MQTT message using codec-native types.
 ///
 /// Delivered to the public layer via [`Event::MessageArrived`].
@@ -61,10 +80,10 @@ pub(crate) struct ReceivedMessage {
 pub(crate) enum Command {
     /// Establish an MQTT connection.
     Connect {
-        /// Broker hostname or IP address.
-        host: String,
-        /// Broker TCP port.
-        port: u16,
+        /// Resolved transport address.
+        addr: ServerAddr,
+        /// Original server URI string, carried into `ConnectResponse`.
+        server_uri: String,
         /// Client identifier.
         client_id: String,
         /// Whether to request a clean session / discard existing state.

@@ -41,13 +41,15 @@ use paho_mqtt_codec::{
     ConnAck, Disconnect, MqttVersion, PubAck, QoS, Subscribe, Subscription, Unsubscribe,
     packet::{Packet, RawPacket},
 };
+#[cfg(unix)]
+use tokio::net::UnixStream;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf, WriteHalf},
     net::TcpStream,
     time,
 };
 
-use super::commands::{Command, Event, ReceivedMessage};
+use super::commands::{Command, Event, ReceivedMessage, ServerAddr};
 use crate::{
     responses::{ConnectResponse, PublishResponse, SubscribeResponse, UnsubscribeResponse},
     token::Completer,
@@ -111,6 +113,59 @@ impl AsyncWrite for TcpConnection {
 }
 
 impl Connection for TcpConnection {}
+
+/////////////////////////////////////////////////////////////////////////////
+
+/// A Unix-domain socket transport backed by [`tokio::net::UnixStream`].
+#[cfg(unix)]
+pub(crate) struct UnixConnection {
+    stream: UnixStream,
+}
+
+#[cfg(unix)]
+impl UnixConnection {
+    /// Opens a Unix-domain socket connection to `path`.
+    pub(crate) async fn connect(path: &str) -> io::Result<Self> {
+        let stream = UnixStream::connect(path).await?;
+        Ok(Self { stream })
+    }
+}
+
+#[cfg(unix)]
+impl AsyncRead for UnixConnection {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.stream).poll_read(cx, buf)
+    }
+}
+
+#[cfg(unix)]
+impl AsyncWrite for UnixConnection {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.stream).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.stream).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.stream).poll_shutdown(cx)
+    }
+}
+
+#[cfg(unix)]
+impl Connection for UnixConnection {}
 
 /////////////////////////////////////////////////////////////////////////////
 
@@ -583,8 +638,8 @@ pub(crate) async fn run_event_loop(
         };
 
         let (
-            host,
-            port,
+            addr,
+            server_uri,
             client_id,
             clean_start,
             keep_alive_secs,
@@ -597,8 +652,8 @@ pub(crate) async fn run_event_loop(
             connected_flag,
         ) = match cmd {
             Command::Connect {
-                host,
-                port,
+                addr,
+                server_uri,
                 client_id,
                 clean_start,
                 keep_alive_secs,
@@ -610,8 +665,8 @@ pub(crate) async fn run_event_loop(
                 tx,
                 connected_flag,
             } => (
-                host,
-                port,
+                addr,
+                server_uri,
                 client_id,
                 clean_start,
                 keep_alive_secs,
@@ -626,13 +681,25 @@ pub(crate) async fn run_event_loop(
             _ => continue, // ignore non-Connect commands before connecting
         };
 
-        // ---- TCP connect ----
-        let conn = match TcpConnection::connect(&host, port).await {
-            Ok(c) => c,
-            Err(e) => {
-                tx.complete(Err(e.into()));
-                continue;
+        // ---- Transport connect ----
+        let conn: Box<dyn Connection> = match addr {
+            ServerAddr::Tcp { host, port } => {
+                match TcpConnection::connect(&host, port).await {
+                    Ok(c) => Box::new(c),
+                    Err(e) => {
+                        tx.complete(Err(e.into()));
+                        continue;
+                    }
+                }
             }
+            #[cfg(unix)]
+            ServerAddr::Unix { path } => match UnixConnection::connect(&path).await {
+                Ok(c) => Box::new(c),
+                Err(e) => {
+                    tx.complete(Err(e.into()));
+                    continue;
+                }
+            },
         };
 
         // ---- Build codec CONNECT packet ----
@@ -648,8 +715,7 @@ pub(crate) async fn run_event_loop(
         };
 
         // ---- Split and send CONNECT ----
-        let boxed: Box<dyn Connection> = Box::new(conn);
-        let (mut reader, mut writer) = tokio::io::split(boxed);
+        let (mut reader, mut writer) = tokio::io::split(conn);
 
         let mut buf = BytesMut::with_capacity(256);
         if let Err(e) =
@@ -683,7 +749,7 @@ pub(crate) async fn run_event_loop(
         };
 
         let response = ConnectResponse {
-            server_uri: format!("mqtt://{}:{}", host, port),
+            server_uri,
             mqtt_version,
             session_present: connack.session_present,
             reason_code: connack.reason_code,
