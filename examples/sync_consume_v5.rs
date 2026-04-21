@@ -88,7 +88,10 @@ fn try_reconnect(cli: &mqtt::Client) -> bool {
 
 // Create a set of properties with a single Subscription ID
 fn sub_id(id: u32) -> mqtt::Properties {
-    mqtt::properties![SubscriptionIdentifier(id)]
+    mqtt::properties![mqtt::Property::new(
+        mqtt::PropertyId::SubscriptionIdentifier,
+        mqtt::PropertyValue::VarInt(id)
+    )]
 }
 
 // --------------------------------------------------------------------------
@@ -127,7 +130,10 @@ fn main() -> mqtt::Result<()> {
     // (3600sec) if the service disconnects or restarts.
     let conn_opts = mqtt::ConnectOptionsBuilder::new_v5()
         .clean_start(false)
-        .properties(mqtt::properties![SessionExpiryInterval(3600)])
+        .properties(mqtt::properties![mqtt::Property::new(
+            mqtt::PropertyId::SessionExpiryInterval,
+            mqtt::PropertyValue::U32(3600)
+        )])
         .will_message(lwt)
         .finalize();
 
@@ -173,10 +179,13 @@ fn main() -> mqtt::Result<()> {
             // In a real app you'd want to do a lot more error checking and
             // recovery, but this should give an idea about the basics.
 
-            let sub_id = msg
+            let sub_id = match msg
                 .properties()
-                .get_uint(mqtt::PropertyCode::SubscriptionIdentifier)
-                .expect("No Subscription ID") as usize;
+                .get(mqtt::PropertyId::SubscriptionIdentifier)
+            {
+                Some(mqtt::PropertyValue::VarInt(n)) => *n as usize,
+                _ => panic!("No Subscription ID"),
+            };
 
             if !handler[sub_id - 1](msg) {
                 break;

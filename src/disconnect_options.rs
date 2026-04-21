@@ -130,7 +130,7 @@ impl DisconnectOptionsBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Property, PropertyCode, ReasonCode};
+    use crate::{Properties, Property, ReasonCode};
 
     #[test]
     fn test_reason_code() {
@@ -150,50 +150,38 @@ mod tests {
 
     #[test]
     fn test_properties() {
+        use crate::{PropertyId, PropertyValue};
+
         let opts = DisconnectOptions::new();
         assert!(opts.properties().is_empty());
-        assert_eq!(opts.properties().len(), 0);
 
         let opts = DisconnectOptionsBuilder::new().finalize();
         assert!(opts.properties().is_empty());
-        assert_eq!(opts.properties().len(), 0);
 
-        let props = Properties::from(
-            &[
-                Property::SessionExpiryInterval(1000),
-                Property::ReasonString("causeIwanna".into()),
-            ][..],
-        );
+        let mut props = Properties::new();
+        props.push(Property::new(
+            PropertyId::SessionExpiryInterval,
+            PropertyValue::U32(1000),
+        ));
+        props.push(Property::new(
+            PropertyId::ReasonString,
+            PropertyValue::String("causeIwanna".into()),
+        ));
 
         let opts = DisconnectOptionsBuilder::new().properties(props).finalize();
         let props = opts.properties();
 
         assert!(!props.is_empty());
-        assert_eq!(props.len(), 2);
 
         assert_eq!(
-            props.get_uint(PropertyCode::SessionExpiryInterval),
-            Some(1000)
+            props.get(PropertyId::SessionExpiryInterval),
+            Some(&PropertyValue::U32(1000))
         );
         assert_eq!(
-            props.get_string(PropertyCode::ReasonString),
-            Some("causeIwanna")
+            props.get(PropertyId::ReasonString),
+            Some(&PropertyValue::String("causeIwanna".into()))
         );
 
-        assert_eq!(props.get_uint(PropertyCode::ContentType), None);
-
-        /*
-        let props = Properties::from_c_struct(&copts.properties);
-        assert_eq!(props.len(), 2);
-
-        assert_eq!(
-            props.get_int(PropertyCode::SessionExpiryInterval),
-            Some(1000)
-        );
-        assert_eq!(
-            props.get_val::<String>(PropertyCode::ReasonString),
-            Some("causeIwanna".to_string())
-        );
-        */
+        assert_eq!(props.get(PropertyId::ContentType), None);
     }
 }

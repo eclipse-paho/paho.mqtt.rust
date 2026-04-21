@@ -38,9 +38,9 @@ macro_rules! properties {
     );
     ($($x:expr),+ $(,)?) => {
         {
-            #[allow(unused_imports)]
-            use $crate::Property::{self, *};
-            $crate::Properties::from(vec![$($x),+])
+            let mut _props = $crate::Properties::new();
+            $(_props.push($x);)+
+            _props
         }
     };
 }

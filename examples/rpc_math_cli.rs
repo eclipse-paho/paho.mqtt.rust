@@ -87,13 +87,16 @@ fn main() -> mqtt::Result<()> {
     // response. The Client ID will help form a unique "reply to" topic
     // for us.
 
-    let client_id = rsp
+    let client_id = match rsp
         .properties
-        .get_string(mqtt::PropertyCode::AssignedClientIdentifier)
-        .unwrap_or_else(|| {
+        .get(mqtt::PropertyId::AssignedClientIdentifier)
+    {
+        Some(mqtt::PropertyValue::String(s)) => s.clone(),
+        _ => {
             eprintln!("Unable to retrieve Client ID");
             process::exit(1);
-        });
+        }
+    };
 
     // We form a unique reply topic based on the Client ID,
     // and then subscribe to that topic.
@@ -104,8 +107,14 @@ fn main() -> mqtt::Result<()> {
     let corr_id = b"1";
 
     let props = mqtt::properties![
-        ResponseTopic(reply_topic),
-        CorrelationData(corr_id.to_vec()),
+        mqtt::Property::new(
+            mqtt::PropertyId::ResponseTopic,
+            mqtt::PropertyValue::String(reply_topic.clone())
+        ),
+        mqtt::Property::new(
+            mqtt::PropertyId::CorrelationData,
+            mqtt::PropertyValue::Binary(corr_id.to_vec().into())
+        ),
     ];
 
     // The request topic will be of the form:
@@ -145,12 +154,12 @@ fn main() -> mqtt::Result<()> {
     // Since we only sent one request, this should certainly be our reply!
 
     if let Some(msg) = rx.recv().unwrap() {
-        let reply_corr_id = msg
-            .properties()
-            .get_binary(mqtt::PropertyCode::CorrelationData)
-            .unwrap();
+        let reply_corr_id = match msg.properties().get(mqtt::PropertyId::CorrelationData) {
+            Some(mqtt::PropertyValue::Binary(b)) => b.clone(),
+            _ => bytes::Bytes::new(),
+        };
 
-        if reply_corr_id == corr_id {
+        if reply_corr_id.as_ref() == corr_id.as_ref() {
             let ret: f64 = serde_json::from_str(&msg.payload_str()).unwrap();
             println!("{}", ret);
         }

@@ -115,15 +115,15 @@ fn try_reconnect(cli: &mqtt::AsyncClient, opts: mqtt::ConnectOptions) -> bool {
 fn handle_request(cli: &mqtt::AsyncClient, msg: mqtt::Message) -> mqtt::Result<()> {
     // We need both a response topic and correlation data to respond.
 
-    let reply_to = msg
-        .properties()
-        .get_string(mqtt::PropertyCode::ResponseTopic)
-        .ok_or_else(|| mqtt::Error::from("No response topic provided."))?;
+    let reply_to = match msg.properties().get(mqtt::PropertyId::ResponseTopic) {
+        Some(mqtt::PropertyValue::String(s)) => s.clone(),
+        _ => return Err("No response topic provided.".into()),
+    };
 
-    let corr_id = msg
-        .properties()
-        .get_binary(mqtt::PropertyCode::CorrelationData)
-        .ok_or_else(|| mqtt::Error::from("No correlation data provided."))?;
+    let corr_id = match msg.properties().get(mqtt::PropertyId::CorrelationData) {
+        Some(mqtt::PropertyValue::Binary(b)) => b.clone(),
+        _ => return Err("No correlation data provided.".into()),
+    };
 
     println!(
         "\nRequest w/ Reply To: {}, Correlation ID: {:?}",
@@ -153,7 +153,10 @@ fn handle_request(cli: &mqtt::AsyncClient, msg: mqtt::Message) -> mqtt::Result<(
 
         // Form a reply message, using the correlation ID
 
-        let props = mqtt::properties![CorrelationData(corr_id.into())];
+        let props = mqtt::properties![mqtt::Property::new(
+            mqtt::PropertyId::CorrelationData,
+            mqtt::PropertyValue::Binary(corr_id)
+        )];
 
         // Create the reply message and publish it on the response topic
 
@@ -206,7 +209,10 @@ fn main() -> mqtt::Result<()> {
     // session of 60 sec. But we set a clean start
     let mut conn_opts = mqtt::ConnectOptionsBuilder::new_v5()
         .clean_start(true)
-        .properties(mqtt::properties![SessionExpiryInterval(60)])
+        .properties(mqtt::properties![mqtt::Property::new(
+            mqtt::PropertyId::SessionExpiryInterval,
+            mqtt::PropertyValue::U32(60)
+        )])
         .finalize();
 
     // Connect and wait for it to complete or fail

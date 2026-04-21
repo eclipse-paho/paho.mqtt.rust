@@ -69,15 +69,15 @@ fn main() -> mqtt::Result<()> {
         process::exit(1);
     });
 
-    match rsp
-        .properties
-        .get_u16(mqtt::PropertyCode::TopicAliasMaximum)
-    {
-        None | Some(0) => {
+    match rsp.properties.get(mqtt::PropertyId::TopicAliasMaximum) {
+        None | Some(mqtt::PropertyValue::U16(0)) => {
             eprintln!("The server doesn't support Topic Aliases.");
             process::exit(2);
         }
-        Some(n) => println!("The server supports up to {} aliases.", n),
+        Some(mqtt::PropertyValue::U16(n)) => {
+            println!("The server supports up to {} aliases.", n)
+        }
+        _ => {}
     }
 
     // Create a topic and publish to it

@@ -22,16 +22,9 @@
 
 use crate::{
     AsyncClient, Client, ClientPersistence, MqttVersion, PersistenceType, Result, UserData,
-    UserPersistence, ffi,
+    UserPersistence,
 };
-use std::{cmp, os::raw::c_int};
-
-/*
-    Remember the C constants (c_uint)
-        MQTTCLIENT_PERSISTENCE_DEFAULT = 0
-        MQTTCLIENT_PERSISTENCE_NONE    = 1
-        MQTTCLIENT_PERSISTENCE_USER    = 2
-*/
+use std::cmp;
 
 /////////////////////////////////////////////////////////////////////////////
 //                            Create Options
@@ -92,28 +85,6 @@ impl CreateOptions {
             server_uri: server_uri.into(),
             client_id: client_id.into(),
             ..Self::default()
-        }
-    }
-
-    /// Creates the FFI create struct to send to the C library.
-    /// Note that despite the String's in the options, those are sent to the
-    /// C lib through a separate path, and the C struct only has POD types.
-    /// So we don't need a separate FFI data struct to cache values.
-    /// This is sufficuent.
-    ///
-    /// We also always tell the C lib that we want to support the v5 protocol.
-    /// The lib will then create a persistence store that supports either v3x
-    /// or v5. So it's universal.
-    pub(crate) fn c_struct(&self) -> ffi::MQTTAsync_createOptions {
-        ffi::MQTTAsync_createOptions {
-            sendWhileDisconnected: self.send_while_disconnected as c_int,
-            maxBufferedMessages: self.max_buffered_msgs as c_int,
-            MQTTVersion: MqttVersion::V5 as i32,
-            allowDisconnectedSendAtAnyTime: self.allow_send_any_time as c_int,
-            deleteOldestMessages: self.delete_oldest as c_int,
-            restoreMessages: self.restore_msgs as c_int,
-            persistQoS0: self.persist_qos0 as c_int,
-            ..ffi::MQTTAsync_createOptions::default()
         }
     }
 }
@@ -385,114 +356,33 @@ impl CreateOptionsBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::raw::c_char;
 
-    // The identifier for the create options structure
-    const STRUCT_ID: [c_char; 4] = [
-        b'M' as c_char,
-        b'Q' as c_char,
-        b'C' as c_char,
-        b'O' as c_char,
-    ];
-
-    // The currently supported create struct version
-    const STRUCT_VERSION: i32 = ffi::CREATE_OPTIONS_STRUCT_VERSION;
-
-    // Rust options should be the same as the C options
     #[test]
     fn test_default() {
         let opts = CreateOptions::default();
-        let copts = opts.c_struct();
-
-        // Get default C options for comparison
-        let dflt_copts = ffi::MQTTAsync_createOptions::default();
-
-        // First, make sure C options valid
-        assert_eq!(STRUCT_ID, dflt_copts.struct_id);
-        assert_eq!(STRUCT_VERSION, dflt_copts.struct_version);
-
-        assert_eq!(dflt_copts.struct_id, copts.struct_id);
-        assert_eq!(dflt_copts.struct_version, copts.struct_version);
-        assert_eq!(
-            dflt_copts.sendWhileDisconnected,
-            copts.sendWhileDisconnected
-        );
-        assert_eq!(dflt_copts.maxBufferedMessages, copts.maxBufferedMessages);
-
-        // TODO: memcmp strings in copts throughout
         assert_eq!("", &opts.server_uri);
         assert_eq!("", &opts.client_id);
-
-        if !matches!(opts.persistence, PersistenceType::None) {
-            unreachable!();
-        }
+        assert!(!opts.send_while_disconnected);
+        assert_eq!(100, opts.max_buffered_msgs);
+        assert!(matches!(opts.persistence, PersistenceType::None));
     }
 
     #[test]
     fn test_from_string() {
         const HOST: &str = "localhost";
-
         let opts = CreateOptions::from(HOST);
-        let copts = opts.c_struct();
-
-        let dflt_copts = ffi::MQTTAsync_createOptions::default();
-
-        assert_eq!(STRUCT_ID, copts.struct_id);
-        assert_eq!(STRUCT_VERSION, copts.struct_version);
-        assert_eq!(
-            dflt_copts.sendWhileDisconnected,
-            copts.sendWhileDisconnected
-        );
-        assert_eq!(dflt_copts.maxBufferedMessages, copts.maxBufferedMessages);
-
         assert_eq!(HOST, &opts.server_uri);
         assert_eq!("", &opts.client_id);
-        //assert_eq!(PersistenceType::File, opts.persistence);
     }
 
     #[test]
     fn test_from_tuple() {
         const HOST: &str = "localhost";
         const ID: &str = "bubba";
-
         let opts = CreateOptions::from((HOST, ID));
-        let copts = opts.c_struct();
-
-        let dflt_copts = ffi::MQTTAsync_createOptions::default();
-
-        assert_eq!(STRUCT_ID, copts.struct_id);
-        assert_eq!(STRUCT_VERSION, copts.struct_version);
-        assert_eq!(
-            dflt_copts.sendWhileDisconnected,
-            copts.sendWhileDisconnected
-        );
-        assert_eq!(dflt_copts.maxBufferedMessages, copts.maxBufferedMessages);
-
         assert_eq!(HOST, &opts.server_uri);
         assert_eq!(ID, &opts.client_id);
         assert!(matches!(opts.persistence, PersistenceType::File));
-    }
-
-    #[test]
-    fn test_default_builder() {
-        let opts = CreateOptionsBuilder::new().finalize();
-        let copts = opts.c_struct();
-
-        let dflt_copts = ffi::MQTTAsync_createOptions::default();
-
-        // First, make sure C options valid
-        assert_eq!(STRUCT_ID, copts.struct_id);
-        assert_eq!(STRUCT_VERSION, copts.struct_version);
-
-        assert_eq!(
-            dflt_copts.sendWhileDisconnected,
-            copts.sendWhileDisconnected
-        );
-        assert_eq!(dflt_copts.maxBufferedMessages, copts.maxBufferedMessages);
-
-        assert_eq!("", &opts.server_uri);
-        assert_eq!("", &opts.client_id);
-        //assert_eq!(PersistenceType::File, opts.persistence);
     }
 
     #[test]
@@ -501,22 +391,16 @@ mod tests {
         const ID: &str = "bubba";
         const MAX_BUF_MSGS: usize = 250;
 
-        // TODO: Test persistence
-
         let opts = CreateOptionsBuilder::new()
             .server_uri(HOST)
             .client_id(ID)
             .max_buffered_messages(MAX_BUF_MSGS)
             .finalize();
-        let copts = opts.c_struct();
-
-        assert_eq!(STRUCT_ID, copts.struct_id);
-        assert_eq!(STRUCT_VERSION, copts.struct_version);
 
         assert_eq!(HOST, &opts.server_uri);
         assert_eq!(ID, &opts.client_id);
-        assert_eq!(0, copts.sendWhileDisconnected);
-        assert_eq!(MAX_BUF_MSGS as i32, copts.maxBufferedMessages);
+        assert!(!opts.send_while_disconnected);
+        assert_eq!(MAX_BUF_MSGS, opts.max_buffered_msgs);
 
         let opts = CreateOptionsBuilder::new()
             .server_uri(HOST)
@@ -524,14 +408,10 @@ mod tests {
             .send_while_disconnected(true)
             .max_buffered_messages(MAX_BUF_MSGS)
             .finalize();
-        let copts = opts.c_struct();
-
-        assert_eq!(STRUCT_ID, copts.struct_id);
-        assert_eq!(STRUCT_VERSION, copts.struct_version);
 
         assert_eq!(HOST, &opts.server_uri);
         assert_eq!(ID, &opts.client_id);
-        assert!(0 != copts.sendWhileDisconnected);
-        assert_eq!(MAX_BUF_MSGS as i32, copts.maxBufferedMessages);
+        assert!(opts.send_while_disconnected);
+        assert_eq!(MAX_BUF_MSGS, opts.max_buffered_msgs);
     }
 }

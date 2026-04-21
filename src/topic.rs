@@ -23,8 +23,9 @@
 //!
 
 use crate::{
-    AsyncClient, Client, DeliveryToken, Error, Message, MessageBuilder, Properties, QoS,
-    Result, SubscribeOptions, SubscribeResponse, token::SubscribeToken,
+    AsyncClient, Client, DeliveryToken, Error, Message, MessageBuilder, Properties,
+    Property, PropertyId, PropertyValue, QoS, Result, SubscribeOptions, SubscribeResponse,
+    token::SubscribeToken,
 };
 use std::fmt;
 
@@ -118,7 +119,12 @@ impl<'a> Topic<'a> {
         }
 
         if self.alias != 0 {
-            bld = bld.properties(properties! { TopicAlias(self.alias) });
+            let mut props = Properties::new();
+            props.push(Property::new(
+                PropertyId::TopicAlias,
+                PropertyValue::U16(self.alias),
+            ));
+            bld = bld.properties(props);
         }
 
         bld.finalize()

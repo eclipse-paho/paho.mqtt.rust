@@ -23,10 +23,7 @@
 //! Each async operation returns a [`Token<T>`](crate::Token) where `T` is one of
 //! the response types defined here.
 
-use crate::{
-    Properties, ReasonCode, Result,
-    server_response::{RequestResponse, ServerResponse},
-};
+use crate::{Properties, ReasonCode};
 
 /// Response data from a CONNECT → CONNACK exchange.
 #[derive(Clone, Default, Debug)]
@@ -74,61 +71,4 @@ pub struct UnsubscribeResponse {
     pub reason_codes: Vec<ReasonCode>,
     /// MQTT v5 properties from the UNSUBACK. Empty on v3.1.1.
     pub properties: Properties,
-}
-
-// ---- convert functions -------------------------------------------------------
-
-/// Converts a raw [`ServerResponse`] to a typed [`ConnectResponse`].
-pub(crate) fn connect_convert(rsp: ServerResponse) -> Result<ConnectResponse> {
-    let data = rsp.connect_data().unwrap_or_default();
-    Ok(ConnectResponse {
-        server_uri: data.server_uri,
-        mqtt_version: data.mqtt_version,
-        session_present: data.session_present,
-        reason_code: rsp.reason_code(),
-        properties: rsp.properties().clone(),
-    })
-}
-
-/// Converts a raw [`ServerResponse`] to a typed [`PublishResponse`].
-pub(crate) fn publish_convert(rsp: ServerResponse) -> Result<PublishResponse> {
-    Ok(PublishResponse {
-        reason_code: rsp.reason_code(),
-        properties: rsp.properties().clone(),
-    })
-}
-
-/// Converts a raw [`ServerResponse`] to a typed [`SubscribeResponse`].
-pub(crate) fn subscribe_convert(rsp: ServerResponse) -> Result<SubscribeResponse> {
-    let reason_codes = match rsp.request_response() {
-        RequestResponse::Subscribe(qos) => vec![ReasonCode::from(*qos as u8)],
-        RequestResponse::SubscribeMany(qosv) => {
-            qosv.iter().map(|&q| ReasonCode::from(q as u8)).collect()
-        }
-        _ => vec![rsp.reason_code()],
-    };
-    Ok(SubscribeResponse {
-        reason_codes,
-        properties: rsp.properties().clone(),
-    })
-}
-
-/// Converts a raw [`ServerResponse`] to a typed [`UnsubscribeResponse`].
-pub(crate) fn unsubscribe_convert(rsp: ServerResponse) -> Result<UnsubscribeResponse> {
-    let reason_codes = match rsp.request_response() {
-        RequestResponse::Unsubscribe(qos) => vec![ReasonCode::from(*qos as u8)],
-        RequestResponse::UnsubscribeMany(qosv) => {
-            qosv.iter().map(|&q| ReasonCode::from(q as u8)).collect()
-        }
-        _ => vec![],
-    };
-    Ok(UnsubscribeResponse {
-        reason_codes,
-        properties: rsp.properties().clone(),
-    })
-}
-
-/// Discards the response value for operations that return `Token<()>`.
-pub(crate) fn unit_convert(_rsp: ServerResponse) -> Result<()> {
-    Ok(())
 }

@@ -1,5 +1,5 @@
 [workspace]
-members = ["paho-mqtt-sys", "paho-mqtt-codec"]
+members = ["paho-mqtt-codec"]
 resolver = "2"
 
 [package]
@@ -17,18 +17,12 @@ The Eclipse Paho MQTT Rust client library.
 """
 
 [features]
-default = ["bundled", "ssl"]
-bundled = ["paho-mqtt-sys/bundled"]
-build_bindgen = ["paho-mqtt-sys/build_bindgen"]
-ssl = ["paho-mqtt-sys/ssl"]
-vendored-ssl = ["paho-mqtt-sys/vendored-ssl"]
+default = ["tokio"]
 serde = ["dep:serde"]
 
 [dependencies]
-paho-mqtt-sys = { version = "0.11", path = "paho-mqtt-sys", default-features=false }
 paho-mqtt-codec = { path = "paho-mqtt-codec" }
 bytes = "1"
-libc = "0.2"
 futures = "0.3"
 futures-timer = "3.0"
 async-channel = "2.5"
@@ -42,16 +36,11 @@ serde = { version = "1.0", features = ["derive"], optional = true }
 env_logger = "0.11"
 toml = "0.9"
 serde = "1.0"
-#serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 lazy_static = "1.4"
 futures-util = "0.3"
 ctrlc = "3.2"
 smol = "2.0"
-
-[[example]]
-name = "ssl_publish"
-required-features = ["ssl"]
 
 [[example]]
 name = "tokio_event_subscribe_v5"
@@ -60,4 +49,3 @@ required-features = ["tokio"]
 [[example]]
 name = "tokio_publish"
 required-features = ["tokio"]
-

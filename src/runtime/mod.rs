@@ -34,7 +34,7 @@ pub(crate) mod commands;
 pub(crate) mod tokio_rt;
 
 #[cfg(feature = "tokio")]
-pub(crate) use commands::{Command, Event, ReceivedMessage};
+pub(crate) use commands::{Command, Event};
 
 #[cfg(feature = "tokio")]
-pub(crate) use tokio_rt::{Connection, RuntimeHandle, TcpConnection};
+pub(crate) use tokio_rt::RuntimeHandle;

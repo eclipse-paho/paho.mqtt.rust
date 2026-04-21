@@ -4,7 +4,7 @@
 //
 
 /*******************************************************************************
- * Copyright (c) 2017-2025 Frank Pagliughi <fpagliughi@mindspring.com>
+ * Copyright (c) 2017-2026 Frank Pagliughi <fpagliughi@mindspring.com>
  *
  * All rights reserved. This program and the accompanying materials
  * are made available under the terms of the Eclipse Public License v2.0
@@ -19,13 +19,9 @@
  *    Frank Pagliughi - initial implementation and documentation
  *******************************************************************************/
 
-use std::{
-    borrow::Cow,
-    ffi::{c_char, c_void},
-    fmt, slice,
-};
+use std::{borrow::Cow, fmt};
 
-use crate::{QoS, ffi, properties::Properties};
+use crate::{QoS, properties::Properties};
 
 /// An "outbound" MQTT message.
 ///
@@ -94,128 +90,13 @@ impl OutMessage {
     }
 }
 
-// --------------------------------------------------------------------------
-
-/// An "inbound" MQTT message.
-///
-/// This is a message received from the remote broker. Internally, it's kept
-/// in the received format to prevent unnecessary copying of the topic or
-/// payload.
-#[derive(Debug)]
-pub struct InMessage {
-    /// Pointer to the message topic from the C lib.
-    /// The underlying library promises that this is UTF-8
-    topic_ptr: *const c_char,
-    /// The topic as a slice
-    topic: &'static str,
-    /// The C message structure
-    cmsg: &'static ffi::MQTTAsync_message,
-    /// The payload as a slice
-    payload: &'static [u8],
-    /// The properties in Rust format
-    props: Properties,
-}
-
-impl InMessage {
-    //// Creates a new inbound message from the C parts.
-    pub(crate) fn new(
-        topic_ptr: *const c_char,
-        topic_len: usize,
-        cmsg: *const ffi::MQTTAsync_message,
-    ) -> Self {
-        // TODO: Handle UTF-8 error(s) in the topic?
-        unsafe {
-            let topic = std::str::from_utf8_unchecked(slice::from_raw_parts(
-                topic_ptr as *const _ as *const u8,
-                topic_len,
-            ));
-
-            let cmsg = cmsg.as_ref().unwrap();
-
-            let payload =
-                slice::from_raw_parts(cmsg.payload as *const u8, cmsg.payloadlen as usize);
-
-            let props = (&cmsg.properties).into();
-
-            Self {
-                topic_ptr,
-                topic,
-                cmsg,
-                payload,
-                props,
-            }
-        }
-    }
-
-    /// Gets the message topic.
-    pub fn topic(&self) -> &str {
-        self.topic
-    }
-
-    /// Gets the message payload
-    pub fn payload(&self) -> &[u8] {
-        self.payload
-    }
-
-    /// Gets the payload of the message as a string.
-    ///
-    /// This utilizes the "lossy" style of conversion from the std library.
-    /// If the contents of the CStr are valid UTF-8 data, this function will
-    /// return a `Cow::Borrowed(&str)` with the the corresponding `&str` slice.
-    /// Otherwise, it will replace any invalid UTF-8 sequences with U+FFFD
-    /// REPLACEMENT CHARACTER and return a `Cow::Owned(String)` with the result.
-    pub fn payload_str(&self) -> Cow<'_, str> {
-        String::from_utf8_lossy(self.payload)
-    }
-
-    /// Gets the QoS of the message.
-    pub fn qos(&self) -> QoS {
-        self.cmsg.qos.into()
-    }
-
-    /// Gets the retain flag of the message
-    pub fn retain(&self) -> bool {
-        crate::from_c_bool(self.cmsg.retained)
-    }
-
-    /// Gets the properties in the message
-    pub fn properties(&self) -> &Properties {
-        &self.props
-    }
-
-    /// Gets the message identifier.
-    pub fn msgid(&self) -> Option<u16> {
-        let msgid = self.cmsg.msgid as u16;
-        (msgid != 0).then_some(msgid)
-    }
-}
-
-unsafe impl Send for InMessage {}
-unsafe impl Sync for InMessage {}
-
-impl Drop for InMessage {
-    // Deallocate the memory from the Paho C lib.
-    fn drop(&mut self) {
-        let mut cmsg = self.cmsg as *const _ as *mut ffi::MQTTAsync_message;
-        unsafe {
-            ffi::MQTTAsync_freeMessage(&mut cmsg);
-            ffi::MQTTAsync_free(self.topic_ptr as *mut c_void);
-        }
-    }
-}
-
 /////////////////////////////////////////////////////////////////////////////
 
 /// An MQTT Message.
 /// This represents all the information passed in an MQTT PUBLISH packet.
 /// It's the primary data transfer mechanism for the protocol.
-#[derive(Debug)]
-pub enum Message {
-    /// An out-bound message, created by the app for publication .
-    Out(OutMessage),
-    /// An in-bound message received from the broker
-    In(InMessage),
-}
+#[derive(Debug, Default, Clone)]
+pub struct Message(OutMessage);
 
 impl Message {
     /// Creates a new message.
@@ -231,7 +112,7 @@ impl Message {
         V: Into<Vec<u8>>,
         Q: Into<QoS>,
     {
-        Self::Out(OutMessage::new(topic, payload, qos))
+        Self(OutMessage::new(topic, payload, qos))
     }
 
     /// Creates a new message that will be retained by the broker.
@@ -249,32 +130,17 @@ impl Message {
         V: Into<Vec<u8>>,
         Q: Into<QoS>,
     {
-        Self::Out(OutMessage::new_retained(topic, payload, qos))
-    }
-
-    /// Creates a message from the C parts
-    pub(crate) fn from_c_parts(
-        topic: *const c_char,
-        topic_len: usize,
-        cmsg: *const ffi::MQTTAsync_message,
-    ) -> Self {
-        Self::In(InMessage::new(topic, topic_len, cmsg))
+        Self(OutMessage::new_retained(topic, payload, qos))
     }
 
     /// Gets the message topic.
     pub fn topic(&self) -> &str {
-        match self {
-            Self::Out(msg) => &msg.topic,
-            Self::In(msg) => msg.topic(),
-        }
+        &self.0.topic
     }
 
     /// Gets the message payload
     pub fn payload(&self) -> &[u8] {
-        match self {
-            Self::Out(msg) => &msg.payload,
-            Self::In(msg) => msg.payload(),
-        }
+        &self.0.payload
     }
 
     /// Gets the payload of the message as a string.
@@ -290,18 +156,12 @@ impl Message {
 
     /// Gets the QoS of the message.
     pub fn qos(&self) -> QoS {
-        match self {
-            Self::Out(msg) => msg.qos,
-            Self::In(msg) => msg.qos(),
-        }
+        self.0.qos
     }
 
     /// Gets the retain flag of the message
     pub fn retain(&self) -> bool {
-        match self {
-            Self::Out(msg) => msg.retain,
-            Self::In(msg) => msg.retain(),
-        }
+        self.0.retain
     }
 
     // TODO: Mark as deprecated?
@@ -313,49 +173,18 @@ impl Message {
 
     /// Gets the properties in the message
     pub fn properties(&self) -> &Properties {
-        match self {
-            Self::Out(msg) => &msg.props,
-            Self::In(msg) => msg.properties(),
-        }
+        &self.0.props
     }
 
     /// Gets the message identifier.
     pub fn msgid(&self) -> Option<u16> {
-        match self {
-            Self::Out(msg) => msg.msgid,
-            Self::In(msg) => msg.msgid(),
-        }
+        self.0.msgid
     }
 }
 
-impl Default for Message {
-    fn default() -> Self {
-        Self::Out(OutMessage::default())
-    }
-}
-
-impl Clone for Message {
-    fn clone(&self) -> Self {
-        match self {
-            Self::Out(msg) => Self::Out(msg.clone()),
-            Self::In(msg) => {
-                let topic = msg.topic().to_string();
-                let payload = msg.payload().to_vec();
-                let qos = msg.qos();
-                let retain = msg.retain();
-                let props = msg.properties().clone();
-
-                Self::Out(OutMessage {
-                    topic,
-                    payload,
-                    qos,
-                    retain,
-                    props,
-                    // TODO: Implement these?
-                    ..OutMessage::default()
-                })
-            }
-        }
+impl From<OutMessage> for Message {
+    fn from(msg: OutMessage) -> Self {
+        Self(msg)
     }
 }
 
@@ -438,7 +267,7 @@ impl MessageBuilder {
 
     /// Finalize the builder to create the message.
     pub fn finalize(self) -> Message {
-        Message::Out(self.0)
+        Message(self.0)
     }
 }
 

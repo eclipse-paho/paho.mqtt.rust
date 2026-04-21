@@ -20,25 +20,12 @@
  *******************************************************************************/
 
 use std::{
-    ffi::CString,
-    fmt, io,
+    fmt,
     path::{Path, PathBuf},
     sync::Arc,
 };
 
-use crate::{AsyncClient, Result, SslErrorCallback};
-
-/// Convert a path name to a CString
-pub fn path_to_cstring<P: AsRef<Path>>(path: P) -> Result<CString> {
-    let s = CString::new(
-        path.as_ref()
-            .to_str()
-            .ok_or_else(|| io::Error::other("Path string error"))?,
-    )?;
-    Ok(s)
-}
-
-/////////////////////////////////////////////////////////////////////////////
+use crate::{AsyncClient, SslErrorCallback};
 
 /// The SSL/TLS versions that can be requested.
 #[repr(u32)]
@@ -46,13 +33,13 @@ pub fn path_to_cstring<P: AsRef<Path>>(path: P) -> Result<CString> {
 pub enum SslVersion {
     /// The default library SSL/TLS version
     #[default]
-    Default = ffi::MQTT_SSL_VERSION_DEFAULT,
+    Default = 0,
     /// TLS version 1.0
-    Tls_1_0 = ffi::MQTT_SSL_VERSION_TLS_1_0,
+    Tls1_0 = 1,
     /// TLS version 1.1
-    Tls_1_1 = ffi::MQTT_SSL_VERSION_TLS_1_1,
+    Tls1_1 = 2,
     /// TLS version 1.2
-    Tls_1_2 = ffi::MQTT_SSL_VERSION_TLS_1_2,
+    Tls1_2 = 3,
 }
 
 /////////////////////////////////////////////////////////////////////////////

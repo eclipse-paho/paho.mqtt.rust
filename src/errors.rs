@@ -21,7 +21,7 @@
  *    Frank Pagliughi - initial implementation and documentation
  *******************************************************************************/
 
-use crate::{Message, Properties, ReasonCode, ffi};
+use crate::{Message, Properties, ReasonCode};
 use std::{fmt, io, result, str};
 use thiserror::Error;
 
@@ -197,9 +197,6 @@ pub enum Error {
     /// An error parsing a UTF-8 string
     #[error("String UTF-8 Error")]
     Utf8(#[from] str::Utf8Error),
-    /// A string NUL error
-    #[error("String NUL Error")]
-    Nul(#[from] std::ffi::NulError),
     /// Missing SSL/TLS options
     #[error("Missing SSL/TLS options")]
     MissingSslOptions,
@@ -229,24 +226,24 @@ impl Error {
     pub fn from_return_code(rc: i32) -> Self {
         use Error::*;
         match rc {
-            ffi::MQTTASYNC_PERSISTENCE_ERROR => PersistenceError,
-            ffi::MQTTASYNC_DISCONNECTED => Disconnected,
-            ffi::MQTTASYNC_MAX_MESSAGES_INFLIGHT => MaxMessagesInflight,
-            ffi::MQTTASYNC_BAD_UTF8_STRING => BadUtf8String,
-            ffi::MQTTASYNC_NULL_PARAMETER => NullParameter,
-            ffi::MQTTASYNC_TOPICNAME_TRUNCATED => TopicNameTruncated,
-            ffi::MQTTASYNC_BAD_STRUCTURE => BadStructure,
-            ffi::MQTTASYNC_BAD_QOS => BadQos,
-            ffi::MQTTASYNC_NO_MORE_MSGIDS => NoMoreMsgIds,
-            ffi::MQTTASYNC_OPERATION_INCOMPLETE => OperationIncomplete,
-            ffi::MQTTASYNC_MAX_BUFFERED_MESSAGES => MaxBufferedMessages,
-            ffi::MQTTASYNC_SSL_NOT_SUPPORTED => SslNotSupported,
-            ffi::MQTTASYNC_BAD_PROTOCOL => BadProtocol,
-            ffi::MQTTASYNC_BAD_MQTT_OPTION => BadMqttOption,
-            ffi::MQTTASYNC_WRONG_MQTT_VERSION => WrongMqttVersion,
-            ffi::MQTTASYNC_0_LEN_WILL_TOPIC => ZeroLenWillTopic,
-            ffi::MQTTASYNC_COMMAND_IGNORED => CommandIgnored,
-            ffi::MQTTASYNC_MAX_BUFFERED => MaxBufferedZero,
+            -2 => PersistenceError,
+            -3 => Disconnected,
+            -4 => MaxMessagesInflight,
+            -5 => BadUtf8String,
+            -6 => NullParameter,
+            -7 => TopicNameTruncated,
+            -8 => BadStructure,
+            -9 => BadQos,
+            -10 => NoMoreMsgIds,
+            -11 => OperationIncomplete,
+            -12 => MaxBufferedMessages,
+            -13 => SslNotSupported,
+            -14 => BadProtocol,
+            -15 => BadMqttOption,
+            -16 => WrongMqttVersion,
+            -17 => ZeroLenWillTopic,
+            -18 => CommandIgnored,
+            -19 => MaxBufferedZero,
             _ => Failure,
         }
     }
@@ -273,22 +270,14 @@ impl From<i32> for Error {
 }
 
 impl From<(i32, &str)> for Error {
-    /// Convert a Paho C return code w/ reason string to an Error.
-    ///
-    /// The Paho C library passes up error description strings that are
-    /// supposed to be for "additional" information, but they actually
-    /// describe specific errors that should have been enumerated.
-    /// This is somewhat of a hack to use the string to enumerate errors.
-    /// These strings are pulled directly from the C sources, and could change.
+    /// Convert a return code with reason string to an Error.
     fn from((rc, msg): (i32, &str)) -> Self {
         use Error::*;
         match (rc, msg) {
-            (ffi::MQTTASYNC_FAILURE, "TCP connect timeout") => TcpConnectTimeout,
-            (ffi::MQTTASYNC_FAILURE, "TCP connect completion failure") => {
-                TcpConnectCompletionFailure
-            }
-            (ffi::MQTTASYNC_FAILURE, "TCP/TLS connect failure") => TcpTlsConnectFailure,
-            (ffi::MQTTASYNC_DISCONNECTED, _) => Disconnected,
+            (-1, "TCP connect timeout") => TcpConnectTimeout,
+            (-1, "TCP connect completion failure") => TcpConnectCompletionFailure,
+            (-1, "TCP/TLS connect failure") => TcpTlsConnectFailure,
+            (-3, _) => Disconnected,
             (rc, "Received disconnect") => ReceivedDisconnect(rc),
             (rc, "CONNACK return code") => match ConnectReturnCode::try_from(rc as u8) {
                 Ok(ret) => ConnectReturn(ret),
@@ -306,12 +295,6 @@ impl From<(i32, Option<String>)> for Error {
             Some(msg) => Self::from((rc, msg.as_str())),
             None => Self::from(rc),
         }
-    }
-}
-
-impl From<std::ffi::IntoStringError> for Error {
-    fn from(_: std::ffi::IntoStringError) -> Self {
-        Error::BadUtf8String
     }
 }
 
@@ -342,28 +325,28 @@ impl From<Error> for io::Error {
 /// The result type for MQTT operations.
 pub type Result<T> = result::Result<T, Error>;
 
-/// Gets the string associated with the error code from the C lib.
+/// Gets the error message string for a numeric error code.
 pub fn error_message(rc: i32) -> &'static str {
     match rc {
-        ffi::MQTTASYNC_FAILURE => "General failure",
-        ffi::MQTTASYNC_PERSISTENCE_ERROR => "Persistence error",
-        ffi::MQTTASYNC_DISCONNECTED => "Client disconnected",
-        ffi::MQTTASYNC_MAX_MESSAGES_INFLIGHT => "Maximum inflight messages",
-        ffi::MQTTASYNC_BAD_UTF8_STRING => "Bad UTF8 string",
-        ffi::MQTTASYNC_NULL_PARAMETER => "NULL Parameter",
-        ffi::MQTTASYNC_TOPICNAME_TRUNCATED => "Topic name truncated",
-        ffi::MQTTASYNC_BAD_STRUCTURE => "Bad structure",
-        ffi::MQTTASYNC_BAD_QOS => "Bad QoS",
-        ffi::MQTTASYNC_NO_MORE_MSGIDS => "No more message ID's",
-        ffi::MQTTASYNC_OPERATION_INCOMPLETE => "Operation incomplete",
-        ffi::MQTTASYNC_MAX_BUFFERED_MESSAGES => "Max buffered messages",
-        ffi::MQTTASYNC_SSL_NOT_SUPPORTED => "SSL not supported by Paho C library",
-        ffi::MQTTASYNC_BAD_PROTOCOL => "Bad protocol",
-        ffi::MQTTASYNC_BAD_MQTT_OPTION => "Bad MQTT option",
-        ffi::MQTTASYNC_WRONG_MQTT_VERSION => "Wrong MQTT version",
-        ffi::MQTTASYNC_0_LEN_WILL_TOPIC => "Zero length Will Topic",
-        ffi::MQTTASYNC_COMMAND_IGNORED => "Command Ignored",
-        ffi::MQTTASYNC_MAX_BUFFERED => "Max buffered is zero",
+        -1 => "General failure",
+        -2 => "Persistence error",
+        -3 => "Client disconnected",
+        -4 => "Maximum inflight messages",
+        -5 => "Bad UTF8 string",
+        -6 => "NULL Parameter",
+        -7 => "Topic name truncated",
+        -8 => "Bad structure",
+        -9 => "Bad QoS",
+        -10 => "No more message ID's",
+        -11 => "Operation incomplete",
+        -12 => "Max buffered messages",
+        -13 => "SSL not supported",
+        -14 => "Bad protocol",
+        -15 => "Bad MQTT option",
+        -16 => "Wrong MQTT version",
+        -17 => "Zero length Will Topic",
+        -18 => "Command Ignored",
+        -19 => "Max buffered is zero",
         _ => "Unknown Error",
     }
 }
@@ -387,11 +370,8 @@ mod tests {
 
     #[test]
     fn test_error_from() {
-        assert!(matches!(
-            Error::from(ffi::MQTTASYNC_FAILURE),
-            Error::Failure
-        ));
-        assert!(matches!(Error::from(ffi::MQTTASYNC_BAD_QOS), Error::BadQos));
+        assert!(matches!(Error::from(-1), Error::Failure));
+        assert!(matches!(Error::from(-9), Error::BadQos));
 
         // Out of range is considered a general failure.
         assert!(matches!(Error::from(127), Error::Failure));
@@ -400,11 +380,11 @@ mod tests {
     #[test]
     fn test_error_from_tuple() {
         assert!(matches!(
-            Error::from((ffi::MQTTASYNC_FAILURE, "unspecified error")),
+            Error::from((-1, "unspecified error")),
             Error::Failure
         ));
         assert!(matches!(
-            Error::from((ffi::MQTTASYNC_FAILURE, "TCP connect timeout")),
+            Error::from((-1, "TCP connect timeout")),
             Error::TcpConnectTimeout
         ));
         assert!(matches!(
