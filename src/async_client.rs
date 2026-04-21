@@ -79,7 +79,9 @@ pub(crate) struct InnerAsyncClient {
     /// Command sender to the internal event loop.
     cmd_tx: async_channel::Sender<Command>,
     /// Whether the client is currently connected.
-    connected: AtomicBool,
+    /// Wrapped in Arc so the event-loop thread can set it before the token
+    /// resolves, eliminating any race between `wait()` and `is_connected()`.
+    connected: Arc<AtomicBool>,
     /// The MQTT version of the connection.
     mqtt_version: AtomicU32,
     /// The options used to create the client.
@@ -139,7 +141,7 @@ impl AsyncClient {
 
         let inner = Arc::new(InnerAsyncClient {
             cmd_tx,
-            connected: AtomicBool::new(false),
+            connected: Arc::new(AtomicBool::new(false)),
             mqtt_version: AtomicU32::new(opts.mqtt_version as u32),
             opts,
             conn_opts: RwLock::new(ConnectOptions::new()),
@@ -222,6 +224,7 @@ impl AsyncClient {
             ver,
             props: Default::default(),
             tx: comp,
+            connected_flag: Arc::clone(&self.inner.connected),
         };
 
         if self.inner.cmd_tx.send_blocking(cmd).is_err() {
@@ -251,6 +254,7 @@ impl AsyncClient {
             reason_code: paho_mqtt_codec::ReasonCode::NormalDisconnection,
             props: Default::default(),
             tx: comp,
+            connected_flag: Arc::clone(&self.inner.connected),
         };
 
         if self.inner.cmd_tx.send_blocking(cmd).is_err() {
@@ -529,7 +533,7 @@ impl AsyncClient {
         use crate::runtime::Event as Ev;
         match ev {
             Ev::Connected(_response) => {
-                self.inner.connected.store(true, Ordering::SeqCst);
+                // connected flag already set by event loop before token resolved
                 let mut cbctx = self.inner.callback_context.lock().unwrap();
                 if let Some(ref mut cb) = cbctx.on_connected {
                     cb(self);

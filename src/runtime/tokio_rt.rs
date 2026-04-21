@@ -28,6 +28,10 @@ use std::{
     collections::HashMap,
     io,
     pin::Pin,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     task::{Context, Poll},
     time::Duration,
 };
@@ -235,6 +239,8 @@ struct Session {
     event_tx: async_channel::Sender<Event>,
     /// True when a PINGREQ has been sent and PINGRESP has not yet arrived.
     ping_outstanding: bool,
+    /// Shared flag cleared before the disconnect token resolves.
+    connected_flag: Arc<AtomicBool>,
 }
 
 impl Session {
@@ -243,6 +249,7 @@ impl Session {
         ver: MqttVersion,
         keep_alive: Duration,
         event_tx: async_channel::Sender<Event>,
+        connected_flag: Arc<AtomicBool>,
     ) -> Self {
         Self {
             writer,
@@ -257,6 +264,7 @@ impl Session {
             pending_unsub: HashMap::new(),
             event_tx,
             ping_outstanding: false,
+            connected_flag,
         }
     }
 
@@ -536,12 +544,16 @@ impl Session {
                 reason_code,
                 props,
                 tx,
+                connected_flag,
             } => {
                 let disc = Disconnect {
                     reason_code,
                     properties: props,
                 };
                 self.send(&Packet::Disconnect(disc)).await?;
+                // Clear the flag before resolving the token so `is_connected()`
+                // returns false as soon as `wait()` returns in the caller.
+                connected_flag.store(false, Ordering::SeqCst);
                 tx.complete(Ok(()));
                 return Ok(true); // signal clean shutdown
             }
@@ -582,6 +594,7 @@ pub(crate) async fn run_event_loop(
             ver,
             props,
             tx,
+            connected_flag,
         ) = match cmd {
             Command::Connect {
                 host,
@@ -595,6 +608,7 @@ pub(crate) async fn run_event_loop(
                 ver,
                 props,
                 tx,
+                connected_flag,
             } => (
                 host,
                 port,
@@ -607,6 +621,7 @@ pub(crate) async fn run_event_loop(
                 ver,
                 props,
                 tx,
+                connected_flag,
             ),
             _ => continue, // ignore non-Connect commands before connecting
         };
@@ -674,6 +689,9 @@ pub(crate) async fn run_event_loop(
             reason_code: connack.reason_code,
             properties: Default::default(),
         };
+        // Set the flag before resolving the token so `is_connected()` is
+        // true as soon as `wait()` / `.await` returns in the caller.
+        connected_flag.store(true, Ordering::SeqCst);
         let _ = event_tx.send(Event::Connected(response.clone())).await;
         tx.complete(Ok(response));
 
@@ -685,8 +703,10 @@ pub(crate) async fn run_event_loop(
             Duration::from_secs(3600)
         };
 
-        let mut session = Session::new(writer, ver, keep_alive, event_tx.clone());
+        let mut session =
+            Session::new(writer, ver, keep_alive, event_tx.clone(), connected_flag);
         if let Err(e) = session.run(&mut reader, &cmd_rx).await {
+            session.connected_flag.store(false, Ordering::SeqCst);
             let _ = event_tx.send(Event::ConnectionLost(e)).await;
         }
     }

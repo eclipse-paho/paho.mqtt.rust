@@ -23,6 +23,8 @@
 //! [`Command`] values flow from the public API to the event loop.
 //! [`Event`] values flow back from the event loop to the public layer.
 
+use std::sync::{Arc, atomic::AtomicBool};
+
 use bytes::Bytes;
 use paho_mqtt_codec::{MqttVersion, Properties as CodecProperties, QoS, ReasonCode, Will};
 
@@ -81,6 +83,8 @@ pub(crate) enum Command {
         props: CodecProperties,
         /// Completer resolved with the CONNACK result.
         tx: Completer<ConnectResponse>,
+        /// Set to `true` before resolving `tx` on success; cleared on failure.
+        connected_flag: Arc<AtomicBool>,
     },
 
     /// Publish an application message.
@@ -127,6 +131,8 @@ pub(crate) enum Command {
         props: CodecProperties,
         /// Completer signalled when the disconnect is complete.
         tx: Completer<()>,
+        /// Cleared to `false` before resolving `tx`.
+        connected_flag: Arc<AtomicBool>,
     },
 }
 
