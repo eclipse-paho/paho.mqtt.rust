@@ -25,10 +25,10 @@
 
 use bytes::Bytes;
 use paho_mqtt_codec::{MqttVersion, Properties as CodecProperties, QoS, ReasonCode, Will};
-use tokio::sync::oneshot;
 
-use crate::responses::{
-    ConnectResponse, PublishResponse, SubscribeResponse, UnsubscribeResponse,
+use crate::{
+    responses::{ConnectResponse, PublishResponse, SubscribeResponse, UnsubscribeResponse},
+    token::Completer,
 };
 
 /////////////////////////////////////////////////////////////////////////////
@@ -79,8 +79,8 @@ pub(crate) enum Command {
         ver: MqttVersion,
         /// MQTT v5 CONNECT properties; empty for v3.1.1.
         props: CodecProperties,
-        /// Oneshot channel for the CONNACK result.
-        tx: oneshot::Sender<crate::Result<ConnectResponse>>,
+        /// Completer resolved with the CONNACK result.
+        tx: Completer<ConnectResponse>,
     },
 
     /// Publish an application message.
@@ -95,8 +95,8 @@ pub(crate) enum Command {
         retain: bool,
         /// MQTT v5 properties; empty for v3.1.1.
         props: CodecProperties,
-        /// Oneshot channel for the PUBACK / PUBCOMP result.
-        tx: oneshot::Sender<crate::Result<PublishResponse>>,
+        /// Completer resolved with the PUBACK / PUBCOMP result.
+        tx: Completer<PublishResponse>,
     },
 
     /// Subscribe to one or more topic filters.
@@ -105,8 +105,8 @@ pub(crate) enum Command {
         filters: Vec<(String, QoS)>,
         /// MQTT v5 properties; empty for v3.1.1.
         props: CodecProperties,
-        /// Oneshot channel for the SUBACK result.
-        tx: oneshot::Sender<crate::Result<SubscribeResponse>>,
+        /// Completer resolved with the SUBACK result.
+        tx: Completer<SubscribeResponse>,
     },
 
     /// Unsubscribe from one or more topic filters.
@@ -115,8 +115,8 @@ pub(crate) enum Command {
         filters: Vec<String>,
         /// MQTT v5 properties; empty for v3.1.1.
         props: CodecProperties,
-        /// Oneshot channel for the UNSUBACK result.
-        tx: oneshot::Sender<crate::Result<UnsubscribeResponse>>,
+        /// Completer resolved with the UNSUBACK result.
+        tx: Completer<UnsubscribeResponse>,
     },
 
     /// Send a DISCONNECT packet and close the connection.
@@ -125,8 +125,8 @@ pub(crate) enum Command {
         reason_code: ReasonCode,
         /// MQTT v5 properties; empty for v3.1.1.
         props: CodecProperties,
-        /// Oneshot channel signalled when the disconnect is complete.
-        tx: oneshot::Sender<crate::Result<()>>,
+        /// Completer signalled when the disconnect is complete.
+        tx: Completer<()>,
     },
 }
 

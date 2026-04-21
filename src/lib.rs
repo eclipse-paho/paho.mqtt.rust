@@ -130,8 +130,8 @@ pub use crate::subscribe_options::{
     SUBSCRIBE_NO_LOCAL, SubscribeOptions, SubscribeOptionsBuilder,
 };
 pub use crate::token::{
-    ConnectToken, DeliveryToken, FailureCallback, SubscribeManyToken, SubscribeToken,
-    SuccessCallback, Token, UnsubscribeManyToken, UnsubscribeToken,
+    ConnectToken, DeliveryToken, SubscribeManyToken, SubscribeToken, Token,
+    UnsubscribeManyToken, UnsubscribeToken,
 };
 pub use crate::topic::{SyncTopic, Topic, TopicFilter, is_topic_filter_valid};
 pub use crate::topic_matcher::TopicMatcher;

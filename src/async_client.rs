@@ -532,63 +532,6 @@ impl AsyncClient {
         tok
     }
 
-    /// Connects to an MQTT broker using the specified connect options.
-    ///
-    /// # Arguments
-    ///
-    /// * `opts` The connect options
-    /// * `success_cb` The callback for a successful connection.
-    /// * `failure_cb` The callback for a failed connection attempt.
-    pub fn connect_with_callbacks<FS, FF>(
-        &self,
-        opts: ConnectOptions,
-        success_cb: FS,
-        failure_cb: FF,
-    ) -> ConnectToken
-    where
-        FS: Fn(&AsyncClient, u16) + Send + 'static,
-        FF: Fn(&AsyncClient, u16, i32) + Send + 'static,
-    {
-        debug!(
-            "Connecting with callbacks. Handle: {:?}, opts: {:?}",
-            self.inner.handle, opts
-        );
-
-        if crate::is_secure_uri(self.server_uri()) && !opts.has_ssl_options() {
-            return ConnectToken::from(Error::MissingSslOptions);
-        }
-
-        if let Err(err) = opts.check() {
-            return ConnectToken::from(err);
-        }
-
-        if opts.mqtt_version() != MqttVersion::Default {
-            self.set_mqtt_version(opts.mqtt_version());
-        }
-
-        let tok = ConnectToken::with_client_callbacks(
-            self,
-            ServerRequest::Connect,
-            connect_convert,
-            success_cb,
-            failure_cb,
-        );
-
-        let mut ffi_opts = ConnectOptionsFfi::from(&opts);
-        ffi_opts.set_token(tok.clone());
-
-        *self.inner.conn_opts.write().unwrap() = opts;
-
-        let rc = unsafe { ffi::MQTTAsync_connect(self.inner.handle, &ffi_opts.copts) };
-
-        if rc != 0 {
-            mem::drop(unsafe { TokenInner::from_raw(ffi_opts.copts.context) });
-            return ConnectToken::from_error(rc, connect_convert);
-        }
-
-        tok
-    }
-
     /// Attempts to reconnect to the broker.
     /// This can only be called after a connection was initially made or
     /// attempted. It will retry with the same connect options.
@@ -596,29 +539,6 @@ impl AsyncClient {
     pub fn reconnect(&self) -> ConnectToken {
         let connopts = self.inner.conn_opts.read().unwrap().clone();
         self.connect(connopts)
-    }
-
-    /// Attempts to reconnect to the broker, using callbacks to signal
-    /// completion.
-    /// This can only be called after a connection was initially made or
-    /// attempted. It will retry with the same connect options.
-    ///
-    /// # Arguments
-    ///
-    /// * `success_cb` The callback for a successful connection.
-    /// * `failure_cb` The callback for a failed connection attempt.
-    ///
-    pub fn reconnect_with_callbacks<FS, FF>(
-        &self,
-        success_cb: FS,
-        failure_cb: FF,
-    ) -> ConnectToken
-    where
-        FS: Fn(&AsyncClient, u16) + Send + 'static,
-        FF: Fn(&AsyncClient, u16, i32) + Send + 'static,
-    {
-        let connopts = self.inner.conn_opts.read().unwrap().clone();
-        self.connect_with_callbacks(connopts, success_cb, failure_cb)
     }
 
     /// Disconnects from the MQTT broker.
@@ -863,7 +783,7 @@ impl AsyncClient {
         let ffi_msg = MessageFfi::try_from(msg.clone())?;
 
         let tok = DeliveryToken::new_pending(publish_convert);
-        let mut call_opts = CallOptionsFfi::new(ver, tok.inner.clone());
+        let mut call_opts = CallOptionsFfi::new(ver, tok.inner());
 
         let rc = unsafe {
             ffi::MQTTAsync_sendMessage(
@@ -910,7 +830,7 @@ impl AsyncClient {
         let ver = self.mqtt_version();
         let tok =
             SubscribeToken::from_request(None, ServerRequest::Subscribe, subscribe_convert);
-        let mut call_opts = CallOptionsFfi::new(ver, tok.inner.clone());
+        let mut call_opts = CallOptionsFfi::new(ver, tok.inner());
         let topic = CString::new(topic.into()).unwrap();
         let qos = qos.into() as i32;
 
@@ -961,7 +881,7 @@ impl AsyncClient {
             SubscribeToken::from_request(None, ServerRequest::Subscribe, subscribe_convert);
 
         let mut call_opts = CallOptionsFfiBuilder::new()
-            .token(tok.inner.clone())
+            .token(tok.inner())
             .subscribe_options(opts.into())
             .properties(props.into().unwrap_or_default())
             .finalize();
@@ -1013,7 +933,7 @@ impl AsyncClient {
             ServerRequest::SubscribeMany(n),
             subscribe_convert,
         );
-        let mut call_opts = CallOptionsFfi::new(ver, tok.inner.clone());
+        let mut call_opts = CallOptionsFfi::new(ver, tok.inner());
         let topics = StringCollectionFfi::new(topics);
         let qos: Vec<i32> = qos.iter().map(|q| (*q).into() as i32).collect();
 
@@ -1084,7 +1004,7 @@ impl AsyncClient {
             subscribe_convert,
         );
         let mut call_opts = CallOptionsFfiBuilder::new()
-            .token(tok.inner.clone())
+            .token(tok.inner())
             .subscribe_many_options(opts)
             .properties(props.into().unwrap_or_default())
             .finalize();
@@ -1133,7 +1053,7 @@ impl AsyncClient {
             ServerRequest::Unsubscribe,
             unsubscribe_convert,
         );
-        let mut call_opts = CallOptionsFfi::new(ver, tok.inner.clone());
+        let mut call_opts = CallOptionsFfi::new(ver, tok.inner());
         let topic = CString::new(topic.into()).unwrap();
 
         debug!("Unsubscribe from '{:?}'", topic);
@@ -1178,7 +1098,7 @@ impl AsyncClient {
             unsubscribe_convert,
         );
         let mut call_opts = CallOptionsFfiBuilder::new()
-            .token(tok.inner.clone())
+            .token(tok.inner())
             .properties(props)
             .finalize();
 
@@ -1221,7 +1141,7 @@ impl AsyncClient {
             ServerRequest::UnsubscribeMany(n),
             unsubscribe_convert,
         );
-        let mut call_opts = CallOptionsFfi::new(ver, tok.inner.clone());
+        let mut call_opts = CallOptionsFfi::new(ver, tok.inner());
         let topics = StringCollectionFfi::new(topics);
 
         debug!("Unsubscribe from '{:?}'", topics);
@@ -1268,7 +1188,7 @@ impl AsyncClient {
             unsubscribe_convert,
         );
         let mut call_opts = CallOptionsFfiBuilder::new()
-            .token(tok.inner.clone())
+            .token(tok.inner())
             .properties(props)
             .finalize();
 

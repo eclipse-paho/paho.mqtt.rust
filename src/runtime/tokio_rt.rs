@@ -40,13 +40,13 @@ use paho_mqtt_codec::{
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf, WriteHalf},
     net::TcpStream,
-    sync::oneshot,
     time,
 };
 
 use super::commands::{Command, Event, ReceivedMessage};
-use crate::responses::{
-    ConnectResponse, PublishResponse, SubscribeResponse, UnsubscribeResponse,
+use crate::{
+    responses::{ConnectResponse, PublishResponse, SubscribeResponse, UnsubscribeResponse},
+    token::Completer,
 };
 
 /////////////////////////////////////////////////////////////////////////////
@@ -212,15 +212,15 @@ struct Session {
     /// Monotonically increasing packet-ID counter (wraps; skips 0).
     next_id: u16,
     /// Pending QoS 1 outbound publishes awaiting PUBACK.
-    pending_pub1: HashMap<u16, oneshot::Sender<crate::Result<PublishResponse>>>,
+    pending_pub1: HashMap<u16, Completer<PublishResponse>>,
     /// Pending QoS 2 outbound publishes awaiting PUBCOMP.
-    pending_pub2: HashMap<u16, oneshot::Sender<crate::Result<PublishResponse>>>,
+    pending_pub2: HashMap<u16, Completer<PublishResponse>>,
     /// Pending inbound QoS 2 messages awaiting PUBREL (packet_id → message).
     pending_pub2_in: HashMap<u16, ReceivedMessage>,
     /// Pending SUBSCRIBE operations awaiting SUBACK.
-    pending_sub: HashMap<u16, oneshot::Sender<crate::Result<SubscribeResponse>>>,
+    pending_sub: HashMap<u16, Completer<SubscribeResponse>>,
     /// Pending UNSUBSCRIBE operations awaiting UNSUBACK.
-    pending_unsub: HashMap<u16, oneshot::Sender<crate::Result<UnsubscribeResponse>>>,
+    pending_unsub: HashMap<u16, Completer<UnsubscribeResponse>>,
     /// Sender to deliver inbound events to the public layer.
     event_tx: async_channel::Sender<Event>,
     /// True when a PINGREQ has been sent and PINGRESP has not yet arrived.
@@ -323,7 +323,7 @@ impl Session {
                         reason_code: ack.reason_code,
                         properties: Default::default(),
                     };
-                    let _ = tx.send(Ok(rsp));
+                    tx.complete(Ok(rsp));
                 }
             }
 
@@ -331,7 +331,7 @@ impl Session {
             Packet::PubRec(rec) => {
                 if rec.reason_code as u8 >= 0x80 {
                     if let Some(tx) = self.pending_pub2.remove(&rec.packet_id) {
-                        let _ = tx.send(Err(crate::Error::ReasonCode(
+                        tx.complete(Err(crate::Error::ReasonCode(
                             rec.reason_code,
                             Default::default(),
                         )));
@@ -349,7 +349,7 @@ impl Session {
                         reason_code: comp.reason_code,
                         properties: Default::default(),
                     };
-                    let _ = tx.send(Ok(rsp));
+                    tx.complete(Ok(rsp));
                 }
             }
 
@@ -360,7 +360,7 @@ impl Session {
                         reason_codes: ack.reason_codes,
                         properties: Default::default(),
                     };
-                    let _ = tx.send(Ok(rsp));
+                    tx.complete(Ok(rsp));
                 }
             }
 
@@ -371,7 +371,7 @@ impl Session {
                         reason_codes: ack.reason_codes,
                         properties: Default::default(),
                     };
-                    let _ = tx.send(Ok(rsp));
+                    tx.complete(Ok(rsp));
                 }
             }
 
@@ -452,7 +452,7 @@ impl Session {
         match cmd {
             Command::Connect { tx, .. } => {
                 // Already connected; reject duplicate connect.
-                let _ = tx.send(Err(crate::Error::General("already connected")));
+                tx.complete(Err(crate::Error::General("already connected")));
             }
 
             Command::Publish {
@@ -481,7 +481,7 @@ impl Session {
 
                 match qos {
                     QoS::QoS0 => {
-                        let _ = tx.send(Ok(PublishResponse::default()));
+                        tx.complete(Ok(PublishResponse::default()));
                     }
                     QoS::QoS1 => {
                         if let Some(id) = id {
@@ -532,7 +532,7 @@ impl Session {
                     properties: props,
                 };
                 self.send(&Packet::Disconnect(disc)).await?;
-                let _ = tx.send(Ok(()));
+                tx.complete(Ok(()));
                 return Ok(true); // signal clean shutdown
             }
         }
@@ -605,7 +605,7 @@ pub(crate) async fn run_event_loop(
         let conn = match TcpConnection::connect(&host, port).await {
             Ok(c) => c,
             Err(e) => {
-                let _ = tx.send(Err(e.into()));
+                tx.complete(Err(e.into()));
                 continue;
             }
         };
@@ -630,7 +630,7 @@ pub(crate) async fn run_event_loop(
         if let Err(e) =
             send_packet(&mut writer, &Packet::Connect(connect_pkt), ver, &mut buf).await
         {
-            let _ = tx.send(Err(e));
+            tx.complete(Err(e));
             continue;
         }
 
@@ -639,13 +639,13 @@ pub(crate) async fn run_event_loop(
         let connack = match recv_connack(&mut reader, &mut read_buf, ver).await {
             Ok(c) => c,
             Err(e) => {
-                let _ = tx.send(Err(e));
+                tx.complete(Err(e));
                 continue;
             }
         };
 
         if connack.reason_code as u8 >= 0x80 {
-            let _ = tx.send(Err(crate::Error::ReasonCode(
+            tx.complete(Err(crate::Error::ReasonCode(
                 connack.reason_code,
                 Default::default(),
             )));
@@ -664,7 +664,7 @@ pub(crate) async fn run_event_loop(
             reason_code: connack.reason_code,
             properties: Default::default(),
         };
-        let _ = tx.send(Ok(response));
+        tx.complete(Ok(response));
 
         // ---- Run the session ----
         let keep_alive = if keep_alive_secs > 0 {

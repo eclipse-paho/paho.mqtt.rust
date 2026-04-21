@@ -57,35 +57,14 @@ type UserTopics = RwLock<Vec<String>>;
 
 /////////////////////////////////////////////////////////////////////////////
 
-// Callback for a successful connection to the broker.
-// We subscribe to the topic(s) we want here.
-fn on_connect_success(cli: &mqtt::AsyncClient, _msgid: u16) {
-    println!("Connection succeeded");
+fn subscribe_topics(cli: &mqtt::AsyncClient) {
     let data = cli.user_data().unwrap();
-
     if let Some(lock) = data.downcast_ref::<UserTopics>() {
         let topics = lock.read().unwrap();
         println!("Subscribing to topics: {:?}", topics);
-
-        // Create a QoS vector, same len as # topics
         let qos = vec![QOS; topics.len()];
-        // Subscribe to the desired topic(s).
         cli.subscribe_many(&topics, &qos);
-        // TODO: This doesn't yet handle a failed subscription.
     }
-}
-
-// Callback for a failed attempt to connect to the server.
-// We simply sleep and then try again.
-//
-// Note that normally we don't want to do a blocking operation or sleep
-// from  within a callback. But in this case, we know that the client is
-// *not* connected, and thus not doing anything important. So we don't worry
-// too much about stopping its callback thread.
-fn on_connect_failure(cli: &mqtt::AsyncClient, _msgid: u16, rc: i32) {
-    println!("Connection attempt failed with error code {}.\n", rc);
-    thread::sleep(Duration::from_millis(2500));
-    cli.reconnect_with_callbacks(on_connect_success, on_connect_failure);
 }
 
 /////////////////////////////////////////////////////////////////////////////
@@ -114,18 +93,15 @@ fn main() {
         process::exit(1);
     });
 
-    // Set a closure to be called whenever the client connection is established.
-    cli.set_connected_callback(|_cli: &mqtt::AsyncClient| {
+    // Subscribe to topics on every successful connection (initial + reconnects).
+    cli.set_connected_callback(|cli: &mqtt::AsyncClient| {
         println!("Connected.");
+        subscribe_topics(cli);
     });
 
     // Set a closure to be called whenever the client loses the connection.
-    // It will attempt to reconnect, and set up function callbacks to keep
-    // retrying until the connection is re-established.
-    cli.set_connection_lost_callback(|cli: &mqtt::AsyncClient| {
+    cli.set_connection_lost_callback(|_| {
         println!("Connection lost. Attempting reconnect.");
-        thread::sleep(Duration::from_millis(2500));
-        cli.reconnect_with_callbacks(on_connect_success, on_connect_failure);
     });
 
     // Attach a closure to the client to receive callback
@@ -165,7 +141,10 @@ fn main() {
 
     // Make the connection to the broker
     println!("Connecting to the MQTT server...");
-    cli.connect_with_callbacks(conn_opts, on_connect_success, on_connect_failure);
+    if let Err(e) = cli.connect(conn_opts).wait() {
+        println!("Unable to connect: {}", e);
+        process::exit(1);
+    }
 
     // Just wait for incoming messages.
     loop {

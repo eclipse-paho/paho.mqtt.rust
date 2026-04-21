@@ -48,29 +48,6 @@ const MAX_RECONNECT: Duration = Duration::from_secs(30);
 
 /////////////////////////////////////////////////////////////////////////////
 
-// Callback for a successful initial connect to the broker.
-// This is the callback given to the connect() function, so is only called
-// once after the initial connect succeeds (not after reconnects).
-// We subscribe to the topic(s) we want here.
-fn on_connect_success(cli: &mqtt::AsyncClient, _msgid: u16) {
-    println!(
-        "Initial connection succeeded. Subscribing to topics: {:?}",
-        TOPICS
-    );
-    // Subscribe to the desired topic(s).
-    cli.subscribe_many(TOPICS, QOS);
-    // TODO: This doesn't yet handle a failed subscription.
-}
-
-// Callback for a failed initialattempt to connect to the server.
-// We report the failure and exit.
-fn on_connect_failure(_cli: &mqtt::AsyncClient, _msgid: u16, rc: i32) {
-    println!("Connection attempt failed with error code {}.", rc);
-    process::exit(1);
-}
-
-/////////////////////////////////////////////////////////////////////////////
-
 fn main() {
     // Initialize the logger from the environment
     env_logger::init();
@@ -92,11 +69,10 @@ fn main() {
         process::exit(1);
     });
 
-    // Set a closure to be called whenever the client connection is established.
-    // This is called after the initial connection and also after successful
-    // reconnections.
-    cli.set_connected_callback(|_| {
-        println!("Connected.");
+    // Subscribe to topics on every successful connection (initial + reconnects).
+    cli.set_connected_callback(|cli| {
+        println!("Connected. Subscribing to topics: {:?}", TOPICS);
+        cli.subscribe_many(TOPICS, QOS);
     });
 
     // Set a closure to be called whenever the client loses the connection.
@@ -128,7 +104,10 @@ fn main() {
 
     // Make the connection to the broker
     println!("Connecting to the MQTT server...");
-    cli.connect_with_callbacks(conn_opts, on_connect_success, on_connect_failure);
+    if let Err(e) = cli.connect(conn_opts).wait() {
+        println!("Unable to connect: {}", e);
+        process::exit(1);
+    }
 
     // Just wait for incoming messages.
     loop {
