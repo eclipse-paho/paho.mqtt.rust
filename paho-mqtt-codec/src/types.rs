@@ -23,14 +23,14 @@
 use crate::error::Error;
 use std::fmt;
 
-/// Connect with the default MQTT version (tries v3.1.1 then falls back to v3.1).
-pub const MQTT_VERSION_DEFAULT: u8 = 0;
-
-/// Connect with MQTT v3.1.
-pub const MQTT_VERSION_3_1: u8 = 3;
+/// Connect with the default MQTT version (currently v5).
+pub const MQTT_VERSION_DEFAULT: u8 = 5;
 
 /// Connect with MQTT v3.1.1.
 pub const MQTT_VERSION_3_1_1: u8 = 4;
+
+/// Connect with MQTT v3.1.1.
+pub const MQTT_VERSION_3: u8 = MQTT_VERSION_3_1_1;
 
 /// Connect with MQTT v5.
 pub const MQTT_VERSION_5: u8 = 5;
@@ -48,25 +48,27 @@ pub const QOS_2: i32 = 2;
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(u8)]
 pub enum MqttVersion {
-    /// Default: try v3.1.1 first, fall back to v3.1.
-    #[default]
-    Default = MQTT_VERSION_DEFAULT,
-    /// Version 3.1 (protocol byte 3).
-    V3_1 = MQTT_VERSION_3_1,
     /// Version 3.1.1 (protocol byte 4).
     V3_1_1 = MQTT_VERSION_3_1_1,
     /// Version 5 (protocol byte 5).
+    #[default]
     V5 = MQTT_VERSION_5,
+}
+
+impl MqttVersion {
+    /// The only supported v3 is v3.1.1
+    pub const v3: MqttVersion = Self::V3_1_1;
+    /// Default: (currently v5)
+    pub const Default: MqttVersion = Self::V5;
 }
 
 impl From<u8> for MqttVersion {
     fn from(ver: u8) -> Self {
         use MqttVersion::*;
         match ver {
-            MQTT_VERSION_3_1 => V3_1,
             MQTT_VERSION_3_1_1 => V3_1_1,
             MQTT_VERSION_5 => V5,
-            _ => Default,
+            _ => Self::Default,
         }
     }
 }

@@ -21,6 +21,6 @@
 //! MQTT support types.
 
 pub use paho_mqtt_codec::{
-    MQTT_VERSION_3_1, MQTT_VERSION_3_1_1, MQTT_VERSION_5, MQTT_VERSION_DEFAULT,
-    MqttVersion, QOS_0, QOS_1, QOS_2, QoS,
+    MQTT_VERSION_3, MQTT_VERSION_3_1_1, MQTT_VERSION_5, MQTT_VERSION_DEFAULT, MqttVersion,
+    QOS_0, QOS_1, QOS_2, QoS,
 };

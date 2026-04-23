@@ -87,8 +87,8 @@ pub use crate::token::{
 pub use crate::topic::{SyncTopic, Topic, TopicFilter, is_topic_filter_valid};
 pub use crate::topic_matcher::TopicMatcher;
 pub use crate::types::{
-    MQTT_VERSION_3_1, MQTT_VERSION_3_1_1, MQTT_VERSION_5, MQTT_VERSION_DEFAULT,
-    MqttVersion, QOS_0, QOS_1, QOS_2, QoS,
+    MQTT_VERSION_3, MQTT_VERSION_3_1_1, MQTT_VERSION_5, MQTT_VERSION_DEFAULT, MqttVersion,
+    QOS_0, QOS_1, QOS_2, QoS,
 };
 
 use std::any::Any;
