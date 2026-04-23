@@ -27,7 +27,10 @@ macro_rules! topic {
 #[test]
 fn test_connect_disconnect_v3() {
     let cli = mqtt::AsyncClient::new(HOST).unwrap();
-    let rsp = cli.connect(None).wait().expect("connect failed");
+    let rsp = cli
+        .connect(mqtt::ConnectOptions::new_v3())
+        .wait()
+        .expect("connect failed");
     assert_eq!(rsp.mqtt_version, 4); // v3.1.1 on wire
     assert!(!rsp.session_present);
     cli.disconnect(None).wait().expect("disconnect failed");
@@ -406,7 +409,7 @@ fn test_v5_publish_subscribe() {
 fn test_connect_unix_socket() {
     let cli = mqtt::AsyncClient::new(UNIX_HOST).unwrap();
     let rsp = cli.connect(None).wait().expect("unix connect failed");
-    assert_eq!(rsp.mqtt_version, 4);
+    assert_eq!(rsp.mqtt_version, 5); // default is now v5
     assert!(!rsp.session_present);
     assert!(cli.is_connected());
     cli.disconnect(None).wait().expect("unix disconnect failed");

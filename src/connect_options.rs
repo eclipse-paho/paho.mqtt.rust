@@ -83,9 +83,12 @@ impl ConnectOptions {
         Self::default()
     }
 
-    /// Creates a new, default set of connect options for MQTT v3.x
+    /// Creates a new, default set of connect options for MQTT v3.1.1
     pub fn new_v3() -> Self {
-        Self::default()
+        Self {
+            mqtt_version: MqttVersion::V3_1_1,
+            ..Self::default()
+        }
     }
 
     /// Creates a new, default set of connect options for MQTT v5
@@ -101,6 +104,16 @@ impl ConnectOptions {
     pub fn new_ws() -> Self {
         Self {
             keep_alive_interval: DEFAULT_KEEP_ALIVE_INTERVAL_WS,
+            ..Self::default()
+        }
+    }
+
+    /// Creates a new, default set of connect options for connecting MQTT v3.1.1
+    /// over websockets.
+    pub fn new_ws_v3() -> Self {
+        Self {
+            keep_alive_interval: DEFAULT_KEEP_ALIVE_INTERVAL_WS,
+            mqtt_version: MqttVersion::V3_1_1,
             ..Self::default()
         }
     }
@@ -253,6 +266,12 @@ impl ConnectOptionsBuilder {
     /// Creates a new `ConnectOptionsBuilder` for connecting over websockets.
     pub fn new_ws() -> Self {
         Self(ConnectOptions::new_ws())
+    }
+
+    /// Creates a new `ConnectOptionsBuilder` for connecting to MQTT v3.1.1
+    /// over websockets.
+    pub fn new_ws_v3() -> Self {
+        Self(ConnectOptions::new_ws_v3())
     }
 
     /// Creates a new `ConnectOptionsBuilder` for connecting to MQTT v5
@@ -556,13 +575,19 @@ mod tests {
 
     #[test]
     fn test_new_versions() {
-        // v3 defaults to clean session, but no clean start
+        // new() defaults to v5: clean start, no clean session
         let opts = ConnectOptions::new();
-        assert_eq!(MqttVersion::Default, opts.mqtt_version());
+        assert_eq!(MqttVersion::V5, opts.mqtt_version());
+        assert!(!opts.clean_session());
+        assert!(opts.clean_start());
+
+        // new_v3() explicitly selects v3.1.1: clean session, no clean start
+        let opts = ConnectOptions::new_v3();
+        assert_eq!(MqttVersion::V3_1_1, opts.mqtt_version());
         assert!(opts.clean_session());
         assert!(!opts.clean_start());
 
-        // v5 defaults to clean start, but no clean session
+        // new_v5() explicitly selects v5: clean start, no clean session
         let opts = ConnectOptions::new_v5();
         assert_eq!(MqttVersion::V5, opts.mqtt_version());
         assert!(!opts.clean_session());

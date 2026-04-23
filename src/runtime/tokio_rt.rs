@@ -38,7 +38,8 @@ use std::{
 
 use bytes::{Bytes, BytesMut};
 use paho_mqtt_codec::{
-    ConnAck, Disconnect, MqttVersion, PubAck, QoS, Subscribe, Subscription, Unsubscribe,
+    ConnAck, Disconnect, MqttVersion, PubAck, QoS, RetainHandling as CodecRetainHandling,
+    Subscribe, Subscription, Unsubscribe,
     packet::{Packet, RawPacket},
 };
 #[cfg(unix)]
@@ -394,7 +395,7 @@ impl Session {
                 if let Some(tx) = self.pending_pub1.remove(&ack.packet_id) {
                     let rsp = PublishResponse {
                         reason_code: ack.reason_code,
-                        properties: Default::default(),
+                        properties: ack.properties,
                     };
                     tx.complete(Ok(rsp));
                 }
@@ -406,7 +407,7 @@ impl Session {
                     if let Some(tx) = self.pending_pub2.remove(&rec.packet_id) {
                         tx.complete(Err(crate::Error::ReasonCode(
                             rec.reason_code,
-                            Default::default(),
+                            rec.properties,
                         )));
                     }
                     return Ok(());
@@ -420,7 +421,7 @@ impl Session {
                 if let Some(tx) = self.pending_pub2.remove(&comp.packet_id) {
                     let rsp = PublishResponse {
                         reason_code: comp.reason_code,
-                        properties: Default::default(),
+                        properties: comp.properties,
                     };
                     tx.complete(Ok(rsp));
                 }
@@ -431,7 +432,7 @@ impl Session {
                 if let Some(tx) = self.pending_sub.remove(&ack.packet_id) {
                     let rsp = SubscribeResponse {
                         reason_codes: ack.reason_codes,
-                        properties: Default::default(),
+                        properties: ack.properties,
                     };
                     tx.complete(Ok(rsp));
                 }
@@ -442,7 +443,7 @@ impl Session {
                 if let Some(tx) = self.pending_unsub.remove(&ack.packet_id) {
                     let rsp = UnsubscribeResponse {
                         reason_codes: ack.reason_codes,
-                        properties: Default::default(),
+                        properties: ack.properties,
                     };
                     tx.complete(Ok(rsp));
                 }
@@ -573,7 +574,22 @@ impl Session {
                 let id = self.alloc_id();
                 let subscriptions = filters
                     .into_iter()
-                    .map(|(f, q)| Subscription::new(f, q))
+                    .map(|(f, q, opts)| {
+                        use crate::subscribe_options::RetainHandling as RH;
+                        Subscription {
+                            topic_filter: f,
+                            qos: q,
+                            no_local: opts.no_local,
+                            retain_as_published: opts.retain_as_published,
+                            retain_handling: match opts.retain_handling {
+                                RH::SendRetainedOnSubscribe => {
+                                    CodecRetainHandling::SendOnSubscribe
+                                }
+                                RH::SendRetainedOnNew => CodecRetainHandling::SendIfNew,
+                                RH::DontSendRetained => CodecRetainHandling::DoNotSend,
+                            },
+                        }
+                    })
                     .collect();
                 let sub = Subscribe {
                     packet_id: id,
@@ -738,7 +754,7 @@ pub(crate) async fn run_event_loop(
         if connack.reason_code as u8 >= 0x80 {
             tx.complete(Err(crate::Error::ReasonCode(
                 connack.reason_code,
-                Default::default(),
+                connack.properties,
             )));
             continue;
         }
@@ -753,7 +769,7 @@ pub(crate) async fn run_event_loop(
             mqtt_version,
             session_present: connack.session_present,
             reason_code: connack.reason_code,
-            properties: Default::default(),
+            properties: connack.properties,
         };
         // Set the flag before resolving the token so `is_connected()` is
         // true as soon as `wait()` / `.await` returns in the caller.

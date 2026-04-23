@@ -139,12 +139,20 @@ impl AsyncClient {
         let rt = RuntimeHandle::spawn();
         let (cmd_tx, event_rx) = rt.into_parts();
 
+        // Seed the stored connect opts with the client's initial MQTT version
+        // so that reconnect() and pre-connect sends use the right version.
+        let create_ver = opts.mqtt_version;
+        let initial_conn_opts = ConnectOptions {
+            mqtt_version: create_ver,
+            ..ConnectOptions::default()
+        };
+
         let inner = Arc::new(InnerAsyncClient {
             cmd_tx,
             connected: Arc::new(AtomicBool::new(false)),
-            mqtt_version: AtomicU32::new(opts.mqtt_version as u32),
+            mqtt_version: AtomicU32::new(create_ver as u32),
             opts,
-            conn_opts: RwLock::new(ConnectOptions::new()),
+            conn_opts: RwLock::new(initial_conn_opts),
             callback_context: Mutex::new(CallbackContext::default()),
         });
 
@@ -177,19 +185,30 @@ impl AsyncClient {
     where
         T: Into<Option<ConnectOptions>>,
     {
-        let opts = opts.into().unwrap_or_default();
-        debug!("Connecting with opts: {:?}", opts);
+        let explicit: Option<ConnectOptions> = opts.into();
+        debug!("Connecting with opts: {:?}", explicit);
+
+        // None → keep the client's current version unchanged.
+        // Some(opts) → use opts.mqtt_version and update the stored version.
+        let ver = match &explicit {
+            None => self.mqtt_version(),
+            Some(o) => {
+                self.set_mqtt_version(o.mqtt_version);
+                o.mqtt_version
+            }
+        };
+
+        // Normalize: ensure the opts we store and send have the resolved version.
+        let mut opts = explicit.unwrap_or_default();
+        opts.mqtt_version = ver;
 
         if let Err(err) = opts.check() {
             return ConnectToken::from(err);
         }
 
-        let ver = if opts.mqtt_version == MqttVersion::Default {
-            MqttVersion::V3_1_1
+        if !opts.props.is_empty() && ver < MqttVersion::V5 {
+            return ConnectToken::from(Error::WrongMqttVersion);
         }
-        else {
-            opts.mqtt_version
-        };
 
         let server_uri = self.inner.opts.server_uri.clone();
         let addr = match parse_server_uri(&server_uri) {
@@ -210,7 +229,6 @@ impl AsyncClient {
         });
 
         let (tok, comp) = ConnectToken::new();
-        self.set_mqtt_version(ver);
         *self.inner.conn_opts.write().unwrap() = opts.clone();
 
         let cmd = Command::Connect {
@@ -285,6 +303,9 @@ impl AsyncClient {
         use bytes::Bytes;
         debug!("Publish: {:?}", msg);
 
+        let props = msg.properties().clone();
+        self.require_v5_for_props(&props)?;
+
         let qos = msg.qos();
         let (tok, comp) = DeliveryToken::new();
 
@@ -293,7 +314,7 @@ impl AsyncClient {
             payload: Bytes::copy_from_slice(msg.payload()),
             qos,
             retain: msg.retain(),
-            props: Default::default(),
+            props,
             tx: comp,
         };
 
@@ -329,7 +350,7 @@ impl AsyncClient {
     {
         let (tok, comp) = SubscribeToken::new();
         let cmd = Command::Subscribe {
-            filters: vec![(topic.into(), qos.into())],
+            filters: vec![(topic.into(), qos.into(), SubscribeOptions::default())],
             props: Default::default(),
             tx: comp,
         };
@@ -352,8 +373,8 @@ impl AsyncClient {
         &self,
         topic: S,
         qos: Q,
-        _opts: T,
-        _props: P,
+        opts: T,
+        props: P,
     ) -> SubscribeToken
     where
         S: Into<String>,
@@ -361,7 +382,24 @@ impl AsyncClient {
         T: Into<SubscribeOptions>,
         P: Into<Option<Properties>>,
     {
-        self.subscribe(topic, qos)
+        let opts: SubscribeOptions = opts.into();
+        let props = props.into().unwrap_or_default();
+        if let Err(e) = self.require_v5_for_sub_opts(&opts) {
+            return SubscribeToken::from_err(e);
+        }
+        if let Err(e) = self.require_v5_for_props(&props) {
+            return SubscribeToken::from_err(e);
+        }
+        let (tok, comp) = SubscribeToken::new();
+        let cmd = Command::Subscribe {
+            filters: vec![(topic.into(), qos.into(), opts)],
+            props,
+            tx: comp,
+        };
+        if self.inner.cmd_tx.send_blocking(cmd).is_err() {
+            return SubscribeToken::from_err(Error::Disconnected);
+        }
+        tok
     }
 
     /// Subscribes to multiple topics simultaneously.
@@ -387,7 +425,13 @@ impl AsyncClient {
         let filters = topics
             .iter()
             .zip(qos.iter())
-            .map(|(t, q)| (t.as_ref().to_string(), (*q).into()))
+            .map(|(t, q)| {
+                (
+                    t.as_ref().to_string(),
+                    (*q).into(),
+                    SubscribeOptions::default(),
+                )
+            })
             .collect();
 
         let cmd = Command::Subscribe {
@@ -430,15 +474,57 @@ impl AsyncClient {
         &self,
         topics: &[T],
         qos: &[Q],
-        _opts: &[SubscribeOptions],
-        _props: P,
+        opts: &[SubscribeOptions],
+        props: P,
     ) -> SubscribeManyToken
     where
         T: AsRef<str>,
         Q: Into<QoS> + Copy,
         P: Into<Option<Properties>>,
     {
-        self.subscribe_many(topics, qos)
+        let n = topics.len();
+        if n != qos.len() {
+            return SubscribeManyToken::from_err(Error::General(
+                "topics/qos length mismatch",
+            ));
+        }
+        if !opts.is_empty() && opts.len() != n {
+            return SubscribeManyToken::from_err(Error::General(
+                "topics/opts length mismatch",
+            ));
+        }
+
+        let props = props.into().unwrap_or_default();
+        if let Err(e) = self.require_v5_for_props(&props) {
+            return SubscribeManyToken::from_err(e);
+        }
+
+        let filters: Result<Vec<_>> = topics
+            .iter()
+            .zip(qos.iter())
+            .enumerate()
+            .map(|(i, (t, q))| {
+                let sub_opts = opts.get(i).copied().unwrap_or_default();
+                self.require_v5_for_sub_opts(&sub_opts)?;
+                Ok((t.as_ref().to_string(), (*q).into(), sub_opts))
+            })
+            .collect();
+
+        let filters = match filters {
+            Ok(f) => f,
+            Err(e) => return SubscribeManyToken::from_err(e),
+        };
+
+        let (tok, comp) = SubscribeManyToken::new();
+        let cmd = Command::Subscribe {
+            filters,
+            props,
+            tx: comp,
+        };
+        if self.inner.cmd_tx.send_blocking(cmd).is_err() {
+            return SubscribeManyToken::from_err(Error::Disconnected);
+        }
+        tok
     }
 
     /// Unsubscribes from a single topic.
@@ -474,12 +560,24 @@ impl AsyncClient {
     pub fn unsubscribe_with_options<S>(
         &self,
         topic: S,
-        _props: Properties,
+        props: Properties,
     ) -> UnsubscribeToken
     where
         S: Into<String>,
     {
-        self.unsubscribe(topic)
+        if let Err(e) = self.require_v5_for_props(&props) {
+            return UnsubscribeToken::from_err(e);
+        }
+        let (tok, comp) = UnsubscribeToken::new();
+        let cmd = Command::Unsubscribe {
+            filters: vec![topic.into()],
+            props,
+            tx: comp,
+        };
+        if self.inner.cmd_tx.send_blocking(cmd).is_err() {
+            return UnsubscribeToken::from_err(Error::Disconnected);
+        }
+        tok
     }
 
     /// Unsubscribes from multiple topics simultaneously.
@@ -516,17 +614,57 @@ impl AsyncClient {
     pub fn unsubscribe_many_with_options<T>(
         &self,
         topics: &[T],
-        _props: Properties,
+        props: Properties,
     ) -> UnsubscribeManyToken
     where
         T: AsRef<str>,
     {
-        self.unsubscribe_many(topics)
+        if let Err(e) = self.require_v5_for_props(&props) {
+            return UnsubscribeManyToken::from_err(e);
+        }
+        let (tok, comp) = UnsubscribeManyToken::new();
+        let filters = topics.iter().map(|t| t.as_ref().to_string()).collect();
+        let cmd = Command::Unsubscribe {
+            filters,
+            props,
+            tx: comp,
+        };
+        if self.inner.cmd_tx.send_blocking(cmd).is_err() {
+            return UnsubscribeManyToken::from_err(Error::Disconnected);
+        }
+        tok
     }
 
     /// Determines if this client is currently connected to an MQTT broker.
     pub fn is_connected(&self) -> bool {
         self.inner.connected.load(Ordering::SeqCst)
+    }
+
+    /// Returns `Err(WrongMqttVersion)` if v5 properties are non-empty but the
+    /// current connection is not MQTT v5.
+    fn require_v5_for_props(&self, props: &Properties) -> Result<()> {
+        if !props.is_empty() && self.mqtt_version() < MqttVersion::V5 {
+            Err(Error::WrongMqttVersion)
+        }
+        else {
+            Ok(())
+        }
+    }
+
+    /// Returns `Err(WrongMqttVersion)` if any v5-only subscription option is
+    /// set but the current connection is not MQTT v5.
+    fn require_v5_for_sub_opts(&self, opts: &SubscribeOptions) -> Result<()> {
+        if self.mqtt_version() < MqttVersion::V5
+            && (opts.no_local
+                || opts.retain_as_published
+                || opts.retain_handling
+                    != crate::subscribe_options::RetainHandling::default())
+        {
+            Err(Error::WrongMqttVersion)
+        }
+        else {
+            Ok(())
+        }
     }
 
     /// Dispatches an event from the runtime to the registered callbacks.
@@ -559,7 +697,7 @@ impl AsyncClient {
                     retain: recv.retain,
                     dup: recv.dup,
                     msgid: recv.packet_id,
-                    props: Properties::default(),
+                    props: recv.props,
                 });
                 let mut cbctx = self.inner.callback_context.lock().unwrap();
                 if let Some(ref mut cb) = cbctx.on_message_arrived {

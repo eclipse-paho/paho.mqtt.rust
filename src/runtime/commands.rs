@@ -30,6 +30,7 @@ use paho_mqtt_codec::{MqttVersion, Properties as CodecProperties, QoS, ReasonCod
 
 use crate::{
     responses::{ConnectResponse, PublishResponse, SubscribeResponse, UnsubscribeResponse},
+    subscribe_options::SubscribeOptions,
     token::Completer,
 };
 
@@ -124,8 +125,8 @@ pub(crate) enum Command {
 
     /// Subscribe to one or more topic filters.
     Subscribe {
-        /// `(topic_filter, max_qos)` pairs.
-        filters: Vec<(String, QoS)>,
+        /// `(topic_filter, max_qos, subscribe_options)` triples.
+        filters: Vec<(String, QoS, SubscribeOptions)>,
         /// MQTT v5 properties; empty for v3.1.1.
         props: CodecProperties,
         /// Completer resolved with the SUBACK result.
