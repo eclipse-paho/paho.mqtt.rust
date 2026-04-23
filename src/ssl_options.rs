@@ -28,18 +28,17 @@ use std::{
 use crate::{AsyncClient, SslErrorCallback};
 
 /// The SSL/TLS versions that can be requested.
-#[repr(u32)]
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum SslVersion {
     /// The default library SSL/TLS version
     #[default]
-    Default = 0,
+    Default,
     /// TLS version 1.0
-    Tls1_0 = 1,
+    Tls1_0,
     /// TLS version 1.1
-    Tls1_1 = 2,
+    Tls1_1,
     /// TLS version 1.2
-    Tls1_2 = 3,
+    Tls1_2,
 }
 
 /////////////////////////////////////////////////////////////////////////////

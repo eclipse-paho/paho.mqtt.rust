@@ -223,7 +223,7 @@ impl AsyncClient {
             password: opts.password,
             will,
             ver,
-            props: Default::default(),
+            props: opts.props,
             tx: comp,
             connected_flag: Arc::clone(&self.inner.connected),
         };

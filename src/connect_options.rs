@@ -57,8 +57,6 @@ pub struct ConnectOptions {
     pub password: Option<Vec<u8>>,
     /// The timeout for the connection attempt
     pub timeout: Duration,
-    /// MQTT v3 publish retry interval. (Ignored for MQTT v5)
-    pub retry_interval: Option<Duration>,
     /// The servers to which the client will connect, as URIs.
     pub server_uris: Vec<String>,
     /// The MQTT protocol for the connection
@@ -101,15 +99,6 @@ impl ConnectOptions {
     /// Creates a new, default set of connect options for connecting over
     /// websockets.
     pub fn new_ws() -> Self {
-        Self {
-            keep_alive_interval: DEFAULT_KEEP_ALIVE_INTERVAL_WS,
-            ..Self::default()
-        }
-    }
-
-    /// Creates a new, default set of connect options for connecting over
-    /// websockets.
-    pub fn new_ws_v3() -> Self {
         Self {
             keep_alive_interval: DEFAULT_KEEP_ALIVE_INTERVAL_WS,
             ..Self::default()
@@ -223,7 +212,6 @@ impl Default for ConnectOptions {
             user_name: None,
             password: None,
             timeout: Duration::from_secs(30),
-            retry_interval: None,
             server_uris: Vec::new(),
             mqtt_version: MqttVersion::Default,
             auto_reconnect: false,
@@ -262,8 +250,7 @@ impl ConnectOptionsBuilder {
         Self(ConnectOptions::new_v5())
     }
 
-    /// Creates a new `ConnectOptionsBuilder` for connecting to MQTT v3.x
-    /// over websockets.
+    /// Creates a new `ConnectOptionsBuilder` for connecting over websockets.
     pub fn new_ws() -> Self {
         Self(ConnectOptions::new_ws())
     }
@@ -445,23 +432,6 @@ impl ConnectOptionsBuilder {
     pub fn connect_timeout(&mut self, timeout: Duration) -> &mut Self {
         // TODO: Lower limit of 1 sec?
         self.0.timeout = timeout;
-        self
-    }
-
-    /// Sets the publish retry interval for MQTT v3 connections.
-    ///
-    /// This is ignored for MQTT v5 connections, as retrying is only allowed
-    /// on a reconnect in v5.
-    ///
-    /// # Arguments
-    ///
-    /// `interval` The publish retry interval. This has a resolution of seconds.
-    ///
-    pub fn retry_interval<D>(&mut self, interval: D) -> &mut Self
-    where
-        D: Into<Option<Duration>>,
-    {
-        self.0.retry_interval = interval.into();
         self
     }
 
@@ -654,17 +624,5 @@ mod tests {
             .ssl_options(None)
             .finalize();
         assert!(opts.ssl.is_none());
-
-        // retry_interval: set then clear with None
-        let opts = ConnectOptionsBuilder::new()
-            .retry_interval(Duration::from_secs(5))
-            .finalize();
-        assert_eq!(opts.retry_interval, Some(Duration::from_secs(5)));
-
-        let opts = ConnectOptionsBuilder::new()
-            .retry_interval(Duration::from_secs(5))
-            .retry_interval(None)
-            .finalize();
-        assert!(opts.retry_interval.is_none());
     }
 }

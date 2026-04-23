@@ -268,9 +268,8 @@ impl CreateOptionsBuilder {
     ///     to zero also disables any off-line buffering.
     ///
     pub fn max_buffered_messages(mut self, n: usize) -> Self {
-        // Note that the C lib seems to need at least a single slot
-        // to send messages, even when connected. For sanity we put
-        // a small lower limit.
+        // Enforce a small lower bound so the client has at least a few
+        // slots available for in-flight operations even when connected.
         self.opts.max_buffered_msgs = cmp::max(4, n);
         if n == 0 {
             self.opts.send_while_disconnected = false;
