@@ -65,8 +65,8 @@ pub use crate::errors::{
 pub use crate::event::Event;
 pub use crate::message::{Message, MessageBuilder, OutMessage};
 pub use crate::persistence::{
-    ClientPersistence, ClientPersistenceBox, PERSISTENCE_ERROR, PERSISTENCE_SUCCESS,
-    PersistenceType, UserPersistence,
+    ClientPersistence, ClientPersistenceBox, FilePersistence, PERSISTENCE_ERROR,
+    PERSISTENCE_SUCCESS, PersistenceType, UserPersistence,
 };
 pub use crate::properties::{
     Properties, Property, PropertyCode, PropertyId, PropertyType, PropertyValue,

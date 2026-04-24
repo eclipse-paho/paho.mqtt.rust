@@ -47,10 +47,11 @@
 use crate::event::Event;
 use crate::{
     AsyncReceiver, ConnectOptions, ConnectToken, CreateOptions, DeliveryToken,
-    DisconnectOptions, Message, Properties, ReasonCode, SubscribeManyToken,
-    SubscribeOptions, SubscribeToken, SyncReceiver, UnsubscribeManyToken, UnsubscribeToken,
-    UserData,
+    DisconnectOptions, FilePersistence, Message, PersistenceType, Properties, ReasonCode,
+    SubscribeManyToken, SubscribeOptions, SubscribeToken, SyncReceiver,
+    UnsubscribeManyToken, UnsubscribeToken, UserData,
     errors::{Error, Result},
+    persistence::ClientPersistence,
     runtime::{Command, RuntimeHandle, ServerAddr},
     token::Token,
     types::*,
@@ -64,6 +65,23 @@ use std::{
     },
     time::Duration,
 };
+
+/////////////////////////////////////////////////////////////////////////////
+
+/// Constructs a boxed, mutex-wrapped persistence store from a `PersistenceType`.
+///
+/// Returns `None` when `typ` is `PersistenceType::None`.
+fn make_persistence(
+    typ: PersistenceType,
+) -> Option<Arc<Mutex<Box<dyn ClientPersistence>>>> {
+    let store: Box<dyn ClientPersistence> = match typ {
+        PersistenceType::None => return None,
+        PersistenceType::File => Box::new(FilePersistence::new(".")),
+        PersistenceType::FilePath(p) => Box::new(FilePersistence::new(p)),
+        PersistenceType::User(up) => up.into_inner(),
+    };
+    Some(Arc::new(Mutex::new(store)))
+}
 
 /////////////////////////////////////////////////////////////////////////////
 // AsyncClient
@@ -90,6 +108,8 @@ pub(crate) struct InnerAsyncClient {
     conn_opts: RwLock<ConnectOptions>,
     /// User-registered event callbacks.
     callback_context: Mutex<CallbackContext>,
+    /// Persistence store, if any.
+    persist: Option<Arc<Mutex<Box<dyn ClientPersistence>>>>,
 }
 
 // The client is safe to send or share between threads.
@@ -133,7 +153,7 @@ impl AsyncClient {
     where
         T: Into<CreateOptions>,
     {
-        let opts = opts.into();
+        let mut opts: CreateOptions = opts.into();
         debug!("Create options: {:?}", opts);
 
         let rt = RuntimeHandle::spawn();
@@ -147,6 +167,11 @@ impl AsyncClient {
             ..ConnectOptions::default()
         };
 
+        // Extract persistence before moving opts into inner, so we can consume
+        // PersistenceType::User without cloning the trait object.
+        let persist_type = std::mem::replace(&mut opts.persistence, PersistenceType::None);
+        let persist = make_persistence(persist_type);
+
         let inner = Arc::new(InnerAsyncClient {
             cmd_tx,
             connected: Arc::new(AtomicBool::new(false)),
@@ -154,6 +179,7 @@ impl AsyncClient {
             opts,
             conn_opts: RwLock::new(initial_conn_opts),
             callback_context: Mutex::new(CallbackContext::default()),
+            persist,
         });
 
         let weak = Arc::downgrade(&inner);
@@ -244,6 +270,7 @@ impl AsyncClient {
             props: opts.props,
             tx: comp,
             connected_flag: Arc::clone(&self.inner.connected),
+            persist: self.inner.persist.as_ref().map(Arc::clone),
         };
 
         if self.inner.cmd_tx.send_blocking(cmd).is_err() {

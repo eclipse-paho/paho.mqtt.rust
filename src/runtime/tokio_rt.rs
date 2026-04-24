@@ -29,7 +29,7 @@ use std::{
     io,
     pin::Pin,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
     task::{Context, Poll},
@@ -52,6 +52,7 @@ use tokio::{
 
 use super::commands::{Command, Event, ReceivedMessage, ServerAddr};
 use crate::{
+    persistence::ClientPersistence,
     responses::{ConnectResponse, PublishResponse, SubscribeResponse, UnsubscribeResponse},
     token::Completer,
 };
@@ -297,6 +298,8 @@ struct Session {
     ping_outstanding: bool,
     /// Shared flag cleared before the disconnect token resolves.
     connected_flag: Arc<AtomicBool>,
+    /// Persistence store for in-flight QoS 1/2 messages (if any).
+    persist: Option<Arc<Mutex<Box<dyn ClientPersistence>>>>,
 }
 
 impl Session {
@@ -306,6 +309,7 @@ impl Session {
         keep_alive: Duration,
         event_tx: async_channel::Sender<Event>,
         connected_flag: Arc<AtomicBool>,
+        persist: Option<Arc<Mutex<Box<dyn ClientPersistence>>>>,
     ) -> Self {
         Self {
             writer,
@@ -321,6 +325,21 @@ impl Session {
             event_tx,
             ping_outstanding: false,
             connected_flag,
+            persist,
+        }
+    }
+
+    /// Persists `data` under `key`, silently ignoring errors.
+    fn persist_put(&self, key: &str, data: &[u8]) {
+        if let Some(p) = &self.persist {
+            let _ = p.lock().unwrap().put(key, vec![data]);
+        }
+    }
+
+    /// Removes the persistence entry for `key`, silently ignoring errors.
+    fn persist_remove(&self, key: &str) {
+        if let Some(p) = &self.persist {
+            let _ = p.lock().unwrap().remove(key);
         }
     }
 
@@ -393,6 +412,7 @@ impl Session {
             // ---- Publish acknowledgements ----
             Packet::PubAck(ack) => {
                 if let Some(tx) = self.pending_pub1.remove(&ack.packet_id) {
+                    self.persist_remove(&format!("s{}", ack.packet_id));
                     let rsp = PublishResponse {
                         reason_code: ack.reason_code,
                         properties: ack.properties,
@@ -419,6 +439,7 @@ impl Session {
             // ---- QoS 2 outbound: PUBCOMP → resolve token ----
             Packet::PubComp(comp) => {
                 if let Some(tx) = self.pending_pub2.remove(&comp.packet_id) {
+                    self.persist_remove(&format!("s{}", comp.packet_id));
                     let rsp = PublishResponse {
                         reason_code: comp.reason_code,
                         properties: comp.properties,
@@ -480,6 +501,15 @@ impl Session {
                 }
                 QoS::QoS2 => {
                     let id = pub_pkt.packet_id.unwrap_or(0);
+                    // Persist the inbound QoS 2 PUBLISH before acknowledging
+                    // so we can redeliver the message on reconnect.
+                    let mut enc_buf = BytesMut::with_capacity(256);
+                    if Packet::Publish(pub_pkt.clone())
+                        .encode(&mut enc_buf, self.ver)
+                        .is_ok()
+                    {
+                        self.persist_put(&format!("r{id}"), &enc_buf);
+                    }
                     let msg = ReceivedMessage {
                         topic: pub_pkt.topic,
                         payload: pub_pkt.payload,
@@ -498,6 +528,7 @@ impl Session {
             // ---- QoS 2 inbound: PUBREL → send PUBCOMP, deliver message ----
             Packet::PubRel(rel) => {
                 if let Some(msg) = self.pending_pub2_in.remove(&rel.packet_id) {
+                    self.persist_remove(&format!("r{}", rel.packet_id));
                     let _ = self.event_tx.send(Event::MessageArrived(msg)).await;
                 }
                 let comp = PubAck::new(rel.packet_id);
@@ -551,6 +582,19 @@ impl Session {
                     payload,
                     properties: props,
                 };
+
+                // Persist QoS 1/2 PUBLISH before sending so we can
+                // re-transmit after a crash.
+                if let Some(pid) = id {
+                    let mut enc_buf = BytesMut::with_capacity(256);
+                    if Packet::Publish(pub_pkt.clone())
+                        .encode(&mut enc_buf, self.ver)
+                        .is_ok()
+                    {
+                        self.persist_put(&format!("s{pid}"), &enc_buf);
+                    }
+                }
+
                 self.send(&Packet::Publish(pub_pkt)).await?;
 
                 match qos {
@@ -666,6 +710,7 @@ pub(crate) async fn run_event_loop(
             props,
             tx,
             connected_flag,
+            persist,
         ) = match cmd {
             Command::Connect {
                 addr,
@@ -680,6 +725,7 @@ pub(crate) async fn run_event_loop(
                 props,
                 tx,
                 connected_flag,
+                persist,
             } => (
                 addr,
                 server_uri,
@@ -693,6 +739,7 @@ pub(crate) async fn run_event_loop(
                 props,
                 tx,
                 connected_flag,
+                persist,
             ),
             _ => continue, // ignore non-Connect commands before connecting
         };
@@ -717,6 +764,14 @@ pub(crate) async fn run_event_loop(
                 }
             },
         };
+
+        // ---- Open persistence for this connection ----
+        if let Some(p) = &persist {
+            if let Err(e) = p.lock().unwrap().open(&client_id, &server_uri) {
+                tx.complete(Err(e));
+                continue;
+            }
+        }
 
         // ---- Build codec CONNECT packet ----
         let connect_pkt = paho_mqtt_codec::Connect {
@@ -785,11 +840,20 @@ pub(crate) async fn run_event_loop(
             Duration::from_secs(3600)
         };
 
-        let mut session =
-            Session::new(writer, ver, keep_alive, event_tx.clone(), connected_flag);
+        let mut session = Session::new(
+            writer,
+            ver,
+            keep_alive,
+            event_tx.clone(),
+            connected_flag,
+            persist,
+        );
         if let Err(e) = session.run(&mut reader, &cmd_rx).await {
             session.connected_flag.store(false, Ordering::SeqCst);
             let _ = event_tx.send(Event::ConnectionLost(e)).await;
+        }
+        if let Some(p) = &session.persist {
+            let _ = p.lock().unwrap().close();
         }
     }
 }

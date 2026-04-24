@@ -23,12 +23,13 @@
 //! [`Command`] values flow from the public API to the event loop.
 //! [`Event`] values flow back from the event loop to the public layer.
 
-use std::sync::{Arc, atomic::AtomicBool};
+use std::sync::{Arc, Mutex, atomic::AtomicBool};
 
 use bytes::Bytes;
 use paho_mqtt_codec::{MqttVersion, Properties as CodecProperties, QoS, ReasonCode, Will};
 
 use crate::{
+    persistence::ClientPersistence,
     responses::{ConnectResponse, PublishResponse, SubscribeResponse, UnsubscribeResponse},
     subscribe_options::SubscribeOptions,
     token::Completer,
@@ -105,6 +106,8 @@ pub(crate) enum Command {
         tx: Completer<ConnectResponse>,
         /// Set to `true` before resolving `tx` on success; cleared on failure.
         connected_flag: Arc<AtomicBool>,
+        /// Persistence store, opened for this connection (if any).
+        persist: Option<Arc<Mutex<Box<dyn ClientPersistence>>>>,
     },
 
     /// Publish an application message.

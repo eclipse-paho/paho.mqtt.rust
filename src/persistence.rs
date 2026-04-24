@@ -27,6 +27,7 @@
 use crate::errors::Result;
 use std::{
     fmt,
+    io::Write,
     path::{Path, PathBuf},
 };
 
@@ -171,8 +172,201 @@ impl UserPersistence {
     }
 }
 
+impl UserPersistence {
+    /// Extracts the inner [`ClientPersistence`] implementation.
+    pub fn into_inner(self) -> Box<dyn ClientPersistence> {
+        *self.0
+    }
+}
+
 impl From<Box<dyn ClientPersistence>> for UserPersistence {
     fn from(persistence: ClientPersistenceBox) -> Self {
         Self(Box::new(persistence))
+    }
+}
+
+/////////////////////////////////////////////////////////////////////////////
+//                          FilePersistence
+/////////////////////////////////////////////////////////////////////////////
+
+/// Sanitizes a string for use as a directory-name component.
+fn sanitize_path_component(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+            c => c,
+        })
+        .collect()
+}
+
+/// File-system persistence store.
+///
+/// Stores each entry as a separate file under a subdirectory of the given
+/// base directory. The subdirectory is named
+/// `<client_id>-<server_uri>` (with characters invalid in path names
+/// replaced by underscores), so a separate store is maintained for each
+/// unique client/server pair.
+pub struct FilePersistence {
+    /// Root directory supplied at construction time.
+    base_dir: PathBuf,
+    /// Active store directory; set by [`open`](Self::open).
+    dir: PathBuf,
+}
+
+impl FilePersistence {
+    /// Creates a new `FilePersistence` instance rooted at `base_dir`.
+    ///
+    /// The actual storage directory is not created until
+    /// [`open`](ClientPersistence::open) is called.
+    pub fn new<P: Into<PathBuf>>(base_dir: P) -> Self {
+        Self {
+            base_dir: base_dir.into(),
+            dir: PathBuf::new(),
+        }
+    }
+
+    fn key_path(&self, key: &str) -> PathBuf {
+        self.dir.join(key)
+    }
+}
+
+impl ClientPersistence for FilePersistence {
+    fn open(&mut self, client_id: &str, server_uri: &str) -> Result<()> {
+        let dir_name = format!(
+            "{}-{}",
+            sanitize_path_component(client_id),
+            sanitize_path_component(server_uri)
+        );
+        self.dir = self.base_dir.join(dir_name);
+        std::fs::create_dir_all(&self.dir)?;
+        Ok(())
+    }
+
+    fn close(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    fn put(&mut self, key: &str, buffers: Vec<&[u8]>) -> Result<()> {
+        let mut f = std::fs::File::create(self.key_path(key))?;
+        for buf in buffers {
+            f.write_all(buf)?;
+        }
+        Ok(())
+    }
+
+    fn get(&mut self, key: &str) -> Result<Vec<u8>> {
+        Ok(std::fs::read(self.key_path(key))?)
+    }
+
+    fn remove(&mut self, key: &str) -> Result<()> {
+        let path = self.key_path(key);
+        if path.exists() {
+            std::fs::remove_file(path)?;
+        }
+        Ok(())
+    }
+
+    fn keys(&mut self) -> Result<Vec<String>> {
+        let mut keys = Vec::new();
+        for entry in std::fs::read_dir(&self.dir)? {
+            let entry = entry?;
+            if let Some(name) = entry.file_name().to_str() {
+                keys.push(name.to_string());
+            }
+        }
+        Ok(keys)
+    }
+
+    fn clear(&mut self) -> Result<()> {
+        for entry in std::fs::read_dir(&self.dir)? {
+            std::fs::remove_file(entry?.path())?;
+        }
+        Ok(())
+    }
+
+    fn contains_key(&mut self, key: &str) -> bool {
+        self.key_path(key).exists()
+    }
+}
+
+/////////////////////////////////////////////////////////////////////////////
+//                              Unit Tests
+/////////////////////////////////////////////////////////////////////////////
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    /// Opens a `FilePersistence` in a fresh temp directory and returns it
+    /// together with the temp dir handle (dropped at end of test).
+    fn open_temp() -> (FilePersistence, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut p = FilePersistence::new(tmp.path());
+        p.open("test_client", "tcp://localhost:1883").expect("open");
+        (p, tmp)
+    }
+
+    #[test]
+    fn test_put_get_roundtrip() {
+        let (mut p, _tmp) = open_temp();
+        p.put("key1", vec![b"hello", b" world"]).expect("put");
+        let got = p.get("key1").expect("get");
+        assert_eq!(got, b"hello world");
+    }
+
+    #[test]
+    fn test_contains_key() {
+        let (mut p, _tmp) = open_temp();
+        assert!(!p.contains_key("k"));
+        p.put("k", vec![b"v"]).expect("put");
+        assert!(p.contains_key("k"));
+    }
+
+    #[test]
+    fn test_remove() {
+        let (mut p, _tmp) = open_temp();
+        p.put("k", vec![b"v"]).expect("put");
+        assert!(p.contains_key("k"));
+        p.remove("k").expect("remove");
+        assert!(!p.contains_key("k"));
+        // Removing a non-existent key must not error.
+        p.remove("k").expect("remove missing");
+    }
+
+    #[test]
+    fn test_keys() {
+        let (mut p, _tmp) = open_temp();
+        p.put("a", vec![b"1"]).expect("put a");
+        p.put("b", vec![b"2"]).expect("put b");
+        p.put("c", vec![b"3"]).expect("put c");
+        let keys: HashSet<String> = p.keys().expect("keys").into_iter().collect();
+        assert!(keys.contains("a"));
+        assert!(keys.contains("b"));
+        assert!(keys.contains("c"));
+        assert_eq!(keys.len(), 3);
+    }
+
+    #[test]
+    fn test_clear() {
+        let (mut p, _tmp) = open_temp();
+        p.put("x", vec![b"1"]).expect("put");
+        p.put("y", vec![b"2"]).expect("put");
+        p.clear().expect("clear");
+        assert!(p.keys().expect("keys").is_empty());
+    }
+
+    #[test]
+    fn test_close_reopen() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut p = FilePersistence::new(tmp.path());
+        p.open("cli", "tcp://localhost:1883").expect("open");
+        p.put("persist_me", vec![b"data"]).expect("put");
+        p.close().expect("close");
+
+        // Re-open should see the persisted data.
+        let mut p2 = FilePersistence::new(tmp.path());
+        p2.open("cli", "tcp://localhost:1883").expect("reopen");
+        assert_eq!(p2.get("persist_me").expect("get"), b"data");
     }
 }
