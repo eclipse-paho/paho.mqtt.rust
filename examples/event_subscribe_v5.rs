@@ -116,7 +116,7 @@ fn main() {
 
         while let Ok(evt) = strm.recv().await {
             match evt {
-                Event::Connected => println!("Connected"),
+                Event::Connected(rsp) => println!("Connected (v{})", rsp.mqtt_version),
                 Event::Message(msg) => {
                     if msg.retained() {
                         print!("(R) ");

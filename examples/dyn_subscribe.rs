@@ -94,7 +94,7 @@ fn main() {
     });
 
     // Subscribe to topics on every successful connection (initial + reconnects).
-    cli.set_connected_callback(|cli: &mqtt::AsyncClient| {
+    cli.set_connected_callback(|cli: &mqtt::AsyncClient, _rsp| {
         println!("Connected.");
         subscribe_topics(cli);
     });

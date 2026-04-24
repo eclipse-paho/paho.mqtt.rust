@@ -70,7 +70,7 @@ fn main() {
     });
 
     // Subscribe to topics on every successful connection (initial + reconnects).
-    cli.set_connected_callback(|cli| {
+    cli.set_connected_callback(|cli, _rsp| {
         println!("Connected. Subscribing to topics: {:?}", TOPICS);
         cli.subscribe_many(TOPICS, QOS);
     });

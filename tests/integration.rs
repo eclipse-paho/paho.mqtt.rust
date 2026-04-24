@@ -385,7 +385,7 @@ fn test_auto_reconnect() {
     )
     .unwrap();
 
-    cli.set_connected_callback(move |_| {
+    cli.set_connected_callback(move |_, _rsp| {
         cc.fetch_add(1, Ordering::SeqCst);
         let _ = cb_tx.send(());
     });

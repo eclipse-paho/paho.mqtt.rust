@@ -46,10 +46,10 @@
 
 use crate::event::Event;
 use crate::{
-    AsyncReceiver, ConnectOptions, ConnectToken, CreateOptions, DeliveryToken,
-    DisconnectOptions, FilePersistence, Message, PersistenceType, Properties, ReasonCode,
-    SubscribeManyToken, SubscribeOptions, SubscribeToken, SyncReceiver,
-    UnsubscribeManyToken, UnsubscribeToken, UserData,
+    AsyncReceiver, ConnectOptions, ConnectResponse, ConnectToken, CreateOptions,
+    DeliveryToken, DisconnectOptions, FilePersistence, Message, PersistenceType,
+    Properties, ReasonCode, SubscribeManyToken, SubscribeOptions, SubscribeToken,
+    SyncReceiver, UnsubscribeManyToken, UnsubscribeToken, UserData,
     errors::{Error, Result},
     persistence::ClientPersistence,
     runtime::{Command, RuntimeHandle, ServerAddr},
@@ -117,7 +117,7 @@ unsafe impl Send for InnerAsyncClient {}
 unsafe impl Sync for InnerAsyncClient {}
 
 /// User callback type for when the client is connected.
-pub type ConnectedCallback = dyn FnMut(&AsyncClient) + Send + 'static;
+pub type ConnectedCallback = dyn FnMut(&AsyncClient, &ConnectResponse) + Send + 'static;
 
 /// User callback type for when the connection is lost from the broker.
 pub type ConnectionLostCallback = dyn FnMut(&AsyncClient) + Send + 'static;
@@ -702,11 +702,11 @@ impl AsyncClient {
     fn dispatch_event(&self, ev: crate::runtime::Event) {
         use crate::runtime::Event as Ev;
         match ev {
-            Ev::Connected(_response) => {
+            Ev::Connected(response) => {
                 // connected flag already set by event loop before token resolved
                 let mut cbctx = self.inner.callback_context.lock().unwrap();
                 if let Some(ref mut cb) = cbctx.on_connected {
-                    cb(self);
+                    cb(self, &response);
                 }
             }
             Ev::ConnectionLost(_err) => {
@@ -804,7 +804,7 @@ impl AsyncClient {
     ///   function or a closure.
     pub fn set_connected_callback<F>(&self, cb: F)
     where
-        F: FnMut(&AsyncClient) + Send + 'static,
+        F: FnMut(&AsyncClient, &crate::ConnectResponse) + Send + 'static,
     {
         self.inner.callback_context.lock().unwrap().on_connected = Some(Box::new(cb));
     }
@@ -921,8 +921,8 @@ impl AsyncClient {
 
         self.set_connected_callback({
             let tx = tx.clone();
-            move |_cli| {
-                log_channel_err(tx.try_send(Event::Connected));
+            move |_cli, rsp| {
+                log_channel_err(tx.try_send(Event::Connected(rsp.clone())));
             }
         });
 
@@ -989,8 +989,8 @@ impl AsyncClient {
 
         self.set_connected_callback({
             let tx = tx.clone();
-            move |_cli| {
-                log_stream_err(tx.try_send(Event::Connected));
+            move |_cli, rsp| {
+                log_stream_err(tx.try_send(Event::Connected(rsp.clone())));
             }
         });
 
