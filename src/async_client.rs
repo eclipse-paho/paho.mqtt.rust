@@ -308,14 +308,15 @@ impl AsyncClient {
     where
         T: Into<Option<DisconnectOptions>>,
     {
-        let _opts = opts.into().unwrap_or_default();
+        let opts = opts.into().unwrap_or_default();
         debug!("Disconnecting");
 
         let (tok, comp) = Token::<()>::new();
 
         let cmd = Command::Disconnect {
-            reason_code: paho_mqtt_codec::ReasonCode::NormalDisconnection,
-            props: Default::default(),
+            timeout: opts.timeout,
+            reason_code: opts.reason_code,
+            props: opts.props,
             tx: comp,
             connected_flag: Arc::clone(&self.inner.connected),
         };

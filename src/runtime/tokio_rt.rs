@@ -506,6 +506,14 @@ impl Session {
         }
     }
 
+    /// Returns `true` if any outbound operations are waiting for broker ACKs.
+    fn has_pending(&self) -> bool {
+        !self.pending_pub1.is_empty()
+            || !self.pending_pub2.is_empty()
+            || !self.pending_sub.is_empty()
+            || !self.pending_unsub.is_empty()
+    }
+
     /// Persists `data` under `key`, silently ignoring errors.
     fn persist_put(&self, key: &str, data: &[u8]) {
         if let Some(p) = &self.persist {
@@ -569,6 +577,51 @@ impl Session {
                 }
                 cmd = cmd_rx.recv() => {
                     match cmd {
+                        Err(_) => return Ok(()),
+                        Ok(Command::Disconnect {
+                            timeout,
+                            reason_code,
+                            props,
+                            tx,
+                            connected_flag,
+                        }) => {
+                            // If requested, wait for in-flight ops to complete
+                            // before sending DISCONNECT.
+                            if !timeout.is_zero() && self.has_pending() {
+                                let deadline = time::Instant::now() + timeout;
+                                'drain: loop {
+                                    if !self.has_pending() {
+                                        break;
+                                    }
+                                    tokio::select! {
+                                        result = reader.read_buf(&mut read_buf) => {
+                                            match result {
+                                                Ok(0) | Err(_) => break 'drain,
+                                                Ok(_) => {
+                                                    while let Ok(Some(raw)) =
+                                                        RawPacket::decode(&mut read_buf)
+                                                    {
+                                                        match Packet::from_raw(raw, self.ver) {
+                                                            Ok(pkt) => {
+                                                                let _ =
+                                                                    self.handle_packet(pkt).await;
+                                                            }
+                                                            Err(_) => break 'drain,
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        _ = time::sleep_until(deadline) => break 'drain,
+                                    }
+                                }
+                            }
+                            let disc = Disconnect { reason_code, properties: props };
+                            let _ = self.send(&Packet::Disconnect(disc)).await;
+                            connected_flag.store(false, Ordering::SeqCst);
+                            tx.complete(Ok(()));
+                            return Ok(());
+                        }
                         Ok(cmd) => {
                             if self.handle_command(cmd).await? {
                                 return Ok(());
@@ -578,7 +631,6 @@ impl Session {
                                 ka_sleep.as_mut().reset(time::Instant::now() + keep_alive);
                             }
                         }
-                        Err(_) => return Ok(()),
                     }
                 }
                 _ = &mut ka_sleep, if ka_enabled => {
@@ -600,10 +652,7 @@ impl Session {
             Packet::PubAck(ack) => {
                 if let Some(tx) = self.pending_pub1.remove(&ack.packet_id) {
                     self.persist_remove(&format!("s{}", ack.packet_id));
-                    let rsp = PublishResponse {
-                        reason_code: ack.reason_code,
-                        properties: ack.properties,
-                    };
+                    let rsp = PublishResponse::new(ack.reason_code, ack.properties);
                     tx.complete(Ok(rsp));
                 }
             }
@@ -627,10 +676,7 @@ impl Session {
             Packet::PubComp(comp) => {
                 if let Some(tx) = self.pending_pub2.remove(&comp.packet_id) {
                     self.persist_remove(&format!("s{}", comp.packet_id));
-                    let rsp = PublishResponse {
-                        reason_code: comp.reason_code,
-                        properties: comp.properties,
-                    };
+                    let rsp = PublishResponse::new(comp.reason_code, comp.properties);
                     tx.complete(Ok(rsp));
                 }
             }
@@ -638,10 +684,7 @@ impl Session {
             // ---- Subscription acknowledgement ----
             Packet::SubAck(ack) => {
                 if let Some(tx) = self.pending_sub.remove(&ack.packet_id) {
-                    let rsp = SubscribeResponse {
-                        reason_codes: ack.reason_codes,
-                        properties: ack.properties,
-                    };
+                    let rsp = SubscribeResponse::new(ack.reason_codes, ack.properties);
                     tx.complete(Ok(rsp));
                 }
             }
@@ -649,10 +692,7 @@ impl Session {
             // ---- Unsubscription acknowledgement ----
             Packet::UnsubAck(ack) => {
                 if let Some(tx) = self.pending_unsub.remove(&ack.packet_id) {
-                    let rsp = UnsubscribeResponse {
-                        reason_codes: ack.reason_codes,
-                        properties: ack.properties,
-                    };
+                    let rsp = UnsubscribeResponse::new(ack.reason_codes, ack.properties);
                     tx.complete(Ok(rsp));
                 }
             }
@@ -660,28 +700,12 @@ impl Session {
             // ---- Inbound application message ----
             Packet::Publish(pub_pkt) => match pub_pkt.qos {
                 QoS::QoS0 => {
-                    let msg = Message {
-                        topic: pub_pkt.topic,
-                        payload: pub_pkt.payload,
-                        qos: pub_pkt.qos,
-                        retain: pub_pkt.retain,
-                        dup: pub_pkt.dup,
-                        msgid: None,
-                        props: pub_pkt.properties,
-                    };
+                    let msg = Message::from(pub_pkt);
                     let _ = self.event_tx.send(Event::MessageArrived(msg)).await;
                 }
                 QoS::QoS1 => {
                     let id = pub_pkt.packet_id.unwrap_or(0);
-                    let msg = Message {
-                        topic: pub_pkt.topic,
-                        payload: pub_pkt.payload,
-                        qos: pub_pkt.qos,
-                        retain: pub_pkt.retain,
-                        dup: pub_pkt.dup,
-                        msgid: Some(id),
-                        props: pub_pkt.properties,
-                    };
+                    let msg = Message::from(pub_pkt);
                     let _ = self.event_tx.send(Event::MessageArrived(msg)).await;
                     let ack = PubAck::new(id);
                     self.send(&Packet::PubAck(ack)).await?;
@@ -697,15 +721,7 @@ impl Session {
                     {
                         self.persist_put(&format!("r{id}"), &enc_buf);
                     }
-                    let msg = Message {
-                        topic: pub_pkt.topic,
-                        payload: pub_pkt.payload,
-                        qos: pub_pkt.qos,
-                        retain: pub_pkt.retain,
-                        dup: pub_pkt.dup,
-                        msgid: Some(id),
-                        props: pub_pkt.properties,
-                    };
+                    let msg = Message::from(pub_pkt);
                     self.pending_pub2_in.insert(id, msg);
                     let rec = PubAck::new(id);
                     self.send(&Packet::PubRec(rec)).await?;
@@ -739,7 +755,8 @@ impl Session {
 
     /// Handles one command from the public API.
     ///
-    /// Returns `true` when a `Disconnect` command signals a clean shutdown.
+    /// `Command::Disconnect` is intercepted by `run()` before this is called
+    /// and should never reach here.
     async fn handle_command(&mut self, cmd: Command) -> Result<bool> {
         match cmd {
             Command::Connect { tx, .. } => {
@@ -842,23 +859,8 @@ impl Session {
                 self.pending_unsub.insert(id, tx);
             }
 
-            Command::Disconnect {
-                reason_code,
-                props,
-                tx,
-                connected_flag,
-            } => {
-                let disc = Disconnect {
-                    reason_code,
-                    properties: props,
-                };
-                self.send(&Packet::Disconnect(disc)).await?;
-                // Clear the flag before resolving the token so `is_connected()`
-                // returns false as soon as `wait()` returns in the caller.
-                connected_flag.store(false, Ordering::SeqCst);
-                tx.complete(Ok(()));
-                return Ok(true); // signal clean shutdown
-            }
+            // Intercepted in run() before this method is called.
+            Command::Disconnect { .. } => unreachable!(),
         }
         Ok(false)
     }

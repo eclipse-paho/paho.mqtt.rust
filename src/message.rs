@@ -19,15 +19,14 @@
  *    Frank Pagliughi - initial implementation and documentation
  *******************************************************************************/
 
-use std::{borrow::Cow, fmt};
-
-use bytes::Bytes;
-
 use crate::{QoS, properties::Properties};
+use bytes::Bytes;
+use paho_mqtt_codec::Publish as PublishPacket;
+use std::{borrow::Cow, fmt};
 
 /// An MQTT Message.
 ///
-/// This represents all the information passed in an MQTT PUBLISH packet.
+/// This represents the information passed in an MQTT PUBLISH packet.
 /// It is the primary data transfer mechanism for the protocol, used for
 /// both outbound publications and inbound deliveries.
 #[derive(Debug, Default, Clone)]
@@ -135,6 +134,24 @@ impl Message {
     /// Gets the message identifier.
     pub fn msgid(&self) -> Option<u16> {
         self.msgid
+    }
+}
+
+impl From<PublishPacket> for Message {
+    fn from(pub_pkt: PublishPacket) -> Self {
+        let id = match pub_pkt.qos {
+            QoS::QoS0 => None,
+            _ => Some(pub_pkt.packet_id.unwrap_or(0)),
+        };
+        Self {
+            topic: pub_pkt.topic,
+            payload: pub_pkt.payload,
+            qos: pub_pkt.qos,
+            retain: pub_pkt.retain,
+            dup: pub_pkt.dup,
+            msgid: id,
+            props: pub_pkt.properties,
+        }
     }
 }
 

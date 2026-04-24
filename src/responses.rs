@@ -52,6 +52,16 @@ pub struct PublishResponse {
     pub properties: Properties,
 }
 
+impl PublishResponse {
+    /// Create a new response
+    pub fn new(reason_code: ReasonCode, properties: Properties) -> Self {
+        Self {
+            reason_code,
+            properties,
+        }
+    }
+}
+
 /// Response data from a SUBSCRIBE → SUBACK exchange.
 #[derive(Clone, Default, Debug)]
 pub struct SubscribeResponse {
@@ -64,6 +74,16 @@ pub struct SubscribeResponse {
     pub properties: Properties,
 }
 
+impl SubscribeResponse {
+    /// Create a new response
+    pub fn new(reason_codes: Vec<ReasonCode>, properties: Properties) -> Self {
+        Self {
+            reason_codes,
+            properties,
+        }
+    }
+}
+
 /// Response data from an UNSUBSCRIBE → UNSUBACK exchange.
 #[derive(Clone, Default, Debug)]
 pub struct UnsubscribeResponse {
@@ -71,4 +91,14 @@ pub struct UnsubscribeResponse {
     pub reason_codes: Vec<ReasonCode>,
     /// MQTT v5 properties from the UNSUBACK. Empty on v3.1.1.
     pub properties: Properties,
+}
+
+impl UnsubscribeResponse {
+    /// Create a new response
+    pub fn new(reason_codes: Vec<ReasonCode>, properties: Properties) -> Self {
+        Self {
+            reason_codes,
+            properties,
+        }
+    }
 }

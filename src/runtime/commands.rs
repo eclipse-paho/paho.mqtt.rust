@@ -164,6 +164,9 @@ pub(crate) enum Command {
 
     /// Send a DISCONNECT packet and close the connection.
     Disconnect {
+        /// How long to wait for in-flight operations to complete before
+        /// disconnecting. `Duration::ZERO` means disconnect immediately.
+        timeout: Duration,
         /// Reason for disconnecting (v5 only; ignored on v3.1.1).
         reason_code: ReasonCode,
         /// MQTT v5 properties; empty for v3.1.1.
