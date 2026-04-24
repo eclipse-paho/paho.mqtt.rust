@@ -363,6 +363,76 @@ fn test_reconnect() {
     cli.disconnect(None).wait().ok();
 }
 
+#[test]
+fn test_auto_reconnect() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+        mpsc,
+    };
+
+    const CLIENT_ID: &str = "paho-rust-v2-auto-reconnect";
+
+    let connect_count = Arc::new(AtomicUsize::new(0));
+    let cc = Arc::clone(&connect_count);
+    let (cb_tx, cb_rx) = mpsc::channel::<()>();
+
+    let cli = mqtt::AsyncClient::new(
+        mqtt::CreateOptionsBuilder::new()
+            .server_uri(HOST)
+            .client_id(CLIENT_ID)
+            .finalize(),
+    )
+    .unwrap();
+
+    cli.set_connected_callback(move |_| {
+        cc.fetch_add(1, Ordering::SeqCst);
+        let _ = cb_tx.send(());
+    });
+
+    let opts = mqtt::ConnectOptionsBuilder::new()
+        .automatic_reconnect(Duration::from_millis(200), Duration::from_secs(2))
+        .finalize();
+
+    cli.connect(opts).wait().expect("initial connect failed");
+    assert!(cli.is_connected());
+
+    cb_rx
+        .recv_timeout(TIMEOUT)
+        .expect("initial connected callback did not fire");
+    assert_eq!(connect_count.load(Ordering::SeqCst), 1);
+
+    // Force the broker to disconnect our client by connecting a second client
+    // with the same client ID.  The broker must close the first session.
+    let intruder = mqtt::AsyncClient::new(
+        mqtt::CreateOptionsBuilder::new()
+            .server_uri(HOST)
+            .client_id(CLIENT_ID)
+            .finalize(),
+    )
+    .unwrap();
+    intruder
+        .connect(None)
+        .wait()
+        .expect("intruder connect failed");
+
+    cb_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("auto-reconnect did not fire connected callback within 10 s");
+
+    assert!(
+        cli.is_connected(),
+        "auto-reconnect did not restore the session"
+    );
+    assert!(
+        connect_count.load(Ordering::SeqCst) >= 2,
+        "connected callback should have fired at least twice"
+    );
+
+    drop(intruder);
+    cli.disconnect(None).wait().ok();
+}
+
 /////////////////////////////////////////////////////////////////////////////
 // MQTT v5
 /////////////////////////////////////////////////////////////////////////////

@@ -23,7 +23,10 @@
 //! [`Command`] values flow from the public API to the event loop.
 //! [`Event`] values flow back from the event loop to the public layer.
 
-use std::sync::{Arc, Mutex, atomic::AtomicBool};
+use std::{
+    sync::{Arc, Mutex, atomic::AtomicBool},
+    time::Duration,
+};
 
 use bytes::Bytes;
 use paho_mqtt_codec::{MqttVersion, Properties as CodecProperties, QoS, ReasonCode, Will};
@@ -108,6 +111,12 @@ pub(crate) enum Command {
         connected_flag: Arc<AtomicBool>,
         /// Persistence store, opened for this connection (if any).
         persist: Option<Arc<Mutex<Box<dyn ClientPersistence>>>>,
+        /// Whether the event loop should automatically reconnect on session loss.
+        auto_reconnect: bool,
+        /// Minimum backoff interval between reconnect attempts.
+        min_retry_interval: Duration,
+        /// Maximum backoff interval between reconnect attempts.
+        max_retry_interval: Duration,
     },
 
     /// Publish an application message.

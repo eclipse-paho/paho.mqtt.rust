@@ -271,6 +271,9 @@ impl AsyncClient {
             tx: comp,
             connected_flag: Arc::clone(&self.inner.connected),
             persist: self.inner.persist.as_ref().map(Arc::clone),
+            auto_reconnect: opts.auto_reconnect,
+            min_retry_interval: opts.min_retry_interval,
+            max_retry_interval: opts.max_retry_interval,
         };
 
         if self.inner.cmd_tx.send_blocking(cmd).is_err() {

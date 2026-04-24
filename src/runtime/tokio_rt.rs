@@ -45,7 +45,9 @@ use paho_mqtt_codec::{
 #[cfg(unix)]
 use tokio::net::UnixStream;
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf, WriteHalf},
+    io::{
+        AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf, ReadHalf, WriteHalf,
+    },
     net::TcpStream,
     time,
 };
@@ -678,40 +680,35 @@ impl Session {
 }
 
 /////////////////////////////////////////////////////////////////////////////
-// Top-level event loop
+// Auto-reconnect helpers
 
-/// Drives the MQTT event loop on behalf of a [`RuntimeHandle`].
+/// All parameters needed to establish one MQTT session.
 ///
-/// This function runs indefinitely on a dedicated tokio runtime thread. It
-/// waits for a [`Command::Connect`], establishes the TCP + MQTT handshake,
-/// and then delegates to [`Session::run`] for the lifetime of the connection.
-/// If the session ends it loops back and waits for the next connect command.
-pub(crate) async fn run_event_loop(
-    cmd_rx: async_channel::Receiver<Command>,
-    event_tx: async_channel::Sender<Event>,
-) {
-    loop {
-        // ---- Wait for a Connect command ----
-        let cmd = match cmd_rx.recv().await {
-            Ok(cmd) => cmd,
-            Err(_) => return,
-        };
+/// Extracted from [`Command::Connect`] so they can be retained across
+/// reconnect attempts without re-receiving the command.
+struct ConnectJob {
+    addr: ServerAddr,
+    server_uri: String,
+    client_id: String,
+    clean_start: bool,
+    keep_alive_secs: u16,
+    user_name: Option<String>,
+    password: Option<Vec<u8>>,
+    will: Option<paho_mqtt_codec::Will>,
+    ver: MqttVersion,
+    props: paho_mqtt_codec::Properties,
+    connected_flag: Arc<AtomicBool>,
+    persist: Option<Arc<Mutex<Box<dyn ClientPersistence>>>>,
+    auto_reconnect: bool,
+    min_retry_interval: Duration,
+    max_retry_interval: Duration,
+}
 
-        let (
-            addr,
-            server_uri,
-            client_id,
-            clean_start,
-            keep_alive_secs,
-            user_name,
-            password,
-            will,
-            ver,
-            props,
-            tx,
-            connected_flag,
-            persist,
-        ) = match cmd {
+impl ConnectJob {
+    /// Extracts a `ConnectJob` from a `Command::Connect`, returning `None` for
+    /// any other command variant.
+    fn extract(cmd: Command) -> Option<(Self, Completer<ConnectResponse>)> {
+        match cmd {
             Command::Connect {
                 addr,
                 server_uri,
@@ -726,136 +723,361 @@ pub(crate) async fn run_event_loop(
                 tx,
                 connected_flag,
                 persist,
-            } => (
-                addr,
-                server_uri,
-                client_id,
-                clean_start,
-                keep_alive_secs,
-                user_name,
-                password,
-                will,
-                ver,
-                props,
+                auto_reconnect,
+                min_retry_interval,
+                max_retry_interval,
+            } => Some((
+                Self {
+                    addr,
+                    server_uri,
+                    client_id,
+                    clean_start,
+                    keep_alive_secs,
+                    user_name,
+                    password,
+                    will,
+                    ver,
+                    props,
+                    connected_flag,
+                    persist,
+                    auto_reconnect,
+                    min_retry_interval,
+                    max_retry_interval,
+                },
                 tx,
-                connected_flag,
-                persist,
-            ),
-            _ => continue, // ignore non-Connect commands before connecting
-        };
-
-        // ---- Transport connect ----
-        let conn: Box<dyn Connection> = match addr {
-            ServerAddr::Tcp { host, port } => {
-                match TcpConnection::connect(&host, port).await {
-                    Ok(c) => Box::new(c),
-                    Err(e) => {
-                        tx.complete(Err(e.into()));
-                        continue;
-                    }
-                }
-            }
-            #[cfg(unix)]
-            ServerAddr::Unix { path } => match UnixConnection::connect(&path).await {
-                Ok(c) => Box::new(c),
-                Err(e) => {
-                    tx.complete(Err(e.into()));
-                    continue;
-                }
-            },
-        };
-
-        // ---- Open persistence for this connection ----
-        if let Some(p) = &persist {
-            if let Err(e) = p.lock().unwrap().open(&client_id, &server_uri) {
-                tx.complete(Err(e));
-                continue;
-            }
+            )),
+            _ => None,
         }
+    }
 
-        // ---- Build codec CONNECT packet ----
-        let connect_pkt = paho_mqtt_codec::Connect {
-            clean_start,
-            keep_alive: keep_alive_secs,
-            client_id,
-            username: user_name,
-            password: password.map(Bytes::from),
-            will,
-            properties: props,
-            ..Default::default()
-        };
-
-        // ---- Split and send CONNECT ----
-        let (mut reader, mut writer) = tokio::io::split(conn);
-
-        let mut buf = BytesMut::with_capacity(256);
-        if let Err(e) =
-            send_packet(&mut writer, &Packet::Connect(connect_pkt), ver, &mut buf).await
-        {
-            tx.complete(Err(e));
-            continue;
-        }
-
-        // ---- Wait for CONNACK ----
-        let mut read_buf = BytesMut::with_capacity(256);
-        let connack = match recv_connack(&mut reader, &mut read_buf, ver).await {
-            Ok(c) => c,
-            Err(e) => {
-                tx.complete(Err(e));
-                continue;
-            }
-        };
-
-        if connack.reason_code as u8 >= 0x80 {
-            tx.complete(Err(crate::Error::ReasonCode(
-                connack.reason_code,
-                connack.properties,
-            )));
-            continue;
-        }
-
-        let mqtt_version = match ver {
-            MqttVersion::V5 => 5u32,
-            _ => 4,
-        };
-
-        let response = ConnectResponse {
-            server_uri,
-            mqtt_version,
-            session_present: connack.session_present,
-            reason_code: connack.reason_code,
-            properties: connack.properties,
-        };
-        // Set the flag before resolving the token so `is_connected()` is
-        // true as soon as `wait()` / `.await` returns in the caller.
-        connected_flag.store(true, Ordering::SeqCst);
-        let _ = event_tx.send(Event::Connected(response.clone())).await;
-        tx.complete(Ok(response));
-
-        // ---- Run the session ----
-        let keep_alive = if keep_alive_secs > 0 {
-            Duration::from_secs(keep_alive_secs as u64)
+    /// Converts `keep_alive_secs` to a [`Duration`], substituting one hour
+    /// when keep-alive is disabled (value 0).
+    fn keep_alive_duration(&self) -> Duration {
+        if self.keep_alive_secs > 0 {
+            Duration::from_secs(self.keep_alive_secs as u64)
         }
         else {
             Duration::from_secs(3600)
+        }
+    }
+}
+
+/// Opens the transport, opens persistence, sends CONNECT, waits for CONNACK.
+async fn do_connect(
+    job: &ConnectJob,
+) -> crate::Result<(
+    ReadHalf<Box<dyn Connection>>,
+    WriteHalf<Box<dyn Connection>>,
+    ConnAck,
+)> {
+    // ---- Open persistence ----
+    if let Some(p) = &job.persist {
+        p.lock().unwrap().open(&job.client_id, &job.server_uri)?;
+    }
+
+    // ---- Transport connect ----
+    let conn: Box<dyn Connection> = match &job.addr {
+        ServerAddr::Tcp { host, port } => {
+            Box::new(TcpConnection::connect(host, *port).await?)
+        }
+        #[cfg(unix)]
+        ServerAddr::Unix { path } => Box::new(UnixConnection::connect(path).await?),
+    };
+
+    let (mut reader, mut writer) = tokio::io::split(conn);
+
+    // ---- Build and send CONNECT packet ----
+    let connect_pkt = paho_mqtt_codec::Connect {
+        clean_start: job.clean_start,
+        keep_alive: job.keep_alive_secs,
+        client_id: job.client_id.clone(),
+        username: job.user_name.clone(),
+        password: job.password.clone().map(Bytes::from),
+        will: job.will.clone(),
+        properties: job.props.clone(),
+        ..Default::default()
+    };
+
+    let mut buf = BytesMut::with_capacity(256);
+    send_packet(
+        &mut writer,
+        &Packet::Connect(connect_pkt),
+        job.ver,
+        &mut buf,
+    )
+    .await?;
+
+    // ---- Wait for CONNACK ----
+    let mut read_buf = BytesMut::with_capacity(256);
+    let connack = recv_connack(&mut reader, &mut read_buf, job.ver).await?;
+
+    Ok((reader, writer, connack))
+}
+
+/// Result of waiting for the reconnect timer to fire.
+enum WaitOutcome {
+    /// Timer expired — proceed with the current [`ConnectJob`].
+    Retry,
+    /// A `Disconnect` command arrived; the token has been resolved and the
+    /// reconnect loop should be abandoned.
+    Abort,
+    /// A new `Connect` command arrived with updated parameters; use these
+    /// for the next attempt and resolve the supplied token with the result.
+    Replace(ConnectJob, Completer<ConnectResponse>),
+}
+
+/// Waits for `delay` to elapse while draining the command queue.
+///
+/// * `Disconnect` → completes the token (already disconnected) and returns
+///   [`WaitOutcome::Abort`].
+/// * `Connect` → captures the new parameters and returns
+///   [`WaitOutcome::Replace`] immediately (skips remaining delay).
+/// * Any other command → completes the completer with
+///   [`Error::Disconnected`] and keeps waiting.
+async fn reconnect_wait(
+    delay: Duration,
+    cmd_rx: &async_channel::Receiver<Command>,
+) -> WaitOutcome {
+    let sleep = time::sleep(delay);
+    tokio::pin!(sleep);
+
+    loop {
+        tokio::select! {
+            _ = &mut sleep => return WaitOutcome::Retry,
+            result = cmd_rx.recv() => {
+                match result {
+                    Err(_) => return WaitOutcome::Abort,
+                    Ok(cmd) => match cmd {
+                        Command::Connect {
+                            addr,
+                            server_uri,
+                            client_id,
+                            clean_start,
+                            keep_alive_secs,
+                            user_name,
+                            password,
+                            will,
+                            ver,
+                            props,
+                            tx,
+                            connected_flag,
+                            persist,
+                            auto_reconnect,
+                            min_retry_interval,
+                            max_retry_interval,
+                        } => {
+                            return WaitOutcome::Replace(
+                                ConnectJob {
+                                    addr,
+                                    server_uri,
+                                    client_id,
+                                    clean_start,
+                                    keep_alive_secs,
+                                    user_name,
+                                    password,
+                                    will,
+                                    ver,
+                                    props,
+                                    connected_flag,
+                                    persist,
+                                    auto_reconnect,
+                                    min_retry_interval,
+                                    max_retry_interval,
+                                },
+                                tx,
+                            );
+                        }
+                        Command::Disconnect {
+                            tx,
+                            connected_flag,
+                            ..
+                        } => {
+                            // We are already disconnected; satisfy the caller.
+                            connected_flag.store(false, Ordering::SeqCst);
+                            tx.complete(Ok(()));
+                            return WaitOutcome::Abort;
+                        }
+                        Command::Publish { tx, .. } => {
+                            tx.complete(Err(crate::Error::Disconnected));
+                        }
+                        Command::Subscribe { tx, .. } => {
+                            tx.complete(Err(crate::Error::Disconnected));
+                        }
+                        Command::Unsubscribe { tx, .. } => {
+                            tx.complete(Err(crate::Error::Disconnected));
+                        }
+                    },
+                }
+            }
+        }
+    }
+}
+
+/// Builds a [`ConnectResponse`] from a successful CONNACK and job metadata.
+fn build_connect_response(job: &ConnectJob, connack: ConnAck) -> ConnectResponse {
+    ConnectResponse {
+        server_uri: job.server_uri.clone(),
+        mqtt_version: if job.ver == MqttVersion::V5 { 5 } else { 4 },
+        session_present: connack.session_present,
+        reason_code: connack.reason_code,
+        properties: connack.properties,
+    }
+}
+
+/////////////////////////////////////////////////////////////////////////////
+// Top-level event loop
+
+/// Drives the MQTT event loop on behalf of a [`RuntimeHandle`].
+///
+/// Runs indefinitely on a dedicated tokio runtime thread.  Waits for a
+/// [`Command::Connect`], calls [`do_connect`] to perform the TCP + MQTT
+/// handshake, then delegates to [`Session::run`] for the lifetime of the
+/// connection.
+///
+/// If `auto_reconnect` is set in the connect options and the session ends
+/// unexpectedly, the loop retries with exponential backoff (capped at
+/// `max_retry_interval`) without re-waiting for a new `Command::Connect`.
+/// An explicit `Command::Disconnect` during the backoff wait aborts the
+/// reconnect loop.
+pub(crate) async fn run_event_loop(
+    cmd_rx: async_channel::Receiver<Command>,
+    event_tx: async_channel::Sender<Event>,
+) {
+    'outer: loop {
+        // ---- Wait for a Connect command ----
+        let cmd = match cmd_rx.recv().await {
+            Ok(cmd) => cmd,
+            Err(_) => return,
         };
 
+        let Some((mut job, initial_tx)) = ConnectJob::extract(cmd)
+        else {
+            continue 'outer;
+        };
+
+        // ---- First connection attempt ----
+        let (mut reader, writer, connack) = match do_connect(&job).await {
+            Err(e) => {
+                initial_tx.complete(Err(e));
+                continue 'outer;
+            }
+            Ok(t) => t,
+        };
+
+        if connack.reason_code as u8 >= 0x80 {
+            initial_tx.complete(Err(crate::Error::ReasonCode(
+                connack.reason_code,
+                connack.properties,
+            )));
+            continue 'outer;
+        }
+
+        let response = build_connect_response(&job, connack);
+        // Set the flag before resolving the token so `is_connected()` is true
+        // as soon as `wait()` / `.await` returns in the caller.
+        job.connected_flag.store(true, Ordering::SeqCst);
+        let _ = event_tx.send(Event::Connected(response.clone())).await;
+        initial_tx.complete(Ok(response));
+
+        // ---- Run the session ----
         let mut session = Session::new(
             writer,
-            ver,
-            keep_alive,
+            job.ver,
+            job.keep_alive_duration(),
             event_tx.clone(),
-            connected_flag,
-            persist,
+            job.connected_flag.clone(),
+            job.persist.clone(),
         );
-        if let Err(e) = session.run(&mut reader, &cmd_rx).await {
-            session.connected_flag.store(false, Ordering::SeqCst);
-            let _ = event_tx.send(Event::ConnectionLost(e)).await;
-        }
+
+        let first_result = session.run(&mut reader, &cmd_rx).await;
         if let Some(p) = &session.persist {
             let _ = p.lock().unwrap().close();
         }
-    }
+
+        match first_result {
+            Ok(()) => continue 'outer, // clean disconnect
+            Err(e) => {
+                job.connected_flag.store(false, Ordering::SeqCst);
+                let _ = event_tx.send(Event::ConnectionLost(e)).await;
+
+                if !job.auto_reconnect {
+                    continue 'outer;
+                }
+            }
+        }
+
+        // ---- Auto-reconnect loop ----
+        let mut retry_delay = job.min_retry_interval;
+
+        'retry: loop {
+            // Wait for the backoff delay, draining the command queue.
+            let tx_opt: Option<Completer<ConnectResponse>> =
+                match reconnect_wait(retry_delay, &cmd_rx).await {
+                    WaitOutcome::Abort => break 'retry,
+                    WaitOutcome::Retry => None,
+                    WaitOutcome::Replace(new_job, new_tx) => {
+                        // Explicit reconnect/connect: use the new params and
+                        // reset the backoff.
+                        job = new_job;
+                        retry_delay = job.min_retry_interval;
+                        Some(new_tx)
+                    }
+                };
+
+            match do_connect(&job).await {
+                Err(e) => {
+                    if let Some(tx) = tx_opt {
+                        tx.complete(Err(e));
+                    }
+                    retry_delay = (retry_delay * 2).min(job.max_retry_interval);
+                }
+                Ok((mut reader, writer, connack)) => {
+                    if connack.reason_code as u8 >= 0x80 {
+                        let e = crate::Error::ReasonCode(
+                            connack.reason_code,
+                            connack.properties,
+                        );
+                        if let Some(tx) = tx_opt {
+                            tx.complete(Err(e));
+                        }
+                        retry_delay = (retry_delay * 2).min(job.max_retry_interval);
+                        continue 'retry;
+                    }
+
+                    let response = build_connect_response(&job, connack);
+                    job.connected_flag.store(true, Ordering::SeqCst);
+                    let _ = event_tx.send(Event::Connected(response.clone())).await;
+                    if let Some(tx) = tx_opt {
+                        tx.complete(Ok(response));
+                    }
+
+                    let mut session = Session::new(
+                        writer,
+                        job.ver,
+                        job.keep_alive_duration(),
+                        event_tx.clone(),
+                        job.connected_flag.clone(),
+                        job.persist.clone(),
+                    );
+
+                    let result = session.run(&mut reader, &cmd_rx).await;
+                    if let Some(p) = &session.persist {
+                        let _ = p.lock().unwrap().close();
+                    }
+
+                    match result {
+                        Ok(()) => break 'retry, // clean disconnect
+                        Err(e) => {
+                            job.connected_flag.store(false, Ordering::SeqCst);
+                            let _ = event_tx.send(Event::ConnectionLost(e)).await;
+                            // Reset backoff on each successful-then-lost connection.
+                            retry_delay = job.min_retry_interval;
+                        }
+                    }
+                }
+            }
+        } // 'retry
+    } // 'outer
 }
 
 /////////////////////////////////////////////////////////////////////////////
