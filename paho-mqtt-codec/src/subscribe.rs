@@ -27,7 +27,7 @@
 //! the QoS bits and v3.1.1 decode leaves the v5 fields at their defaults.
 
 use crate::{
-    Error, MqttVersion, Properties, QoS, ReasonCode, Result,
+    Error, MqttVersion, Properties, QoS, ReasonCode, Result, String, Vec,
     wire::{get_utf8, put_utf8, utf8_wire_size},
 };
 use bytes::{Buf, BufMut, Bytes};

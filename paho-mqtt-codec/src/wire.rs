@@ -25,7 +25,7 @@
 //! them here avoids duplication and keeps the per-packet modules focused on
 //! their own structure.
 
-use crate::{Error, Result};
+use crate::{Error, Result, String};
 use bytes::{Buf, BufMut, Bytes};
 
 /// Writes a 2-byte big-endian length prefix followed by the UTF-8 bytes of `s`.

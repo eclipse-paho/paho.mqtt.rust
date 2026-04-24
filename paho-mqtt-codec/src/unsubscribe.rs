@@ -28,7 +28,7 @@
 //! both — `reason_codes` is an empty `Vec` on v3.1.1 connections.
 
 use crate::{
-    Error, MqttVersion, Properties, ReasonCode, Result,
+    Error, MqttVersion, Properties, ReasonCode, Result, String, Vec,
     wire::{get_utf8, put_utf8, utf8_wire_size},
 };
 use bytes::{Buf, BufMut, Bytes};

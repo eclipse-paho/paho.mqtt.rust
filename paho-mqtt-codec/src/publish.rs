@@ -25,7 +25,7 @@
 //! a separate parameter extracted from [`crate::packet::RawPacket::header`].
 
 use crate::{
-    Error, MqttVersion, Properties, QoS, ReasonCode, Result,
+    Error, MqttVersion, Properties, QoS, ReasonCode, Result, String,
     wire::{get_utf8, put_utf8, utf8_wire_size},
 };
 use bytes::{Buf, BufMut, Bytes};

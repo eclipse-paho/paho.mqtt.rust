@@ -29,15 +29,19 @@
 //! or read from the wire.
 
 use crate::{
-    Error, MqttVersion, Result, varlen,
+    Error, MqttVersion, Result, String, Vec, varlen,
     wire::{get_binary, get_utf8, put_utf8},
 };
 use bytes::{Buf, BufMut, Bytes};
+
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
 
 /////////////////////////////////////////////////////////////////////////////
 
 /// The wire encoding type of an MQTT v5 property value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum PropertyType {
     /// Single byte.
     Byte,
@@ -63,6 +67,7 @@ pub enum PropertyType {
 /// The numeric discriminants match the values on the wire.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[allow(missing_docs)]
 pub enum PropertyId {
     PayloadFormatIndicator = 0x01,
@@ -175,6 +180,7 @@ impl TryFrom<u8> for PropertyId {
 
 /// The typed value of an MQTT v5 property.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum PropertyValue {
     /// Single-byte value.
     Byte(u8),
@@ -264,6 +270,7 @@ impl PropertyValue {
 
 /// A single MQTT v5 property: an identifier paired with its typed value.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct Property {
     /// The property identifier.
     pub id: PropertyId,
@@ -308,6 +315,7 @@ impl Property {
 /// On v3.1.1 connections, properties are always empty and are never written
 /// to the wire.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct Properties(Vec<Property>);
 
 impl Properties {

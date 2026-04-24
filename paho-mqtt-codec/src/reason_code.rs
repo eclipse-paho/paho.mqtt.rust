@@ -20,7 +20,7 @@
 
 //! MQTT v5 reason codes.
 
-use std::fmt;
+use core::fmt;
 
 /// MQTT v5 single-byte reason codes.
 ///

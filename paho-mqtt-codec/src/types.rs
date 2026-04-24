@@ -21,7 +21,10 @@
 //! MQTT support types.
 
 use crate::error::Error;
-use std::fmt;
+use core::fmt;
+
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
 
 /// Connect with the default MQTT version (currently v5).
 pub const MQTT_VERSION_DEFAULT: u8 = 5;
@@ -46,6 +49,7 @@ pub const QOS_2: i32 = 2;
 
 /// Supported MQTT protocol versions.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[repr(u8)]
 pub enum MqttVersion {
     /// Version 3.1.1 (protocol byte 4).
@@ -57,8 +61,9 @@ pub enum MqttVersion {
 
 impl MqttVersion {
     /// The only supported v3 is v3.1.1
-    pub const v3: MqttVersion = Self::V3_1_1;
+    pub const V3: MqttVersion = Self::V3_1_1;
     /// Default: (currently v5)
+    #[allow(non_upper_case_globals)]
     pub const Default: MqttVersion = Self::V5;
 }
 
@@ -93,6 +98,7 @@ impl fmt::Display for MqttVersion {
 
 /// Supported Quality of Service levels.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[repr(u8)]
 pub enum QoS {
     /// At most once (fire and forget).

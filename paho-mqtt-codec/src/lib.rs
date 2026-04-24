@@ -24,7 +24,30 @@
 //! for protocol versions 3.1.1 and 5.0. It has no I/O dependency — all
 //! types are pure data transformations.
 
+#![no_std]
 #![deny(missing_docs)]
+
+extern crate alloc;
+
+#[cfg(feature = "std")]
+extern crate std;
+
+/// The Vec type for the 'std' build.
+#[cfg(feature = "std")]
+pub type Vec<T> = std::vec::Vec<T>;
+
+/// The Vec type for the 'no_std' build.
+#[cfg(not(feature = "std"))]
+pub type Vec<T> = alloc::vec::Vec<T>;
+
+/// The String type for the 'std' build.
+#[cfg(feature = "std")]
+pub type String = std::string::String;
+
+/// The String type for the 'no_std' build.
+#[cfg(not(feature = "std"))]
+pub type String = alloc::string::String;
+
 
 /// Codec error and result types.
 pub mod error;

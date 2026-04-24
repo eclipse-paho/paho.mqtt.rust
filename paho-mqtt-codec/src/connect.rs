@@ -21,7 +21,7 @@
 //! MQTT CONNECT and CONNACK packets.
 
 use crate::{
-    Error, MqttVersion, Properties, QoS, ReasonCode, Result, varlen,
+    Error, MqttVersion, Properties, QoS, ReasonCode, Result, String, varlen,
     wire::{binary_wire_size, get_binary, get_utf8, put_utf8, utf8_wire_size},
 };
 use bytes::{Buf, BufMut, Bytes, BytesMut};
