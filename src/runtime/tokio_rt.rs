@@ -538,15 +538,20 @@ impl Session {
     }
 
     /// Main event loop: read from `reader`, dispatch commands from `cmd_rx`,
-    /// and service keep-alive ticks until an error or clean disconnect.
+    /// and service keep-alive until an error or clean disconnect.
     async fn run(
         &mut self,
         reader: &mut (impl AsyncRead + Unpin),
         cmd_rx: &async_channel::Receiver<Command>,
     ) -> Result<()> {
         let keep_alive = self.keep_alive;
-        let mut ka = time::interval(keep_alive);
-        ka.tick().await; // consume the immediate first tick
+        // keep_alive == ZERO means disabled; the select arm is gated on this flag.
+        let ka_enabled = !keep_alive.is_zero();
+
+        // Resettable sleep: deadline advances on every outbound packet so that
+        // PINGREQs are only sent when the connection has been truly idle.
+        let ka_sleep = time::sleep(keep_alive);
+        tokio::pin!(ka_sleep);
 
         let mut read_buf = BytesMut::with_capacity(4096);
 
@@ -568,16 +573,21 @@ impl Session {
                             if self.handle_command(cmd).await? {
                                 return Ok(());
                             }
+                            // Any outbound packet resets the keep-alive deadline.
+                            if ka_enabled {
+                                ka_sleep.as_mut().reset(time::Instant::now() + keep_alive);
+                            }
                         }
                         Err(_) => return Ok(()),
                     }
                 }
-                _ = ka.tick() => {
+                _ = &mut ka_sleep, if ka_enabled => {
                     if self.ping_outstanding {
                         return Err(Error::Timeout);
                     }
                     self.send(&Packet::PingReq).await?;
                     self.ping_outstanding = true;
+                    ka_sleep.as_mut().reset(time::Instant::now() + keep_alive);
                 }
             }
         }

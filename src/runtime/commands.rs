@@ -99,15 +99,11 @@ pub(crate) struct ConnectParams {
 }
 
 impl ConnectParams {
-    /// Converts `keep_alive_secs` to a [`Duration`], substituting one hour
-    /// when keep-alive is disabled (value 0).
+    /// Converts `keep_alive_secs` to a [`Duration`].
+    ///
+    /// Returns [`Duration::ZERO`] when keep-alive is disabled (`keep_alive_secs == 0`).
     pub fn keep_alive_duration(&self) -> Duration {
-        if self.keep_alive_secs > 0 {
-            Duration::from_secs(self.keep_alive_secs as u64)
-        }
-        else {
-            Duration::from_secs(3600)
-        }
+        Duration::from_secs(self.keep_alive_secs as u64)
     }
 }
 

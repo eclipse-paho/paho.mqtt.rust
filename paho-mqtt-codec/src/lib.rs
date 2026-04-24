@@ -48,7 +48,6 @@ pub type String = std::string::String;
 #[cfg(not(feature = "std"))]
 pub type String = alloc::string::String;
 
-
 /// Codec error and result types.
 pub mod error;
 
