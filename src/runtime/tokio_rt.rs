@@ -872,8 +872,9 @@ impl Session {
 /// Extracted from [`Command::Connect`] so they can be retained across
 /// reconnect attempts without re-receiving the command.
 struct ConnectJob {
-    addr: ServerAddr,
     params: ConnectParams,
+    /// Index into `params.servers` for the current connection attempt.
+    server_idx: usize,
     connected_flag: Arc<AtomicBool>,
     persist: Option<Arc<Mutex<Box<dyn ClientPersistence>>>>,
 }
@@ -884,15 +885,14 @@ impl ConnectJob {
     fn extract(cmd: Command) -> Option<(Self, Completer<ConnectResponse>)> {
         match cmd {
             Command::Connect {
-                addr,
                 params,
                 tx,
                 connected_flag,
                 persist,
             } => Some((
                 Self {
-                    addr,
                     params,
+                    server_idx: 0,
                     connected_flag,
                     persist,
                 },
@@ -912,14 +912,15 @@ async fn do_connect(
     ConnAck,
 )> {
     let p = &job.params;
+    let (addr, server_uri) = &p.servers[job.server_idx];
 
     // ---- Open persistence ----
     if let Some(store) = &job.persist {
-        store.lock().unwrap().open(&p.client_id, &p.server_uri)?;
+        store.lock().unwrap().open(&p.client_id, server_uri)?;
     }
 
     // ---- Transport connect ----
-    let conn: Box<dyn Connection> = match &job.addr {
+    let conn: Box<dyn Connection> = match addr {
         ServerAddr::Tcp { host, port } => {
             Box::new(TcpConnection::connect(host, *port).await?)
         }
@@ -1001,14 +1002,18 @@ async fn reconnect_wait(
                     Err(_) => return WaitOutcome::Abort,
                     Ok(cmd) => match cmd {
                         Command::Connect {
-                            addr,
                             params,
                             tx,
                             connected_flag,
                             persist,
                         } => {
                             return WaitOutcome::Replace(
-                                ConnectJob { addr, params, connected_flag, persist },
+                                ConnectJob {
+                                    params,
+                                    server_idx: 0,
+                                    connected_flag,
+                                    persist,
+                                },
                                 tx,
                             );
                         }
@@ -1040,8 +1045,9 @@ async fn reconnect_wait(
 
 /// Builds a [`ConnectResponse`] from a successful CONNACK and job metadata.
 fn build_connect_response(job: &ConnectJob, connack: ConnAck) -> ConnectResponse {
+    let server_uri = job.params.servers[job.server_idx].1.clone();
     ConnectResponse {
-        server_uri: job.params.server_uri.clone(),
+        server_uri,
         mqtt_version: if job.params.ver == MqttVersion::V5 {
             5
         }
@@ -1085,22 +1091,39 @@ pub(crate) async fn run_event_loop(
             continue 'outer;
         };
 
-        // ---- First connection attempt ----
-        let (mut reader, writer, connack) = match do_connect(&job).await {
-            Err(e) => {
-                initial_tx.complete(Err(e));
+        // ---- First connection attempt: try each server in order ----
+        let n = job.params.servers.len();
+        let mut last_err: Option<Error> = None;
+        let mut initial_result = None;
+
+        for idx in 0..n {
+            job.server_idx = idx;
+            match do_connect(&job).await {
+                Err(e) => last_err = Some(e),
+                Ok((reader, writer, connack)) => {
+                    if connack.reason_code as u8 >= 0x80 {
+                        last_err = Some(Error::ReasonCode(
+                            connack.reason_code,
+                            connack.properties,
+                        ));
+                    }
+                    else {
+                        initial_result = Some((reader, writer, connack));
+                        break;
+                    }
+                }
+            }
+        }
+
+        let (mut reader, writer, connack) = match initial_result {
+            Some(t) => t,
+            None => {
+                initial_tx.complete(Err(
+                    last_err.unwrap_or(Error::General("no servers configured"))
+                ));
                 continue 'outer;
             }
-            Ok(t) => t,
         };
-
-        if connack.reason_code as u8 >= 0x80 {
-            initial_tx.complete(Err(Error::ReasonCode(
-                connack.reason_code,
-                connack.properties,
-            )));
-            continue 'outer;
-        }
 
         let response = build_connect_response(&job, connack);
         // Set the flag before resolving the token so `is_connected()` is true
@@ -1144,7 +1167,12 @@ pub(crate) async fn run_event_loop(
             let tx_opt: Option<Completer<ConnectResponse>> =
                 match reconnect_wait(retry_delay, &cmd_rx).await {
                     WaitOutcome::Abort => break 'retry,
-                    WaitOutcome::Retry => None,
+                    WaitOutcome::Retry => {
+                        // Advance to the next server in round-robin order.
+                        let n = job.params.servers.len();
+                        job.server_idx = (job.server_idx + 1) % n;
+                        None
+                    }
                     WaitOutcome::Replace(new_job, new_tx) => {
                         // Explicit reconnect/connect: use the new params and
                         // reset the backoff.

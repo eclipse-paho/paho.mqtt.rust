@@ -70,8 +70,11 @@ pub(crate) enum ServerAddr {
 
 /// Connection parameters grouped for reuse across reconnect attempts.
 pub(crate) struct ConnectParams {
-    /// Original server URI string, carried into `ConnectResponse`.
-    pub server_uri: String,
+    /// Ordered list of `(transport address, URI string)` pairs.
+    ///
+    /// The event loop tries them left-to-right on the initial connect and
+    /// cycles round-robin on each auto-reconnect attempt.
+    pub servers: Vec<(ServerAddr, String)>,
     /// Client identifier.
     pub client_id: String,
     /// Whether to request a clean session / discard existing state.
@@ -113,9 +116,7 @@ impl ConnectParams {
 pub(crate) enum Command {
     /// Establish an MQTT connection.
     Connect {
-        /// Resolved transport address.
-        addr: ServerAddr,
-        /// Session and authentication parameters.
+        /// Session, authentication, and server-list parameters.
         params: ConnectParams,
         /// Completer resolved with the CONNACK result.
         tx: Completer<ConnectResponse>,

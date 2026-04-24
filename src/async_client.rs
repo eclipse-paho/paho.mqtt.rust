@@ -237,11 +237,21 @@ impl AsyncClient {
             return ConnectToken::from(Error::WrongMqttVersion);
         }
 
-        let server_uri = self.inner.opts.server_uri.clone();
-        let addr = match parse_server_uri(&server_uri) {
-            Ok(v) => v,
-            Err(e) => return ConnectToken::from(e),
+        // Build the ordered server list: explicit list from connect opts, or
+        // fall back to the URI given at client creation time.
+        let uris: Vec<String> = if opts.server_uris.is_empty() {
+            vec![self.inner.opts.server_uri.clone()]
+        }
+        else {
+            opts.server_uris.clone()
         };
+        let mut servers: Vec<(ServerAddr, String)> = Vec::with_capacity(uris.len());
+        for uri in uris {
+            match parse_server_uri(&uri) {
+                Ok(addr) => servers.push((addr, uri)),
+                Err(e) => return ConnectToken::from(e),
+            }
+        }
 
         let keep_alive_secs =
             opts.keep_alive_interval.as_secs().min(u16::MAX as u64) as u16;
@@ -259,7 +269,7 @@ impl AsyncClient {
         *self.inner.conn_opts.write().unwrap() = opts.clone();
 
         let params = ConnectParams {
-            server_uri,
+            servers,
             client_id: self.inner.opts.client_id.clone(),
             clean_start: opts.clean_start,
             keep_alive_secs,
@@ -275,7 +285,6 @@ impl AsyncClient {
         };
 
         let cmd = Command::Connect {
-            addr,
             params,
             tx: comp,
             connected_flag: Arc::clone(&self.inner.connected),
