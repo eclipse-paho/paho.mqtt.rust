@@ -278,6 +278,7 @@ impl AsyncClient {
             ver,
             props: opts.props,
             ssl: opts.ssl,
+            http_headers: opts.http_headers,
             auto_reconnect: opts.auto_reconnect,
             min_retry_interval: opts.min_retry_interval,
             max_retry_interval: opts.max_retry_interval,
@@ -1063,12 +1064,44 @@ fn log_stream_err<T>(res: StdResult<(), async_channel::TrySendError<T>>) {
     }
 }
 
+/// Extracts `(host, port, path)` from the authority+path portion of a URI.
+///
+/// `rest` is the URI with its scheme prefix stripped (e.g. `"broker:1883/mqtt"`).
+/// `default_port` is used when no explicit port appears. `path` is `"/"` when
+/// the URI has no path component.
+fn parse_host_port_path(rest: &str, default_port: u16) -> Result<(String, u16, String)> {
+    let authority = rest.split('/').next().unwrap_or(rest);
+    let path = if authority.len() < rest.len() {
+        rest[authority.len()..].to_string()
+    }
+    else {
+        "/".to_string()
+    };
+
+    let (host, port) = if let Some(colon) = authority.rfind(':') {
+        let host = authority[..colon].to_string();
+        let port = authority[colon + 1..]
+            .parse::<u16>()
+            .map_err(|_| Error::General("invalid port in server URI"))?;
+        (host, port)
+    }
+    else {
+        (authority.to_string(), default_port)
+    };
+
+    Ok((host, port, path))
+}
+
 /// Parses an MQTT URI into a [`ServerAddr`].
 ///
 /// Recognises:
 /// - `unix://` or `unix:` — Unix-domain socket path
-/// - `mqtt://`, `tcp://`, `ws://` — plain TCP (default port 1883)
-/// - `mqtts://`, `ssl://`, `tls://`, `wss://` — TLS TCP (default port 8883)
+/// - `mqtt://`, `tcp://` — plain TCP (default port 1883)
+/// - `ws://` — WebSocket over TCP (default port 1883); [`ServerAddr::Ws`] when
+///   the `websocket` feature is enabled, plain TCP otherwise
+/// - `mqtts://`, `ssl://`, `tls://` — TLS TCP (default port 8883)
+/// - `wss://` — WebSocket over TLS (default port 8883); [`ServerAddr::Wss`]
+///   when both `websocket` and `tls` features are enabled, TLS TCP otherwise
 ///
 /// If no explicit port is present the default for the scheme is used.
 fn parse_server_uri(uri: &str) -> Result<ServerAddr> {
@@ -1083,6 +1116,27 @@ fn parse_server_uri(uri: &str) -> Result<ServerAddr> {
         });
     }
 
+    // WebSocket transports (feature-gated).
+    #[cfg(feature = "websocket")]
+    if let Some(rest) = uri.strip_prefix("ws://") {
+        let (host, port, path) = parse_host_port_path(rest, 1883)?;
+        return Ok(ServerAddr::Ws { host, port, path });
+    }
+
+    #[cfg(all(feature = "websocket", feature = "tls"))]
+    if let Some(rest) = uri.strip_prefix("wss://") {
+        let (host, port, path) = parse_host_port_path(rest, 8883)?;
+        return Ok(ServerAddr::Wss { host, port, path });
+    }
+
+    // wss:// with websocket but without tls is an error.
+    #[cfg(all(feature = "websocket", not(feature = "tls")))]
+    if uri.starts_with("wss://") {
+        return Err(Error::SslNotSupported);
+    }
+
+    // Plain TCP / TLS transports (wss:// falls through to TLS when websocket
+    // feature is absent).
     let (default_port, is_tls, rest) = if let Some(s) = uri
         .strip_prefix("mqtts://")
         .or_else(|| uri.strip_prefix("ssl://"))
@@ -1102,18 +1156,7 @@ fn parse_server_uri(uri: &str) -> Result<ServerAddr> {
         (1883u16, false, uri)
     };
 
-    let authority = rest.split('/').next().unwrap_or(rest);
-
-    let (host, port) = if let Some(colon) = authority.rfind(':') {
-        let host = authority[..colon].to_string();
-        let port = authority[colon + 1..]
-            .parse::<u16>()
-            .map_err(|_| Error::General("invalid port in server URI"))?;
-        (host, port)
-    }
-    else {
-        (authority.to_string(), default_port)
-    };
+    let (host, port, _) = parse_host_port_path(rest, default_port)?;
 
     if is_tls {
         #[cfg(feature = "tls")]
@@ -1340,9 +1383,18 @@ mod tests {
             parse_server_uri("mqtts://secure.broker.io"),
             Err(Error::SslNotSupported)
         ));
+        // Without the websocket feature ws:// maps to plain TCP.
+        #[cfg(not(feature = "websocket"))]
         assert!(matches!(
             parse_server_uri("ws://localhost:8080/mqtt").unwrap(),
             ServerAddr::Tcp { host, port } if host == "localhost" && port == 8080
+        ));
+        // With the websocket feature ws:// maps to a WebSocket address.
+        #[cfg(feature = "websocket")]
+        assert!(matches!(
+            parse_server_uri("ws://localhost:8080/mqtt").unwrap(),
+            ServerAddr::Ws { ref host, port, ref path }
+                if host == "localhost" && port == 8080 && path == "/mqtt"
         ));
         #[cfg(unix)]
         assert!(matches!(

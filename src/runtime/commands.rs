@@ -24,6 +24,7 @@
 //! [`Event`] values flow back from the event loop to the public layer.
 
 use std::{
+    collections::HashMap,
     sync::{Arc, Mutex, atomic::AtomicBool},
     time::Duration,
 };
@@ -64,6 +65,26 @@ pub(crate) enum ServerAddr {
         /// Filesystem path to the socket.
         path: String,
     },
+    /// Plain WebSocket connection (requires the `websocket` feature).
+    #[cfg(feature = "websocket")]
+    Ws {
+        /// Broker hostname or IP address.
+        host: String,
+        /// Broker TCP port.
+        port: u16,
+        /// WebSocket path (e.g. `/mqtt`).
+        path: String,
+    },
+    /// WebSocket over TLS connection (requires both `websocket` and `tls` features).
+    #[cfg(all(feature = "websocket", feature = "tls"))]
+    Wss {
+        /// Broker hostname or IP address.
+        host: String,
+        /// Broker TCP port.
+        port: u16,
+        /// WebSocket path (e.g. `/mqtt`).
+        path: String,
+    },
 }
 
 /////////////////////////////////////////////////////////////////////////////
@@ -93,6 +114,9 @@ pub(crate) struct ConnectParams {
     pub props: CodecProperties,
     /// TLS/SSL options; `Some` only when using a TLS transport.
     pub ssl: Option<crate::SslOptions>,
+    /// HTTP headers included in the WebSocket upgrade request.
+    /// Empty for non-WebSocket transports.
+    pub http_headers: HashMap<String, String>,
     /// Whether the event loop should automatically reconnect on session loss.
     pub auto_reconnect: bool,
     /// Minimum backoff interval between reconnect attempts.
