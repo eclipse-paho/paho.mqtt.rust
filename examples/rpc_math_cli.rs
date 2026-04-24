@@ -32,9 +32,10 @@
  *    Frank Pagliughi - initial implementation and documentation
  *******************************************************************************/
 
+use log::debug;
 use paho_mqtt as mqtt;
 use serde_json::json;
-use std::{env, process};
+use std::{env, process, time::Instant};
 
 /////////////////////////////////////////////////////////////////////////////
 
@@ -142,6 +143,7 @@ fn main() -> mqtt::Result<()> {
         .properties(props)
         .finalize();
 
+    let start_time = Instant::now();
     let tok = cli.publish(msg);
 
     if let Err(e) = tok.wait() {
@@ -160,6 +162,9 @@ fn main() -> mqtt::Result<()> {
         };
 
         if reply_corr_id.as_ref() == corr_id.as_ref() {
+            let ms = 1000.0 * start_time.elapsed().as_secs_f64();
+            debug!("Server responded in {:.3}ms", ms);
+
             let ret: f64 = serde_json::from_str(&msg.payload_str()).unwrap();
             println!("{}", ret);
         }

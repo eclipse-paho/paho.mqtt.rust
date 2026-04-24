@@ -86,6 +86,7 @@ impl TcpConnection {
     /// Opens a TCP connection to `host` on `port`.
     pub(crate) async fn connect(host: &str, port: u16) -> io::Result<Self> {
         let stream = TcpStream::connect((host, port)).await?;
+        stream.set_nodelay(true)?;
         Ok(Self { stream })
     }
 }
@@ -923,6 +924,7 @@ async fn do_connect(
                 })?
                 .to_owned();
             let tcp = TcpStream::connect((host.as_str(), *port)).await?;
+            tcp.set_nodelay(true)?;
             let tls = connector.connect(server_name, tcp).await?;
             Box::new(TlsConnection { stream: tls })
         }
