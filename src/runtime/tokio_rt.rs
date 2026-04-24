@@ -58,6 +58,7 @@ use tokio_rustls::TlsConnector;
 
 use super::commands::{Command, Event, ReceivedMessage, ServerAddr};
 use crate::{
+    Error, Result,
     persistence::ClientPersistence,
     responses::{ConnectResponse, PublishResponse, SubscribeResponse, UnsubscribeResponse},
     token::Completer,
@@ -219,6 +220,9 @@ impl AsyncWrite for TlsConnection {
 #[cfg(feature = "tls")]
 impl Connection for TlsConnection {}
 
+#[cfg(feature = "tls")]
+type TlsResult<T> = std::result::Result<T, rustls::Error>;
+
 /// A [`rustls::client::ServerCertVerifier`] that accepts any certificate.
 ///
 /// Used when `SslOptions::enable_server_cert_auth` is `false`.
@@ -235,7 +239,7 @@ impl rustls::client::danger::ServerCertVerifier for NoCertVerifier {
         _server_name: &rustls::pki_types::ServerName<'_>,
         _ocsp_response: &[u8],
         _now: rustls::pki_types::UnixTime,
-    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+    ) -> TlsResult<rustls::client::danger::ServerCertVerified> {
         Ok(rustls::client::danger::ServerCertVerified::assertion())
     }
 
@@ -244,7 +248,7 @@ impl rustls::client::danger::ServerCertVerifier for NoCertVerifier {
         _message: &[u8],
         _cert: &rustls::pki_types::CertificateDer<'_>,
         _dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+    ) -> TlsResult<rustls::client::danger::HandshakeSignatureValid> {
         Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
     }
 
@@ -253,7 +257,7 @@ impl rustls::client::danger::ServerCertVerifier for NoCertVerifier {
         _message: &[u8],
         _cert: &rustls::pki_types::CertificateDer<'_>,
         _dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+    ) -> TlsResult<rustls::client::danger::HandshakeSignatureValid> {
         Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
     }
 
@@ -279,27 +283,26 @@ impl rustls::client::danger::ServerCertVerifier for NoCertVerifier {
 
 /// Builds a [`rustls::ClientConfig`] from [`SslOptions`].
 #[cfg(feature = "tls")]
-fn make_tls_config(ssl: &crate::SslOptions) -> crate::Result<StdArc<rustls::ClientConfig>> {
+fn make_tls_config(ssl: &crate::SslOptions) -> Result<StdArc<rustls::ClientConfig>> {
     use rustls::RootCertStore;
     use std::io::BufReader;
 
     let mut root_store = RootCertStore::empty();
 
     if !ssl.disable_default_trust_store {
-        let native_certs =
-            rustls_native_certs::load_native_certs().map_err(crate::Error::Io)?;
+        let native_certs = rustls_native_certs::load_native_certs().map_err(Error::Io)?;
         for cert in native_certs {
             let _ = root_store.add(cert);
         }
     }
 
     if !ssl.trust_store.as_os_str().is_empty() {
-        let f = std::fs::File::open(&ssl.trust_store).map_err(crate::Error::Io)?;
+        let f = std::fs::File::open(&ssl.trust_store).map_err(Error::Io)?;
         let mut r = BufReader::new(f);
         for cert in rustls_pemfile::certs(&mut r) {
             root_store
-                .add(cert.map_err(crate::Error::Io)?)
-                .map_err(|e| crate::Error::GeneralString(e.to_string()))?;
+                .add(cert.map_err(Error::Io)?)
+                .map_err(|e| Error::GeneralString(e.to_string()))?;
         }
     }
 
@@ -313,11 +316,11 @@ fn make_tls_config(ssl: &crate::SslOptions) -> crate::Result<StdArc<rustls::Clie
     };
 
     let mut config = if !ssl.key_store.as_os_str().is_empty() {
-        let cert_f = std::fs::File::open(&ssl.key_store).map_err(crate::Error::Io)?;
+        let cert_f = std::fs::File::open(&ssl.key_store).map_err(Error::Io)?;
         let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
             rustls_pemfile::certs(&mut BufReader::new(cert_f))
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(crate::Error::Io)?;
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(Error::Io)?;
 
         let key_path = if !ssl.private_key.as_os_str().is_empty() {
             &ssl.private_key
@@ -325,14 +328,14 @@ fn make_tls_config(ssl: &crate::SslOptions) -> crate::Result<StdArc<rustls::Clie
         else {
             &ssl.key_store
         };
-        let key_f = std::fs::File::open(key_path).map_err(crate::Error::Io)?;
+        let key_f = std::fs::File::open(key_path).map_err(Error::Io)?;
         let key = rustls_pemfile::private_key(&mut BufReader::new(key_f))
-            .map_err(crate::Error::Io)?
-            .ok_or_else(|| crate::Error::General("no private key found in key store"))?;
+            .map_err(Error::Io)?
+            .ok_or_else(|| Error::General("no private key found in key store"))?;
 
         wants_client
             .with_client_auth_cert(certs, key)
-            .map_err(|e| crate::Error::GeneralString(e.to_string()))?
+            .map_err(|e| Error::GeneralString(e.to_string()))?
     }
     else {
         wants_client.with_no_client_auth()
@@ -378,18 +381,15 @@ impl RuntimeHandle {
     }
 
     /// Sends a command to the event loop asynchronously.
-    pub(crate) async fn send_cmd(&self, cmd: Command) -> crate::Result<()> {
-        self.cmd_tx
-            .send(cmd)
-            .await
-            .map_err(|_| crate::Error::Disconnected)
+    pub(crate) async fn send_cmd(&self, cmd: Command) -> Result<()> {
+        self.cmd_tx.send(cmd).await.map_err(|_| Error::Disconnected)
     }
 
     /// Sends a command to the event loop from a synchronous context.
-    pub(crate) fn send_cmd_blocking(&self, cmd: Command) -> crate::Result<()> {
+    pub(crate) fn send_cmd_blocking(&self, cmd: Command) -> Result<()> {
         self.cmd_tx
             .send_blocking(cmd)
-            .map_err(|_| crate::Error::Disconnected)
+            .map_err(|_| Error::Disconnected)
     }
 
     /// Returns a reference to the inbound event receiver.
@@ -418,13 +418,13 @@ async fn recv_connack(
     reader: &mut (impl AsyncRead + Unpin),
     buf: &mut BytesMut,
     ver: MqttVersion,
-) -> crate::Result<ConnAck> {
+) -> Result<ConnAck> {
     loop {
         reader.read_buf(buf).await?;
         while let Some(raw) = RawPacket::decode(buf)? {
             match Packet::from_raw(raw, ver)? {
                 Packet::ConnAck(ack) => return Ok(ack),
-                _ => return Err(crate::Error::General("expected CONNACK")),
+                _ => return Err(Error::General("expected CONNACK")),
             }
         }
     }
@@ -436,7 +436,7 @@ async fn send_packet(
     packet: &Packet,
     ver: MqttVersion,
     buf: &mut BytesMut,
-) -> crate::Result<()> {
+) -> Result<()> {
     buf.clear();
     packet.encode(buf, ver)?;
     writer.write_all(buf).await?;
@@ -529,7 +529,7 @@ impl Session {
     }
 
     /// Encodes and sends a packet on the wire.
-    async fn send(&mut self, packet: &Packet) -> crate::Result<()> {
+    async fn send(&mut self, packet: &Packet) -> Result<()> {
         self.write_buf.clear();
         packet.encode(&mut self.write_buf, self.ver)?;
         self.writer.write_all(&self.write_buf).await?;
@@ -542,7 +542,7 @@ impl Session {
         &mut self,
         reader: &mut (impl AsyncRead + Unpin),
         cmd_rx: &async_channel::Receiver<Command>,
-    ) -> crate::Result<()> {
+    ) -> Result<()> {
         let keep_alive = self.keep_alive;
         let mut ka = time::interval(keep_alive);
         ka.tick().await; // consume the immediate first tick
@@ -554,7 +554,7 @@ impl Session {
                 result = reader.read_buf(&mut read_buf) => {
                     let n = result?;
                     if n == 0 {
-                        return Err(crate::Error::Disconnected);
+                        return Err(Error::Disconnected);
                     }
                     while let Some(raw) = RawPacket::decode(&mut read_buf)? {
                         let packet = Packet::from_raw(raw, self.ver)?;
@@ -573,7 +573,7 @@ impl Session {
                 }
                 _ = ka.tick() => {
                     if self.ping_outstanding {
-                        return Err(crate::Error::Timeout);
+                        return Err(Error::Timeout);
                     }
                     self.send(&Packet::PingReq).await?;
                     self.ping_outstanding = true;
@@ -583,7 +583,7 @@ impl Session {
     }
 
     /// Handles one inbound packet from the broker.
-    async fn handle_packet(&mut self, packet: Packet) -> crate::Result<()> {
+    async fn handle_packet(&mut self, packet: Packet) -> Result<()> {
         match packet {
             // ---- Publish acknowledgements ----
             Packet::PubAck(ack) => {
@@ -601,7 +601,7 @@ impl Session {
             Packet::PubRec(rec) => {
                 if rec.reason_code as u8 >= 0x80 {
                     if let Some(tx) = self.pending_pub2.remove(&rec.packet_id) {
-                        tx.complete(Err(crate::Error::ReasonCode(
+                        tx.complete(Err(Error::ReasonCode(
                             rec.reason_code,
                             rec.properties,
                         )));
@@ -718,7 +718,7 @@ impl Session {
 
             // ---- Broker-initiated disconnect (v5) ----
             Packet::Disconnect(_) => {
-                return Err(crate::Error::Disconnected);
+                return Err(Error::Disconnected);
             }
 
             _ => {} // ignore unexpected packets
@@ -729,11 +729,11 @@ impl Session {
     /// Handles one command from the public API.
     ///
     /// Returns `true` when a `Disconnect` command signals a clean shutdown.
-    async fn handle_command(&mut self, cmd: Command) -> crate::Result<bool> {
+    async fn handle_command(&mut self, cmd: Command) -> Result<bool> {
         match cmd {
             Command::Connect { tx, .. } => {
                 // Already connected; reject duplicate connect.
-                tx.complete(Err(crate::Error::General("already connected")));
+                tx.complete(Err(Error::General("already connected")));
             }
 
             Command::Publish {
@@ -942,7 +942,7 @@ impl ConnectJob {
 /// Opens the transport, opens persistence, sends CONNECT, waits for CONNACK.
 async fn do_connect(
     job: &ConnectJob,
-) -> crate::Result<(
+) -> Result<(
     ReadHalf<Box<dyn Connection>>,
     WriteHalf<Box<dyn Connection>>,
     ConnAck,
@@ -959,15 +959,12 @@ async fn do_connect(
         }
         #[cfg(feature = "tls")]
         ServerAddr::Tls { host, port } => {
-            let ssl = job.ssl.as_ref().ok_or(crate::Error::MissingSslOptions)?;
+            let ssl = job.ssl.as_ref().ok_or(Error::MissingSslOptions)?;
             let config = make_tls_config(ssl)?;
             let connector = TlsConnector::from(config);
             let server_name = rustls::pki_types::ServerName::try_from(host.as_str())
                 .map_err(|_| {
-                    crate::Error::GeneralString(format!(
-                        "invalid TLS server name: {}",
-                        host
-                    ))
+                    Error::GeneralString(format!("invalid TLS server name: {}", host))
                 })?
                 .to_owned();
             let tcp = TcpStream::connect((host.as_str(), *port)).await?;
@@ -1094,13 +1091,13 @@ async fn reconnect_wait(
                             return WaitOutcome::Abort;
                         }
                         Command::Publish { tx, .. } => {
-                            tx.complete(Err(crate::Error::Disconnected));
+                            tx.complete(Err(Error::Disconnected));
                         }
                         Command::Subscribe { tx, .. } => {
-                            tx.complete(Err(crate::Error::Disconnected));
+                            tx.complete(Err(Error::Disconnected));
                         }
                         Command::Unsubscribe { tx, .. } => {
-                            tx.complete(Err(crate::Error::Disconnected));
+                            tx.complete(Err(Error::Disconnected));
                         }
                     },
                 }
@@ -1161,7 +1158,7 @@ pub(crate) async fn run_event_loop(
         };
 
         if connack.reason_code as u8 >= 0x80 {
-            initial_tx.complete(Err(crate::Error::ReasonCode(
+            initial_tx.complete(Err(Error::ReasonCode(
                 connack.reason_code,
                 connack.properties,
             )));
@@ -1229,10 +1226,7 @@ pub(crate) async fn run_event_loop(
                 }
                 Ok((mut reader, writer, connack)) => {
                     if connack.reason_code as u8 >= 0x80 {
-                        let e = crate::Error::ReasonCode(
-                            connack.reason_code,
-                            connack.properties,
-                        );
+                        let e = Error::ReasonCode(connack.reason_code, connack.properties);
                         if let Some(tx) = tx_opt {
                             tx.complete(Err(e));
                         }

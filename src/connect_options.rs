@@ -78,7 +78,7 @@ pub struct ConnectOptions {
 }
 
 impl ConnectOptions {
-    /// Creates a new, default set of connect options for MQTT v3.x
+    /// Creates a new, default set of connect options, currently for MQTT v5
     pub fn new() -> Self {
         Self::default()
     }
@@ -243,7 +243,7 @@ impl Default for ConnectOptions {
 /////////////////////////////////////////////////////////////////////////////
 
 /// Builder to create the options to connect to the MQTT server.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct ConnectOptionsBuilder(ConnectOptions);
 
 impl ConnectOptionsBuilder {

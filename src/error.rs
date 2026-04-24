@@ -1,4 +1,4 @@
-// errors.rs
+// error.rs
 //
 // Error and Result types for the Paho MQTT Rust library.
 //

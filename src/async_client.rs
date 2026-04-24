@@ -50,7 +50,7 @@ use crate::{
     DeliveryToken, DisconnectOptions, FilePersistence, Message, PersistenceType,
     Properties, ReasonCode, SubscribeManyToken, SubscribeOptions, SubscribeToken,
     SyncReceiver, UnsubscribeManyToken, UnsubscribeToken, UserData,
-    errors::{Error, Result},
+    error::{Error, Result},
     persistence::ClientPersistence,
     runtime::{Command, RuntimeHandle, ServerAddr},
     token::Token,

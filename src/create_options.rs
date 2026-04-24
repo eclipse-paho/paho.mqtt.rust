@@ -100,7 +100,7 @@ impl Default for CreateOptions {
             delete_oldest: false,
             restore_msgs: true,
             persist_qos0: true,
-            mqtt_version: MqttVersion::V5,
+            mqtt_version: MqttVersion::Default,
             persistence: PersistenceType::default(),
             user_data: None,
         }

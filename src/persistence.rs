@@ -24,7 +24,7 @@
 //! The MQTT client can use persistence to store in-flight messages so they
 //! can be recovered in the event of an application crash or restart.
 
-use crate::errors::Result;
+use crate::error::Result;
 use std::{
     fmt,
     io::Write,

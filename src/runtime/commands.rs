@@ -32,6 +32,7 @@ use bytes::Bytes;
 use paho_mqtt_codec::{MqttVersion, Properties as CodecProperties, QoS, ReasonCode, Will};
 
 use crate::{
+    Error,
     persistence::ClientPersistence,
     responses::{ConnectResponse, PublishResponse, SubscribeResponse, UnsubscribeResponse},
     subscribe_options::SubscribeOptions,
@@ -185,7 +186,7 @@ pub(crate) enum Event {
     /// A connection to the broker was successfully established (CONNACK received).
     Connected(crate::responses::ConnectResponse),
     /// The network connection was lost unexpectedly.
-    ConnectionLost(crate::Error),
+    ConnectionLost(Error),
     /// An application message arrived from the broker.
     MessageArrived(ReceivedMessage),
 }

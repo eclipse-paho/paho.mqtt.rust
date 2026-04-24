@@ -64,7 +64,7 @@ pub use crate::client::Client;
 pub use crate::connect_options::{ConnectOptions, ConnectOptionsBuilder};
 pub use crate::create_options::{CreateOptions, CreateOptionsBuilder};
 pub use crate::disconnect_options::{DisconnectOptions, DisconnectOptionsBuilder};
-pub use crate::errors::{
+pub use crate::error::{
     ConnectReturnCode, Error, Result, error_message, error_message_opt,
 };
 pub use crate::event::Event;
@@ -144,7 +144,7 @@ pub mod types;
 pub mod persistence;
 
 /// The MQTT errors
-pub mod errors;
+pub mod error;
 
 /// Events emitted by the client
 pub mod event;
