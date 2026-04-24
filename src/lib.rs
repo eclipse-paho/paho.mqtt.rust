@@ -50,6 +50,12 @@ pub use async_channel::{self, Receiver as AsyncReceiver};
 /// Re-export crossbeam channel as sync components
 pub use crossbeam_channel::{self as sync_channel, Receiver as SyncReceiver};
 
+/// Re-export the codec
+pub use paho_mqtt_codec::{
+    self, MQTT_VERSION_3, MQTT_VERSION_3_1_1, MQTT_VERSION_5, MQTT_VERSION_DEFAULT,
+    MqttVersion, QOS_0, QOS_1, QOS_2, QoS, ReasonCode,
+};
+
 /// The asynchronous API
 pub mod async_client;
 pub use crate::async_client::{
@@ -76,7 +82,6 @@ pub use crate::persistence::{
 pub use crate::properties::{
     Properties, Property, PropertyCode, PropertyId, PropertyType, PropertyValue,
 };
-pub use crate::reason_code::ReasonCode;
 pub use crate::responses::{
     ConnectResponse, PublishResponse, SubscribeResponse, UnsubscribeResponse,
 };
@@ -91,10 +96,6 @@ pub use crate::token::{
 };
 pub use crate::topic::{SyncTopic, Topic, TopicFilter, is_topic_filter_valid};
 pub use crate::topic_matcher::TopicMatcher;
-pub use crate::types::{
-    MQTT_VERSION_3, MQTT_VERSION_3_1_1, MQTT_VERSION_5, MQTT_VERSION_DEFAULT, MqttVersion,
-    QOS_0, QOS_1, QOS_2, QoS,
-};
 
 use std::any::Any;
 
@@ -133,12 +134,6 @@ pub mod topic;
 
 // Topic matcher struct
 pub mod topic_matcher;
-
-/// MQTT v5 Reason Codes
-pub mod reason_code;
-
-/// Miscellaneous types
-pub mod types;
 
 /// Message persistence for the client.
 pub mod persistence;

@@ -44,20 +44,19 @@
 //! tok.wait().unwrap();
 //! ```
 
-use crate::event::Event;
 use crate::{
     AsyncReceiver, ConnectOptions, ConnectResponse, ConnectToken, CreateOptions,
-    DeliveryToken, DisconnectOptions, FilePersistence, Message, PersistenceType,
+    DeliveryToken, DisconnectOptions, Event, FilePersistence, Message, PersistenceType,
     Properties, ReasonCode, SubscribeManyToken, SubscribeOptions, SubscribeToken,
     SyncReceiver, UnsubscribeManyToken, UnsubscribeToken, UserData,
     error::{Error, Result},
     persistence::ClientPersistence,
     runtime::{Command, ConnectParams, RuntimeHandle, ServerAddr},
     token::Token,
-    types::*,
 };
 use bytes::Bytes;
 use crossbeam_channel as sync_channel;
+use paho_mqtt_codec::types::*;
 use std::{
     result::Result as StdResult,
     sync::{
