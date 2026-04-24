@@ -42,6 +42,8 @@ use paho_mqtt_codec::{
     Subscribe, Subscription, Unsubscribe,
     packet::{Packet, RawPacket},
 };
+#[cfg(feature = "tls")]
+use std::sync::Arc as StdArc;
 #[cfg(unix)]
 use tokio::net::UnixStream;
 use tokio::{
@@ -51,6 +53,8 @@ use tokio::{
     net::TcpStream,
     time,
 };
+#[cfg(feature = "tls")]
+use tokio_rustls::TlsConnector;
 
 use super::commands::{Command, Event, ReceivedMessage, ServerAddr};
 use crate::{
@@ -170,6 +174,176 @@ impl AsyncWrite for UnixConnection {
 
 #[cfg(unix)]
 impl Connection for UnixConnection {}
+
+/////////////////////////////////////////////////////////////////////////////
+
+/// A TLS transport backed by [`tokio_rustls`] (requires the `tls` feature).
+#[cfg(feature = "tls")]
+pub(crate) struct TlsConnection {
+    stream: tokio_rustls::client::TlsStream<TcpStream>,
+}
+
+#[cfg(feature = "tls")]
+impl AsyncRead for TlsConnection {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.stream).poll_read(cx, buf)
+    }
+}
+
+#[cfg(feature = "tls")]
+impl AsyncWrite for TlsConnection {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.stream).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.stream).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.stream).poll_shutdown(cx)
+    }
+}
+
+#[cfg(feature = "tls")]
+impl Connection for TlsConnection {}
+
+/// A [`rustls::client::ServerCertVerifier`] that accepts any certificate.
+///
+/// Used when `SslOptions::enable_server_cert_auth` is `false`.
+#[cfg(feature = "tls")]
+#[derive(Debug)]
+struct NoCertVerifier;
+
+#[cfg(feature = "tls")]
+impl rustls::client::danger::ServerCertVerifier for NoCertVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        use rustls::SignatureScheme::*;
+        vec![
+            RSA_PKCS1_SHA1,
+            ECDSA_SHA1_Legacy,
+            RSA_PKCS1_SHA256,
+            ECDSA_NISTP256_SHA256,
+            RSA_PKCS1_SHA384,
+            ECDSA_NISTP384_SHA384,
+            RSA_PKCS1_SHA512,
+            ECDSA_NISTP521_SHA512,
+            RSA_PSS_SHA256,
+            RSA_PSS_SHA384,
+            RSA_PSS_SHA512,
+            ED25519,
+            ED448,
+        ]
+    }
+}
+
+/// Builds a [`rustls::ClientConfig`] from [`SslOptions`].
+#[cfg(feature = "tls")]
+fn make_tls_config(ssl: &crate::SslOptions) -> crate::Result<StdArc<rustls::ClientConfig>> {
+    use rustls::RootCertStore;
+    use std::io::BufReader;
+
+    let mut root_store = RootCertStore::empty();
+
+    if !ssl.disable_default_trust_store {
+        let native_certs =
+            rustls_native_certs::load_native_certs().map_err(crate::Error::Io)?;
+        for cert in native_certs {
+            let _ = root_store.add(cert);
+        }
+    }
+
+    if !ssl.trust_store.as_os_str().is_empty() {
+        let f = std::fs::File::open(&ssl.trust_store).map_err(crate::Error::Io)?;
+        let mut r = BufReader::new(f);
+        for cert in rustls_pemfile::certs(&mut r) {
+            root_store
+                .add(cert.map_err(crate::Error::Io)?)
+                .map_err(|e| crate::Error::GeneralString(e.to_string()))?;
+        }
+    }
+
+    let wants_client = if ssl.enable_server_cert_auth {
+        rustls::ClientConfig::builder().with_root_certificates(root_store)
+    }
+    else {
+        rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(StdArc::new(NoCertVerifier))
+    };
+
+    let mut config = if !ssl.key_store.as_os_str().is_empty() {
+        let cert_f = std::fs::File::open(&ssl.key_store).map_err(crate::Error::Io)?;
+        let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+            rustls_pemfile::certs(&mut BufReader::new(cert_f))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(crate::Error::Io)?;
+
+        let key_path = if !ssl.private_key.as_os_str().is_empty() {
+            &ssl.private_key
+        }
+        else {
+            &ssl.key_store
+        };
+        let key_f = std::fs::File::open(key_path).map_err(crate::Error::Io)?;
+        let key = rustls_pemfile::private_key(&mut BufReader::new(key_f))
+            .map_err(crate::Error::Io)?
+            .ok_or_else(|| crate::Error::General("no private key found in key store"))?;
+
+        wants_client
+            .with_client_auth_cert(certs, key)
+            .map_err(|e| crate::Error::GeneralString(e.to_string()))?
+    }
+    else {
+        wants_client.with_no_client_auth()
+    };
+
+    if !ssl.protos.is_empty() {
+        config.alpn_protocols = ssl.protos.iter().map(|p| p.as_bytes().to_vec()).collect();
+    }
+
+    Ok(StdArc::new(config))
+}
 
 /////////////////////////////////////////////////////////////////////////////
 
@@ -697,6 +871,7 @@ struct ConnectJob {
     will: Option<paho_mqtt_codec::Will>,
     ver: MqttVersion,
     props: paho_mqtt_codec::Properties,
+    ssl: Option<crate::SslOptions>,
     connected_flag: Arc<AtomicBool>,
     persist: Option<Arc<Mutex<Box<dyn ClientPersistence>>>>,
     auto_reconnect: bool,
@@ -720,6 +895,7 @@ impl ConnectJob {
                 will,
                 ver,
                 props,
+                ssl,
                 tx,
                 connected_flag,
                 persist,
@@ -738,6 +914,7 @@ impl ConnectJob {
                     will,
                     ver,
                     props,
+                    ssl,
                     connected_flag,
                     persist,
                     auto_reconnect,
@@ -779,6 +956,23 @@ async fn do_connect(
     let conn: Box<dyn Connection> = match &job.addr {
         ServerAddr::Tcp { host, port } => {
             Box::new(TcpConnection::connect(host, *port).await?)
+        }
+        #[cfg(feature = "tls")]
+        ServerAddr::Tls { host, port } => {
+            let ssl = job.ssl.as_ref().ok_or(crate::Error::MissingSslOptions)?;
+            let config = make_tls_config(ssl)?;
+            let connector = TlsConnector::from(config);
+            let server_name = rustls::pki_types::ServerName::try_from(host.as_str())
+                .map_err(|_| {
+                    crate::Error::GeneralString(format!(
+                        "invalid TLS server name: {}",
+                        host
+                    ))
+                })?
+                .to_owned();
+            let tcp = TcpStream::connect((host.as_str(), *port)).await?;
+            let tls = connector.connect(server_name, tcp).await?;
+            Box::new(TlsConnection { stream: tls })
         }
         #[cfg(unix)]
         ServerAddr::Unix { path } => Box::new(UnixConnection::connect(path).await?),
@@ -859,6 +1053,7 @@ async fn reconnect_wait(
                             will,
                             ver,
                             props,
+                            ssl,
                             tx,
                             connected_flag,
                             persist,
@@ -878,6 +1073,7 @@ async fn reconnect_wait(
                                     will,
                                     ver,
                                     props,
+                                    ssl,
                                     connected_flag,
                                     persist,
                                     auto_reconnect,

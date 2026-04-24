@@ -49,6 +49,14 @@ pub(crate) enum ServerAddr {
         /// Broker TCP port.
         port: u16,
     },
+    /// TLS connection (requires the `tls` feature).
+    #[cfg(feature = "tls")]
+    Tls {
+        /// Broker hostname or IP address.
+        host: String,
+        /// Broker TCP port.
+        port: u16,
+    },
     /// Unix-domain socket connection (Unix/Linux/macOS only).
     #[cfg(unix)]
     Unix {
@@ -105,6 +113,8 @@ pub(crate) enum Command {
         ver: MqttVersion,
         /// MQTT v5 CONNECT properties; empty for v3.1.1.
         props: CodecProperties,
+        /// TLS/SSL options; `Some` only when using a TLS transport.
+        ssl: Option<crate::SslOptions>,
         /// Completer resolved with the CONNACK result.
         tx: Completer<ConnectResponse>,
         /// Set to `true` before resolving `tx` on success; cleared on failure.

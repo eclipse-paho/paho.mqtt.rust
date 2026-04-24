@@ -26,6 +26,11 @@
 //! * **tokio** *(default)*
 //!   Enables the Tokio-based internal async runtime for pure-Rust MQTT I/O.
 //!
+//! * **tls**
+//!   Enables TLS/SSL transport via [`rustls`](https://docs.rs/rustls) and
+//!   [`tokio-rustls`](https://docs.rs/tokio-rustls). Adds support for
+//!   `ssl://`, `mqtts://`, and `tls://` URIs. Implies the `tokio` feature.
+//!
 //! * **serde**
 //!   Serialization support for messages.
 //!

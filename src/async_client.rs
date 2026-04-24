@@ -268,6 +268,7 @@ impl AsyncClient {
             will,
             ver,
             props: opts.props,
+            ssl: opts.ssl,
             tx: comp,
             connected_flag: Arc::clone(&self.inner.connected),
             persist: self.inner.persist.as_ref().map(Arc::clone),
@@ -1079,23 +1080,23 @@ fn parse_server_uri(uri: &str) -> Result<ServerAddr> {
         });
     }
 
-    let (default_port, rest) = if let Some(s) = uri
+    let (default_port, is_tls, rest) = if let Some(s) = uri
         .strip_prefix("mqtts://")
         .or_else(|| uri.strip_prefix("ssl://"))
         .or_else(|| uri.strip_prefix("tls://"))
         .or_else(|| uri.strip_prefix("wss://"))
     {
-        (8883u16, s)
+        (8883u16, true, s)
     }
     else if let Some(s) = uri
         .strip_prefix("mqtt://")
         .or_else(|| uri.strip_prefix("tcp://"))
         .or_else(|| uri.strip_prefix("ws://"))
     {
-        (1883u16, s)
+        (1883u16, false, s)
     }
     else {
-        (1883u16, uri)
+        (1883u16, false, uri)
     };
 
     let authority = rest.split('/').next().unwrap_or(rest);
@@ -1110,6 +1111,13 @@ fn parse_server_uri(uri: &str) -> Result<ServerAddr> {
     else {
         (authority.to_string(), default_port)
     };
+
+    if is_tls {
+        #[cfg(feature = "tls")]
+        return Ok(ServerAddr::Tls { host, port });
+        #[cfg(not(feature = "tls"))]
+        return Err(Error::SslNotSupported);
+    }
 
     Ok(ServerAddr::Tcp { host, port })
 }
@@ -1306,17 +1314,29 @@ mod tests {
             parse_server_uri("tcp://broker.example.com:1883").unwrap(),
             ServerAddr::Tcp { host, port } if host == "broker.example.com" && port == 1883
         ));
+        #[cfg(feature = "tls")]
         assert!(matches!(
             parse_server_uri("mqtts://broker.example.com:8883").unwrap(),
-            ServerAddr::Tcp { host, port } if host == "broker.example.com" && port == 8883
+            ServerAddr::Tls { host, port } if host == "broker.example.com" && port == 8883
+        ));
+        #[cfg(not(feature = "tls"))]
+        assert!(matches!(
+            parse_server_uri("mqtts://broker.example.com:8883"),
+            Err(Error::SslNotSupported)
         ));
         assert!(matches!(
             parse_server_uri("mqtt://localhost").unwrap(),
             ServerAddr::Tcp { host, port } if host == "localhost" && port == 1883
         ));
+        #[cfg(feature = "tls")]
         assert!(matches!(
             parse_server_uri("mqtts://secure.broker.io").unwrap(),
-            ServerAddr::Tcp { host, port } if host == "secure.broker.io" && port == 8883
+            ServerAddr::Tls { host, port } if host == "secure.broker.io" && port == 8883
+        ));
+        #[cfg(not(feature = "tls"))]
+        assert!(matches!(
+            parse_server_uri("mqtts://secure.broker.io"),
+            Err(Error::SslNotSupported)
         ));
         assert!(matches!(
             parse_server_uri("ws://localhost:8080/mqtt").unwrap(),

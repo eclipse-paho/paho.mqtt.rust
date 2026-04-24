@@ -18,6 +18,7 @@ The Eclipse Paho MQTT Rust client library.
 
 [features]
 default = ["tokio"]
+tls = ["dep:tokio-rustls", "dep:rustls", "dep:rustls-pemfile", "dep:rustls-native-certs", "tokio"]
 serde = ["dep:serde"]
 
 [dependencies]
@@ -30,6 +31,10 @@ crossbeam-channel = "0.5"
 log = "0.4"
 thiserror = "2.0"
 tokio = { version = "1.49", features = ["full"], optional = true }
+tokio-rustls = { version = "0.26", optional = true }
+rustls = { version = "0.23", optional = true }
+rustls-pemfile = { version = "2", optional = true }
+rustls-native-certs = { version = "0.7", optional = true }
 serde = { version = "1.0", features = ["derive"], optional = true }
 
 [dev-dependencies]
