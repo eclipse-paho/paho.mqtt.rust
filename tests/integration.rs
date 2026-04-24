@@ -114,7 +114,7 @@ fn subscribe_and_receive(qos: mqtt::QoS) {
     // Publisher client
     let pub_cli = mqtt::AsyncClient::new(HOST).unwrap();
     pub_cli.connect(None).wait().expect("pub connect failed");
-    let msg = mqtt::Message::new(topic, payload.as_bytes(), qos);
+    let msg = mqtt::Message::new(topic, payload.clone(), qos);
     pub_cli.publish(msg).wait().expect("publish failed");
 
     // Receive

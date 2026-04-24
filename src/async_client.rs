@@ -52,10 +52,11 @@ use crate::{
     SyncReceiver, UnsubscribeManyToken, UnsubscribeToken, UserData,
     error::{Error, Result},
     persistence::ClientPersistence,
-    runtime::{Command, RuntimeHandle, ServerAddr},
+    runtime::{Command, ConnectParams, RuntimeHandle, ServerAddr},
     token::Token,
     types::*,
 };
+use bytes::Bytes;
 use crossbeam_channel as sync_channel;
 use std::{
     result::Result as StdResult,
@@ -257,24 +258,28 @@ impl AsyncClient {
         let (tok, comp) = ConnectToken::new();
         *self.inner.conn_opts.write().unwrap() = opts.clone();
 
-        let cmd = Command::Connect {
-            addr,
+        let params = ConnectParams {
             server_uri,
             client_id: self.inner.opts.client_id.clone(),
             clean_start: opts.clean_start,
             keep_alive_secs,
             user_name: opts.user_name,
-            password: opts.password,
+            password: opts.password.map(Bytes::from),
             will,
             ver,
             props: opts.props,
             ssl: opts.ssl,
-            tx: comp,
-            connected_flag: Arc::clone(&self.inner.connected),
-            persist: self.inner.persist.as_ref().map(Arc::clone),
             auto_reconnect: opts.auto_reconnect,
             min_retry_interval: opts.min_retry_interval,
             max_retry_interval: opts.max_retry_interval,
+        };
+
+        let cmd = Command::Connect {
+            addr,
+            params,
+            tx: comp,
+            connected_flag: Arc::clone(&self.inner.connected),
+            persist: self.inner.persist.as_ref().map(Arc::clone),
         };
 
         if self.inner.cmd_tx.send_blocking(cmd).is_err() {
@@ -331,7 +336,6 @@ impl AsyncClient {
     /// Returns a Publish Error on failure so that the original message
     /// can be recovered and sent again.
     pub fn try_publish(&self, msg: Message) -> Result<DeliveryToken> {
-        use bytes::Bytes;
         debug!("Publish: {:?}", msg);
 
         let props = msg.properties().clone();
@@ -341,8 +345,8 @@ impl AsyncClient {
         let (tok, comp) = DeliveryToken::new();
 
         let cmd = Command::Publish {
-            topic: msg.topic().to_string(),
-            payload: Bytes::copy_from_slice(msg.payload()),
+            topic: msg.topic.clone(),
+            payload: msg.payload.clone(),
             qos,
             retain: msg.retain(),
             props,
@@ -719,17 +723,7 @@ impl AsyncClient {
                     cb(self);
                 }
             }
-            Ev::MessageArrived(recv) => {
-                use crate::message::OutMessage;
-                let msg = Message::from(OutMessage {
-                    topic: recv.topic,
-                    payload: recv.payload.into(),
-                    qos: recv.qos,
-                    retain: recv.retain,
-                    dup: recv.dup,
-                    msgid: recv.packet_id,
-                    props: recv.props,
-                });
+            Ev::MessageArrived(msg) => {
                 let mut cbctx = self.inner.callback_context.lock().unwrap();
                 if let Some(ref mut cb) = cbctx.on_message_arrived {
                     cb(self, Some(msg));
@@ -1129,7 +1123,6 @@ fn parse_server_uri(uri: &str) -> Result<ServerAddr> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::MessageBuilder;
     use crate::create_options::CreateOptionsBuilder;
     use std::sync::{Arc, Mutex, RwLock};
     use std::thread;

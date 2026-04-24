@@ -34,7 +34,7 @@ pub(crate) mod commands;
 pub(crate) mod tokio_rt;
 
 #[cfg(feature = "tokio")]
-pub(crate) use commands::{Command, Event, ServerAddr};
+pub(crate) use commands::{Command, ConnectParams, Event, ServerAddr};
 
 #[cfg(feature = "tokio")]
 pub(crate) use tokio_rt::RuntimeHandle;

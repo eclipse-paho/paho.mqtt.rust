@@ -68,7 +68,7 @@ pub use crate::error::{
     ConnectReturnCode, Error, Result, error_message, error_message_opt,
 };
 pub use crate::event::Event;
-pub use crate::message::{Message, MessageBuilder, OutMessage};
+pub use crate::message::{Message, MessageBuilder};
 pub use crate::persistence::{
     ClientPersistence, ClientPersistenceBox, FilePersistence, PERSISTENCE_ERROR,
     PERSISTENCE_SUCCESS, PersistenceType, UserPersistence,

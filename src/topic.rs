@@ -107,7 +107,7 @@ impl<'a> Topic<'a> {
     /// message.
     pub fn create_message_with_topic<V>(&self, payload: V, inc_topic: bool) -> Message
     where
-        V: Into<Vec<u8>>,
+        V: Into<bytes::Bytes>,
     {
         let mut bld = MessageBuilder::new()
             .payload(payload)
@@ -134,7 +134,7 @@ impl<'a> Topic<'a> {
     ///
     pub fn create_message<V>(&self, payload: V) -> Message
     where
-        V: Into<Vec<u8>>,
+        V: Into<bytes::Bytes>,
     {
         self.create_message_with_topic(payload, false)
     }
@@ -166,7 +166,7 @@ impl<'a> Topic<'a> {
     ///
     pub fn publish<V>(&self, payload: V) -> DeliveryToken
     where
-        V: Into<Vec<u8>>,
+        V: Into<bytes::Bytes>,
     {
         let msg = self.create_message(payload);
         self.cli.publish(msg)
@@ -187,7 +187,7 @@ impl<'a> Topic<'a> {
     /// Returns a Publish Error containing the complete message on failure.
     pub fn try_publish<V>(&self, payload: V) -> Result<DeliveryToken>
     where
-        V: Into<Vec<u8>>,
+        V: Into<bytes::Bytes>,
     {
         let msg = self.create_message(payload);
         self.cli.try_publish(msg)
@@ -220,7 +220,7 @@ impl<'a> Topic<'a> {
     ///
     pub fn publish_with_alias<V>(&mut self, alias: u16, payload: V) -> DeliveryToken
     where
-        V: Into<Vec<u8>>,
+        V: Into<bytes::Bytes>,
     {
         self.alias = alias;
 
@@ -241,7 +241,7 @@ impl<'a> Topic<'a> {
         payload: V,
     ) -> Result<DeliveryToken>
     where
-        V: Into<Vec<u8>>,
+        V: Into<bytes::Bytes>,
     {
         self.alias = alias;
 
@@ -323,7 +323,7 @@ impl<'a> SyncTopic<'a> {
     /// Create a message for the topic using the supplied payload
     pub fn create_message<V>(&self, payload: V) -> Message
     where
-        V: Into<Vec<u8>>,
+        V: Into<bytes::Bytes>,
     {
         self.topic.create_message(payload)
     }
@@ -359,7 +359,7 @@ impl<'a> SyncTopic<'a> {
     ///
     pub fn publish<V>(&self, payload: V) -> Result<()>
     where
-        V: Into<Vec<u8>>,
+        V: Into<bytes::Bytes>,
     {
         let msg = self.create_message(payload);
         self.cli.publish(msg).map(|_| ())
@@ -392,7 +392,7 @@ impl<'a> SyncTopic<'a> {
     ///
     pub fn publish_with_alias<V>(&mut self, alias: u16, payload: V) -> Result<()>
     where
-        V: Into<Vec<u8>>,
+        V: Into<bytes::Bytes>,
     {
         self.topic.alias = alias;
 

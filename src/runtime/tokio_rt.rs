@@ -36,7 +36,7 @@ use std::{
     time::Duration,
 };
 
-use bytes::{Bytes, BytesMut};
+use bytes::BytesMut;
 use paho_mqtt_codec::{
     ConnAck, Disconnect, MqttVersion, PubAck, QoS, RetainHandling as CodecRetainHandling,
     Subscribe, Subscription, Unsubscribe,
@@ -56,9 +56,9 @@ use tokio::{
 #[cfg(feature = "tls")]
 use tokio_rustls::TlsConnector;
 
-use super::commands::{Command, Event, ReceivedMessage, ServerAddr};
+use super::commands::{Command, ConnectParams, Event, ServerAddr};
 use crate::{
-    Error, Result,
+    Error, Message, Result,
     persistence::ClientPersistence,
     responses::{ConnectResponse, PublishResponse, SubscribeResponse, UnsubscribeResponse},
     token::Completer,
@@ -463,7 +463,7 @@ struct Session {
     /// Pending QoS 2 outbound publishes awaiting PUBCOMP.
     pending_pub2: HashMap<u16, Completer<PublishResponse>>,
     /// Pending inbound QoS 2 messages awaiting PUBREL (packet_id → message).
-    pending_pub2_in: HashMap<u16, ReceivedMessage>,
+    pending_pub2_in: HashMap<u16, Message>,
     /// Pending SUBSCRIBE operations awaiting SUBACK.
     pending_sub: HashMap<u16, Completer<SubscribeResponse>>,
     /// Pending UNSUBSCRIBE operations awaiting UNSUBACK.
@@ -649,26 +649,26 @@ impl Session {
             // ---- Inbound application message ----
             Packet::Publish(pub_pkt) => match pub_pkt.qos {
                 QoS::QoS0 => {
-                    let msg = ReceivedMessage {
+                    let msg = Message {
                         topic: pub_pkt.topic,
                         payload: pub_pkt.payload,
                         qos: pub_pkt.qos,
                         retain: pub_pkt.retain,
                         dup: pub_pkt.dup,
-                        packet_id: None,
+                        msgid: None,
                         props: pub_pkt.properties,
                     };
                     let _ = self.event_tx.send(Event::MessageArrived(msg)).await;
                 }
                 QoS::QoS1 => {
                     let id = pub_pkt.packet_id.unwrap_or(0);
-                    let msg = ReceivedMessage {
+                    let msg = Message {
                         topic: pub_pkt.topic,
                         payload: pub_pkt.payload,
                         qos: pub_pkt.qos,
                         retain: pub_pkt.retain,
                         dup: pub_pkt.dup,
-                        packet_id: Some(id),
+                        msgid: Some(id),
                         props: pub_pkt.properties,
                     };
                     let _ = self.event_tx.send(Event::MessageArrived(msg)).await;
@@ -686,13 +686,13 @@ impl Session {
                     {
                         self.persist_put(&format!("r{id}"), &enc_buf);
                     }
-                    let msg = ReceivedMessage {
+                    let msg = Message {
                         topic: pub_pkt.topic,
                         payload: pub_pkt.payload,
                         qos: pub_pkt.qos,
                         retain: pub_pkt.retain,
                         dup: pub_pkt.dup,
-                        packet_id: Some(id),
+                        msgid: Some(id),
                         props: pub_pkt.properties,
                     };
                     self.pending_pub2_in.insert(id, msg);
@@ -862,21 +862,9 @@ impl Session {
 /// reconnect attempts without re-receiving the command.
 struct ConnectJob {
     addr: ServerAddr,
-    server_uri: String,
-    client_id: String,
-    clean_start: bool,
-    keep_alive_secs: u16,
-    user_name: Option<String>,
-    password: Option<Vec<u8>>,
-    will: Option<paho_mqtt_codec::Will>,
-    ver: MqttVersion,
-    props: paho_mqtt_codec::Properties,
-    ssl: Option<crate::SslOptions>,
+    params: ConnectParams,
     connected_flag: Arc<AtomicBool>,
     persist: Option<Arc<Mutex<Box<dyn ClientPersistence>>>>,
-    auto_reconnect: bool,
-    min_retry_interval: Duration,
-    max_retry_interval: Duration,
 }
 
 impl ConnectJob {
@@ -886,55 +874,20 @@ impl ConnectJob {
         match cmd {
             Command::Connect {
                 addr,
-                server_uri,
-                client_id,
-                clean_start,
-                keep_alive_secs,
-                user_name,
-                password,
-                will,
-                ver,
-                props,
-                ssl,
+                params,
                 tx,
                 connected_flag,
                 persist,
-                auto_reconnect,
-                min_retry_interval,
-                max_retry_interval,
             } => Some((
                 Self {
                     addr,
-                    server_uri,
-                    client_id,
-                    clean_start,
-                    keep_alive_secs,
-                    user_name,
-                    password,
-                    will,
-                    ver,
-                    props,
-                    ssl,
+                    params,
                     connected_flag,
                     persist,
-                    auto_reconnect,
-                    min_retry_interval,
-                    max_retry_interval,
                 },
                 tx,
             )),
             _ => None,
-        }
-    }
-
-    /// Converts `keep_alive_secs` to a [`Duration`], substituting one hour
-    /// when keep-alive is disabled (value 0).
-    fn keep_alive_duration(&self) -> Duration {
-        if self.keep_alive_secs > 0 {
-            Duration::from_secs(self.keep_alive_secs as u64)
-        }
-        else {
-            Duration::from_secs(3600)
         }
     }
 }
@@ -947,9 +900,11 @@ async fn do_connect(
     WriteHalf<Box<dyn Connection>>,
     ConnAck,
 )> {
+    let p = &job.params;
+
     // ---- Open persistence ----
-    if let Some(p) = &job.persist {
-        p.lock().unwrap().open(&job.client_id, &job.server_uri)?;
+    if let Some(store) = &job.persist {
+        store.lock().unwrap().open(&p.client_id, &p.server_uri)?;
     }
 
     // ---- Transport connect ----
@@ -959,7 +914,7 @@ async fn do_connect(
         }
         #[cfg(feature = "tls")]
         ServerAddr::Tls { host, port } => {
-            let ssl = job.ssl.as_ref().ok_or(Error::MissingSslOptions)?;
+            let ssl = p.ssl.as_ref().ok_or(Error::MissingSslOptions)?;
             let config = make_tls_config(ssl)?;
             let connector = TlsConnector::from(config);
             let server_name = rustls::pki_types::ServerName::try_from(host.as_str())
@@ -979,28 +934,22 @@ async fn do_connect(
 
     // ---- Build and send CONNECT packet ----
     let connect_pkt = paho_mqtt_codec::Connect {
-        clean_start: job.clean_start,
-        keep_alive: job.keep_alive_secs,
-        client_id: job.client_id.clone(),
-        username: job.user_name.clone(),
-        password: job.password.clone().map(Bytes::from),
-        will: job.will.clone(),
-        properties: job.props.clone(),
+        clean_start: p.clean_start,
+        keep_alive: p.keep_alive_secs,
+        client_id: p.client_id.clone(),
+        username: p.user_name.clone(),
+        password: p.password.clone(),
+        will: p.will.clone(),
+        properties: p.props.clone(),
         ..Default::default()
     };
 
     let mut buf = BytesMut::with_capacity(256);
-    send_packet(
-        &mut writer,
-        &Packet::Connect(connect_pkt),
-        job.ver,
-        &mut buf,
-    )
-    .await?;
+    send_packet(&mut writer, &Packet::Connect(connect_pkt), p.ver, &mut buf).await?;
 
     // ---- Wait for CONNACK ----
     let mut read_buf = BytesMut::with_capacity(256);
-    let connack = recv_connack(&mut reader, &mut read_buf, job.ver).await?;
+    let connack = recv_connack(&mut reader, &mut read_buf, p.ver).await?;
 
     Ok((reader, writer, connack))
 }
@@ -1041,42 +990,13 @@ async fn reconnect_wait(
                     Ok(cmd) => match cmd {
                         Command::Connect {
                             addr,
-                            server_uri,
-                            client_id,
-                            clean_start,
-                            keep_alive_secs,
-                            user_name,
-                            password,
-                            will,
-                            ver,
-                            props,
-                            ssl,
+                            params,
                             tx,
                             connected_flag,
                             persist,
-                            auto_reconnect,
-                            min_retry_interval,
-                            max_retry_interval,
                         } => {
                             return WaitOutcome::Replace(
-                                ConnectJob {
-                                    addr,
-                                    server_uri,
-                                    client_id,
-                                    clean_start,
-                                    keep_alive_secs,
-                                    user_name,
-                                    password,
-                                    will,
-                                    ver,
-                                    props,
-                                    ssl,
-                                    connected_flag,
-                                    persist,
-                                    auto_reconnect,
-                                    min_retry_interval,
-                                    max_retry_interval,
-                                },
+                                ConnectJob { addr, params, connected_flag, persist },
                                 tx,
                             );
                         }
@@ -1109,8 +1029,13 @@ async fn reconnect_wait(
 /// Builds a [`ConnectResponse`] from a successful CONNACK and job metadata.
 fn build_connect_response(job: &ConnectJob, connack: ConnAck) -> ConnectResponse {
     ConnectResponse {
-        server_uri: job.server_uri.clone(),
-        mqtt_version: if job.ver == MqttVersion::V5 { 5 } else { 4 },
+        server_uri: job.params.server_uri.clone(),
+        mqtt_version: if job.params.ver == MqttVersion::V5 {
+            5
+        }
+        else {
+            4
+        },
         session_present: connack.session_present,
         reason_code: connack.reason_code,
         properties: connack.properties,
@@ -1175,8 +1100,8 @@ pub(crate) async fn run_event_loop(
         // ---- Run the session ----
         let mut session = Session::new(
             writer,
-            job.ver,
-            job.keep_alive_duration(),
+            job.params.ver,
+            job.params.keep_alive_duration(),
             event_tx.clone(),
             job.connected_flag.clone(),
             job.persist.clone(),
@@ -1193,14 +1118,14 @@ pub(crate) async fn run_event_loop(
                 job.connected_flag.store(false, Ordering::SeqCst);
                 let _ = event_tx.send(Event::ConnectionLost(e)).await;
 
-                if !job.auto_reconnect {
+                if !job.params.auto_reconnect {
                     continue 'outer;
                 }
             }
         }
 
         // ---- Auto-reconnect loop ----
-        let mut retry_delay = job.min_retry_interval;
+        let mut retry_delay = job.params.min_retry_interval;
 
         'retry: loop {
             // Wait for the backoff delay, draining the command queue.
@@ -1212,7 +1137,7 @@ pub(crate) async fn run_event_loop(
                         // Explicit reconnect/connect: use the new params and
                         // reset the backoff.
                         job = new_job;
-                        retry_delay = job.min_retry_interval;
+                        retry_delay = job.params.min_retry_interval;
                         Some(new_tx)
                     }
                 };
@@ -1222,7 +1147,7 @@ pub(crate) async fn run_event_loop(
                     if let Some(tx) = tx_opt {
                         tx.complete(Err(e));
                     }
-                    retry_delay = (retry_delay * 2).min(job.max_retry_interval);
+                    retry_delay = (retry_delay * 2).min(job.params.max_retry_interval);
                 }
                 Ok((mut reader, writer, connack)) => {
                     if connack.reason_code as u8 >= 0x80 {
@@ -1230,7 +1155,7 @@ pub(crate) async fn run_event_loop(
                         if let Some(tx) = tx_opt {
                             tx.complete(Err(e));
                         }
-                        retry_delay = (retry_delay * 2).min(job.max_retry_interval);
+                        retry_delay = (retry_delay * 2).min(job.params.max_retry_interval);
                         continue 'retry;
                     }
 
@@ -1243,8 +1168,8 @@ pub(crate) async fn run_event_loop(
 
                     let mut session = Session::new(
                         writer,
-                        job.ver,
-                        job.keep_alive_duration(),
+                        job.params.ver,
+                        job.params.keep_alive_duration(),
                         event_tx.clone(),
                         job.connected_flag.clone(),
                         job.persist.clone(),
@@ -1261,7 +1186,7 @@ pub(crate) async fn run_event_loop(
                             job.connected_flag.store(false, Ordering::SeqCst);
                             let _ = event_tx.send(Event::ConnectionLost(e)).await;
                             // Reset backoff on each successful-then-lost connection.
-                            retry_delay = job.min_retry_interval;
+                            retry_delay = job.params.min_retry_interval;
                         }
                     }
                 }

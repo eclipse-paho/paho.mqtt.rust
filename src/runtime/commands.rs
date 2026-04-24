@@ -68,24 +68,47 @@ pub(crate) enum ServerAddr {
 
 /////////////////////////////////////////////////////////////////////////////
 
-/// An inbound MQTT message using codec-native types.
-///
-/// Delivered to the public layer via [`Event::MessageArrived`].
-pub(crate) struct ReceivedMessage {
-    /// Topic on which the message was published.
-    pub topic: String,
-    /// Application payload.
-    pub payload: Bytes,
-    /// Quality of service level.
-    pub qos: QoS,
-    /// Whether the broker stored and forwarded this message.
-    pub retain: bool,
-    /// Whether this is a re-delivery of an unacknowledged packet.
-    pub dup: bool,
-    /// Packet identifier; present for QoS 1 and 2, absent for QoS 0.
-    pub packet_id: Option<u16>,
-    /// MQTT v5 properties; empty on v3.1.1 connections.
+/// Connection parameters grouped for reuse across reconnect attempts.
+pub(crate) struct ConnectParams {
+    /// Original server URI string, carried into `ConnectResponse`.
+    pub server_uri: String,
+    /// Client identifier.
+    pub client_id: String,
+    /// Whether to request a clean session / discard existing state.
+    pub clean_start: bool,
+    /// Keep-alive interval in seconds (0 = disabled).
+    pub keep_alive_secs: u16,
+    /// Optional username for authentication.
+    pub user_name: Option<String>,
+    /// Optional password for authentication.
+    pub password: Option<Bytes>,
+    /// Optional Last Will and Testament message.
+    pub will: Option<Will>,
+    /// MQTT protocol version to use.
+    pub ver: MqttVersion,
+    /// MQTT v5 CONNECT properties; empty for v3.1.1.
     pub props: CodecProperties,
+    /// TLS/SSL options; `Some` only when using a TLS transport.
+    pub ssl: Option<crate::SslOptions>,
+    /// Whether the event loop should automatically reconnect on session loss.
+    pub auto_reconnect: bool,
+    /// Minimum backoff interval between reconnect attempts.
+    pub min_retry_interval: Duration,
+    /// Maximum backoff interval between reconnect attempts.
+    pub max_retry_interval: Duration,
+}
+
+impl ConnectParams {
+    /// Converts `keep_alive_secs` to a [`Duration`], substituting one hour
+    /// when keep-alive is disabled (value 0).
+    pub fn keep_alive_duration(&self) -> Duration {
+        if self.keep_alive_secs > 0 {
+            Duration::from_secs(self.keep_alive_secs as u64)
+        }
+        else {
+            Duration::from_secs(3600)
+        }
+    }
 }
 
 /////////////////////////////////////////////////////////////////////////////
@@ -96,38 +119,14 @@ pub(crate) enum Command {
     Connect {
         /// Resolved transport address.
         addr: ServerAddr,
-        /// Original server URI string, carried into `ConnectResponse`.
-        server_uri: String,
-        /// Client identifier.
-        client_id: String,
-        /// Whether to request a clean session / discard existing state.
-        clean_start: bool,
-        /// Keep-alive interval in seconds (0 = disabled).
-        keep_alive_secs: u16,
-        /// Optional username for authentication.
-        user_name: Option<String>,
-        /// Optional password for authentication.
-        password: Option<Vec<u8>>,
-        /// Optional Last Will and Testament message.
-        will: Option<Will>,
-        /// MQTT protocol version to use.
-        ver: MqttVersion,
-        /// MQTT v5 CONNECT properties; empty for v3.1.1.
-        props: CodecProperties,
-        /// TLS/SSL options; `Some` only when using a TLS transport.
-        ssl: Option<crate::SslOptions>,
+        /// Session and authentication parameters.
+        params: ConnectParams,
         /// Completer resolved with the CONNACK result.
         tx: Completer<ConnectResponse>,
         /// Set to `true` before resolving `tx` on success; cleared on failure.
         connected_flag: Arc<AtomicBool>,
         /// Persistence store, opened for this connection (if any).
         persist: Option<Arc<Mutex<Box<dyn ClientPersistence>>>>,
-        /// Whether the event loop should automatically reconnect on session loss.
-        auto_reconnect: bool,
-        /// Minimum backoff interval between reconnect attempts.
-        min_retry_interval: Duration,
-        /// Maximum backoff interval between reconnect attempts.
-        max_retry_interval: Duration,
     },
 
     /// Publish an application message.
@@ -188,5 +187,5 @@ pub(crate) enum Event {
     /// The network connection was lost unexpectedly.
     ConnectionLost(Error),
     /// An application message arrived from the broker.
-    MessageArrived(ReceivedMessage),
+    MessageArrived(crate::Message),
 }

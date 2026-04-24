@@ -21,18 +21,21 @@
 
 use std::{borrow::Cow, fmt};
 
+use bytes::Bytes;
+
 use crate::{QoS, properties::Properties};
 
-/// An "outbound" MQTT message.
+/// An MQTT Message.
 ///
-/// This is the form of an MQTT message created by the application for
-/// publication. It consists of standard Rust fields.
+/// This represents all the information passed in an MQTT PUBLISH packet.
+/// It is the primary data transfer mechanism for the protocol, used for
+/// both outbound publications and inbound deliveries.
 #[derive(Debug, Default, Clone)]
-pub struct OutMessage {
+pub struct Message {
     /// The message topic
     pub topic: String,
     /// The message payload
-    pub payload: Vec<u8>,
+    pub payload: Bytes,
     /// The message quality of service
     pub qos: QoS,
     /// Whether this is a retain message
@@ -40,63 +43,10 @@ pub struct OutMessage {
     /// The message properties
     pub props: Properties,
     /// Whether this is a duplicate
-    /// Not to be set by the application
-    pub dup: bool,
+    pub(crate) dup: bool,
     /// The message identifier.
-    pub msgid: Option<u16>,
+    pub(crate) msgid: Option<u16>,
 }
-
-impl OutMessage {
-    /// Creates a new message.
-    ///
-    /// # Arguments
-    ///
-    /// * `topic` The topic on which the message is published.
-    /// * `payload` The binary payload of the message
-    /// * `qos` The quality of service for message delivery (0, 1, or 2)
-    pub fn new<S, V, Q>(topic: S, payload: V, qos: Q) -> Self
-    where
-        S: Into<String>,
-        V: Into<Vec<u8>>,
-        Q: Into<QoS>,
-    {
-        Self {
-            topic: topic.into(),
-            payload: payload.into(),
-            qos: qos.into(),
-            ..Self::default()
-        }
-    }
-
-    /// Creates a new message that will be retained by the broker.
-    /// This creates a message with the 'retained' flag set.
-    ///
-    /// # Arguments
-    ///
-    /// * `topic` The topic on which the message is published.
-    /// * `payload` The binary payload of the message
-    /// * `qos` The quality of service for message delivery (0, 1, or 2)
-    ///
-    pub fn new_retained<S, V, Q>(topic: S, payload: V, qos: Q) -> Self
-    where
-        S: Into<String>,
-        V: Into<Vec<u8>>,
-        Q: Into<QoS>,
-    {
-        Self {
-            retain: true,
-            ..Self::new(topic, payload, qos)
-        }
-    }
-}
-
-/////////////////////////////////////////////////////////////////////////////
-
-/// An MQTT Message.
-/// This represents all the information passed in an MQTT PUBLISH packet.
-/// It's the primary data transfer mechanism for the protocol.
-#[derive(Debug, Default, Clone)]
-pub struct Message(OutMessage);
 
 impl Message {
     /// Creates a new message.
@@ -109,38 +59,44 @@ impl Message {
     pub fn new<S, V, Q>(topic: S, payload: V, qos: Q) -> Self
     where
         S: Into<String>,
-        V: Into<Vec<u8>>,
+        V: Into<Bytes>,
         Q: Into<QoS>,
     {
-        Self(OutMessage::new(topic, payload, qos))
+        Self {
+            topic: topic.into(),
+            payload: payload.into(),
+            qos: qos.into(),
+            ..Self::default()
+        }
     }
 
     /// Creates a new message that will be retained by the broker.
-    /// This creates a message with the 'retained' flag set.
     ///
     /// # Arguments
     ///
     /// * `topic` The topic on which the message is published.
     /// * `payload` The binary payload of the message
     /// * `qos` The quality of service for message delivery (0, 1, or 2)
-    ///
     pub fn new_retained<S, V, Q>(topic: S, payload: V, qos: Q) -> Self
     where
         S: Into<String>,
-        V: Into<Vec<u8>>,
+        V: Into<Bytes>,
         Q: Into<QoS>,
     {
-        Self(OutMessage::new_retained(topic, payload, qos))
+        Self {
+            retain: true,
+            ..Self::new(topic, payload, qos)
+        }
     }
 
     /// Gets the message topic.
     pub fn topic(&self) -> &str {
-        &self.0.topic
+        &self.topic
     }
 
     /// Gets the message payload
     pub fn payload(&self) -> &[u8] {
-        &self.0.payload
+        &self.payload
     }
 
     /// Gets the payload of the message as a string.
@@ -156,12 +112,12 @@ impl Message {
 
     /// Gets the QoS of the message.
     pub fn qos(&self) -> QoS {
-        self.0.qos
+        self.qos
     }
 
     /// Gets the retain flag of the message
     pub fn retain(&self) -> bool {
-        self.0.retain
+        self.retain
     }
 
     // TODO: Mark as deprecated?
@@ -173,18 +129,12 @@ impl Message {
 
     /// Gets the properties in the message
     pub fn properties(&self) -> &Properties {
-        &self.0.props
+        &self.props
     }
 
     /// Gets the message identifier.
     pub fn msgid(&self) -> Option<u16> {
-        self.0.msgid
-    }
-}
-
-impl From<OutMessage> for Message {
-    fn from(msg: OutMessage) -> Self {
-        Self(msg)
+        self.msgid
     }
 }
 
@@ -199,7 +149,7 @@ impl fmt::Display for Message {
 
 /// Builder to create a new Message
 #[derive(Debug, Default, Clone)]
-pub struct MessageBuilder(OutMessage);
+pub struct MessageBuilder(Message);
 
 impl MessageBuilder {
     /// Create a new message builder.
@@ -222,7 +172,7 @@ impl MessageBuilder {
     /// # Arguments
     ///
     /// `payload` The binary payload of the message
-    pub fn payload<V: Into<Vec<u8>>>(mut self, payload: V) -> Self {
+    pub fn payload<V: Into<Bytes>>(mut self, payload: V) -> Self {
         self.0.payload = payload.into();
         self
     }
@@ -267,7 +217,7 @@ impl MessageBuilder {
 
     /// Finalize the builder to create the message.
     pub fn finalize(self) -> Message {
-        Message(self.0)
+        self.0
     }
 }
 
