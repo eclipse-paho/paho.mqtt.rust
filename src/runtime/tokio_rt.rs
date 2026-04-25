@@ -25,7 +25,7 @@
 //! [`Session`] event loop.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     io,
     pin::Pin,
     sync::{
@@ -61,7 +61,7 @@ use {
     tokio_tungstenite::{WebSocketStream, tungstenite::Message as WsMessage},
 };
 
-use super::commands::{Command, ConnectParams, Event, ServerAddr};
+use super::commands::{BufConfig, Command, ConnectParams, Event, ServerAddr};
 use crate::{
     Error, Message, Result,
     persistence::ClientPersistence,
@@ -553,7 +553,7 @@ impl RuntimeHandle {
     ///
     /// Returns a handle that can send commands to and receive events from the
     /// loop.
-    pub(crate) fn spawn() -> Self {
+    pub(crate) fn spawn(buf_cfg: BufConfig) -> Self {
         let (cmd_tx, cmd_rx) = async_channel::unbounded::<Command>();
         let (event_tx, event_rx) = async_channel::unbounded::<Event>();
 
@@ -562,7 +562,7 @@ impl RuntimeHandle {
                 .enable_all()
                 .build()
                 .expect("build tokio runtime")
-                .block_on(run_event_loop(cmd_rx, event_tx));
+                .block_on(run_event_loop(cmd_rx, event_tx, buf_cfg));
         });
 
         Self { cmd_tx, event_rx }
@@ -1074,16 +1074,20 @@ struct ConnectJob {
 }
 
 impl ConnectJob {
-    /// Extracts a `ConnectJob` from a `Command::Connect`, returning `None` for
-    /// any other command variant.
-    fn extract(cmd: Command) -> Option<(Self, Completer<ConnectResponse>)> {
+    /// Extracts a `ConnectJob` from a `Command::Connect`.
+    ///
+    /// Returns `Ok((job, tx))` on success or `Err(cmd)` if `cmd` is not a
+    /// `Connect` variant, giving the caller back the original command.
+    fn extract(
+        cmd: Command,
+    ) -> std::result::Result<(Self, Completer<ConnectResponse>), Command> {
         match cmd {
             Command::Connect {
                 params,
                 tx,
                 connected_flag,
                 persist,
-            } => Some((
+            } => Ok((
                 Self {
                     params,
                     server_idx: 0,
@@ -1092,7 +1096,7 @@ impl ConnectJob {
                 },
                 tx,
             )),
-            _ => None,
+            other => Err(other),
         }
     }
 }
@@ -1192,6 +1196,23 @@ async fn do_connect(
     Ok((reader, writer, connack))
 }
 
+/// Pushes a bufferable command into the send-while-disconnected buffer.
+///
+/// If the buffer is already at capacity and `cfg.delete_oldest` is set, the
+/// front entry is evicted (its `Completer` drops → `Error::Disconnected`).
+/// If `delete_oldest` is not set and the buffer is full, the incoming command
+/// is dropped instead (same effect on its completer).
+fn buf_push(buf: &mut VecDeque<Command>, cmd: Command, cfg: &BufConfig) {
+    if buf.len() < cfg.max_buffered_msgs {
+        buf.push_back(cmd);
+    }
+    else if cfg.delete_oldest {
+        buf.pop_front(); // oldest Completer drops → resolves with Disconnected
+        buf.push_back(cmd);
+    }
+    // else: buffer full, new cmd is dropped → its Completer resolves with Disconnected
+}
+
 /// Result of waiting for the reconnect timer to fire.
 enum WaitOutcome {
     /// Timer expired — proceed with the current [`ConnectJob`].
@@ -1210,11 +1231,14 @@ enum WaitOutcome {
 ///   [`WaitOutcome::Abort`].
 /// * `Connect` → captures the new parameters and returns
 ///   [`WaitOutcome::Replace`] immediately (skips remaining delay).
+/// * `Publish` with `send_while_disconnected` set → pushed into `buf`.
 /// * Any other command → completes the completer with
 ///   [`Error::Disconnected`] and keeps waiting.
 async fn reconnect_wait(
     delay: Duration,
     cmd_rx: &async_channel::Receiver<Command>,
+    buf: &mut VecDeque<Command>,
+    buf_cfg: &BufConfig,
 ) -> WaitOutcome {
     let sleep = time::sleep(delay);
     tokio::pin!(sleep);
@@ -1251,6 +1275,9 @@ async fn reconnect_wait(
                             connected_flag.store(false, Ordering::SeqCst);
                             tx.complete(Ok(()));
                             return WaitOutcome::Abort;
+                        }
+                        cmd @ Command::Publish { .. } if buf_cfg.send_while_disconnected => {
+                            buf_push(buf, cmd, buf_cfg);
                         }
                         Command::Publish { tx, .. } => {
                             tx.complete(Err(Error::Disconnected));
@@ -1300,20 +1327,57 @@ fn build_connect_response(job: &ConnectJob, connack: ConnAck) -> ConnectResponse
 /// `max_retry_interval`) without re-waiting for a new `Command::Connect`.
 /// An explicit `Command::Disconnect` during the backoff wait aborts the
 /// reconnect loop.
+///
+/// `buf_cfg` controls the send-while-disconnected buffer.  When enabled,
+/// `Publish` commands received while the client is disconnected are queued
+/// and flushed into the session immediately after a successful (re)connect.
 pub(crate) async fn run_event_loop(
     cmd_rx: async_channel::Receiver<Command>,
     event_tx: async_channel::Sender<Event>,
+    buf_cfg: BufConfig,
 ) {
+    // Buffer for Publish commands received while disconnected.
+    let mut buf: VecDeque<Command> = VecDeque::new();
+    // True once the first successful CONNACK has been received.
+    let mut ever_connected = false;
+
     'outer: loop {
         // ---- Wait for a Connect command ----
-        let cmd = match cmd_rx.recv().await {
-            Ok(cmd) => cmd,
-            Err(_) => return,
-        };
-
-        let Some((mut job, initial_tx)) = ConnectJob::extract(cmd)
-        else {
-            continue 'outer;
+        // While waiting, optionally buffer Publish commands.
+        let (mut job, initial_tx) = loop {
+            let cmd = match cmd_rx.recv().await {
+                Ok(cmd) => cmd,
+                Err(_) => return,
+            };
+            match ConnectJob::extract(cmd) {
+                Ok(pair) => break pair,
+                Err(cmd) => {
+                    // Non-Connect command while not connected.
+                    let should_buf = buf_cfg.allow_send_any_time
+                        || (ever_connected && buf_cfg.send_while_disconnected);
+                    match cmd {
+                        cmd @ Command::Publish { .. } if should_buf => {
+                            buf_push(&mut buf, cmd, &buf_cfg);
+                        }
+                        Command::Publish { tx, .. } => {
+                            tx.complete(Err(Error::Disconnected));
+                        }
+                        Command::Subscribe { tx, .. } => {
+                            tx.complete(Err(Error::Disconnected));
+                        }
+                        Command::Unsubscribe { tx, .. } => {
+                            tx.complete(Err(Error::Disconnected));
+                        }
+                        Command::Disconnect {
+                            tx, connected_flag, ..
+                        } => {
+                            connected_flag.store(false, Ordering::SeqCst);
+                            tx.complete(Ok(()));
+                        }
+                        Command::Connect { .. } => unreachable!(),
+                    }
+                }
+            }
         };
 
         // ---- First connection attempt: try each server in order ----
@@ -1354,6 +1418,7 @@ pub(crate) async fn run_event_loop(
         // Set the flag before resolving the token so `is_connected()` is true
         // as soon as `wait()` / `.await` returns in the caller.
         job.connected_flag.store(true, Ordering::SeqCst);
+        ever_connected = true;
         let _ = event_tx.send(Event::Connected(response.clone())).await;
         initial_tx.complete(Ok(response));
 
@@ -1366,6 +1431,14 @@ pub(crate) async fn run_event_loop(
             job.connected_flag.clone(),
             job.persist.clone(),
         );
+
+        // Flush any buffered commands into the newly connected session.
+        while let Some(cmd) = buf.pop_front() {
+            if session.handle_command(cmd).await.is_err() {
+                buf.clear();
+                break;
+            }
+        }
 
         let first_result = session.run(&mut reader, &cmd_rx).await;
         if let Some(p) = &session.persist {
@@ -1390,7 +1463,7 @@ pub(crate) async fn run_event_loop(
         'retry: loop {
             // Wait for the backoff delay, draining the command queue.
             let tx_opt: Option<Completer<ConnectResponse>> =
-                match reconnect_wait(retry_delay, &cmd_rx).await {
+                match reconnect_wait(retry_delay, &cmd_rx, &mut buf, &buf_cfg).await {
                     WaitOutcome::Abort => break 'retry,
                     WaitOutcome::Retry => {
                         // Advance to the next server in round-robin order.
@@ -1439,6 +1512,14 @@ pub(crate) async fn run_event_loop(
                         job.connected_flag.clone(),
                         job.persist.clone(),
                     );
+
+                    // Flush buffered commands into the reconnected session.
+                    while let Some(cmd) = buf.pop_front() {
+                        if session.handle_command(cmd).await.is_err() {
+                            buf.clear();
+                            break;
+                        }
+                    }
 
                     let result = session.run(&mut reader, &cmd_rx).await;
                     if let Some(p) = &session.persist {

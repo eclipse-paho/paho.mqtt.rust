@@ -42,6 +42,26 @@ use crate::{
 
 /////////////////////////////////////////////////////////////////////////////
 
+/// Configuration for the send-while-disconnected message buffer.
+///
+/// Passed to the event loop at spawn time; derived from [`CreateOptions`].
+///
+/// [`CreateOptions`]: crate::CreateOptions
+pub(crate) struct BufConfig {
+    /// Buffer publish commands when the client is disconnected after a prior
+    /// successful connection.
+    pub send_while_disconnected: bool,
+    /// Maximum number of commands that may be held in the buffer at once.
+    pub max_buffered_msgs: usize,
+    /// Buffer publishes even before the first successful connection has been
+    /// made.
+    pub allow_send_any_time: bool,
+    /// When the buffer is full, evict the oldest entry rather than the newest.
+    pub delete_oldest: bool,
+}
+
+/////////////////////////////////////////////////////////////////////////////
+
 /// The resolved transport address for a connection attempt.
 pub(crate) enum ServerAddr {
     /// Plain TCP connection.

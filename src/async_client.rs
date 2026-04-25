@@ -51,7 +51,7 @@ use crate::{
     SyncReceiver, UnsubscribeManyToken, UnsubscribeToken, UserData,
     error::{Error, Result},
     persistence::ClientPersistence,
-    runtime::{Command, ConnectParams, RuntimeHandle, ServerAddr},
+    runtime::{BufConfig, Command, ConnectParams, RuntimeHandle, ServerAddr},
     token::Token,
 };
 use bytes::Bytes;
@@ -156,7 +156,12 @@ impl AsyncClient {
         let mut opts: CreateOptions = opts.into();
         debug!("Create options: {:?}", opts);
 
-        let rt = RuntimeHandle::spawn();
+        let rt = RuntimeHandle::spawn(BufConfig {
+            send_while_disconnected: opts.send_while_disconnected,
+            max_buffered_msgs: opts.max_buffered_msgs,
+            allow_send_any_time: opts.allow_send_any_time,
+            delete_oldest: opts.delete_oldest,
+        });
         let (cmd_tx, event_rx) = rt.into_parts();
 
         // Seed the stored connect opts with the client's initial MQTT version
