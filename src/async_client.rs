@@ -162,6 +162,7 @@ impl AsyncClient {
             allow_send_any_time: opts.allow_send_any_time,
             delete_oldest: opts.delete_oldest,
             restore_msgs: opts.restore_msgs,
+            persist_qos0: opts.persist_qos0,
         });
         let (cmd_tx, event_rx) = rt.into_parts();
 

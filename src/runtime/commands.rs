@@ -61,6 +61,11 @@ pub(crate) struct BufConfig {
     /// After a successful connect, re-transmit persisted in-flight QoS 1/2
     /// messages with DUP=true and reload inbound QoS 2 state from persistence.
     pub restore_msgs: bool,
+    /// Buffer QoS 0 publishes in the send-while-disconnected buffer.
+    ///
+    /// When `false`, QoS 0 publishes received while disconnected are completed
+    /// immediately with `Ok` (silently dropped) rather than queued.
+    pub persist_qos0: bool,
 }
 
 /////////////////////////////////////////////////////////////////////////////

@@ -1536,6 +1536,11 @@ async fn reconnect_wait(
                             tx.complete(Ok(()));
                             return WaitOutcome::Abort;
                         }
+                        Command::Publish { qos: QoS::QoS0, tx, .. }
+                            if buf_cfg.send_while_disconnected && !buf_cfg.persist_qos0 =>
+                        {
+                            tx.complete(Ok(PublishResponse::default()));
+                        }
                         cmd @ Command::Publish { .. } if buf_cfg.send_while_disconnected => {
                             buf_push(buf, cmd, buf_cfg);
                         }
@@ -1616,6 +1621,11 @@ pub(crate) async fn run_event_loop(
                     let should_buf = buf_cfg.allow_send_any_time
                         || (ever_connected && buf_cfg.send_while_disconnected);
                     match cmd {
+                        Command::Publish {
+                            qos: QoS::QoS0, tx, ..
+                        } if should_buf && !buf_cfg.persist_qos0 => {
+                            tx.complete(Ok(PublishResponse::default()));
+                        }
                         cmd @ Command::Publish { .. } if should_buf => {
                             buf_push(&mut buf, cmd, &buf_cfg);
                         }
