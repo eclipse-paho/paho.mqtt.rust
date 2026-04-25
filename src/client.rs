@@ -29,9 +29,10 @@
 //! The synchronous calls use a default timeout
 
 use crate::{
-    AsyncClient, ConnectOptions, ConnectResponse, CreateOptions, DisconnectOptions, Event,
-    Message, Properties, PublishResponse, QoS, Result, SubscribeOptions, SubscribeResponse,
-    SyncReceiver,
+    AsyncClient, AsyncReceiver, ConnectOptions, ConnectResponse, CreateOptions,
+    DeliveryToken, DisconnectOptions, Event, Message, MqttVersion, Properties,
+    PublishResponse, QoS, ReasonCode, Result, SubscribeOptions, SubscribeResponse,
+    SyncReceiver, UserData,
 };
 use std::time::Duration;
 
@@ -352,6 +353,120 @@ impl Client {
     /// CreateOptionsBuilder for symmetry
     pub fn client_id(&self) -> &str {
         self.cli.client_id()
+    }
+
+    /// Returns the server URI used for connection.
+    pub fn server_uri(&self) -> &str {
+        self.cli.server_uri()
+    }
+
+    /// Returns the MQTT protocol version negotiated for the last connection.
+    pub fn mqtt_version(&self) -> MqttVersion {
+        self.cli.mqtt_version()
+    }
+
+    /// Returns the raw integer MQTT version negotiated for the last connection.
+    pub fn mqtt_version_raw(&self) -> u32 {
+        self.cli.mqtt_version_raw()
+    }
+
+    /// Gets a copy of the options used in the last connection attempt.
+    pub fn connect_options(&self) -> ConnectOptions {
+        self.cli.connect_options()
+    }
+
+    /// Gets access to the user-defined data stored in the client.
+    pub fn user_data(&self) -> Option<&UserData> {
+        self.cli.user_data()
+    }
+
+    /// Attempts to publish a message without blocking or queuing.
+    ///
+    /// Returns a `DeliveryToken` immediately if the message was accepted,
+    /// or an error if the client's command channel is full or closed.
+    pub fn try_publish(&self, msg: Message) -> Result<DeliveryToken> {
+        self.cli.try_publish(msg)
+    }
+
+    /// Sets the callback for when the connection is established with the broker.
+    pub fn set_connected_callback<F>(&self, cb: F)
+    where
+        F: FnMut(&AsyncClient, &ConnectResponse) + Send + 'static,
+    {
+        self.cli.set_connected_callback(cb);
+    }
+
+    /// Removes the callback for when the connection is established.
+    pub fn remove_connected_callback(&self) {
+        self.cli.remove_connected_callback();
+    }
+
+    /// Sets the callback for when the connection to the broker is lost.
+    pub fn set_connection_lost_callback<F>(&self, cb: F)
+    where
+        F: FnMut(&AsyncClient) + Send + 'static,
+    {
+        self.cli.set_connection_lost_callback(cb);
+    }
+
+    /// Removes the callback for when the connection is lost.
+    pub fn remove_connection_lost_callback(&self) {
+        self.cli.remove_connection_lost_callback();
+    }
+
+    /// Sets the callback for when a DISCONNECT packet arrives from the broker.
+    pub fn set_disconnected_callback<F>(&self, cb: F)
+    where
+        F: FnMut(&AsyncClient, Properties, ReasonCode) + Send + 'static,
+    {
+        self.cli.set_disconnected_callback(cb);
+    }
+
+    /// Removes the callback for when a DISCONNECT packet is received.
+    pub fn remove_disconnected_callback(&self) {
+        self.cli.remove_disconnected_callback();
+    }
+
+    /// Sets the callback for when a message arrives from the broker.
+    pub fn set_message_callback<F>(&self, cb: F)
+    where
+        F: FnMut(&AsyncClient, Option<Message>) + Send + 'static,
+    {
+        self.cli.set_message_callback(cb);
+    }
+
+    /// Removes the callback for when a message arrives.
+    pub fn remove_message_callback(&self) {
+        self.cli.remove_message_callback();
+    }
+
+    /// Creates an async message stream.
+    ///
+    /// Returns the receive end of a channel delivering `Option<Message>` values.
+    /// Pass `Some(n)` for a bounded channel of capacity `n`, or `None` for
+    /// unbounded.
+    pub fn get_stream<L>(&mut self, buffer_lim: L) -> AsyncReceiver<Option<Message>>
+    where
+        L: Into<Option<usize>>,
+    {
+        self.cli.get_stream(buffer_lim)
+    }
+
+    /// Creates an async event stream.
+    ///
+    /// Returns the receive end of a channel delivering [`Event`] values.
+    /// Pass `Some(n)` for a bounded channel of capacity `n`, or `None` for
+    /// unbounded.
+    pub fn get_event_stream<L>(&mut self, buffer_lim: L) -> AsyncReceiver<Event>
+    where
+        L: Into<Option<usize>>,
+    {
+        self.cli.get_event_stream(buffer_lim)
+    }
+
+    /// Stops the async stream by removing the message callback.
+    pub fn stop_stream(&self) {
+        self.cli.stop_stream();
     }
 }
 
