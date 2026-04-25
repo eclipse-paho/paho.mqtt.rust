@@ -93,6 +93,19 @@ pub(crate) struct Completer<T: 'static + Send> {
 }
 
 impl<T: 'static + Send> Completer<T> {
+    /// Creates a standalone completer with no paired [`Token`].
+    ///
+    /// Use when an operation needs to drive ACK-based cleanup (e.g. removing a
+    /// persistence entry) but no caller is waiting on the result.  When
+    /// [`complete`](Self::complete) is called the shared state is freed
+    /// immediately; if dropped without completing it resolves to
+    /// [`Error::Disconnected`] and the shared state is freed then.
+    pub(crate) fn orphan() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(FutureData::default())),
+        }
+    }
+
     /// Resolves the paired [`Token`] with `result`.
     pub(crate) fn complete(self, result: Result<T>) {
         let inner = self.inner.clone();

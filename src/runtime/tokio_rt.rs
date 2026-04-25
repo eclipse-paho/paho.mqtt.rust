@@ -755,6 +755,95 @@ impl Session {
         Ok(())
     }
 
+    /// Restores in-flight QoS 1/2 messages from the persistence store after a
+    /// successful connect.
+    ///
+    /// Outbound messages (persistence keys `s{id}`) are re-decoded, marked
+    /// DUP, and retransmitted.  An orphan [`Completer`] is registered for each
+    /// so that the arriving PUBACK/PUBCOMP removes the persistence entry
+    /// without resolving any user token (the original token is long gone).
+    /// `next_id` is advanced past all restored packet IDs to prevent
+    /// collisions with new allocations.
+    ///
+    /// Inbound QoS 2 messages awaiting PUBREL (keys `r{id}`) are reloaded
+    /// into `pending_pub2_in`; when the broker re-sends PUBREL the message
+    /// is delivered and PUBCOMP is sent normally.
+    ///
+    /// Returns early without error if there is no persistence store.  Any
+    /// individual key that fails to decode is silently skipped; a transport
+    /// error aborts the restore and bubbles up via `Err`.
+    async fn restore(&mut self) -> Result<()> {
+        let keys = {
+            let Some(persist) = &self.persist
+            else {
+                return Ok(());
+            };
+            match persist.lock().unwrap().keys() {
+                Ok(k) => k,
+                Err(_) => return Ok(()),
+            }
+        };
+
+        for key in &keys {
+            let data = {
+                let Some(persist) = &self.persist
+                else {
+                    return Ok(());
+                };
+                match persist.lock().unwrap().get(key) {
+                    Ok(d) => d,
+                    Err(_) => continue,
+                }
+            };
+
+            let mut buf = BytesMut::from(data.as_slice());
+            let raw = match RawPacket::decode(&mut buf) {
+                Ok(Some(r)) => r,
+                _ => continue,
+            };
+            let pkt = match Packet::from_raw(raw, self.ver) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+
+            if key.starts_with('s') {
+                // Outbound QoS 1/2 PUBLISH — retransmit with DUP=true.
+                if let Packet::Publish(mut pub_pkt) = pkt {
+                    let Some(pid) = pub_pkt.packet_id
+                    else {
+                        continue;
+                    };
+                    let qos = pub_pkt.qos;
+                    pub_pkt.dup = true;
+                    self.send(&Packet::Publish(pub_pkt)).await?;
+                    if pid > self.next_id {
+                        self.next_id = pid;
+                    }
+                    let comp = Completer::orphan();
+                    match qos {
+                        QoS::QoS1 => {
+                            self.pending_pub1.insert(pid, comp);
+                        }
+                        QoS::QoS2 => {
+                            self.pending_pub2.insert(pid, comp);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            else if key.starts_with('r') {
+                // Inbound QoS 2 awaiting PUBREL — reload so PUBREL is handled.
+                if let Packet::Publish(pub_pkt) = pkt {
+                    let id = pub_pkt.packet_id.unwrap_or(0);
+                    let msg = Message::from(pub_pkt);
+                    self.pending_pub2_in.insert(id, msg);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// Main event loop: read from `reader`, dispatch commands from `cmd_rx`,
     /// and service keep-alive until an error or clean disconnect.
     async fn run(
@@ -1450,7 +1539,13 @@ pub(crate) async fn run_event_loop(
             job.persist.clone(),
         );
 
-        // Flush any buffered commands into the newly connected session.
+        // Restore persisted in-flight messages, then flush the disconnected
+        // buffer into the newly connected session.
+        if buf_cfg.restore_msgs {
+            if session.restore().await.is_err() {
+                continue 'outer;
+            }
+        }
         while let Some(cmd) = buf.pop_front() {
             if session.handle_command(cmd).await.is_err() {
                 buf.clear();
@@ -1531,7 +1626,15 @@ pub(crate) async fn run_event_loop(
                         job.persist.clone(),
                     );
 
-                    // Flush buffered commands into the reconnected session.
+                    // Restore persisted in-flight messages, then flush the
+                    // disconnected buffer into the reconnected session.
+                    if buf_cfg.restore_msgs {
+                        if session.restore().await.is_err() {
+                            retry_delay =
+                                (retry_delay * 2).min(job.params.max_retry_interval);
+                            continue 'retry;
+                        }
+                    }
                     while let Some(cmd) = buf.pop_front() {
                         if session.handle_command(cmd).await.is_err() {
                             buf.clear();

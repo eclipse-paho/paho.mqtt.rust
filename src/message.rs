@@ -135,6 +135,11 @@ impl Message {
     pub fn msgid(&self) -> Option<u16> {
         self.msgid
     }
+
+    /// Gets the value of the DUP flag.
+    pub fn dup(&self) -> bool {
+        self.dup
+    }
 }
 
 impl From<PublishPacket> for Message {

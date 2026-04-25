@@ -58,6 +58,9 @@ pub(crate) struct BufConfig {
     pub allow_send_any_time: bool,
     /// When the buffer is full, evict the oldest entry rather than the newest.
     pub delete_oldest: bool,
+    /// After a successful connect, re-transmit persisted in-flight QoS 1/2
+    /// messages with DUP=true and reload inbound QoS 2 state from persistence.
+    pub restore_msgs: bool,
 }
 
 /////////////////////////////////////////////////////////////////////////////
