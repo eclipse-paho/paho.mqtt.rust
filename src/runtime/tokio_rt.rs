@@ -1190,12 +1190,14 @@ impl Session {
                     // Persist the inbound QoS 2 PUBLISH before acknowledging
                     // so we can redeliver the message on reconnect.
                     let mut enc_buf = BytesMut::with_capacity(256);
-                    if Packet::Publish(pub_pkt.clone())
-                        .encode(&mut enc_buf, self.ver)
-                        .is_ok()
-                    {
+                    let packet = Packet::Publish(pub_pkt);
+                    if packet.encode(&mut enc_buf, self.ver).is_ok() {
                         self.persist_put(&format!("r{id}"), &enc_buf);
                     }
+                    let Packet::Publish(pub_pkt) = packet
+                    else {
+                        unreachable!()
+                    };
                     let msg = Message::from(pub_pkt);
                     self.pending_pub2_in.insert(id, msg);
                     let rec = PubAck::new(id);
@@ -1279,19 +1281,18 @@ impl Session {
                     properties: props,
                 };
 
+                let packet = Packet::Publish(pub_pkt);
+
                 // Persist QoS 1/2 PUBLISH before sending so we can
                 // re-transmit after a crash.
                 if let Some(pid) = id {
                     let mut enc_buf = BytesMut::with_capacity(256);
-                    if Packet::Publish(pub_pkt.clone())
-                        .encode(&mut enc_buf, self.ver)
-                        .is_ok()
-                    {
+                    if packet.encode(&mut enc_buf, self.ver).is_ok() {
                         self.persist_put(&format!("s{pid}"), &enc_buf);
                     }
                 }
 
-                self.send(&Packet::Publish(pub_pkt)).await?;
+                self.send(&packet).await?;
 
                 match qos {
                     QoS::QoS0 => {

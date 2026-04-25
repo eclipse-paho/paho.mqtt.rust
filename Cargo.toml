@@ -61,3 +61,11 @@ required-features = ["tokio"]
 [[example]]
 name = "tokio_publish"
 required-features = ["tokio"]
+
+[[example]]
+name = "tokio_math_srvr"
+required-features = ["tokio"]
+
+[[example]]
+name = "tokio_math_srvr"
+required-features = ["tokio"]

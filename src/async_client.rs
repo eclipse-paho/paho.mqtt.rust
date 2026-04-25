@@ -264,10 +264,10 @@ impl AsyncClient {
 
         let will = opts.will.as_ref().map(|msg| {
             paho_mqtt_codec::Will::new(
-                msg.topic().to_string(),
-                msg.payload().to_vec(),
-                msg.qos(),
-                msg.retain(),
+                msg.topic.clone(),
+                msg.payload.clone(),
+                msg.qos,
+                msg.retain,
             )
         });
 
@@ -357,17 +357,23 @@ impl AsyncClient {
     pub fn try_publish(&self, msg: Message) -> Result<DeliveryToken> {
         debug!("Publish: {:?}", msg);
 
-        let props = msg.properties().clone();
-        self.require_v5_for_props(&props)?;
+        self.require_v5_for_props(&msg.props)?;
 
-        let qos = msg.qos();
+        let Message {
+            topic,
+            payload,
+            qos,
+            retain,
+            props,
+            ..
+        } = msg;
         let (tok, comp) = DeliveryToken::new();
 
         let cmd = Command::Publish {
-            topic: msg.topic.clone(),
-            payload: msg.payload.clone(),
+            topic,
+            payload,
             qos,
-            retain: msg.retain(),
+            retain,
             props,
             tx: comp,
         };
