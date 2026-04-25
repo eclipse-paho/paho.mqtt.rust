@@ -516,24 +516,42 @@ impl<S: AsyncRead + AsyncWrite + Send + Unpin + 'static> Connection for WsConnec
 
 /// Builds an HTTP upgrade request for a WebSocket MQTT connection.
 ///
-/// Adds the mandatory `Sec-WebSocket-Protocol: mqtt` sub-protocol header and
-/// any application-supplied headers from `http_headers`.
+/// Uses tungstenite's [`IntoClientRequest`] to derive the request from the
+/// URL — which generates a valid `Sec-WebSocket-Key` automatically — then
+/// appends the mandatory `Sec-WebSocket-Protocol: mqtt` header and any
+/// application-supplied headers from `http_headers`.
+///
+/// [`IntoClientRequest`]: tokio_tungstenite::tungstenite::client::IntoClientRequest
 #[cfg(feature = "websocket")]
 fn build_ws_request(
     url: &str,
     http_headers: &std::collections::HashMap<String, String>,
 ) -> Result<tokio_tungstenite::tungstenite::handshake::client::Request> {
-    let mut builder = tokio_tungstenite::tungstenite::http::Request::builder()
-        .uri(url)
-        .header("Sec-WebSocket-Protocol", "mqtt");
+    use tokio_tungstenite::tungstenite::{
+        client::IntoClientRequest,
+        http::header::{HeaderName, HeaderValue},
+    };
 
-    for (name, value) in http_headers {
-        builder = builder.header(name.as_str(), value.as_str());
+    let mut request = url
+        .into_client_request()
+        .map_err(|e| Error::GeneralString(e.to_string()))?;
+
+    {
+        let headers = request.headers_mut();
+        headers.insert(
+            HeaderName::from_static("sec-websocket-protocol"),
+            HeaderValue::from_static("mqtt"),
+        );
+        for (name, value) in http_headers {
+            if let (Ok(h_name), Ok(h_val)) =
+                (name.parse::<HeaderName>(), value.parse::<HeaderValue>())
+            {
+                headers.insert(h_name, h_val);
+            }
+        }
     }
 
-    builder
-        .body(())
-        .map_err(|e| Error::GeneralString(e.to_string()))
+    Ok(request)
 }
 
 /////////////////////////////////////////////////////////////////////////////
