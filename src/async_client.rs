@@ -288,6 +288,7 @@ impl AsyncClient {
             auto_reconnect: opts.auto_reconnect,
             min_retry_interval: opts.min_retry_interval,
             max_retry_interval: opts.max_retry_interval,
+            max_inflight: opts.max_inflight as usize,
         };
 
         let cmd = Command::Connect {

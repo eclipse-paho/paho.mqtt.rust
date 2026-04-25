@@ -146,6 +146,8 @@ pub(crate) struct ConnectParams {
     pub min_retry_interval: Duration,
     /// Maximum backoff interval between reconnect attempts.
     pub max_retry_interval: Duration,
+    /// Maximum concurrent outbound QoS 1/2 publishes; 0 means unlimited.
+    pub max_inflight: usize,
 }
 
 impl ConnectParams {

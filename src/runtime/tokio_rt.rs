@@ -686,6 +686,11 @@ struct Session {
     connected_flag: Arc<AtomicBool>,
     /// Persistence store for in-flight QoS 1/2 messages (if any).
     persist: Option<Arc<Mutex<Box<dyn ClientPersistence>>>>,
+    /// Maximum concurrent outbound QoS 1/2 publishes; 0 means unlimited.
+    max_inflight: usize,
+    /// QoS 1/2 publish commands deferred because the in-flight limit was
+    /// reached.  Drained one-for-one as PUBACK/PUBCOMP ACKs arrive.
+    inflight_deferred: VecDeque<Command>,
 }
 
 impl Session {
@@ -696,6 +701,7 @@ impl Session {
         event_tx: async_channel::Sender<Event>,
         connected_flag: Arc<AtomicBool>,
         persist: Option<Arc<Mutex<Box<dyn ClientPersistence>>>>,
+        max_inflight: usize,
     ) -> Self {
         Self {
             writer,
@@ -712,15 +718,40 @@ impl Session {
             ping_outstanding: false,
             connected_flag,
             persist,
+            max_inflight,
+            inflight_deferred: VecDeque::new(),
         }
     }
 
-    /// Returns `true` if any outbound operations are waiting for broker ACKs.
+    /// Returns `true` if any outbound operations are waiting for broker ACKs
+    /// or are queued in the in-flight deferred buffer.
     fn has_pending(&self) -> bool {
         !self.pending_pub1.is_empty()
             || !self.pending_pub2.is_empty()
             || !self.pending_sub.is_empty()
             || !self.pending_unsub.is_empty()
+            || !self.inflight_deferred.is_empty()
+    }
+
+    /// Number of outbound QoS 1/2 publishes currently awaiting broker ACKs.
+    fn inflight_count(&self) -> usize {
+        self.pending_pub1.len() + self.pending_pub2.len()
+    }
+
+    /// Drains deferred publish commands into the session while the in-flight
+    /// count is below `max_inflight`.  A transport error propagates immediately.
+    async fn drain_deferred(&mut self) -> Result<()> {
+        loop {
+            if self.max_inflight != 0 && self.inflight_count() >= self.max_inflight {
+                break;
+            }
+            let Some(cmd) = self.inflight_deferred.pop_front()
+            else {
+                break;
+            };
+            self.handle_command(cmd).await?;
+        }
+        Ok(())
     }
 
     /// Persists `data` under `key`, silently ignoring errors.
@@ -954,6 +985,7 @@ impl Session {
                     let rsp = PublishResponse::new(ack.reason_code, ack.properties);
                     tx.complete(Ok(rsp));
                 }
+                self.drain_deferred().await?;
             }
 
             // ---- QoS 2 outbound: PUBREC → send PUBREL ----
@@ -978,6 +1010,7 @@ impl Session {
                     let rsp = PublishResponse::new(comp.reason_code, comp.properties);
                     tx.complete(Ok(rsp));
                 }
+                self.drain_deferred().await?;
             }
 
             // ---- Subscription acknowledgement ----
@@ -1071,6 +1104,23 @@ impl Session {
                 props,
                 tx,
             } => {
+                // QoS 1/2 publishes are deferred when the in-flight limit is
+                // reached.  QoS 0 is never gated (no ACK, no packet ID).
+                if qos != QoS::QoS0
+                    && self.max_inflight != 0
+                    && self.inflight_count() >= self.max_inflight
+                {
+                    self.inflight_deferred.push_back(Command::Publish {
+                        topic,
+                        payload,
+                        qos,
+                        retain,
+                        props,
+                        tx,
+                    });
+                    return Ok(false);
+                }
+
                 let id = match qos {
                     QoS::QoS0 => None,
                     _ => Some(self.alloc_id()),
@@ -1537,6 +1587,7 @@ pub(crate) async fn run_event_loop(
             event_tx.clone(),
             job.connected_flag.clone(),
             job.persist.clone(),
+            job.params.max_inflight,
         );
 
         // Restore persisted in-flight messages, then flush the disconnected
@@ -1624,6 +1675,7 @@ pub(crate) async fn run_event_loop(
                         event_tx.clone(),
                         job.connected_flag.clone(),
                         job.persist.clone(),
+                        job.params.max_inflight,
                     );
 
                     // Restore persisted in-flight messages, then flush the
