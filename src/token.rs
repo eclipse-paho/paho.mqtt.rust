@@ -241,31 +241,7 @@ pub type UnsubscribeManyToken = Token<UnsubscribeResponse>;
 /////////////////////////////////////////////////////////////////////////////
 // From<Error> conversions
 
-impl From<Error> for ConnectToken {
-    fn from(err: Error) -> Self {
-        Token::from_err(err)
-    }
-}
-
-impl From<Error> for DeliveryToken {
-    fn from(err: Error) -> Self {
-        Token::from_err(err)
-    }
-}
-
-impl From<Error> for SubscribeToken {
-    fn from(err: Error) -> Self {
-        Token::from_err(err)
-    }
-}
-
-impl From<Error> for UnsubscribeToken {
-    fn from(err: Error) -> Self {
-        Token::from_err(err)
-    }
-}
-
-impl From<Error> for Token<()> {
+impl<T: 'static + Send> From<Error> for Token<T> {
     fn from(err: Error) -> Self {
         Token::from_err(err)
     }

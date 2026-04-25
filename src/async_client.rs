@@ -285,6 +285,7 @@ impl AsyncClient {
             ver,
             props: opts.props,
             tls: opts.tls,
+            #[cfg(feature = "websocket")]
             http_headers: opts.http_headers,
             auto_reconnect: opts.auto_reconnect,
             min_retry_interval: opts.min_retry_interval,
@@ -293,7 +294,7 @@ impl AsyncClient {
         };
 
         let cmd = Command::Connect {
-            params,
+            params: Box::new(params),
             tx: comp,
             connected_flag: Arc::clone(&self.inner.connected),
             persist: self.inner.persist.as_ref().map(Arc::clone),
@@ -992,10 +993,8 @@ impl AsyncClient {
             None => async_channel::unbounded(),
         };
 
-        self.set_message_callback(move |_, msg| match tx.try_send(msg) {
-            Err(err) if err.is_full() => warn!("Message stream full. Losing messages"),
-            Err(_) => error!("Message stream closed"),
-            _ => (),
+        self.set_message_callback(move |_, msg| {
+            log_stream_err(tx.try_send(msg));
         });
 
         rx
@@ -1067,23 +1066,24 @@ impl AsyncClient {
 unsafe impl Send for AsyncClient {}
 unsafe impl Sync for AsyncClient {}
 
-impl Drop for InnerAsyncClient {
-    fn drop(&mut self) {}
+fn log_send_err(is_full: bool) {
+    if is_full {
+        warn!("Event stream full. Losing messages");
+    }
+    else {
+        warn!("Event stream closed");
+    }
 }
 
 fn log_channel_err<T>(res: StdResult<(), sync_channel::TrySendError<T>>) {
-    match res {
-        Err(err) if err.is_full() => warn!("Event stream full. Losing messages"),
-        Err(_) => warn!("Event stream closed"),
-        _ => (),
+    if let Err(e) = res {
+        log_send_err(e.is_full());
     }
 }
 
 fn log_stream_err<T>(res: StdResult<(), async_channel::TrySendError<T>>) {
-    match res {
-        Err(err) if err.is_full() => warn!("Event stream full. Losing messages"),
-        Err(_) => warn!("Event stream closed"),
-        _ => (),
+    if let Err(e) = res {
+        log_send_err(e.is_full());
     }
 }
 

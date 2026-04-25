@@ -23,8 +23,9 @@
 //! [`Command`] values flow from the public API to the event loop.
 //! [`Event`] values flow back from the event loop to the public layer.
 
+#[cfg(feature = "websocket")]
+use std::collections::HashMap;
 use std::{
-    collections::HashMap,
     sync::{Arc, Mutex, atomic::AtomicBool},
     time::Duration,
 };
@@ -143,7 +144,7 @@ pub(crate) struct ConnectParams {
     /// TLS options; `Some` only when using a TLS transport.
     pub tls: Option<crate::TlsOptions>,
     /// HTTP headers included in the WebSocket upgrade request.
-    /// Empty for non-WebSocket transports.
+    #[cfg(feature = "websocket")]
     pub http_headers: HashMap<String, String>,
     /// Whether the event loop should automatically reconnect on session loss.
     pub auto_reconnect: bool,
@@ -171,7 +172,7 @@ pub(crate) enum Command {
     /// Establish an MQTT connection.
     Connect {
         /// Session, authentication, and server-list parameters.
-        params: ConnectParams,
+        params: Box<ConnectParams>,
         /// Completer resolved with the CONNACK result.
         tx: Completer<ConnectResponse>,
         /// Set to `true` before resolving `tx` on success; cleared on failure.

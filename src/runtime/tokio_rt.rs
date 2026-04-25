@@ -100,38 +100,49 @@ impl TcpConnection {
     }
 }
 
-impl AsyncRead for TcpConnection {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.stream).poll_read(cx, buf)
-    }
+/// Implements `AsyncRead`, `AsyncWrite`, and `Connection` for a newtype struct
+/// whose only field is named `stream` and already implements those traits.
+macro_rules! impl_connection {
+    ($ty:ty) => {
+        impl AsyncRead for $ty {
+            fn poll_read(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+                buf: &mut ReadBuf<'_>,
+            ) -> Poll<io::Result<()>> {
+                Pin::new(&mut self.stream).poll_read(cx, buf)
+            }
+        }
+
+        impl AsyncWrite for $ty {
+            fn poll_write(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+                buf: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                Pin::new(&mut self.stream).poll_write(cx, buf)
+            }
+
+            fn poll_flush(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+            ) -> Poll<io::Result<()>> {
+                Pin::new(&mut self.stream).poll_flush(cx)
+            }
+
+            fn poll_shutdown(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+            ) -> Poll<io::Result<()>> {
+                Pin::new(&mut self.stream).poll_shutdown(cx)
+            }
+        }
+
+        impl Connection for $ty {}
+    };
 }
 
-impl AsyncWrite for TcpConnection {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.stream).poll_write(cx, buf)
-    }
-
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.stream).poll_flush(cx)
-    }
-
-    fn poll_shutdown(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.stream).poll_shutdown(cx)
-    }
-}
-
-impl Connection for TcpConnection {}
+impl_connection!(TcpConnection);
 
 /////////////////////////////////////////////////////////////////////////////
 
@@ -151,40 +162,7 @@ impl UnixConnection {
 }
 
 #[cfg(unix)]
-impl AsyncRead for UnixConnection {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.stream).poll_read(cx, buf)
-    }
-}
-
-#[cfg(unix)]
-impl AsyncWrite for UnixConnection {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.stream).poll_write(cx, buf)
-    }
-
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.stream).poll_flush(cx)
-    }
-
-    fn poll_shutdown(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.stream).poll_shutdown(cx)
-    }
-}
-
-#[cfg(unix)]
-impl Connection for UnixConnection {}
+impl_connection!(UnixConnection);
 
 /////////////////////////////////////////////////////////////////////////////
 
@@ -195,40 +173,7 @@ pub(crate) struct TlsConnection {
 }
 
 #[cfg(feature = "tls")]
-impl AsyncRead for TlsConnection {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.stream).poll_read(cx, buf)
-    }
-}
-
-#[cfg(feature = "tls")]
-impl AsyncWrite for TlsConnection {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.stream).poll_write(cx, buf)
-    }
-
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.stream).poll_flush(cx)
-    }
-
-    fn poll_shutdown(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.stream).poll_shutdown(cx)
-    }
-}
-
-#[cfg(feature = "tls")]
-impl Connection for TlsConnection {}
+impl_connection!(TlsConnection);
 
 #[cfg(feature = "tls")]
 type TlsResult<T> = std::result::Result<T, rustls::Error>;
@@ -242,40 +187,7 @@ pub(crate) struct OpenSslConnection {
 }
 
 #[cfg(feature = "openssl")]
-impl AsyncRead for OpenSslConnection {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.stream).poll_read(cx, buf)
-    }
-}
-
-#[cfg(feature = "openssl")]
-impl AsyncWrite for OpenSslConnection {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.stream).poll_write(cx, buf)
-    }
-
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.stream).poll_flush(cx)
-    }
-
-    fn poll_shutdown(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.stream).poll_shutdown(cx)
-    }
-}
-
-#[cfg(feature = "openssl")]
-impl Connection for OpenSslConnection {}
+impl_connection!(OpenSslConnection);
 
 /// A [`rustls::client::ServerCertVerifier`] that accepts any certificate.
 ///
@@ -855,23 +767,6 @@ impl RuntimeHandle {
         Self { cmd_tx, event_rx }
     }
 
-    /// Sends a command to the event loop asynchronously.
-    pub(crate) async fn send_cmd(&self, cmd: Command) -> Result<()> {
-        self.cmd_tx.send(cmd).await.map_err(|_| Error::Disconnected)
-    }
-
-    /// Sends a command to the event loop from a synchronous context.
-    pub(crate) fn send_cmd_blocking(&self, cmd: Command) -> Result<()> {
-        self.cmd_tx
-            .send_blocking(cmd)
-            .map_err(|_| Error::Disconnected)
-    }
-
-    /// Returns a reference to the inbound event receiver.
-    pub(crate) fn event_rx(&self) -> &async_channel::Receiver<Event> {
-        &self.event_rx
-    }
-
     /// Consumes the handle, returning the underlying sender and receiver.
     pub(crate) fn into_parts(
         self,
@@ -896,30 +791,13 @@ async fn recv_connack(
 ) -> Result<ConnAck> {
     loop {
         reader.read_buf(buf).await?;
-        while let Some(raw) = RawPacket::decode(buf)? {
+        if let Some(raw) = RawPacket::decode(buf)? {
             match Packet::from_raw(raw, ver)? {
                 Packet::ConnAck(ack) => return Ok(ack),
                 _ => return Err(Error::General("expected CONNACK")),
             }
         }
     }
-}
-
-/// Encodes `packet` into `buf` and writes it to `writer`.
-///
-/// `flush` is called after writing so that WebSocket transports send the frame
-/// immediately; for TCP/TLS it is a no-op.
-async fn send_packet(
-    writer: &mut (impl AsyncWrite + Unpin),
-    packet: &Packet,
-    ver: MqttVersion,
-    buf: &mut BytesMut,
-) -> Result<()> {
-    buf.clear();
-    packet.encode(buf, ver)?;
-    writer.write_all(buf).await?;
-    writer.flush().await?;
-    Ok(())
 }
 
 /////////////////////////////////////////////////////////////////////////////
@@ -951,8 +829,6 @@ struct Session {
     event_tx: async_channel::Sender<Event>,
     /// True when a PINGREQ has been sent and PINGRESP has not yet arrived.
     ping_outstanding: bool,
-    /// Shared flag cleared before the disconnect token resolves.
-    connected_flag: Arc<AtomicBool>,
     /// Persistence store for in-flight QoS 1/2 messages (if any).
     persist: Option<Arc<Mutex<Box<dyn ClientPersistence>>>>,
     /// Maximum concurrent outbound QoS 1/2 publishes; 0 means unlimited.
@@ -968,7 +844,6 @@ impl Session {
         ver: MqttVersion,
         keep_alive: Duration,
         event_tx: async_channel::Sender<Event>,
-        connected_flag: Arc<AtomicBool>,
         persist: Option<Arc<Mutex<Box<dyn ClientPersistence>>>>,
         max_inflight: usize,
     ) -> Self {
@@ -985,7 +860,6 @@ impl Session {
             pending_unsub: HashMap::new(),
             event_tx,
             ping_outstanding: false,
-            connected_flag,
             persist,
             max_inflight,
             inflight_deferred: VecDeque::new(),
@@ -1492,7 +1366,7 @@ impl Session {
 /// Extracted from [`Command::Connect`] so they can be retained across
 /// reconnect attempts without re-receiving the command.
 struct ConnectJob {
-    params: ConnectParams,
+    params: Box<ConnectParams>,
     /// Index into `params.servers` for the current connection attempt.
     server_idx: usize,
     connected_flag: Arc<AtomicBool>,
@@ -1650,11 +1524,13 @@ async fn do_connect(
         password: p.password.clone(),
         will: p.will.clone(),
         properties: p.props.clone(),
-        ..Default::default()
     };
 
     let mut buf = BytesMut::with_capacity(256);
-    send_packet(&mut writer, &Packet::Connect(connect_pkt), p.ver, &mut buf).await?;
+    buf.clear();
+    Packet::Connect(connect_pkt).encode(&mut buf, p.ver)?;
+    writer.write_all(&buf).await?;
+    writer.flush().await?;
 
     // ---- Wait for CONNACK ----
     let mut read_buf = BytesMut::with_capacity(256);
@@ -1689,7 +1565,7 @@ enum WaitOutcome {
     Abort,
     /// A new `Connect` command arrived with updated parameters; use these
     /// for the next attempt and resolve the supplied token with the result.
-    Replace(ConnectJob, Completer<ConnectResponse>),
+    Replace(Box<ConnectJob>, Completer<ConnectResponse>),
 }
 
 /// Waits for `delay` to elapse while draining the command queue.
@@ -1724,12 +1600,12 @@ async fn reconnect_wait(
                             persist,
                         } => {
                             return WaitOutcome::Replace(
-                                ConnectJob {
+                                Box::new(ConnectJob {
                                     params,
                                     server_idx: 0,
                                     connected_flag,
                                     persist,
-                                },
+                                }),
                                 tx,
                             );
                         }
@@ -1907,17 +1783,14 @@ pub(crate) async fn run_event_loop(
             job.params.ver,
             job.params.keep_alive_duration(),
             event_tx.clone(),
-            job.connected_flag.clone(),
             job.persist.clone(),
             job.params.max_inflight,
         );
 
         // Restore persisted in-flight messages, then flush the disconnected
         // buffer into the newly connected session.
-        if buf_cfg.restore_msgs {
-            if session.restore().await.is_err() {
-                continue 'outer;
-            }
+        if buf_cfg.restore_msgs && session.restore().await.is_err() {
+            continue 'outer;
         }
         while let Some(cmd) = buf.pop_front() {
             if session.handle_command(cmd).await.is_err() {
@@ -1960,7 +1833,7 @@ pub(crate) async fn run_event_loop(
                     WaitOutcome::Replace(new_job, new_tx) => {
                         // Explicit reconnect/connect: use the new params and
                         // reset the backoff.
-                        job = new_job;
+                        job = *new_job;
                         retry_delay = job.params.min_retry_interval;
                         Some(new_tx)
                     }
@@ -1998,19 +1871,15 @@ pub(crate) async fn run_event_loop(
                         job.params.ver,
                         job.params.keep_alive_duration(),
                         event_tx.clone(),
-                        job.connected_flag.clone(),
                         job.persist.clone(),
                         job.params.max_inflight,
                     );
 
                     // Restore persisted in-flight messages, then flush the
                     // disconnected buffer into the reconnected session.
-                    if buf_cfg.restore_msgs {
-                        if session.restore().await.is_err() {
-                            retry_delay =
-                                (retry_delay * 2).min(job.params.max_retry_interval);
-                            continue 'retry;
-                        }
+                    if buf_cfg.restore_msgs && session.restore().await.is_err() {
+                        retry_delay = (retry_delay * 2).min(job.params.max_retry_interval);
+                        continue 'retry;
                     }
                     while let Some(cmd) = buf.pop_front() {
                         if session.handle_command(cmd).await.is_err() {
