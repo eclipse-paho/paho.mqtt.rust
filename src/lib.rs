@@ -60,7 +60,7 @@ pub use paho_mqtt_codec::{
 pub mod async_client;
 pub use crate::async_client::{
     AsyncClient, ConnectedCallback, ConnectionLostCallback, DisconnectedCallback,
-    MessageArrivedCallback, SslErrorCallback,
+    MessageArrivedCallback, TlsErrorCallback,
 };
 
 /// The synchronous API
@@ -85,11 +85,11 @@ pub use crate::properties::{
 pub use crate::responses::{
     ConnectResponse, PublishResponse, SubscribeResponse, UnsubscribeResponse,
 };
-pub use crate::ssl_options::{SslOptions, SslOptionsBuilder, SslVersion};
 pub use crate::subscribe_options::{
     NO_RETAIN_AS_PUBLISHED, RETAIN_AS_PUBLISHED, RetainHandling, SUBSCRIBE_LOCAL,
     SUBSCRIBE_NO_LOCAL, SubscribeOptions, SubscribeOptionsBuilder,
 };
+pub use crate::tls_options::{TlsOptions, TlsOptionsBuilder, TlsVersion};
 pub use crate::token::{
     ConnectToken, DeliveryToken, SubscribeManyToken, SubscribeToken, Token,
     UnsubscribeManyToken, UnsubscribeToken,
@@ -108,7 +108,7 @@ pub mod create_options;
 pub mod connect_options;
 
 /// Options for creating secure connections to the server.
-pub mod ssl_options;
+pub mod tls_options;
 
 /// Options for disconnecting from the server.
 pub mod disconnect_options;

@@ -25,7 +25,7 @@
 //! This contains the structures to define the options for connecting to the
 //! MQTT broker/server.
 
-use crate::{Error, Message, Properties, Result, SslOptions};
+use crate::{Error, Message, Properties, Result, TlsOptions};
 use paho_mqtt_codec::types::*;
 use std::{collections::HashMap, time::Duration};
 
@@ -50,8 +50,8 @@ pub struct ConnectOptions {
     pub max_inflight: u16,
     /// The Last Will and Testament (LWT) message
     pub will: Option<Message>,
-    /// The TLS/SSL options
-    pub ssl: Option<SslOptions>,
+    /// The TLS options
+    pub tls: Option<TlsOptions>,
     /// The user name for authentication
     pub user_name: Option<String>,
     /// The password for authentication
@@ -153,8 +153,8 @@ impl ConnectOptions {
             let uris = &self.server_uris;
             let any_secure = uris.iter().any(|s| crate::is_secure_uri(s));
 
-            if any_secure && !self.has_ssl_options() {
-                return Err(Error::MissingSslOptions);
+            if any_secure && !self.has_tls_options() {
+                return Err(Error::MissingTlsOptions);
             }
         }
         Ok(())
@@ -209,9 +209,9 @@ impl ConnectOptions {
         self.clean_start = clean;
     }
 
-    /// Whether the options have SSL/TLS options for a secure connection
-    pub fn has_ssl_options(&self) -> bool {
-        self.ssl.is_some()
+    /// Whether the options have TLS options for a secure connection
+    pub fn has_tls_options(&self) -> bool {
+        self.tls.is_some()
     }
 }
 
@@ -222,7 +222,7 @@ impl Default for ConnectOptions {
             clean_start: true,
             max_inflight: 65535,
             will: None,
-            ssl: None,
+            tls: None,
             user_name: None,
             password: None,
             timeout: Duration::from_secs(30),
@@ -360,16 +360,16 @@ impl ConnectOptionsBuilder {
         self
     }
 
-    /// Sets the SSL options for the connection.
+    /// Sets the TLS options for the connection.
     ///
     /// # Arguments
     ///
-    /// `ssl` The SSL options for the connection.
-    pub fn ssl_options<S>(&mut self, ssl: S) -> &mut Self
+    /// `tls` The TLS options for the connection.
+    pub fn tls_options<S>(&mut self, tls: S) -> &mut Self
     where
-        S: Into<Option<SslOptions>>,
+        S: Into<Option<TlsOptions>>,
     {
-        self.0.ssl = ssl.into();
+        self.0.tls = tls.into();
         self
     }
 
@@ -607,7 +607,7 @@ mod tests {
     #[test]
     fn test_set_and_clear() {
         let msg = Message::new("lwt", "disconnected", 1);
-        let ssl = SslOptions::default();
+        let ssl = TlsOptions::default();
 
         // user_name: set then clear
         let opts = ConnectOptionsBuilder::new().user_name(NAME).finalize();
@@ -641,14 +641,14 @@ mod tests {
             .finalize();
         assert!(opts.will.is_none());
 
-        // ssl_options: set then clear with None
-        let opts = ConnectOptionsBuilder::new().ssl_options(ssl).finalize();
-        assert!(opts.ssl.is_some());
+        // tls_options: set then clear with None
+        let opts = ConnectOptionsBuilder::new().tls_options(ssl).finalize();
+        assert!(opts.tls.is_some());
 
         let opts = ConnectOptionsBuilder::new()
-            .ssl_options(SslOptions::default())
-            .ssl_options(None)
+            .tls_options(TlsOptions::default())
+            .tls_options(None)
             .finalize();
-        assert!(opts.ssl.is_none());
+        assert!(opts.tls.is_none());
     }
 }

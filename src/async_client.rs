@@ -129,8 +129,8 @@ pub type DisconnectedCallback =
 /// User callback signature for when subscribed messages are received.
 pub type MessageArrivedCallback = dyn FnMut(&AsyncClient, Option<Message>) + Send + 'static;
 
-/// User callback type for an SSL/TLS error
-pub type SslErrorCallback = dyn Fn(&AsyncClient, &str) + Send + Sync + 'static;
+/// User callback type for a TLS error
+pub type TlsErrorCallback = dyn Fn(&AsyncClient, &str) + Send + Sync + 'static;
 
 #[derive(Default)]
 struct CallbackContext {
@@ -283,7 +283,7 @@ impl AsyncClient {
             will,
             ver,
             props: opts.props,
-            ssl: opts.ssl,
+            tls: opts.tls,
             http_headers: opts.http_headers,
             auto_reconnect: opts.auto_reconnect,
             min_retry_interval: opts.min_retry_interval,
@@ -746,7 +746,7 @@ impl AsyncClient {
                     cb(self, Some(msg));
                 }
             }
-            Ev::SslError(msg) => {
+            Ev::TlsError(msg) => {
                 // Clone the Arc out of the RwLock before invoking so we don't
                 // hold the lock across the (potentially blocking) callback.
                 let cb = self
@@ -754,9 +754,9 @@ impl AsyncClient {
                     .conn_opts
                     .read()
                     .unwrap()
-                    .ssl
+                    .tls
                     .as_ref()
-                    .and_then(|ssl| ssl.on_ssl_error.clone());
+                    .and_then(|tls| tls.on_tls_error.clone());
                 if let Some(cb) = cb {
                     cb(self, &msg);
                 }
@@ -1154,7 +1154,7 @@ fn parse_server_uri(uri: &str) -> Result<ServerAddr> {
     // wss:// with websocket but without tls is an error.
     #[cfg(all(feature = "websocket", not(feature = "tls")))]
     if uri.starts_with("wss://") {
-        return Err(Error::SslNotSupported);
+        return Err(Error::TlsNotSupported);
     }
 
     // Plain TCP / TLS transports (wss:// falls through to TLS when websocket
@@ -1184,7 +1184,7 @@ fn parse_server_uri(uri: &str) -> Result<ServerAddr> {
         #[cfg(feature = "tls")]
         return Ok(ServerAddr::Tls { host, port });
         #[cfg(not(feature = "tls"))]
-        return Err(Error::SslNotSupported);
+        return Err(Error::TlsNotSupported);
     }
 
     Ok(ServerAddr::Tcp { host, port })
@@ -1389,7 +1389,7 @@ mod tests {
         #[cfg(not(feature = "tls"))]
         assert!(matches!(
             parse_server_uri("mqtts://broker.example.com:8883"),
-            Err(Error::SslNotSupported)
+            Err(Error::TlsNotSupported)
         ));
         assert!(matches!(
             parse_server_uri("mqtt://localhost").unwrap(),
@@ -1403,7 +1403,7 @@ mod tests {
         #[cfg(not(feature = "tls"))]
         assert!(matches!(
             parse_server_uri("mqtts://secure.broker.io"),
-            Err(Error::SslNotSupported)
+            Err(Error::TlsNotSupported)
         ));
         // Without the websocket feature ws:// maps to plain TCP.
         #[cfg(not(feature = "websocket"))]

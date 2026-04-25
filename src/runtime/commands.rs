@@ -135,8 +135,8 @@ pub(crate) struct ConnectParams {
     pub ver: MqttVersion,
     /// MQTT v5 CONNECT properties; empty for v3.1.1.
     pub props: CodecProperties,
-    /// TLS/SSL options; `Some` only when using a TLS transport.
-    pub ssl: Option<crate::SslOptions>,
+    /// TLS options; `Some` only when using a TLS transport.
+    pub tls: Option<crate::TlsOptions>,
     /// HTTP headers included in the WebSocket upgrade request.
     /// Empty for non-WebSocket transports.
     pub http_headers: HashMap<String, String>,
@@ -237,7 +237,7 @@ pub(crate) enum Event {
     ConnectionLost(Error),
     /// An application message arrived from the broker.
     MessageArrived(crate::Message),
-    /// A TLS/SSL error occurred during connection setup (only when the `tls`
+    /// A TLS error occurred during connection setup (only when the `tls`
     /// feature is enabled and TLS is configured).
-    SslError(String),
+    TlsError(String),
 }

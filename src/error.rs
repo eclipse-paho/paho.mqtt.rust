@@ -130,9 +130,9 @@ pub enum Error {
     /// The limit on the maximum number of message buffers has been reached.
     #[error("Max buffered messages")]
     MaxBufferedMessages,
-    /// Attempting SSL connection using non-SSL version of library.
-    #[error("SSL not supported by library")]
-    SslNotSupported,
+    /// Attempting TLS connection when the `tls` feature is not enabled.
+    #[error("TLS not supported by library")]
+    TlsNotSupported,
     /// A bad URL protocol/schema was requested/
     /// Note that the TLS enabled prefixes (ssl, mqtts, wss) are only
     /// valid if the TLS version of the library is linked int the app.
@@ -197,9 +197,9 @@ pub enum Error {
     /// An error parsing a UTF-8 string
     #[error("String UTF-8 Error")]
     Utf8(#[from] str::Utf8Error),
-    /// Missing SSL/TLS options
-    #[error("Missing SSL/TLS options")]
-    MissingSslOptions,
+    /// Missing TLS options
+    #[error("Missing TLS options")]
+    MissingTlsOptions,
     /// Bad property, typically from improper value type for the code
     #[error("Bad v5 property")]
     BadProperty,
@@ -237,7 +237,7 @@ impl Error {
             -10 => NoMoreMsgIds,
             -11 => OperationIncomplete,
             -12 => MaxBufferedMessages,
-            -13 => SslNotSupported,
+            -13 => TlsNotSupported,
             -14 => BadProtocol,
             -15 => BadMqttOption,
             -16 => WrongMqttVersion,
@@ -340,7 +340,7 @@ pub fn error_message(rc: i32) -> &'static str {
         -10 => "No more message ID's",
         -11 => "Operation incomplete",
         -12 => "Max buffered messages",
-        -13 => "SSL not supported",
+        -13 => "TLS not supported",
         -14 => "Bad protocol",
         -15 => "Bad MQTT option",
         -16 => "Wrong MQTT version",

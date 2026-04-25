@@ -231,7 +231,7 @@ type TlsResult<T> = std::result::Result<T, rustls::Error>;
 
 /// A [`rustls::client::ServerCertVerifier`] that accepts any certificate.
 ///
-/// Used when `SslOptions::enable_server_cert_auth` is `false`.
+/// Used when `TlsOptions::enable_server_cert_auth` is `false`.
 #[cfg(feature = "tls")]
 #[derive(Debug)]
 struct NoCertVerifier;
@@ -321,9 +321,9 @@ fn filter_cipher_suites(spec: &str) -> Result<Vec<rustls::SupportedCipherSuite>>
     Ok(filtered)
 }
 
-/// Builds a [`rustls::ClientConfig`] from [`SslOptions`].
+/// Builds a [`rustls::ClientConfig`] from [`TlsOptions`].
 ///
-/// Implements all `SslOptions` fields that are applicable to the rustls
+/// Implements all `TlsOptions` fields that are applicable to the rustls
 /// backend:
 ///
 /// * `trust_store` — PEM file of trusted CA certificates.
@@ -332,20 +332,20 @@ fn filter_cipher_suites(spec: &str) -> Result<Vec<rustls::SupportedCipherSuite>>
 /// * `private_key_password` — **not supported** by rustls; returns an error
 ///   if set.
 /// * `enable_server_cert_auth` — when `false`, installs [`NoCertVerifier`].
-/// * `ssl_version` — selects allowed TLS protocol versions; TLS 1.0 and 1.1
+/// * `version` — selects allowed TLS protocol versions; TLS 1.0 and 1.1
 ///   are not supported by rustls and fall back to TLS 1.2 with a warning.
 /// * `enabled_cipher_suites` — colon/comma list of rustls suite names;
 ///   empty string keeps all defaults.
 /// * `protos` — ALPN protocol list.
 #[cfg(feature = "tls")]
-fn make_tls_config(ssl: &crate::SslOptions) -> Result<StdArc<rustls::ClientConfig>> {
-    use crate::SslVersion;
+fn make_tls_config(tls: &crate::TlsOptions) -> Result<StdArc<rustls::ClientConfig>> {
+    use crate::TlsVersion;
     use rustls::RootCertStore;
     use std::io::BufReader;
 
     // Encrypted private keys require out-of-band decryption not supported by
     // the rustls backend.
-    if !ssl.private_key_password.is_empty() {
+    if !tls.private_key_password.is_empty() {
         return Err(Error::General(
             "encrypted private keys are not supported with the rustls TLS backend",
         ));
@@ -354,15 +354,15 @@ fn make_tls_config(ssl: &crate::SslOptions) -> Result<StdArc<rustls::ClientConfi
     // ---- Root certificate store ----
     let mut root_store = RootCertStore::empty();
 
-    if !ssl.disable_default_trust_store {
+    if !tls.disable_default_trust_store {
         let native_certs = rustls_native_certs::load_native_certs().map_err(Error::Io)?;
         for cert in native_certs {
             let _ = root_store.add(cert);
         }
     }
 
-    if !ssl.trust_store.as_os_str().is_empty() {
-        let f = std::fs::File::open(&ssl.trust_store).map_err(Error::Io)?;
+    if !tls.trust_store.as_os_str().is_empty() {
+        let f = std::fs::File::open(&tls.trust_store).map_err(Error::Io)?;
         let mut r = BufReader::new(f);
         for cert in rustls_pemfile::certs(&mut r) {
             root_store
@@ -373,8 +373,8 @@ fn make_tls_config(ssl: &crate::SslOptions) -> Result<StdArc<rustls::ClientConfi
 
     // ca_path: load every file in the directory as PEM; silently skip
     // non-PEM / unreadable files so mixed-content directories work.
-    if !ssl.ca_path.as_os_str().is_empty() {
-        for entry in std::fs::read_dir(&ssl.ca_path).map_err(Error::Io)? {
+    if !tls.ca_path.as_os_str().is_empty() {
+        for entry in std::fs::read_dir(&tls.ca_path).map_err(Error::Io)? {
             let path = entry.map_err(Error::Io)?.path();
             if path.is_file() {
                 if let Ok(f) = std::fs::File::open(&path) {
@@ -389,16 +389,16 @@ fn make_tls_config(ssl: &crate::SslOptions) -> Result<StdArc<rustls::ClientConfi
 
     // ---- Crypto provider (cipher suites) ----
     let mut provider = rustls::crypto::ring::default_provider();
-    if !ssl.enabled_cipher_suites.is_empty() {
-        provider.cipher_suites = filter_cipher_suites(&ssl.enabled_cipher_suites)?;
+    if !tls.enabled_cipher_suites.is_empty() {
+        provider.cipher_suites = filter_cipher_suites(&tls.enabled_cipher_suites)?;
     }
 
     // ---- Protocol versions ----
-    let versions: &[&'static rustls::SupportedProtocolVersion] = match ssl.ssl_version {
-        SslVersion::Default | SslVersion::Tls1_2 => {
+    let versions: &[&'static rustls::SupportedProtocolVersion] = match tls.version {
+        TlsVersion::Default | TlsVersion::Tls1_2 => {
             &[&rustls::version::TLS12, &rustls::version::TLS13]
         }
-        SslVersion::Tls1_0 | SslVersion::Tls1_1 => {
+        TlsVersion::Tls1_0 | TlsVersion::Tls1_1 => {
             log::warn!(
                 "TLS 1.0/1.1 are not supported by the rustls backend; \
                  using TLS 1.2 as the minimum version"
@@ -413,7 +413,7 @@ fn make_tls_config(ssl: &crate::SslOptions) -> Result<StdArc<rustls::ClientConfi
         .map_err(|e| Error::GeneralString(e.to_string()))?;
 
     // ---- Certificate verification ----
-    let wants_client = if ssl.enable_server_cert_auth {
+    let wants_client = if tls.enable_server_cert_auth {
         builder.with_root_certificates(root_store)
     }
     else {
@@ -423,18 +423,18 @@ fn make_tls_config(ssl: &crate::SslOptions) -> Result<StdArc<rustls::ClientConfi
     };
 
     // ---- Client authentication ----
-    let mut config = if !ssl.key_store.as_os_str().is_empty() {
-        let cert_f = std::fs::File::open(&ssl.key_store).map_err(Error::Io)?;
+    let mut config = if !tls.key_store.as_os_str().is_empty() {
+        let cert_f = std::fs::File::open(&tls.key_store).map_err(Error::Io)?;
         let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
             rustls_pemfile::certs(&mut BufReader::new(cert_f))
                 .collect::<std::result::Result<Vec<_>, _>>()
                 .map_err(Error::Io)?;
 
-        let key_path = if !ssl.private_key.as_os_str().is_empty() {
-            &ssl.private_key
+        let key_path = if !tls.private_key.as_os_str().is_empty() {
+            &tls.private_key
         }
         else {
-            &ssl.key_store
+            &tls.key_store
         };
         let key_f = std::fs::File::open(key_path).map_err(Error::Io)?;
         let key = rustls_pemfile::private_key(&mut BufReader::new(key_f))
@@ -450,8 +450,8 @@ fn make_tls_config(ssl: &crate::SslOptions) -> Result<StdArc<rustls::ClientConfi
     };
 
     // ---- ALPN protocols ----
-    if !ssl.protos.is_empty() {
-        config.alpn_protocols = ssl.protos.iter().map(|p| p.as_bytes().to_vec()).collect();
+    if !tls.protos.is_empty() {
+        config.alpn_protocols = tls.protos.iter().map(|p| p.as_bytes().to_vec()).collect();
     }
 
     Ok(StdArc::new(config))
@@ -1384,8 +1384,8 @@ async fn do_connect(
         }
         #[cfg(feature = "tls")]
         ServerAddr::Tls { host, port } => {
-            let ssl = p.ssl.as_ref().ok_or(Error::MissingSslOptions)?;
-            let config = make_tls_config(ssl)?;
+            let tls = p.tls.as_ref().ok_or(Error::MissingTlsOptions)?;
+            let config = make_tls_config(tls)?;
             let connector = TlsConnector::from(config);
             let server_name = rustls::pki_types::ServerName::try_from(host.as_str())
                 .map_err(|_| {
@@ -1412,8 +1412,8 @@ async fn do_connect(
         }
         #[cfg(all(feature = "websocket", feature = "tls"))]
         ServerAddr::Wss { host, port, path } => {
-            let ssl = p.ssl.as_ref().ok_or(Error::MissingSslOptions)?;
-            let config = make_tls_config(ssl)?;
+            let tls = p.tls.as_ref().ok_or(Error::MissingTlsOptions)?;
+            let config = make_tls_config(tls)?;
             let connector = TlsConnector::from(config);
             let server_name = rustls::pki_types::ServerName::try_from(host.as_str())
                 .map_err(|_| {
@@ -1668,8 +1668,8 @@ pub(crate) async fn run_event_loop(
             Some(t) => t,
             None => {
                 let err = last_err.unwrap_or(Error::General("no servers configured"));
-                if job.params.ssl.is_some() {
-                    let _ = event_tx.send(Event::SslError(err.to_string())).await;
+                if job.params.tls.is_some() {
+                    let _ = event_tx.send(Event::TlsError(err.to_string())).await;
                 }
                 initial_tx.complete(Err(err));
                 continue 'outer;
@@ -1751,8 +1751,8 @@ pub(crate) async fn run_event_loop(
 
             match do_connect(&job).await {
                 Err(e) => {
-                    if job.params.ssl.is_some() {
-                        let _ = event_tx.send(Event::SslError(e.to_string())).await;
+                    if job.params.tls.is_some() {
+                        let _ = event_tx.send(Event::TlsError(e.to_string())).await;
                     }
                     if let Some(tx) = tx_opt {
                         tx.complete(Err(e));

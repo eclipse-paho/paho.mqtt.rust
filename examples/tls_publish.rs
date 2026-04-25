@@ -1,18 +1,18 @@
-// paho-mqtt/examples/ssl_publish.rs
+// paho-mqtt/examples/tls_publish.rs
 //
 // Example application for Paho MQTT Rust library.
 //
-//! This is a simple asynchronous MQTT publisher using SSL/TSL secured
+//! This is a simple asynchronous MQTT publisher using a TLS secured
 //! connection via the Paho MQTT Rust Library.
 //!
 //! The sample demonstrates:
 //!   - Connecting to an MQTT server/broker securely
-//!   - Setting SSL/TLS options
+//!   - Setting TLS options
 //!   - Publishing messages asynchronously
 //!   - Using using async/await
 //!
 //! We can test this using mosquitto configured with certificates in the
-//! Paho C library. The C library has an SSL/TSL test suite, and we can use
+//! Paho C library. The C library has a TLS test suite, and we can use
 //! that to test:
 //!     $ cd paho.mqtt.c
 //!     $ mosquitto -c test/tls-testing/mosquitto.conf
@@ -75,7 +75,7 @@ fn main() -> mqtt::Result<()> {
         process::exit(1);
     }
 
-    // Let the user override the host, but note the "ssl://" protocol.
+    // Let the user override the host, but note the "mqtts://" protocol.
     let host = env::args()
         .nth(1)
         .unwrap_or_else(|| "mqtts://localhost:18884".to_string());
@@ -88,20 +88,20 @@ fn main() -> mqtt::Result<()> {
         // Create a client & define connect options
         let cli = mqtt::CreateOptionsBuilder::new()
             .server_uri(&host)
-            .client_id("ssl_publish_rs")
+            .client_id("tls_publish_rs")
             .max_buffered_messages(100)
             .create_async_client()?;
 
-        let ssl_opts = mqtt::SslOptionsBuilder::new()
+        let tls_opts = mqtt::TlsOptionsBuilder::new()
             .trust_store(trust_store)
             .key_store(key_store)
             .error_callback(|_, s| {
-                eprintln!("SSL/TLS error: {}", s);
+                eprintln!("TLS error: {}", s);
             })
             .finalize();
 
         let conn_opts = mqtt::ConnectOptionsBuilder::new()
-            .ssl_options(ssl_opts)
+            .tls_options(tls_opts)
             .user_name("testuser")
             .password("testpassword")
             .finalize();

@@ -1,4 +1,4 @@
-// ssl_options.rs
+// tls_options.rs
 //
 // This file is part of the Eclipse Paho MQTT Rust Client library.
 //
@@ -25,12 +25,12 @@ use std::{
     sync::Arc,
 };
 
-use crate::{AsyncClient, SslErrorCallback};
+use crate::{AsyncClient, TlsErrorCallback};
 
-/// The SSL/TLS versions that can be requested.
+/// The TLS versions that can be requested.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub enum SslVersion {
-    /// The default library SSL/TLS version
+pub enum TlsVersion {
+    /// The default library TLS version
     #[default]
     Default,
     /// TLS version 1.0
@@ -42,44 +42,44 @@ pub enum SslVersion {
 }
 
 /////////////////////////////////////////////////////////////////////////////
-//                              SslOptions
+//                              TlsOptions
 /////////////////////////////////////////////////////////////////////////////
 
-/// The options for SSL socket connections to the broker.
-#[derive(Default, Clone)] //Debug, Default, Clone)]
-pub struct SslOptions {
+/// The options for TLS socket connections to the broker.
+#[derive(Default, Clone)]
+pub struct TlsOptions {
     /// File name of the trust store.
     pub trust_store: PathBuf,
-    /// File name of the client't public key store.
+    /// File name of the client's public key store.
     pub key_store: PathBuf,
     /// File name for the private key, if not in key store.
     pub private_key: PathBuf,
     /// Password for the private key, if any.
     pub private_key_password: String,
-    /// The list of cipher quotes that the client presents to the server.
+    /// The list of cipher suites that the client presents to the server.
     pub enabled_cipher_suites: String,
-    /// Whether to enable verification of the server certificate **/
+    /// Whether to enable verification of the server certificate.
     pub enable_server_cert_auth: bool,
-    /// The SSL/TLS version to use.
-    pub ssl_version: SslVersion,
+    /// The TLS version to use.
+    pub version: TlsVersion,
     /// Whether to carry out post-connect checks, including that a certificate
     /// matches the given host name.
     pub verify: bool,
     /// The path to the CA certificates, if specified.
     pub ca_path: PathBuf,
-    /// The SSL error callback.
-    pub on_ssl_error: Option<Arc<SslErrorCallback>>,
+    /// The TLS error callback.
+    pub on_tls_error: Option<Arc<TlsErrorCallback>>,
 
     // TODO: PSK callback and context
-    /// Don't load default SSL CA. Should be used together with PSK to make
+    /// Don't load default TLS CA. Should be used together with PSK to make
     /// sure regular servers with certificate in place is not accepted.
     pub disable_default_trust_store: bool,
     /// The list of ALPN protocols available to be negotiated.
     pub protos: Vec<String>,
 }
 
-impl SslOptions {
-    /// Creates a new, default, set of SSL/TLS options.
+impl TlsOptions {
+    /// Creates a new, default, set of TLS options.
     pub fn new() -> Self {
         Self::default()
     }
@@ -87,16 +87,16 @@ impl SslOptions {
 
 // We manually define a Debug implementation to get around
 // the callback function fields.
-impl fmt::Debug for SslOptions {
+impl fmt::Debug for TlsOptions {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("SslOptions")
+        f.debug_struct("TlsOptions")
             .field("trust_store", &self.trust_store)
             .field("key_store", &self.key_store)
             .field("private_key", &self.private_key)
             .field("private_key_password", &self.private_key_password)
             .field("enabled_cipher_suites", &self.enabled_cipher_suites)
             .field("enable_server_cert_auth", &self.enable_server_cert_auth)
-            .field("ssl_version", &self.ssl_version)
+            .field("version", &self.version)
             .field("verify", &self.verify)
             .field("ca_path", &self.ca_path)
             .field(
@@ -112,11 +112,11 @@ impl fmt::Debug for SslOptions {
 //                              Builder
 /////////////////////////////////////////////////////////////////////////////
 
-/// Builder to create SSL Options.
+/// Builder to create TLS options.
 #[derive(Default)]
-pub struct SslOptionsBuilder(SslOptions);
+pub struct TlsOptionsBuilder(TlsOptions);
 
-impl SslOptionsBuilder {
+impl TlsOptionsBuilder {
     /// Creates a new builder with default options.
     pub fn new() -> Self {
         Self::default()
@@ -154,7 +154,7 @@ impl SslOptionsBuilder {
         self
     }
 
-    /// The password to load the client's privateKey if it's encrypted.
+    /// The password to load the client's private key if it's encrypted.
     pub fn private_key_password<S>(&mut self, private_key_password: S) -> &mut Self
     where
         S: Into<String>,
@@ -164,11 +164,7 @@ impl SslOptionsBuilder {
     }
 
     /// The list of cipher suites that the client will present to the server
-    /// during the SSL handshake.
-    ///
-    /// For a full explanation of the cipher list format, please see the
-    /// OpenSSL on-line documentation:
-    /// <http://www.openssl.org/docs/apps/ciphers.html#CIPHER_LIST_FORMAT>
+    /// during the TLS handshake.
     ///
     /// If this setting is omitted, its default value will be "ALL", that is,
     /// all the cipher suites -excluding those offering no encryption- will
@@ -181,15 +177,15 @@ impl SslOptionsBuilder {
         self
     }
 
-    /// Enable or disable verification of the server certificate
+    /// Enable or disable verification of the server certificate.
     pub fn enable_server_cert_auth(&mut self, on: bool) -> &mut Self {
         self.0.enable_server_cert_auth = on;
         self
     }
 
-    /// The SSL/TLS version to use.
-    pub fn ssl_version(&mut self, ver: SslVersion) -> &mut Self {
-        self.0.ssl_version = ver;
+    /// The TLS version to use.
+    pub fn version(&mut self, ver: TlsVersion) -> &mut Self {
+        self.0.version = ver;
         self
     }
 
@@ -210,16 +206,16 @@ impl SslOptionsBuilder {
         self
     }
 
-    /// Sets the SSL/TLS error callback.
+    /// Sets the TLS error callback.
     pub fn error_callback<F>(&mut self, cb: F) -> &mut Self
     where
         F: Fn(&AsyncClient, &str) + Send + Sync + 'static,
     {
-        self.0.on_ssl_error = Some(Arc::new(cb));
+        self.0.on_tls_error = Some(Arc::new(cb));
         self
     }
 
-    /// Don't load the default SSL CA.
+    /// Don't load the default TLS CA.
     ///
     /// This should be used together with PSK to make sure
     /// regular servers with certificate in place is not accepted.
@@ -234,8 +230,8 @@ impl SslOptionsBuilder {
         self
     }
 
-    /// Create the SSL options from the builder.
-    pub fn finalize(&self) -> SslOptions {
+    /// Create the TLS options from the builder.
+    pub fn finalize(&self) -> TlsOptions {
         self.0.clone()
     }
 }
