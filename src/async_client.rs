@@ -746,6 +746,21 @@ impl AsyncClient {
                     cb(self, Some(msg));
                 }
             }
+            Ev::SslError(msg) => {
+                // Clone the Arc out of the RwLock before invoking so we don't
+                // hold the lock across the (potentially blocking) callback.
+                let cb = self
+                    .inner
+                    .conn_opts
+                    .read()
+                    .unwrap()
+                    .ssl
+                    .as_ref()
+                    .and_then(|ssl| ssl.on_ssl_error.clone());
+                if let Some(cb) = cb {
+                    cb(self, &msg);
+                }
+            }
         }
     }
 }

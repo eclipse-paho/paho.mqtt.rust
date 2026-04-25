@@ -237,4 +237,7 @@ pub(crate) enum Event {
     ConnectionLost(Error),
     /// An application message arrived from the broker.
     MessageArrived(crate::Message),
+    /// A TLS/SSL error occurred during connection setup (only when the `tls`
+    /// feature is enabled and TLS is configured).
+    SslError(String),
 }
