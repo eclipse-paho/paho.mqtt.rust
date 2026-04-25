@@ -79,8 +79,8 @@ pub(crate) enum ServerAddr {
         /// Broker TCP port.
         port: u16,
     },
-    /// TLS connection (requires the `tls` feature).
-    #[cfg(feature = "tls")]
+    /// TLS connection (requires the `tls` or `openssl` feature).
+    #[cfg(any(feature = "tls", feature = "openssl"))]
     Tls {
         /// Broker hostname or IP address.
         host: String,
@@ -103,8 +103,8 @@ pub(crate) enum ServerAddr {
         /// WebSocket path (e.g. `/mqtt`).
         path: String,
     },
-    /// WebSocket over TLS connection (requires both `websocket` and `tls` features).
-    #[cfg(all(feature = "websocket", feature = "tls"))]
+    /// WebSocket over TLS connection (requires `websocket` and `tls` or `openssl`).
+    #[cfg(all(feature = "websocket", any(feature = "tls", feature = "openssl")))]
     Wss {
         /// Broker hostname or IP address.
         host: String,

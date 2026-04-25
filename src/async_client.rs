@@ -1146,14 +1146,14 @@ fn parse_server_uri(uri: &str) -> Result<ServerAddr> {
         return Ok(ServerAddr::Ws { host, port, path });
     }
 
-    #[cfg(all(feature = "websocket", feature = "tls"))]
+    #[cfg(all(feature = "websocket", any(feature = "tls", feature = "openssl")))]
     if let Some(rest) = uri.strip_prefix("wss://") {
         let (host, port, path) = parse_host_port_path(rest, 8883)?;
         return Ok(ServerAddr::Wss { host, port, path });
     }
 
-    // wss:// with websocket but without tls is an error.
-    #[cfg(all(feature = "websocket", not(feature = "tls")))]
+    // wss:// with websocket but without a TLS backend is an error.
+    #[cfg(all(feature = "websocket", not(any(feature = "tls", feature = "openssl"))))]
     if uri.starts_with("wss://") {
         return Err(Error::TlsNotSupported);
     }
@@ -1182,9 +1182,9 @@ fn parse_server_uri(uri: &str) -> Result<ServerAddr> {
     let (host, port, _) = parse_host_port_path(rest, default_port)?;
 
     if is_tls {
-        #[cfg(feature = "tls")]
+        #[cfg(any(feature = "tls", feature = "openssl"))]
         return Ok(ServerAddr::Tls { host, port });
-        #[cfg(not(feature = "tls"))]
+        #[cfg(not(any(feature = "tls", feature = "openssl")))]
         return Err(Error::TlsNotSupported);
     }
 
@@ -1382,12 +1382,12 @@ mod tests {
             parse_server_uri("tcp://broker.example.com:1883").unwrap(),
             ServerAddr::Tcp { host, port } if host == "broker.example.com" && port == 1883
         ));
-        #[cfg(feature = "tls")]
+        #[cfg(any(feature = "tls", feature = "openssl"))]
         assert!(matches!(
             parse_server_uri("mqtts://broker.example.com:8883").unwrap(),
             ServerAddr::Tls { host, port } if host == "broker.example.com" && port == 8883
         ));
-        #[cfg(not(feature = "tls"))]
+        #[cfg(not(any(feature = "tls", feature = "openssl")))]
         assert!(matches!(
             parse_server_uri("mqtts://broker.example.com:8883"),
             Err(Error::TlsNotSupported)
@@ -1396,12 +1396,12 @@ mod tests {
             parse_server_uri("mqtt://localhost").unwrap(),
             ServerAddr::Tcp { host, port } if host == "localhost" && port == 1883
         ));
-        #[cfg(feature = "tls")]
+        #[cfg(any(feature = "tls", feature = "openssl"))]
         assert!(matches!(
             parse_server_uri("mqtts://secure.broker.io").unwrap(),
             ServerAddr::Tls { host, port } if host == "secure.broker.io" && port == 8883
         ));
-        #[cfg(not(feature = "tls"))]
+        #[cfg(not(any(feature = "tls", feature = "openssl")))]
         assert!(matches!(
             parse_server_uri("mqtts://secure.broker.io"),
             Err(Error::TlsNotSupported)

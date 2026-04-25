@@ -19,6 +19,8 @@ The Eclipse Paho MQTT Rust client library.
 [features]
 default = ["tokio"]
 tls = ["dep:tokio-rustls", "dep:rustls", "dep:rustls-pemfile", "dep:rustls-native-certs", "tokio"]
+openssl = ["dep:openssl", "dep:tokio-openssl", "tokio"]
+openssl-vendored = ["openssl", "openssl/vendored"]
 websocket = ["dep:tokio-tungstenite", "tokio"]
 serde = ["dep:serde"]
 
@@ -37,6 +39,8 @@ tokio-tungstenite = { version = "0.24", optional = true }
 rustls = { version = "0.23", features = ["ring"], optional = true }
 rustls-pemfile = { version = "2", optional = true }
 rustls-native-certs = { version = "0.7", optional = true }
+openssl = { version = "0.10", optional = true }
+tokio-openssl = { version = "0.6", optional = true }
 serde = { version = "1.0", features = ["derive"], optional = true }
 
 [dev-dependencies]

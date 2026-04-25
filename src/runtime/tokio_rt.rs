@@ -37,6 +37,10 @@ use std::{
 };
 
 use bytes::BytesMut;
+#[cfg(feature = "openssl")]
+use openssl::ssl::{
+    SslConnector, SslFiletype, SslMethod, SslVerifyMode, SslVersion as OpenSslProtoVersion,
+};
 use paho_mqtt_codec::{
     ConnAck, Disconnect, MqttVersion, PubAck, QoS, RetainHandling as CodecRetainHandling,
     Subscribe, Subscription, Unsubscribe,
@@ -228,6 +232,50 @@ impl Connection for TlsConnection {}
 
 #[cfg(feature = "tls")]
 type TlsResult<T> = std::result::Result<T, rustls::Error>;
+
+/////////////////////////////////////////////////////////////////////////////
+
+/// An OpenSSL TLS transport (requires the `openssl` feature).
+#[cfg(feature = "openssl")]
+pub(crate) struct OpenSslConnection {
+    stream: tokio_openssl::SslStream<TcpStream>,
+}
+
+#[cfg(feature = "openssl")]
+impl AsyncRead for OpenSslConnection {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.stream).poll_read(cx, buf)
+    }
+}
+
+#[cfg(feature = "openssl")]
+impl AsyncWrite for OpenSslConnection {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.stream).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.stream).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.stream).poll_shutdown(cx)
+    }
+}
+
+#[cfg(feature = "openssl")]
+impl Connection for OpenSslConnection {}
 
 /// A [`rustls::client::ServerCertVerifier`] that accepts any certificate.
 ///
@@ -455,6 +503,124 @@ fn make_tls_config(tls: &crate::TlsOptions) -> Result<StdArc<rustls::ClientConfi
     }
 
     Ok(StdArc::new(config))
+}
+
+/// Builds an OpenSSL [`SslConnector`] from [`TlsOptions`].
+///
+/// Maps all applicable `TlsOptions` fields to the OpenSSL API:
+///
+/// * `trust_store` — CA certificate file (PEM).
+/// * `ca_path` — directory of CA certificate files.
+/// * `key_store` / `private_key` — client certificate and private key (PEM).
+/// * `private_key_password` — password for an encrypted private key.
+/// * `enable_server_cert_auth` — when `false`, disables peer verification.
+/// * `version` — minimum TLS protocol version.
+/// * `enabled_cipher_suites` — OpenSSL cipher list string (TLS 1.2 and below).
+/// * `protos` — ALPN protocol list.
+/// * `disable_default_trust_store` — when `true`, skips loading system CA.
+#[cfg(feature = "openssl")]
+fn make_openssl_config(tls: &crate::TlsOptions) -> Result<openssl::ssl::SslConnector> {
+    let mut builder = SslConnector::builder(SslMethod::tls_client())
+        .map_err(|e| Error::GeneralString(e.to_string()))?;
+
+    // Server certificate verification
+    builder.set_verify(if tls.enable_server_cert_auth {
+        SslVerifyMode::PEER
+    }
+    else {
+        SslVerifyMode::NONE
+    });
+
+    // System CA certificates
+    if !tls.disable_default_trust_store {
+        builder
+            .set_default_verify_paths()
+            .map_err(|e| Error::GeneralString(e.to_string()))?;
+    }
+
+    // Explicit CA certificate file
+    if !tls.trust_store.as_os_str().is_empty() {
+        builder
+            .set_ca_file(&tls.trust_store)
+            .map_err(|e| Error::GeneralString(e.to_string()))?;
+    }
+
+    // CA certificate directory — load each PEM file; silently skip non-PEM files.
+    if !tls.ca_path.as_os_str().is_empty() {
+        for entry in std::fs::read_dir(&tls.ca_path).map_err(Error::Io)? {
+            let path = entry.map_err(Error::Io)?.path();
+            if path.is_file() {
+                if let Ok(pem) = std::fs::read(&path) {
+                    if let Ok(cert) = openssl::x509::X509::from_pem(&pem) {
+                        let _ = builder.cert_store_mut().add_cert(cert);
+                    }
+                }
+            }
+        }
+    }
+
+    // Cipher suite list (OpenSSL format, applies to TLS 1.2 and below)
+    if !tls.enabled_cipher_suites.is_empty() {
+        builder
+            .set_cipher_list(&tls.enabled_cipher_suites)
+            .map_err(|e| Error::GeneralString(e.to_string()))?;
+    }
+
+    // Minimum TLS protocol version
+    let min_ver = match tls.version {
+        crate::TlsVersion::Default | crate::TlsVersion::Tls1_2 => {
+            Some(OpenSslProtoVersion::TLS1_2)
+        }
+        crate::TlsVersion::Tls1_0 => Some(OpenSslProtoVersion::TLS1),
+        crate::TlsVersion::Tls1_1 => Some(OpenSslProtoVersion::TLS1_1),
+    };
+    builder
+        .set_min_proto_version(min_ver)
+        .map_err(|e| Error::GeneralString(e.to_string()))?;
+
+    // Client certificate and private key
+    if !tls.key_store.as_os_str().is_empty() {
+        builder
+            .set_certificate_file(&tls.key_store, SslFiletype::PEM)
+            .map_err(|e| Error::GeneralString(e.to_string()))?;
+        let key_path = if !tls.private_key.as_os_str().is_empty() {
+            &tls.private_key
+        }
+        else {
+            &tls.key_store
+        };
+        if !tls.private_key_password.is_empty() {
+            // Load the PEM and decrypt it explicitly (openssl-rs has no sync passwd callback).
+            let pem = std::fs::read(key_path).map_err(Error::Io)?;
+            let key = openssl::pkey::PKey::private_key_from_pem_passphrase(
+                &pem,
+                tls.private_key_password.as_bytes(),
+            )
+            .map_err(|e| Error::GeneralString(e.to_string()))?;
+            builder
+                .set_private_key(&key)
+                .map_err(|e| Error::GeneralString(e.to_string()))?;
+        }
+        else {
+            builder
+                .set_private_key_file(key_path, SslFiletype::PEM)
+                .map_err(|e| Error::GeneralString(e.to_string()))?;
+        }
+    }
+
+    // ALPN protocol negotiation (wire-format: length-prefixed byte strings)
+    if !tls.protos.is_empty() {
+        let mut wire = Vec::new();
+        for proto in &tls.protos {
+            wire.push(proto.len() as u8);
+            wire.extend_from_slice(proto.as_bytes());
+        }
+        builder
+            .set_alpn_protos(&wire)
+            .map_err(|e| Error::GeneralString(e.to_string()))?;
+    }
+
+    Ok(builder.build())
 }
 
 /////////////////////////////////////////////////////////////////////////////
@@ -1397,6 +1563,24 @@ async fn do_connect(
             let tls = connector.connect(server_name, tcp).await?;
             Box::new(TlsConnection { stream: tls })
         }
+        #[cfg(all(not(feature = "tls"), feature = "openssl"))]
+        ServerAddr::Tls { host, port } => {
+            let tls_opts = p.tls.as_ref().ok_or(Error::MissingTlsOptions)?;
+            let connector = make_openssl_config(tls_opts)?;
+            let ssl = connector
+                .configure()
+                .and_then(|c| c.into_ssl(host.as_str()))
+                .map_err(|e| Error::GeneralString(e.to_string()))?;
+            let tcp = TcpStream::connect((host.as_str(), *port)).await?;
+            tcp.set_nodelay(true)?;
+            let mut stream = tokio_openssl::SslStream::new(ssl, tcp)
+                .map_err(|e| Error::GeneralString(e.to_string()))?;
+            std::pin::Pin::new(&mut stream)
+                .connect()
+                .await
+                .map_err(|e| Error::GeneralString(e.to_string()))?;
+            Box::new(OpenSslConnection { stream })
+        }
         #[cfg(unix)]
         ServerAddr::Unix { path } => Box::new(UnixConnection::connect(path).await?),
         #[cfg(feature = "websocket")]
@@ -1426,6 +1610,29 @@ async fn do_connect(
             let url = format!("wss://{}:{}{}", host, port, path);
             let request = build_ws_request(&url, &p.http_headers)?;
             let (ws, _) = tokio_tungstenite::client_async(request, tls)
+                .await
+                .map_err(|e| Error::GeneralString(e.to_string()))?;
+            Box::new(WsConnection::new(ws))
+        }
+        #[cfg(all(feature = "websocket", not(feature = "tls"), feature = "openssl"))]
+        ServerAddr::Wss { host, port, path } => {
+            let tls_opts = p.tls.as_ref().ok_or(Error::MissingTlsOptions)?;
+            let connector = make_openssl_config(tls_opts)?;
+            let ssl = connector
+                .configure()
+                .and_then(|c| c.into_ssl(host.as_str()))
+                .map_err(|e| Error::GeneralString(e.to_string()))?;
+            let tcp = TcpStream::connect((host.as_str(), *port)).await?;
+            tcp.set_nodelay(true)?;
+            let mut stream = tokio_openssl::SslStream::new(ssl, tcp)
+                .map_err(|e| Error::GeneralString(e.to_string()))?;
+            std::pin::Pin::new(&mut stream)
+                .connect()
+                .await
+                .map_err(|e| Error::GeneralString(e.to_string()))?;
+            let url = format!("wss://{}:{}{}", host, port, path);
+            let request = build_ws_request(&url, &p.http_headers)?;
+            let (ws, _) = tokio_tungstenite::client_async(request, stream)
                 .await
                 .map_err(|e| Error::GeneralString(e.to_string()))?;
             Box::new(WsConnection::new(ws))
