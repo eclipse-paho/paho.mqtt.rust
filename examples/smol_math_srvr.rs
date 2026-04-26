@@ -33,12 +33,12 @@
  *    Frank Pagliughi - initial implementation and documentation
  *******************************************************************************/
 
-use lazy_static::lazy_static;
 use paho_mqtt as mqtt;
 use serde_json::json;
 use std::{
     collections::HashMap,
     process,
+    sync::OnceLock,
     time::{Duration, Instant},
 };
 
@@ -63,13 +63,15 @@ type MathFn = fn(args: &[f64]) -> f64;
 // The names are the supported public operations that come in on the
 // request topics:
 //     "requests/math/<operation>"
-lazy_static! {
-    static ref FUNC_TBL: HashMap<&'static str, MathFn> = {
+static FUNC_TBL: OnceLock<HashMap<&'static str, MathFn>> = OnceLock::new();
+
+fn func_tbl() -> &'static HashMap<&'static str, MathFn> {
+    FUNC_TBL.get_or_init(|| {
         let mut tbl = HashMap::new();
         tbl.insert("add", add as MathFn);
         tbl.insert("mult", mult as MathFn);
         tbl
-    };
+    })
 }
 
 // --------------------------------------------------------------------------
