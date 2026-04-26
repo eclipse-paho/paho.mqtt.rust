@@ -457,7 +457,7 @@ impl Client {
     /// Returns the receive end of a channel delivering [`Event`] values.
     /// Pass `Some(n)` for a bounded channel of capacity `n`, or `None` for
     /// unbounded.
-    pub fn get_event_stream<L>(&mut self, buffer_lim: L) -> AsyncReceiver<Event>
+    pub fn get_event_stream<L>(&self, buffer_lim: L) -> AsyncReceiver<Event>
     where
         L: Into<Option<usize>>,
     {

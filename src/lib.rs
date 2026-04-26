@@ -68,7 +68,7 @@ pub mod client;
 pub use crate::client::Client;
 
 pub use crate::connect_options::{ConnectOptions, ConnectOptionsBuilder};
-pub use crate::create_options::{CreateOptions, CreateOptionsBuilder};
+pub use crate::create_options::{CreateOptions, CreateOptionsBuilder, RuntimeMode};
 pub use crate::disconnect_options::{DisconnectOptions, DisconnectOptionsBuilder};
 pub use crate::error::{Error, Result};
 pub use crate::event::Event;

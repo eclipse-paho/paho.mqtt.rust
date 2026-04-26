@@ -9,6 +9,7 @@
 //!
 //! The sample demonstrates:
 //!  - Creating an RPC service for MQTT v5
+//!  - Using the Tokio runtime
 //!  - Connecting to an MQTT v5 server/broker
 //!  - Using MQTT v5 properties
 //!  - Receiving RPC request messages, and sending replies.
@@ -17,7 +18,7 @@
 //
 
 /*******************************************************************************
- * Copyright (c) 2019-2023 Frank Pagliughi <fpagliughi@mindspring.com>
+ * Copyright (c) 2019-2026 Frank Pagliughi <fpagliughi@mindspring.com>
  *
  * All rights reserved. This program and the accompanying materials
  * are made available under the terms of the Eclipse Public License v2.0
@@ -38,7 +39,6 @@ use std::{
     collections::HashMap,
     process,
     sync::OnceLock,
-    thread,
     time::{Duration, Instant},
 };
 
@@ -80,15 +80,15 @@ fn func_tbl() -> &'static HashMap<&'static str, MathFn> {
 // with a few second pause between each attempt. A real system might keep
 // trying indefinitely, with a backoff, or something like that.
 
-fn try_reconnect(cli: &mqtt::AsyncClient, opts: mqtt::ConnectOptions) -> bool {
+async fn try_reconnect(cli: &mqtt::AsyncClient, opts: mqtt::ConnectOptions) -> bool {
     println!("Connection lost. Waiting to retry connection");
 
     const PAUSE: Duration = Duration::from_millis(2500);
     let start = Instant::now();
 
     while start.elapsed() < Duration::from_secs(60) - PAUSE {
-        thread::sleep(PAUSE);
-        if cli.connect(opts.clone()).wait().is_ok() {
+        tokio::time::sleep(PAUSE).await;
+        if cli.connect(opts.clone()).await.is_ok() {
             println!("Successfully reconnected");
             return true;
         }
@@ -112,7 +112,7 @@ fn try_reconnect(cli: &mqtt::AsyncClient, opts: mqtt::ConnectOptions) -> bool {
 // Correlation ID for the response.
 //
 
-fn handle_request(cli: &mqtt::AsyncClient, msg: mqtt::Message) -> mqtt::Result<()> {
+async fn handle_request(cli: &mqtt::AsyncClient, msg: mqtt::Message) -> mqtt::Result<()> {
     // We need both a response topic and correlation data to respond.
 
     let reply_to = match msg.properties().get(mqtt::PropertyId::ResponseTopic) {
@@ -169,7 +169,7 @@ fn handle_request(cli: &mqtt::AsyncClient, msg: mqtt::Message) -> mqtt::Result<(
             .properties(props)
             .finalize();
 
-        let _ = cli.publish(msg).wait();
+        let _ = cli.publish(msg).await;
     }
     else {
         eprintln!("Unknown command: {}", fname);
@@ -201,10 +201,10 @@ async fn main() -> mqtt::Result<()> {
         process::exit(1);
     });
 
-    // Initialize the consumer before connecting.
+    // Create event stream before connecting.
     // With a clean session/start, this order isn't important,
     // but it's still a good habit to start consuming first.
-    let rx = cli.start_consuming();
+    let strm = cli.get_event_stream(25);
 
     // Connect with default options for MQTT v5, and a short persistent
     // session of 60 sec. But we set a clean start
@@ -237,14 +237,22 @@ async fn main() -> mqtt::Result<()> {
     conn_opts.set_clean_start(false);
 
     println!("Processing requests...");
-    for msg in rx.iter() {
-        if let Some(msg) = msg {
-            if let Err(err) = handle_request(&cli, msg) {
-                eprintln!("Error: {}", err);
+
+    // Drive the event stream, handling each incoming message.
+    while let Ok(evt) = strm.recv().await {
+        match evt {
+            mqtt::Event::Message(msg) => {
+                if let Err(err) = handle_request(&cli, msg).await {
+                    eprintln!("Error: {}", err);
+                }
             }
-        }
-        else if cli.is_connected() || !try_reconnect(&cli, conn_opts.clone()) {
-            break;
+            mqtt::Event::ConnectionLost => {
+                if !try_reconnect(&cli, conn_opts.clone()).await {
+                    break;
+                }
+            }
+            mqtt::Event::Disconnected { .. } | mqtt::Event::Shutdown => break,
+            _ => {}
         }
     }
 

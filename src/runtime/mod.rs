@@ -37,4 +37,4 @@ pub(crate) mod tokio_rt;
 pub(crate) use commands::{BufConfig, Command, ConnectParams, Event, ServerAddr};
 
 #[cfg(feature = "tokio")]
-pub(crate) use tokio_rt::RuntimeHandle;
+pub(crate) use tokio_rt::{RuntimeHandle, RuntimeOwnership, resolve_runtime};

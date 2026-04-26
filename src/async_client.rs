@@ -51,7 +51,10 @@ use crate::{
     SyncReceiver, UnsubscribeManyToken, UnsubscribeToken, UserData,
     error::{Error, Result},
     persistence::ClientPersistence,
-    runtime::{BufConfig, Command, ConnectParams, RuntimeHandle, ServerAddr},
+    runtime::{
+        BufConfig, Command, ConnectParams, RuntimeHandle, RuntimeOwnership, ServerAddr,
+        resolve_runtime,
+    },
     token::Token,
 };
 use bytes::Bytes;
@@ -110,6 +113,10 @@ pub(crate) struct InnerAsyncClient {
     callback_context: Mutex<CallbackContext>,
     /// Persistence store, if any.
     persist: Option<Arc<Mutex<Box<dyn ClientPersistence>>>>,
+    /// Keeps the Tokio runtime alive for the lifetime of this client.
+    /// Declared last so it is dropped after `cmd_tx`, ensuring the event-loop
+    /// task sees the closed channel before the runtime shuts down.
+    _rt_ownership: RuntimeOwnership,
 }
 
 // The client is safe to send or share between threads.
@@ -156,14 +163,18 @@ impl AsyncClient {
         let mut opts: CreateOptions = opts.into();
         debug!("Create options: {:?}", opts);
 
-        let rt = RuntimeHandle::spawn(BufConfig {
-            send_while_disconnected: opts.send_while_disconnected,
-            max_buffered_msgs: opts.max_buffered_msgs,
-            allow_send_any_time: opts.allow_send_any_time,
-            delete_oldest: opts.delete_oldest,
-            restore_msgs: opts.restore_msgs,
-            persist_qos0: opts.persist_qos0,
-        });
+        let (rt_handle, rt_ownership) = resolve_runtime(&opts.runtime_mode);
+        let rt = RuntimeHandle::spawn(
+            &rt_handle,
+            BufConfig {
+                send_while_disconnected: opts.send_while_disconnected,
+                max_buffered_msgs: opts.max_buffered_msgs,
+                allow_send_any_time: opts.allow_send_any_time,
+                delete_oldest: opts.delete_oldest,
+                restore_msgs: opts.restore_msgs,
+                persist_qos0: opts.persist_qos0,
+            },
+        );
         let (cmd_tx, event_rx) = rt.into_parts();
 
         // Seed the stored connect opts with the client's initial MQTT version
@@ -187,6 +198,7 @@ impl AsyncClient {
             conn_opts: RwLock::new(initial_conn_opts),
             callback_context: Mutex::new(CallbackContext::default()),
             persist,
+            _rt_ownership: rt_ownership,
         });
 
         let weak = Arc::downgrade(&inner);
@@ -944,7 +956,7 @@ impl AsyncClient {
     ///
     /// The stream will rely on a bounded channel with the given buffer
     /// capacity if `buffer_lim` is `Some`, or an unbounded channel if `None`.
-    pub fn start_consuming_events<L>(&mut self, buffer_lim: L) -> SyncReceiver<Event>
+    pub fn start_consuming_events<L>(&self, buffer_lim: L) -> SyncReceiver<Event>
     where
         L: Into<Option<usize>>,
     {
@@ -1010,7 +1022,7 @@ impl AsyncClient {
     ///
     /// The stream will rely on a bounded channel with the given buffer
     /// capacity if `buffer_lim` is `Some`, or an unbounded channel if `None`.
-    pub fn get_event_stream<L>(&mut self, buffer_lim: L) -> AsyncReceiver<Event>
+    pub fn get_event_stream<L>(&self, buffer_lim: L) -> AsyncReceiver<Event>
     where
         L: Into<Option<usize>>,
     {

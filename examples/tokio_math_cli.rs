@@ -9,6 +9,7 @@
 //!
 //! The sample demonstrates:
 //!  - Creating a dynamic RPC client for MQTT v5
+//!  - Using the Tokio runtime
 //!  - Connecting to an MQTT v5 server/broker
 //!  - Using MQTT v5 properties
 //!  - Publishing RPC request messages
@@ -70,10 +71,8 @@ async fn main() -> mqtt::Result<()> {
         process::exit(1);
     });
 
-    // Initialize the consumer before connecting.
-    // With a clean session/start, this order isn't important,
-    // but it's still a good habit to start consuming first.
-    let rx = cli.start_consuming();
+    // Create event stream before connecting so we don't miss the reply.
+    let strm = cli.get_event_stream(8);
 
     // Connect with default options for MQTT v5, (clean start)
     let conn_opts = mqtt::ConnectOptions::new_v5();
@@ -145,36 +144,42 @@ async fn main() -> mqtt::Result<()> {
         .finalize();
 
     let start_time = Instant::now();
-    let tok = cli.publish(msg);
 
-    if let Err(e) = tok.await {
+    if let Err(e) = cli.publish(msg).await {
         eprintln!("Error sending message: {:?}", e);
         cli.disconnect(None).await.unwrap();
         process::exit(2);
     }
 
-    // Wait for the reply and check the Correlation ID
-    // Since we only sent one request, this should certainly be our reply!
+    // Wait for the reply, skipping any non-message events.
+    // Since we only sent one request, the first message should be our reply.
+    loop {
+        match strm.recv().await {
+            Ok(mqtt::Event::Message(msg)) => {
+                let reply_corr_id =
+                    match msg.properties().get(mqtt::PropertyId::CorrelationData) {
+                        Some(mqtt::PropertyValue::Binary(b)) => b.clone(),
+                        _ => bytes::Bytes::new(),
+                    };
 
-    if let Some(msg) = rx.recv().unwrap() {
-        let reply_corr_id = match msg.properties().get(mqtt::PropertyId::CorrelationData) {
-            Some(mqtt::PropertyValue::Binary(b)) => b.clone(),
-            _ => bytes::Bytes::new(),
-        };
+                if reply_corr_id.as_ref() == corr_id.as_ref() {
+                    let ms = 1000.0 * start_time.elapsed().as_secs_f64();
+                    debug!("Server responded in {:.3}ms", ms);
 
-        if reply_corr_id.as_ref() == corr_id.as_ref() {
-            let ms = 1000.0 * start_time.elapsed().as_secs_f64();
-            debug!("Server responded in {:.3}ms", ms);
-
-            let ret: f64 = serde_json::from_str(&msg.payload_str()).unwrap();
-            println!("{}", ret);
+                    let ret: f64 = serde_json::from_str(&msg.payload_str()).unwrap();
+                    println!("{}", ret);
+                }
+                else {
+                    eprintln!("Unknown response for {:?}", reply_corr_id);
+                }
+                break;
+            }
+            Ok(_) => continue,
+            Err(_) => {
+                eprintln!("Error receiving reply.");
+                break;
+            }
         }
-        else {
-            eprintln!("Unknown response for {:?}", reply_corr_id);
-        }
-    }
-    else {
-        eprintln!("Error receiving reply.");
     }
 
     // Disconnect from the broker

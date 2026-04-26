@@ -68,7 +68,7 @@ fn main() {
         .finalize();
 
     // Create the client connection
-    let mut cli = mqtt::AsyncClient::new(create_opts).unwrap_or_else(|e| {
+    let cli = mqtt::AsyncClient::new(create_opts).unwrap_or_else(|e| {
         println!("Error creating the client: {:?}", e);
         process::exit(1);
     });

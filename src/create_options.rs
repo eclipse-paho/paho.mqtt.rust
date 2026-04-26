@@ -27,6 +27,122 @@ use crate::{
 use std::cmp;
 
 /////////////////////////////////////////////////////////////////////////////
+//                            RuntimeMode
+/////////////////////////////////////////////////////////////////////////////
+
+/// Selects which Tokio runtime the client's internal event loop runs on.
+///
+/// Each [`AsyncClient`] runs a `run_event_loop` task that handles all network
+/// I/O for that client. This enum controls which Tokio runtime hosts that task.
+///
+/// # Choosing a mode
+///
+/// | Situation | Recommended mode |
+/// |---|---|
+/// | Application already uses `#[tokio::main]` or `Runtime::block_on` | [`Auto`] (default) or [`ApplicationRuntime`] |
+/// | Pure synchronous application, no existing runtime | [`Auto`] (default) or [`Shared`] |
+/// | Multiple clients, want a single shared background runtime | [`Auto`] (default) or [`Shared`] |
+/// | Multiple clients, want MQTT isolated from application tasks | [`Shared`] |
+/// | Need explicit control over runtime thread count | [`Shared(n)`] |
+///
+/// Most applications can leave this at the default ([`Auto`]) and get correct
+/// behaviour without any configuration.
+///
+/// # Runtime lifetime and threads
+///
+/// When the library creates its own runtime ([`Auto`] from a sync context, or
+/// [`Shared`]), all clients in the process share a single runtime. The runtime
+/// is created on the first client and dropped when the last client is dropped.
+/// It runs as a Tokio `multi_thread` runtime with background worker thread(s).
+///
+/// When the library borrows the application's runtime ([`Auto`] from an async
+/// context, or [`ApplicationRuntime`]), no extra threads are created for the
+/// runtime itself. The application is responsible for keeping its runtime alive.
+///
+/// Either way, each client also spawns one lightweight OS thread for
+/// dispatching received messages and connection-state callbacks to user code.
+///
+/// [`Auto`]: RuntimeMode::Auto
+/// [`Shared`]: RuntimeMode::Shared
+/// [`Shared(n)`]: RuntimeMode::Shared
+/// [`ApplicationRuntime`]: RuntimeMode::ApplicationRuntime
+#[derive(Debug, Clone, Default)]
+pub enum RuntimeMode {
+    /// Automatically select the runtime (default).
+    ///
+    /// Detection happens at [`AsyncClient::new`] time:
+    ///
+    /// - **Inside an async context** (e.g. `#[tokio::main]`, `Runtime::block_on`,
+    ///   or a running Tokio task): the current runtime is borrowed. No extra
+    ///   threads are created. MQTT event-loop tasks run as peers of the
+    ///   application's own tasks.
+    ///
+    /// - **Outside any async context** (e.g. a plain `fn main()`, a test, or a
+    ///   synchronous thread): the process-wide shared runtime is used, creating
+    ///   it on the first call. The runtime is a `multi_thread` Tokio runtime
+    ///   with 1 worker thread by default. It is dropped when the last client
+    ///   that owns it is dropped.
+    ///
+    /// This mode is appropriate for the vast majority of applications. Switch
+    /// to [`Shared`] only if you need isolation or explicit thread-count control,
+    /// or to [`ApplicationRuntime`] if you need the guarantee that no
+    /// library-owned runtime is ever created.
+    ///
+    /// [`Shared`]: RuntimeMode::Shared
+    /// [`ApplicationRuntime`]: RuntimeMode::ApplicationRuntime
+    #[default]
+    Auto,
+
+    /// Always use the process-wide shared runtime, regardless of whether the
+    /// caller is inside an existing Tokio runtime.
+    ///
+    /// The `usize` value is the number of worker threads for the shared
+    /// runtime. It is honoured only when the runtime is first created;
+    /// subsequent clients that specify a different value log a warning and
+    /// use the existing runtime unchanged. `0` and `1` both produce a runtime
+    /// with 1 worker thread; any larger value produces a runtime with that
+    /// many workers.
+    ///
+    /// **Use this mode when:**
+    /// - You want MQTT I/O to run on a dedicated runtime, isolated from the
+    ///   application's own async tasks.
+    /// - You want to size the runtime thread pool explicitly (e.g. `Shared(4)`
+    ///   for a high-throughput gateway with many clients).
+    /// - You are mixing synchronous and asynchronous code and want consistent
+    ///   runtime behaviour regardless of call site.
+    ///
+    /// All clients created with `Shared` (or [`Auto`] from a sync context)
+    /// share the same runtime instance. The runtime is kept alive by the
+    /// last [`AsyncClient`] that holds it; dropping that client shuts the
+    /// runtime down (blocking briefly while in-flight tasks complete).
+    ///
+    /// [`Auto`]: RuntimeMode::Auto
+    Shared(usize),
+
+    /// Borrow the Tokio runtime that is current when [`AsyncClient::new`] is
+    /// called.
+    ///
+    /// This behaves like the async-context branch of [`Auto`], but is
+    /// **explicit**: it panics immediately if there is no current runtime
+    /// rather than falling back to creating one.
+    ///
+    /// **Use this mode when:**
+    /// - You want a hard guarantee that the library never creates its own
+    ///   runtime or background threads (beyond the per-client event-dispatch
+    ///   thread).
+    /// - You are writing a library on top of paho-mqtt and want to document
+    ///   that callers must supply their own runtime.
+    ///
+    /// The application runtime is not affected by client lifetimes: dropping
+    /// all clients does not shut down the runtime.
+    ///
+    /// **Panics** if called outside a Tokio runtime context.
+    ///
+    /// [`Auto`]: RuntimeMode::Auto
+    ApplicationRuntime,
+}
+
+/////////////////////////////////////////////////////////////////////////////
 //                            Create Options
 /////////////////////////////////////////////////////////////////////////////
 
@@ -71,6 +187,9 @@ pub struct CreateOptions {
     pub persistence: PersistenceType,
     /// User-defined data to store in the client, if any
     pub user_data: Option<UserData>,
+    /// Which Tokio runtime the client's event loop runs on.
+    /// See [`RuntimeMode`] for the available options and guidance on choosing.
+    pub runtime_mode: RuntimeMode,
 }
 
 impl CreateOptions {
@@ -103,6 +222,7 @@ impl Default for CreateOptions {
             mqtt_version: MqttVersion::Default,
             persistence: PersistenceType::default(),
             user_data: None,
+            runtime_mode: RuntimeMode::default(),
         }
     }
 }
@@ -329,6 +449,27 @@ impl CreateOptionsBuilder {
     /// Sets the user-defined data structure for the client.
     pub fn user_data(mut self, data: UserData) -> Self {
         self.opts.user_data = Some(data);
+        self
+    }
+
+    /// Use the process-wide shared runtime with `num_threads` worker threads.
+    ///
+    /// Sets [`RuntimeMode::Shared(num_threads)`](RuntimeMode::Shared). The
+    /// thread count is honoured only when the shared runtime is first created;
+    /// if it already exists the existing thread count is kept and a warning is
+    /// logged. `0` and `1` both produce 1 worker thread.
+    pub fn shared_runtime(mut self, num_threads: usize) -> Self {
+        self.opts.runtime_mode = RuntimeMode::Shared(num_threads);
+        self
+    }
+
+    /// Use the Tokio runtime that is current when [`AsyncClient::new`] is
+    /// called.
+    ///
+    /// Sets [`RuntimeMode::ApplicationRuntime`]. Panics at client-creation
+    /// time if there is no current Tokio runtime.
+    pub fn use_application_runtime(mut self) -> Self {
+        self.opts.runtime_mode = RuntimeMode::ApplicationRuntime;
         self
     }
 

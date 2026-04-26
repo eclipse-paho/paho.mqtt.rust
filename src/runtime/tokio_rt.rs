@@ -29,7 +29,7 @@ use std::{
     io,
     pin::Pin,
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, Weak,
         atomic::{AtomicBool, Ordering},
     },
     task::{Context, Poll},
@@ -740,30 +740,105 @@ fn build_ws_request(
 /// A handle to the internal async runtime.
 ///
 /// Holds the two `async_channel`s that bridge the public (sync) API and the
-/// internal tokio event loop. Created by [`RuntimeHandle::spawn`].
+/// Tracks whether this client owns the Tokio runtime or merely borrows it.
+///
+/// Stored in [`InnerAsyncClient`] to keep the owned runtime alive until the
+/// last client using it is dropped.
+///
+/// [`InnerAsyncClient`]: crate::async_client::InnerAsyncClient
+pub(crate) enum RuntimeOwnership {
+    /// The library created this runtime; the `Arc` keeps it alive until the
+    /// last client that shares it is dropped.
+    #[allow(dead_code)] // held purely for its Drop effect
+    Owned(Arc<tokio::runtime::Runtime>),
+    /// The application owns the runtime; the library only holds a `Handle`.
+    Borrowed,
+}
+
+/// Process-wide shared runtime registry.
+///
+/// Holds a `Weak` reference so the runtime is dropped automatically when
+/// the last owned client is dropped.
+static SHARED_RT: Mutex<Option<Weak<tokio::runtime::Runtime>>> = Mutex::new(None);
+
+/// Returns a `Handle` to the appropriate runtime and the corresponding
+/// ownership record, based on `mode`.
+pub(crate) fn resolve_runtime(
+    mode: &crate::create_options::RuntimeMode,
+) -> (tokio::runtime::Handle, RuntimeOwnership) {
+    use crate::create_options::RuntimeMode;
+    match mode {
+        RuntimeMode::Auto => {
+            if let Ok(h) = tokio::runtime::Handle::try_current() {
+                return (h, RuntimeOwnership::Borrowed);
+            }
+            let rt = get_or_create_shared_runtime(0);
+            let h = rt.handle().clone();
+            (h, RuntimeOwnership::Owned(rt))
+        }
+        RuntimeMode::Shared(n) => {
+            let rt = get_or_create_shared_runtime(*n);
+            let h = rt.handle().clone();
+            (h, RuntimeOwnership::Owned(rt))
+        }
+        RuntimeMode::ApplicationRuntime => {
+            let h = tokio::runtime::Handle::try_current()
+                .expect("RuntimeMode::ApplicationRuntime requires a current Tokio runtime");
+            (h, RuntimeOwnership::Borrowed)
+        }
+    }
+}
+
+/// Returns the process-wide shared runtime, creating it if necessary.
+///
+/// `num_threads` is only honoured on first creation. If the runtime already
+/// exists and the requested thread count differs, a warning is logged and
+/// the existing runtime is returned unchanged.
+fn get_or_create_shared_runtime(num_threads: usize) -> Arc<tokio::runtime::Runtime> {
+    let mut guard = SHARED_RT.lock().unwrap();
+    if let Some(weak) = guard.as_ref() {
+        if let Some(rt) = weak.upgrade() {
+            let existing = rt.metrics().num_workers();
+            let requested = num_threads.max(1);
+            if requested != existing {
+                warn!(
+                    "Ignoring num_threads={} — shared runtime already has {} worker(s)",
+                    num_threads, existing
+                );
+            }
+            return rt;
+        }
+    }
+    let rt = Arc::new(build_runtime(num_threads));
+    *guard = Some(Arc::downgrade(&rt));
+    rt
+}
+
+fn build_runtime(num_threads: usize) -> tokio::runtime::Runtime {
+    // Always use multi_thread: spawned tasks need background worker threads
+    // to drive them. current_thread only runs tasks when block_on is called,
+    // which does not apply to the library-owned shared runtime.
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(num_threads.max(1))
+        .enable_all()
+        .build()
+        .expect("build tokio runtime")
+}
+
+/// Channels connecting the public API to the internal event loop.
+/// Created by [`RuntimeHandle::spawn`].
 pub(crate) struct RuntimeHandle {
     cmd_tx: async_channel::Sender<Command>,
     event_rx: async_channel::Receiver<Event>,
 }
 
 impl RuntimeHandle {
-    /// Spawns a dedicated OS thread with a single-threaded tokio runtime and
-    /// starts the MQTT event loop on it.
-    ///
-    /// Returns a handle that can send commands to and receive events from the
-    /// loop.
-    pub(crate) fn spawn(buf_cfg: BufConfig) -> Self {
+    /// Spawns the MQTT event loop as a task on `handle` and returns the
+    /// channel endpoints for communicating with it.
+    pub(crate) fn spawn(handle: &tokio::runtime::Handle, buf_cfg: BufConfig) -> Self {
         let (cmd_tx, cmd_rx) = async_channel::unbounded::<Command>();
         let (event_tx, event_rx) = async_channel::unbounded::<Event>();
-
-        std::thread::spawn(move || {
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("build tokio runtime")
-                .block_on(run_event_loop(cmd_rx, event_tx, buf_cfg));
-        });
-
+        handle.spawn(run_event_loop(cmd_rx, event_tx, buf_cfg));
         Self { cmd_tx, event_rx }
     }
 
@@ -1918,9 +1993,28 @@ mod tests {
     use super::*;
 
     fn assert_connection<C: Connection>() {}
+    fn assert_send<F: Send + 'static>(_: F) {}
 
     #[test]
     fn test_tcp_connection_implements_connection() {
         assert_connection::<TcpConnection>();
+    }
+
+    #[test]
+    fn test_run_event_loop_is_send() {
+        let (_, cmd_rx) = async_channel::unbounded::<Command>();
+        let (event_tx, _) = async_channel::unbounded::<Event>();
+        assert_send(run_event_loop(
+            cmd_rx,
+            event_tx,
+            BufConfig {
+                send_while_disconnected: false,
+                max_buffered_msgs: 100,
+                allow_send_any_time: false,
+                delete_oldest: false,
+                restore_msgs: false,
+                persist_qos0: true,
+            },
+        ));
     }
 }
