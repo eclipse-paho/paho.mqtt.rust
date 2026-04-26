@@ -98,7 +98,7 @@ impl mqtt::ClientPersistence for MemPersistence {
         trace!("Client persistence [{}]: get key '{}'", self.name, key);
         match self.map.get(key) {
             Some(v) => Ok(v.to_vec()),
-            None => Err(mqtt::Error::PersistenceError),
+            None => Err(mqtt::Error::General("Key not found")),
         }
     }
 
@@ -107,7 +107,7 @@ impl mqtt::ClientPersistence for MemPersistence {
         trace!("Client persistence [{}]: remove key '{}'", self.name, key);
         match self.map.remove(key) {
             Some(_) => Ok(()),
-            None => Err(mqtt::Error::PersistenceError),
+            None => Err(mqtt::Error::General("Key not found")),
         }
     }
 

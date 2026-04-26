@@ -70,9 +70,7 @@ pub use crate::client::Client;
 pub use crate::connect_options::{ConnectOptions, ConnectOptionsBuilder};
 pub use crate::create_options::{CreateOptions, CreateOptionsBuilder};
 pub use crate::disconnect_options::{DisconnectOptions, DisconnectOptionsBuilder};
-pub use crate::error::{
-    ConnectReturnCode, Error, Result, error_message, error_message_opt,
-};
+pub use crate::error::{Error, Result};
 pub use crate::event::Event;
 pub use crate::message::{Message, MessageBuilder};
 pub use crate::persistence::{

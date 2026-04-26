@@ -34,9 +34,9 @@ pub struct ConnectResponse {
     pub mqtt_version: u32,
     /// Whether the client session is already present on the server.
     pub session_present: bool,
-    /// Reason code from the CONNACK (MQTT v5 only). Always `Success` on v3.1.1.
+    /// Reason code from the CONNACK (MQTT v5 only). Always `Success` on v3.
     pub reason_code: ReasonCode,
-    /// MQTT v5 properties from the CONNACK. Empty on v3.1.1.
+    /// MQTT v5 properties from the CONNACK. Empty on v3.
     pub properties: Properties,
 }
 
@@ -46,9 +46,9 @@ pub struct ConnectResponse {
 /// comes from the PUBACK packet; for QoS 2 from the PUBCOMP.
 #[derive(Clone, Default, Debug)]
 pub struct PublishResponse {
-    /// Reason code from PUBACK or PUBCOMP (MQTT v5 only). `Success` on v3.1.1.
+    /// Reason code from PUBACK or PUBCOMP (MQTT v5 only). `Success` on v3.
     pub reason_code: ReasonCode,
-    /// MQTT v5 properties. Empty on v3.1.1.
+    /// MQTT v5 properties. Empty on v3.
     pub properties: Properties,
 }
 
@@ -67,10 +67,10 @@ impl PublishResponse {
 pub struct SubscribeResponse {
     /// Per-topic reason codes from the SUBACK.
     ///
-    /// For MQTT v3.1.1 these carry the granted QoS value cast to `ReasonCode`;
+    /// For MQTT v3 these carry the granted QoS value cast to `ReasonCode`;
     /// for MQTT v5 these are the actual v5 reason codes.
     pub reason_codes: Vec<ReasonCode>,
-    /// MQTT v5 properties from the SUBACK. Empty on v3.1.1.
+    /// MQTT v5 properties from the SUBACK. Empty on v3.
     pub properties: Properties,
 }
 
@@ -87,9 +87,9 @@ impl SubscribeResponse {
 /// Response data from an UNSUBSCRIBE → UNSUBACK exchange.
 #[derive(Clone, Default, Debug)]
 pub struct UnsubscribeResponse {
-    /// Per-topic reason codes from the UNSUBACK (MQTT v5 only). Empty on v3.1.1.
+    /// Per-topic reason codes from the UNSUBACK (MQTT v5 only). Empty on v3.
     pub reason_codes: Vec<ReasonCode>,
-    /// MQTT v5 properties from the UNSUBACK. Empty on v3.1.1.
+    /// MQTT v5 properties from the UNSUBACK. Empty on v3.
     pub properties: Properties,
 }
 
