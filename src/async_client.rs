@@ -744,33 +744,80 @@ impl AsyncClient {
         use crate::runtime::Event as Ev;
         match ev {
             Ev::Connected(response) => {
-                // connected flag already set by event loop before token resolved
-                let mut cbctx = self.inner.callback_context.lock().unwrap();
-                if let Some(ref mut cb) = cbctx.on_connected {
+                // Take the callback out before invoking so we don't hold the
+                // lock across the call — a callback that calls set_*_callback
+                // or remove_callbacks would otherwise deadlock.
+                let cb = self
+                    .inner
+                    .callback_context
+                    .lock()
+                    .unwrap()
+                    .on_connected
+                    .take();
+                if let Some(mut cb) = cb {
                     cb(self, &response);
+                    // Restore only if nothing replaced it while we were running.
+                    let mut cbctx = self.inner.callback_context.lock().unwrap();
+                    if cbctx.on_connected.is_none() {
+                        cbctx.on_connected = Some(cb);
+                    }
                 }
             }
             Ev::ConnectionLost(_err) => {
                 self.inner.connected.store(false, Ordering::SeqCst);
-                let mut cbctx = self.inner.callback_context.lock().unwrap();
-                if let Some(ref mut cb) = cbctx.on_message_arrived {
+                let (msg_cb, lost_cb) = {
+                    let mut cbctx = self.inner.callback_context.lock().unwrap();
+                    (
+                        cbctx.on_message_arrived.take(),
+                        cbctx.on_connection_lost.take(),
+                    )
+                };
+                if let Some(mut cb) = msg_cb {
                     cb(self, None);
+                    let mut cbctx = self.inner.callback_context.lock().unwrap();
+                    if cbctx.on_message_arrived.is_none() {
+                        cbctx.on_message_arrived = Some(cb);
+                    }
                 }
-                if let Some(ref mut cb) = cbctx.on_connection_lost {
+                if let Some(mut cb) = lost_cb {
                     cb(self);
+                    let mut cbctx = self.inner.callback_context.lock().unwrap();
+                    if cbctx.on_connection_lost.is_none() {
+                        cbctx.on_connection_lost = Some(cb);
+                    }
                 }
             }
             Ev::Disconnected { reason_code, props } => {
                 self.inner.connected.store(false, Ordering::SeqCst);
-                let mut cbctx = self.inner.callback_context.lock().unwrap();
-                if let Some(ref mut cb) = cbctx.on_disconnected {
+                let cb = self
+                    .inner
+                    .callback_context
+                    .lock()
+                    .unwrap()
+                    .on_disconnected
+                    .take();
+                if let Some(mut cb) = cb {
                     cb(self, props, reason_code);
+                    let mut cbctx = self.inner.callback_context.lock().unwrap();
+                    if cbctx.on_disconnected.is_none() {
+                        cbctx.on_disconnected = Some(cb);
+                    }
                 }
             }
             Ev::MessageArrived(msg) => {
-                let mut cbctx = self.inner.callback_context.lock().unwrap();
-                if let Some(ref mut cb) = cbctx.on_message_arrived {
+                let cb = self
+                    .inner
+                    .callback_context
+                    .lock()
+                    .unwrap()
+                    .on_message_arrived
+                    .take();
+                if let Some(mut cb) = cb {
                     cb(self, Some(msg));
+                    let mut cbctx = self.inner.callback_context.lock().unwrap();
+                    if cbctx.on_message_arrived.is_none() {
+                        cbctx.on_message_arrived = Some(cb);
+                    }
                 }
             }
             Ev::TlsError(msg) => {
