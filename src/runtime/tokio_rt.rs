@@ -913,6 +913,9 @@ struct Session {
     inflight_deferred: VecDeque<Command>,
     /// Set when the broker sends a DISCONNECT packet; suppresses ConnectionLost.
     broker_disconnected: bool,
+    /// Set by `send()` to indicate a packet was written since the last
+    /// keep-alive timer reset. Checked in `run()` to reset the deadline.
+    sent_packet: bool,
 }
 
 impl Session {
@@ -941,6 +944,7 @@ impl Session {
             max_inflight,
             inflight_deferred: VecDeque::new(),
             broker_disconnected: false,
+            sent_packet: false,
         }
     }
 
@@ -1004,6 +1008,7 @@ impl Session {
         packet.encode(&mut self.write_buf, self.ver)?;
         self.writer.write_all(&self.write_buf).await?;
         self.writer.flush().await?;
+        self.sent_packet = true;
         Ok(())
     }
 
@@ -1125,6 +1130,10 @@ impl Session {
                         let packet = Packet::from_raw(raw, self.ver)?;
                         self.handle_packet(packet).await?;
                     }
+                    if ka_enabled && self.sent_packet {
+                        self.sent_packet = false;
+                        ka_sleep.as_mut().reset(time::Instant::now() + keep_alive);
+                    }
                 }
                 cmd = cmd_rx.recv() => {
                     match cmd {
@@ -1177,8 +1186,8 @@ impl Session {
                             if self.handle_command(cmd).await? {
                                 return Ok(());
                             }
-                            // Any outbound packet resets the keep-alive deadline.
-                            if ka_enabled {
+                            if ka_enabled && self.sent_packet {
+                                self.sent_packet = false;
                                 ka_sleep.as_mut().reset(time::Instant::now() + keep_alive);
                             }
                         }
