@@ -1521,7 +1521,10 @@ async fn do_connect(
                 .to_owned();
             let tcp = TcpStream::connect((host.as_str(), *port)).await?;
             tcp.set_nodelay(true)?;
-            let tls = connector.connect(server_name, tcp).await?;
+            let tls = connector
+                .connect(server_name, tcp)
+                .await
+                .map_err(|e| Error::Tls(e.to_string()))?;
             Box::new(TlsConnection { stream: tls })
         }
         #[cfg(all(not(feature = "tls"), feature = "openssl"))]
@@ -1539,7 +1542,7 @@ async fn do_connect(
             std::pin::Pin::new(&mut stream)
                 .connect()
                 .await
-                .map_err(|e| Error::GeneralString(e.to_string()))?;
+                .map_err(|e| Error::Tls(e.to_string()))?;
             Box::new(OpenSslConnection { stream })
         }
         #[cfg(unix)]
@@ -1567,7 +1570,10 @@ async fn do_connect(
                 .to_owned();
             let tcp = TcpStream::connect((host.as_str(), *port)).await?;
             tcp.set_nodelay(true)?;
-            let tls = connector.connect(server_name, tcp).await?;
+            let tls = connector
+                .connect(server_name, tcp)
+                .await
+                .map_err(|e| Error::Tls(e.to_string()))?;
             let url = format!("wss://{}:{}{}", host, port, path);
             let request = build_ws_request(&url, &p.http_headers)?;
             let (ws, _) = tokio_tungstenite::client_async(request, tls)
@@ -1590,7 +1596,7 @@ async fn do_connect(
             std::pin::Pin::new(&mut stream)
                 .connect()
                 .await
-                .map_err(|e| Error::GeneralString(e.to_string()))?;
+                .map_err(|e| Error::Tls(e.to_string()))?;
             let url = format!("wss://{}:{}{}", host, port, path);
             let request = build_ws_request(&url, &p.http_headers)?;
             let (ws, _) = tokio_tungstenite::client_async(request, stream)
@@ -1848,7 +1854,7 @@ pub(crate) async fn run_event_loop(
             Some(t) => t,
             None => {
                 let err = last_err.unwrap_or(Error::General("no servers configured"));
-                if job.params.tls.is_some() {
+                if matches!(err, Error::Tls(_)) {
                     let _ = event_tx.send(Event::TlsError(err.to_string())).await;
                 }
                 initial_tx.complete(Err(err));
@@ -1935,7 +1941,7 @@ pub(crate) async fn run_event_loop(
 
             match do_connect(&job).await {
                 Err(e) => {
-                    if job.params.tls.is_some() {
+                    if matches!(e, Error::Tls(_)) {
                         let _ = event_tx.send(Event::TlsError(e.to_string())).await;
                     }
                     if let Some(tx) = tx_opt {

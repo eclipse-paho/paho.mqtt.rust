@@ -938,6 +938,12 @@ impl AsyncClient {
             .on_message_arrived = None;
     }
 
+    /// Removes all registered callbacks atomically under a single lock.
+    pub fn remove_callbacks(&self) {
+        let mut cbctx = self.inner.callback_context.lock().unwrap();
+        *cbctx = CallbackContext::default();
+    }
+
     /// Starts the client consuming messages for a blocking (non-async) app.
     ///
     /// Returns the receiving-end of the channel for the application to
@@ -1071,9 +1077,17 @@ impl AsyncClient {
         rx
     }
 
-    /// Stops the client from streaming messages in.
+    /// Stops the event stream created by [`get_event_stream`] or
+    /// [`start_consuming_events`], closing the channel.
+    ///
+    /// Removes all registered callbacks atomically, dropping the last
+    /// channel-sender clones and allowing the receiver to observe channel
+    /// closure.
+    ///
+    /// [`get_event_stream`]: AsyncClient::get_event_stream
+    /// [`start_consuming_events`]: AsyncClient::start_consuming_events
     pub fn stop_stream(&self) {
-        self.remove_message_callback();
+        self.remove_callbacks();
     }
 
     /// Returns the client ID used for the client instance.

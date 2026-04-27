@@ -464,7 +464,12 @@ impl Client {
         self.cli.get_event_stream(buffer_lim)
     }
 
-    /// Stops the async stream by removing the message callback.
+    /// Removes all registered callbacks atomically under a single lock.
+    pub fn remove_callbacks(&self) {
+        self.cli.remove_callbacks();
+    }
+
+    /// Stops the event stream, closing the channel.
     pub fn stop_stream(&self) {
         self.cli.stop_stream();
     }

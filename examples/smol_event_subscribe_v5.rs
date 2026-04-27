@@ -133,10 +133,6 @@ fn main() {
                     println!("Disconnected: {}\nExiting.", reason_code);
                     break;
                 }
-                Event::Shutdown => {
-                    println!("Client shutdown.\nExiting.");
-                    break;
-                }
             }
         }
 

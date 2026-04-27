@@ -37,6 +37,4 @@ pub enum Event {
         /// The reason code from the disconnect message.
         reason_code: ReasonCode,
     },
-    /// When the consumer is being shut down (such as from another thread)
-    Shutdown,
 }

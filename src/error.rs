@@ -38,6 +38,9 @@ pub enum Error {
     /// Attempting a TLS connection when the TLS feature is not enabled.
     #[error("TLS not supported by library")]
     TlsNotSupported,
+    /// A TLS handshake failure.
+    #[error("TLS error: {0}")]
+    Tls(String),
     /// Call not applicable to the client's version of MQTT.
     #[error("Wrong MQTT version")]
     WrongMqttVersion,

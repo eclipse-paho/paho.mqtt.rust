@@ -249,7 +249,7 @@ fn main() -> mqtt::Result<()> {
                         break;
                     }
                 }
-                mqtt::Event::Disconnected { .. } | mqtt::Event::Shutdown => break,
+                mqtt::Event::Disconnected { .. } => break,
                 _ => {}
             }
         }
