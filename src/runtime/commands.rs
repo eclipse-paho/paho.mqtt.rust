@@ -243,6 +243,13 @@ pub(crate) enum Event {
     ConnectionLost(Error),
     /// An application message arrived from the broker.
     MessageArrived(crate::Message),
+    /// The broker sent a DISCONNECT packet (v5) or cleanly closed the connection.
+    Disconnected {
+        /// Disconnect reason code (always `NormalDisconnection` for v3.1.1).
+        reason_code: ReasonCode,
+        /// MQTT v5 properties; empty for v3.1.1.
+        props: CodecProperties,
+    },
     /// A TLS error occurred during connection setup (only when the `tls`
     /// feature is enabled and TLS is configured).
     TlsError(String),

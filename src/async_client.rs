@@ -760,6 +760,13 @@ impl AsyncClient {
                     cb(self);
                 }
             }
+            Ev::Disconnected { reason_code, props } => {
+                self.inner.connected.store(false, Ordering::SeqCst);
+                let mut cbctx = self.inner.callback_context.lock().unwrap();
+                if let Some(ref mut cb) = cbctx.on_disconnected {
+                    cb(self, props, reason_code);
+                }
+            }
             Ev::MessageArrived(msg) => {
                 let mut cbctx = self.inner.callback_context.lock().unwrap();
                 if let Some(ref mut cb) = cbctx.on_message_arrived {
