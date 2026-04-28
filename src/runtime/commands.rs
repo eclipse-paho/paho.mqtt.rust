@@ -34,11 +34,8 @@ use bytes::Bytes;
 use paho_mqtt_codec::{MqttVersion, Properties as CodecProperties, QoS, ReasonCode, Will};
 
 use crate::{
-    Error,
-    persistence::ClientPersistence,
-    responses::{ConnectResponse, PublishResponse, SubscribeResponse, UnsubscribeResponse},
-    subscribe_options::SubscribeOptions,
-    token::Completer,
+    ClientPersistence, ConnectResponse, Error, Message, PublishResponse, SubscribeOptions,
+    SubscribeResponse, UnsubscribeResponse, token::Completer,
 };
 
 /////////////////////////////////////////////////////////////////////////////
@@ -238,11 +235,11 @@ pub(crate) enum Command {
 /// Events emitted by the internal event loop to the public layer.
 pub(crate) enum Event {
     /// A connection to the broker was successfully established (CONNACK received).
-    Connected(crate::responses::ConnectResponse),
+    Connected(ConnectResponse),
     /// The network connection was lost unexpectedly.
     ConnectionLost(Error),
     /// An application message arrived from the broker.
-    MessageArrived(crate::Message),
+    MessageArrived(Message),
     /// The broker sent a DISCONNECT packet (v5) or cleanly closed the connection.
     Disconnected {
         /// Disconnect reason code (always `NormalDisconnection` for v3.1.1).
