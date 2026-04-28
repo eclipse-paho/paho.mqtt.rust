@@ -77,8 +77,8 @@ pub(crate) enum ServerAddr {
         /// Broker TCP port.
         port: u16,
     },
-    /// TLS connection (requires the `tls` or `openssl` feature).
-    #[cfg(any(feature = "tls", feature = "openssl"))]
+    /// TLS connection (requires the `tls`, `openssl`, or `smol-tls` feature).
+    #[cfg(any(feature = "tls", feature = "openssl", feature = "smol-tls"))]
     Tls {
         /// Broker hostname or IP address.
         host: String,

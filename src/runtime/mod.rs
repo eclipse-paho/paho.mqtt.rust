@@ -37,8 +37,22 @@ pub(crate) mod connection;
 #[cfg(feature = "tokio")]
 pub(crate) mod tokio_rt;
 
+#[cfg(all(feature = "smol", not(feature = "tokio")))]
+pub(crate) mod smol_rt;
+
 #[cfg(any(feature = "tokio", feature = "smol"))]
 pub(crate) use commands::{BufConfig, Command, ConnectParams, Event, ServerAddr};
 
 #[cfg(feature = "tokio")]
 pub(crate) use tokio_rt::{RuntimeHandle, RuntimeOwnership, resolve_runtime};
+
+#[cfg(all(feature = "smol", not(feature = "tokio")))]
+pub(crate) use smol_rt::{RuntimeHandle, SmolOwnership, get_or_create_shared_executor};
+
+/// Unified runtime-ownership type for the active backend.
+#[cfg(feature = "tokio")]
+pub(crate) type RtOwnership = tokio_rt::RuntimeOwnership;
+
+/// Unified runtime-ownership type for the active backend.
+#[cfg(all(feature = "smol", not(feature = "tokio")))]
+pub(crate) type RtOwnership = smol_rt::SmolOwnership;

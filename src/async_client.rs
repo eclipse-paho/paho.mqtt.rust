@@ -51,10 +51,7 @@ use crate::{
     SyncReceiver, UnsubscribeManyToken, UnsubscribeToken, UserData,
     error::{Error, Result},
     persistence::ClientPersistence,
-    runtime::{
-        BufConfig, Command, ConnectParams, RuntimeHandle, RuntimeOwnership, ServerAddr,
-        resolve_runtime,
-    },
+    runtime::{BufConfig, Command, ConnectParams, RtOwnership, RuntimeHandle, ServerAddr},
     token::Token,
 };
 use bytes::Bytes;
@@ -113,10 +110,10 @@ pub(crate) struct InnerAsyncClient {
     callback_context: Mutex<CallbackContext>,
     /// Persistence store, if any.
     persist: Option<Arc<Mutex<Box<dyn ClientPersistence>>>>,
-    /// Keeps the Tokio runtime alive for the lifetime of this client.
+    /// Keeps the async runtime alive for the lifetime of this client.
     /// Declared last so it is dropped after `cmd_tx`, ensuring the event-loop
     /// task sees the closed channel before the runtime shuts down.
-    _rt_ownership: RuntimeOwnership,
+    _rt_ownership: RtOwnership,
 }
 
 // The client is safe to send or share between threads.
@@ -163,18 +160,29 @@ impl AsyncClient {
         let mut opts: CreateOptions = opts.into();
         debug!("Create options: {:?}", opts);
 
-        let (rt_handle, rt_ownership) = resolve_runtime(&opts.runtime_mode);
-        let rt = RuntimeHandle::spawn(
-            &rt_handle,
-            BufConfig {
-                send_while_disconnected: opts.send_while_disconnected,
-                max_buffered_msgs: opts.max_buffered_msgs,
-                allow_send_any_time: opts.allow_send_any_time,
-                delete_oldest: opts.delete_oldest,
-                restore_msgs: opts.restore_msgs,
-                persist_qos0: opts.persist_qos0,
-            },
-        );
+        let buf_cfg = BufConfig {
+            send_while_disconnected: opts.send_while_disconnected,
+            max_buffered_msgs: opts.max_buffered_msgs,
+            allow_send_any_time: opts.allow_send_any_time,
+            delete_oldest: opts.delete_oldest,
+            restore_msgs: opts.restore_msgs,
+            persist_qos0: opts.persist_qos0,
+        };
+
+        #[cfg(feature = "tokio")]
+        let (rt, rt_ownership) = {
+            use crate::runtime::{RuntimeHandle, resolve_runtime};
+            let (rt_handle, ownership) = resolve_runtime(&opts.runtime_mode);
+            (RuntimeHandle::spawn(&rt_handle, buf_cfg), ownership)
+        };
+
+        #[cfg(all(feature = "smol", not(feature = "tokio")))]
+        let (rt, rt_ownership) = {
+            use crate::runtime::{SmolOwnership, get_or_create_shared_executor};
+            let executor = get_or_create_shared_executor();
+            let rt = RuntimeHandle::spawn(&executor, buf_cfg);
+            (rt, SmolOwnership::Shared(executor))
+        };
         let (cmd_tx, event_rx) = rt.into_parts();
 
         // Seed the stored connect opts with the client's initial MQTT version
@@ -1268,9 +1276,9 @@ fn parse_server_uri(uri: &str) -> Result<ServerAddr> {
     let (host, port, _) = parse_host_port_path(rest, default_port)?;
 
     if is_tls {
-        #[cfg(any(feature = "tls", feature = "openssl"))]
+        #[cfg(any(feature = "tls", feature = "openssl", feature = "smol-tls"))]
         return Ok(ServerAddr::Tls { host, port });
-        #[cfg(not(any(feature = "tls", feature = "openssl")))]
+        #[cfg(not(any(feature = "tls", feature = "openssl", feature = "smol-tls")))]
         return Err(Error::TlsNotSupported);
     }
 
@@ -1468,12 +1476,12 @@ mod tests {
             parse_server_uri("tcp://broker.example.com:1883").unwrap(),
             ServerAddr::Tcp { host, port } if host == "broker.example.com" && port == 1883
         ));
-        #[cfg(any(feature = "tls", feature = "openssl"))]
+        #[cfg(any(feature = "tls", feature = "openssl", feature = "smol-tls"))]
         assert!(matches!(
             parse_server_uri("mqtts://broker.example.com:8883").unwrap(),
             ServerAddr::Tls { host, port } if host == "broker.example.com" && port == 8883
         ));
-        #[cfg(not(any(feature = "tls", feature = "openssl")))]
+        #[cfg(not(any(feature = "tls", feature = "openssl", feature = "smol-tls")))]
         assert!(matches!(
             parse_server_uri("mqtts://broker.example.com:8883"),
             Err(Error::TlsNotSupported)
@@ -1482,12 +1490,12 @@ mod tests {
             parse_server_uri("mqtt://localhost").unwrap(),
             ServerAddr::Tcp { host, port } if host == "localhost" && port == 1883
         ));
-        #[cfg(any(feature = "tls", feature = "openssl"))]
+        #[cfg(any(feature = "tls", feature = "openssl", feature = "smol-tls"))]
         assert!(matches!(
             parse_server_uri("mqtts://secure.broker.io").unwrap(),
             ServerAddr::Tls { host, port } if host == "secure.broker.io" && port == 8883
         ));
-        #[cfg(not(any(feature = "tls", feature = "openssl")))]
+        #[cfg(not(any(feature = "tls", feature = "openssl", feature = "smol-tls")))]
         assert!(matches!(
             parse_server_uri("mqtts://secure.broker.io"),
             Err(Error::TlsNotSupported)
