@@ -23,7 +23,7 @@
 //! [`Command`] values flow from the public API to the event loop.
 //! [`Event`] values flow back from the event loop to the public layer.
 
-#[cfg(feature = "websocket")]
+#[cfg(any(feature = "websocket", feature = "smol-websocket"))]
 use std::collections::HashMap;
 use std::{
     sync::{Arc, Mutex, atomic::AtomicBool},
@@ -91,8 +91,8 @@ pub(crate) enum ServerAddr {
         /// Filesystem path to the socket.
         path: String,
     },
-    /// Plain WebSocket connection (requires the `websocket` feature).
-    #[cfg(feature = "websocket")]
+    /// Plain WebSocket connection (requires the `websocket` or `smol-websocket` feature).
+    #[cfg(any(feature = "websocket", feature = "smol-websocket"))]
     Ws {
         /// Broker hostname or IP address.
         host: String,
@@ -101,8 +101,13 @@ pub(crate) enum ServerAddr {
         /// WebSocket path (e.g. `/mqtt`).
         path: String,
     },
-    /// WebSocket over TLS connection (requires `websocket` and `tls` or `openssl`).
-    #[cfg(all(feature = "websocket", any(feature = "tls", feature = "openssl")))]
+    /// WebSocket over TLS connection.
+    ///
+    /// Requires `websocket` + (`tls` or `openssl`), or `smol-websocket` + `smol-tls`.
+    #[cfg(any(
+        all(feature = "websocket", any(feature = "tls", feature = "openssl")),
+        all(feature = "smol-websocket", feature = "smol-tls")
+    ))]
     Wss {
         /// Broker hostname or IP address.
         host: String,
@@ -141,7 +146,7 @@ pub(crate) struct ConnectParams {
     /// TLS options; `Some` only when using a TLS transport.
     pub tls: Option<crate::TlsOptions>,
     /// HTTP headers included in the WebSocket upgrade request.
-    #[cfg(feature = "websocket")]
+    #[cfg(any(feature = "websocket", feature = "smol-websocket"))]
     pub http_headers: HashMap<String, String>,
     /// Whether the event loop should automatically reconnect on session loss.
     pub auto_reconnect: bool,

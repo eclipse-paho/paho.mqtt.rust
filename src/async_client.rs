@@ -305,7 +305,7 @@ impl AsyncClient {
             ver,
             props: opts.props,
             tls: opts.tls,
-            #[cfg(feature = "websocket")]
+            #[cfg(any(feature = "websocket", feature = "smol-websocket"))]
             http_headers: opts.http_headers,
             auto_reconnect: opts.auto_reconnect,
             min_retry_interval: opts.min_retry_interval,
@@ -1234,20 +1234,26 @@ fn parse_server_uri(uri: &str) -> Result<ServerAddr> {
     }
 
     // WebSocket transports (feature-gated).
-    #[cfg(feature = "websocket")]
+    #[cfg(any(feature = "websocket", feature = "smol-websocket"))]
     if let Some(rest) = uri.strip_prefix("ws://") {
         let (host, port, path) = parse_host_port_path(rest, 1883)?;
         return Ok(ServerAddr::Ws { host, port, path });
     }
 
-    #[cfg(all(feature = "websocket", any(feature = "tls", feature = "openssl")))]
+    #[cfg(any(
+        all(feature = "websocket", any(feature = "tls", feature = "openssl")),
+        all(feature = "smol-websocket", feature = "smol-tls")
+    ))]
     if let Some(rest) = uri.strip_prefix("wss://") {
         let (host, port, path) = parse_host_port_path(rest, 8883)?;
         return Ok(ServerAddr::Wss { host, port, path });
     }
 
-    // wss:// with websocket but without a TLS backend is an error.
-    #[cfg(all(feature = "websocket", not(any(feature = "tls", feature = "openssl"))))]
+    // wss:// with websocket feature but without a TLS backend is an error.
+    #[cfg(any(
+        all(feature = "websocket", not(any(feature = "tls", feature = "openssl"))),
+        all(feature = "smol-websocket", not(feature = "smol-tls"))
+    ))]
     if uri.starts_with("wss://") {
         return Err(Error::TlsNotSupported);
     }

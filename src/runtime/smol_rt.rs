@@ -161,6 +161,205 @@ type TlsResult<T> = std::result::Result<T, rustls::Error>;
 
 /////////////////////////////////////////////////////////////////////////////
 
+/// A WebSocket transport wrapping an [`async_tungstenite::WebSocketStream`].
+///
+/// Presents a byte-stream interface (`AsyncRead` + `AsyncWrite`) over a
+/// WebSocket connection.  Each flushed write becomes one binary WebSocket
+/// frame; reads reassemble frames back into a byte stream.  Requires the
+/// `smol-websocket` feature.
+#[cfg(feature = "smol-websocket")]
+struct WsConnection<S> {
+    stream: async_tungstenite::WebSocketStream<S>,
+    /// Overflow bytes from the last received frame not yet consumed by the reader.
+    read_buf: Vec<u8>,
+    /// Position within `read_buf` of the next unread byte.
+    read_pos: usize,
+    /// Bytes accumulated via `poll_write`; sent as one binary frame on flush.
+    write_buf: Vec<u8>,
+    /// Non-`None` while waiting for the sink to be ready before `start_send`.
+    pending_msg: Option<Vec<u8>>,
+}
+
+#[cfg(feature = "smol-websocket")]
+impl<S: AsyncRead + AsyncWrite + Unpin> WsConnection<S> {
+    fn new(stream: async_tungstenite::WebSocketStream<S>) -> Self {
+        Self {
+            stream,
+            read_buf: Vec::new(),
+            read_pos: 0,
+            write_buf: Vec::new(),
+            pending_msg: None,
+        }
+    }
+}
+
+#[cfg(feature = "smol-websocket")]
+impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for WsConnection<S> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<io::Result<usize>> {
+        use async_tungstenite::tungstenite::Message as WsMessage;
+        use futures::Stream;
+
+        let this = self.get_mut();
+
+        // Serve buffered bytes from a previous frame first.
+        if this.read_pos < this.read_buf.len() {
+            let available = &this.read_buf[this.read_pos..];
+            let to_copy = buf.len().min(available.len());
+            buf[..to_copy].copy_from_slice(&available[..to_copy]);
+            this.read_pos += to_copy;
+            if this.read_pos >= this.read_buf.len() {
+                this.read_buf.clear();
+                this.read_pos = 0;
+            }
+            return Poll::Ready(Ok(to_copy));
+        }
+
+        // Poll the WebSocket stream for the next message.
+        loop {
+            match Pin::new(&mut this.stream).poll_next(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(None) => return Poll::Ready(Ok(0)),
+                Poll::Ready(Some(Err(e))) => {
+                    return Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, e)));
+                }
+                Poll::Ready(Some(Ok(msg))) => match msg {
+                    WsMessage::Binary(data) => {
+                        if data.is_empty() {
+                            continue;
+                        }
+                        let to_copy = buf.len().min(data.len());
+                        buf[..to_copy].copy_from_slice(&data[..to_copy]);
+                        if to_copy < data.len() {
+                            this.read_buf = data;
+                            this.read_pos = to_copy;
+                        }
+                        return Poll::Ready(Ok(to_copy));
+                    }
+                    WsMessage::Text(text) => {
+                        let data = text.into_bytes();
+                        if data.is_empty() {
+                            continue;
+                        }
+                        let to_copy = buf.len().min(data.len());
+                        buf[..to_copy].copy_from_slice(&data[..to_copy]);
+                        if to_copy < data.len() {
+                            this.read_buf = data;
+                            this.read_pos = to_copy;
+                        }
+                        return Poll::Ready(Ok(to_copy));
+                    }
+                    WsMessage::Close(_) => return Poll::Ready(Ok(0)),
+                    // Control frames are handled internally by tungstenite.
+                    WsMessage::Ping(_) | WsMessage::Pong(_) | WsMessage::Frame(_) => {
+                        continue;
+                    }
+                },
+            }
+        }
+    }
+}
+
+#[cfg(feature = "smol-websocket")]
+impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for WsConnection<S> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        self.get_mut().write_buf.extend_from_slice(buf);
+        Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        use async_tungstenite::tungstenite::Message as WsMessage;
+        use futures::Sink;
+
+        let this = self.get_mut();
+
+        // Move the accumulated write buffer into `pending_msg` for sending.
+        if this.pending_msg.is_none() && !this.write_buf.is_empty() {
+            this.pending_msg = Some(std::mem::take(&mut this.write_buf));
+        }
+
+        // Drive the pending message through the Sink.
+        if let Some(data) = this.pending_msg.take() {
+            match Pin::new(&mut this.stream).poll_ready(cx) {
+                Poll::Pending => {
+                    this.pending_msg = Some(data);
+                    return Poll::Pending;
+                }
+                Poll::Ready(Err(e)) => {
+                    return Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, e)));
+                }
+                Poll::Ready(Ok(())) => {
+                    if let Err(e) =
+                        Pin::new(&mut this.stream).start_send(WsMessage::Binary(data))
+                    {
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::BrokenPipe,
+                            e,
+                        )));
+                    }
+                }
+            }
+        }
+
+        // Flush the sink to push the frame onto the wire.
+        Pin::new(&mut this.stream)
+            .poll_flush(cx)
+            .map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e))
+    }
+
+    fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        use futures::Sink;
+        Pin::new(&mut self.get_mut().stream)
+            .poll_close(cx)
+            .map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e))
+    }
+}
+
+#[cfg(feature = "smol-websocket")]
+impl<S: AsyncRead + AsyncWrite + Send + Unpin + 'static> Connection for WsConnection<S> {}
+
+/// Builds an HTTP upgrade request for a WebSocket MQTT connection.
+#[cfg(feature = "smol-websocket")]
+fn build_ws_request(
+    url: &str,
+    http_headers: &std::collections::HashMap<String, String>,
+) -> Result<async_tungstenite::tungstenite::handshake::client::Request> {
+    use async_tungstenite::tungstenite::{
+        client::IntoClientRequest,
+        http::header::{HeaderName, HeaderValue},
+    };
+
+    let mut request = url
+        .into_client_request()
+        .map_err(|e| Error::GeneralString(e.to_string()))?;
+
+    {
+        let headers = request.headers_mut();
+        headers.insert(
+            HeaderName::from_static("sec-websocket-protocol"),
+            HeaderValue::from_static("mqtt"),
+        );
+        for (name, value) in http_headers {
+            if let (Ok(h_name), Ok(h_val)) =
+                (name.parse::<HeaderName>(), value.parse::<HeaderValue>())
+            {
+                headers.insert(h_name, h_val);
+            }
+        }
+    }
+
+    Ok(request)
+}
+
+/////////////////////////////////////////////////////////////////////////////
+
 /// A [`rustls::client::ServerCertVerifier`] that accepts any certificate.
 ///
 /// Used when `TlsOptions::enable_server_cert_auth` is `false`.
@@ -1112,13 +1311,52 @@ async fn do_connect(
         }
         #[cfg(unix)]
         ServerAddr::Unix { path } => Box::new(UnixConnection::connect(path).await?),
+        #[cfg(feature = "smol-websocket")]
+        ServerAddr::Ws { host, port, path } => {
+            let url = format!("ws://{}:{}{}", host, port, path);
+            let request = build_ws_request(&url, &p.http_headers)?;
+            let tcp = TcpStream::connect((host.as_str(), *port)).await?;
+            tcp.set_nodelay(true)?;
+            let (ws, _) = async_tungstenite::client_async(request, tcp)
+                .await
+                .map_err(|e| Error::GeneralString(e.to_string()))?;
+            Box::new(WsConnection::new(ws))
+        }
+        #[cfg(not(feature = "smol-websocket"))]
         #[cfg(feature = "websocket")]
         ServerAddr::Ws { .. } => {
             return Err(Error::General(
                 "WebSocket is not yet supported with the smol runtime",
             ));
         }
-        #[cfg(all(feature = "websocket", any(feature = "tls", feature = "openssl")))]
+        #[cfg(all(feature = "smol-websocket", feature = "smol-tls"))]
+        ServerAddr::Wss { host, port, path } => {
+            let tls = p.tls.as_ref().ok_or(Error::MissingTlsOptions)?;
+            let config = make_tls_config(tls)?;
+            let connector = futures_rustls::TlsConnector::from(config);
+            let server_name = rustls::pki_types::ServerName::try_from(host.as_str())
+                .map_err(|_| {
+                    Error::GeneralString(format!("invalid TLS server name: {}", host))
+                })?
+                .to_owned();
+            let tcp = TcpStream::connect((host.as_str(), *port)).await?;
+            tcp.set_nodelay(true)?;
+            let tls_stream = connector
+                .connect(server_name, tcp)
+                .await
+                .map_err(|e| Error::Tls(e.to_string()))?;
+            let url = format!("wss://{}:{}{}", host, port, path);
+            let request = build_ws_request(&url, &p.http_headers)?;
+            let (ws, _) = async_tungstenite::client_async(request, tls_stream)
+                .await
+                .map_err(|e| Error::GeneralString(e.to_string()))?;
+            Box::new(WsConnection::new(ws))
+        }
+        #[cfg(all(
+            feature = "smol-websocket",
+            not(feature = "smol-tls"),
+            any(feature = "tls", feature = "openssl")
+        ))]
         ServerAddr::Wss { .. } => {
             return Err(Error::General(
                 "WebSocket+TLS is not yet supported with the smol runtime",
