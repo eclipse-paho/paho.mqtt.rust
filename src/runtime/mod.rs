@@ -24,16 +24,20 @@
 //! async transport layer, runtime-specific implementations, and the
 //! command/event types that bridge the public API and the event loop.
 //!
-//! Currently only the `tokio` runtime is supported; `smol` support is
-//! planned (Step 10 of the v2 plan).
+//! The `tokio` feature (default) enables the tokio-based runtime.
+//! The `smol` feature will enable an alternative smol-based runtime.
+//! The `commands` module is shared between both backends.
 
-#[cfg(feature = "tokio")]
+#[cfg(any(feature = "tokio", feature = "smol"))]
 pub(crate) mod commands;
+
+#[cfg(any(feature = "tokio", feature = "smol"))]
+pub(crate) mod connection;
 
 #[cfg(feature = "tokio")]
 pub(crate) mod tokio_rt;
 
-#[cfg(feature = "tokio")]
+#[cfg(any(feature = "tokio", feature = "smol"))]
 pub(crate) use commands::{BufConfig, Command, ConnectParams, Event, ServerAddr};
 
 #[cfg(feature = "tokio")]

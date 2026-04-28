@@ -20,9 +20,9 @@
 
 //! Tokio-based async transport and event loop for the MQTT client.
 //!
-//! Provides the [`Connection`] trait, [`TcpConnection`] implementation,
-//! [`RuntimeHandle`] for cross-thread communication, and the internal
-//! [`Session`] event loop.
+//! Provides [`TcpConnection`] and other transport implementations of the
+//! shared [`Connection`] trait, [`RuntimeHandle`] for cross-thread
+//! communication, and the internal [`Session`] event loop.
 
 use std::{
     collections::{HashMap, VecDeque},
@@ -65,24 +65,16 @@ use {
     tokio_tungstenite::{WebSocketStream, tungstenite::Message as WsMessage},
 };
 
-use super::commands::{BufConfig, Command, ConnectParams, Event, ServerAddr};
+use super::{
+    commands::{BufConfig, Command, ConnectParams, Event, ServerAddr},
+    connection::Connection,
+};
 use crate::{
     Error, Message, Result,
     persistence::ClientPersistence,
     responses::{ConnectResponse, PublishResponse, SubscribeResponse, UnsubscribeResponse},
     token::Completer,
 };
-
-/////////////////////////////////////////////////////////////////////////////
-
-/// A bidirectional async transport used by the internal event loop.
-///
-/// Any type that implements `AsyncRead + AsyncWrite + Send + Unpin` can serve
-/// as a transport; this marker trait bundles those bounds into a single name.
-pub(crate) trait Connection:
-    AsyncRead + AsyncWrite + Send + Unpin + 'static
-{
-}
 
 /////////////////////////////////////////////////////////////////////////////
 
