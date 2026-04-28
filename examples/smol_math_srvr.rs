@@ -146,7 +146,7 @@ async fn handle_request(cli: &mqtt::AsyncClient, msg: mqtt::Message) -> mqtt::Re
 
     // Look up the function, by name, and call if found
 
-    if let Some(func) = FUNC_TBL.get(fname) {
+    if let Some(func) = func_tbl().get(fname) {
         println!("{}: {:?}", fname, params);
         let x = func(&params);
         println!("    Result: {}", x);
@@ -196,7 +196,7 @@ fn main() -> mqtt::Result<()> {
             .persistence(None)
             .finalize();
 
-        let mut cli = mqtt::AsyncClient::new(create_opts).unwrap_or_else(|err| {
+        let cli = mqtt::AsyncClient::new(create_opts).unwrap_or_else(|err| {
             eprintln!("Error creating the client: {}", err);
             process::exit(1);
         });

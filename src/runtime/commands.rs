@@ -144,6 +144,7 @@ pub(crate) struct ConnectParams {
     /// MQTT v5 CONNECT properties; empty for v3.1.1.
     pub props: CodecProperties,
     /// TLS options; `Some` only when using a TLS transport.
+    #[cfg(any(feature = "tls", feature = "openssl", feature = "smol-tls"))]
     pub tls: Option<crate::TlsOptions>,
     /// HTTP headers included in the WebSocket upgrade request.
     #[cfg(any(feature = "websocket", feature = "smol-websocket"))]

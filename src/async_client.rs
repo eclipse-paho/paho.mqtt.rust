@@ -304,6 +304,7 @@ impl AsyncClient {
             will,
             ver,
             props: opts.props,
+            #[cfg(any(feature = "tls", feature = "openssl", feature = "smol-tls"))]
             tls: opts.tls,
             #[cfg(any(feature = "websocket", feature = "smol-websocket"))]
             http_headers: opts.http_headers,

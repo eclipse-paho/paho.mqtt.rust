@@ -71,7 +71,7 @@ fn main() {
     // We just use an async block to capture and print errors.
     let res: mqtt::Result<()> = smol::block_on(async {
         // Create the client connection
-        let mut cli = mqtt::AsyncClient::new(create_opts)?;
+        let cli = mqtt::AsyncClient::new(create_opts)?;
 
         // Create event stream before connecting.
         let strm = cli.get_event_stream(25);
