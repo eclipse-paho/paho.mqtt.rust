@@ -179,6 +179,7 @@ impl UnsubAck {
 mod tests {
     use super::*;
     use crate::types::{MQTT_VERSION_3_1_1, MQTT_VERSION_5};
+    use alloc::{string::ToString, vec};
     use bytes::BytesMut;
 
     fn v311() -> MqttVersion {

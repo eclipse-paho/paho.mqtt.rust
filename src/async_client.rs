@@ -51,7 +51,7 @@ use crate::{
     SyncReceiver, UnsubscribeManyToken, UnsubscribeToken, UserData,
     error::{Error, Result},
     persistence::ClientPersistence,
-    runtime::{BufConfig, Command, ConnectParams, RtOwnership, RuntimeHandle, ServerAddr},
+    runtime::{BufConfig, Command, ConnectParams, RtOwnership, ServerAddr},
     token::Token,
 };
 use bytes::Bytes;
@@ -178,7 +178,9 @@ impl AsyncClient {
 
         #[cfg(all(feature = "smol", not(feature = "tokio")))]
         let (rt, rt_ownership) = {
-            use crate::runtime::{SmolOwnership, get_or_create_shared_executor};
+            use crate::runtime::{
+                RuntimeHandle, SmolOwnership, get_or_create_shared_executor,
+            };
             let executor = get_or_create_shared_executor();
             let rt = RuntimeHandle::spawn(&executor, buf_cfg);
             (rt, SmolOwnership::Shared(executor))

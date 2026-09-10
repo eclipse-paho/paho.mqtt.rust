@@ -35,6 +35,9 @@ pub(crate) mod commands;
 pub(crate) mod connection;
 
 #[cfg(feature = "tokio")]
+pub(crate) mod tokio_conn;
+
+#[cfg(feature = "tokio")]
 pub(crate) mod tokio_rt;
 
 #[cfg(all(feature = "smol", not(feature = "tokio")))]
@@ -44,7 +47,7 @@ pub(crate) mod smol_rt;
 pub(crate) use commands::{BufConfig, Command, ConnectParams, Event, ServerAddr};
 
 #[cfg(feature = "tokio")]
-pub(crate) use tokio_rt::{RuntimeHandle, RuntimeOwnership, resolve_runtime};
+pub(crate) use tokio_rt::{RuntimeHandle, resolve_runtime};
 
 #[cfg(all(feature = "smol", not(feature = "tokio")))]
 pub(crate) use smol_rt::{RuntimeHandle, SmolOwnership, get_or_create_shared_executor};

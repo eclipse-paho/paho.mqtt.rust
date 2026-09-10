@@ -272,6 +272,7 @@ impl fmt::Display for ReasonCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::string::ToString;
 
     #[test]
     fn test_from_u8() {

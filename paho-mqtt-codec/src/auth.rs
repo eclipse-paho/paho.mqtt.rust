@@ -101,6 +101,7 @@ impl Auth {
 mod tests {
     use super::*;
     use crate::properties::{Property, PropertyId, PropertyValue};
+    use alloc::string::ToString;
     use bytes::BytesMut;
 
     fn round_trip(a: Auth) {

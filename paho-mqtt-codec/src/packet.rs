@@ -314,7 +314,7 @@ mod tests {
     #[test]
     fn test_raw_decode_empty_returns_none() {
         let mut src = BytesMut::new();
-        assert_eq!(RawPacket::decode(&mut src).unwrap().is_none(), true);
+        assert!(RawPacket::decode(&mut src).unwrap().is_none());
     }
 
     #[test]

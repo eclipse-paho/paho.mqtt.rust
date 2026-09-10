@@ -405,6 +405,7 @@ impl Properties {
 mod tests {
     use super::*;
     use crate::types::MQTT_VERSION_5;
+    use alloc::string::ToString;
     use bytes::BytesMut;
 
     fn v5() -> MqttVersion {

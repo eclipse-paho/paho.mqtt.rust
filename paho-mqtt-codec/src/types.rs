@@ -161,17 +161,18 @@ impl From<u32> for QoS {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::string::ToString;
 
     #[test]
     fn test_mqtt_version_display() {
-        assert_eq!(MqttVersion::V3_1.to_string(), "3");
         assert_eq!(MqttVersion::V3_1_1.to_string(), "4");
+        assert_eq!(MqttVersion::V3.to_string(), "4");
         assert_eq!(MqttVersion::V5.to_string(), "5");
     }
 
     #[test]
     fn test_mqtt_version_from_u8() {
-        assert_eq!(MqttVersion::from(3_u8), MqttVersion::V3_1);
+        assert_eq!(MqttVersion::from(3_u8), MqttVersion::Default);
         assert_eq!(MqttVersion::from(4_u8), MqttVersion::V3_1_1);
         assert_eq!(MqttVersion::from(5_u8), MqttVersion::V5);
         assert_eq!(MqttVersion::from(0_u8), MqttVersion::Default);
@@ -180,7 +181,7 @@ mod tests {
 
     #[test]
     fn test_mqtt_version_from_u32() {
-        assert_eq!(MqttVersion::from(3_u32), MqttVersion::V3_1);
+        assert_eq!(MqttVersion::from(3_u32), MqttVersion::Default);
         assert_eq!(MqttVersion::from(4_u32), MqttVersion::V3_1_1);
         assert_eq!(MqttVersion::from(5_u32), MqttVersion::V5);
         assert_eq!(MqttVersion::from(0_u32), MqttVersion::Default);
