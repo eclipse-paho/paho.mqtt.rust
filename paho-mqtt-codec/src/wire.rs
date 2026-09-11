@@ -29,9 +29,23 @@ use crate::{Error, Result, String};
 use bytes::{Buf, BufMut, Bytes};
 
 /// Writes a 2-byte big-endian length prefix followed by the UTF-8 bytes of `s`.
-pub(crate) fn put_utf8<B: BufMut>(s: &str, dst: &mut B) {
-    dst.put_u16(s.len() as u16);
+///
+/// Returns [`Error::StringTooLong`] if `s` exceeds 65,535 bytes.
+pub(crate) fn put_utf8<B: BufMut>(s: &str, dst: &mut B) -> Result<()> {
+    let len = u16::try_from(s.len()).map_err(|_| Error::StringTooLong)?;
+    dst.put_u16(len);
     dst.put_slice(s.as_bytes());
+    Ok(())
+}
+
+/// Writes a 2-byte big-endian length prefix followed by the raw bytes of `b`.
+///
+/// Returns [`Error::BinaryTooLong`] if `b` exceeds 65,535 bytes.
+pub(crate) fn put_binary<B: BufMut>(b: &[u8], dst: &mut B) -> Result<()> {
+    let len = u16::try_from(b.len()).map_err(|_| Error::BinaryTooLong)?;
+    dst.put_u16(len);
+    dst.put_slice(b);
+    Ok(())
 }
 
 /// Reads a 2-byte big-endian length prefix then that many UTF-8 bytes from `src`.

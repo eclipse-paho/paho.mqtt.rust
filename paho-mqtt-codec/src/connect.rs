@@ -22,7 +22,7 @@
 
 use crate::{
     Error, MqttVersion, Properties, QoS, ReasonCode, Result, String, varlen,
-    wire::{binary_wire_size, get_binary, get_utf8, put_utf8, utf8_wire_size},
+    wire::{binary_wire_size, get_binary, get_utf8, put_binary, put_utf8, utf8_wire_size},
 };
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
@@ -151,21 +151,19 @@ impl Connect {
         // v5 connect properties
         self.properties.encode(dst, ver)?;
         // Payload: client ID
-        put_utf8(&self.client_id, dst);
+        put_utf8(&self.client_id, dst)?;
         // Will
         if let Some(will) = &self.will {
             will.properties.encode(dst, ver)?;
-            put_utf8(&will.topic, dst);
-            dst.put_u16(will.payload.len() as u16);
-            dst.put_slice(&will.payload);
+            put_utf8(&will.topic, dst)?;
+            put_binary(&will.payload, dst)?;
         }
         // Username / password
         if let Some(u) = &self.username {
-            put_utf8(u, dst);
+            put_utf8(u, dst)?;
         }
         if let Some(p) = &self.password {
-            dst.put_u16(p.len() as u16);
-            dst.put_slice(p);
+            put_binary(p, dst)?;
         }
         Ok(())
     }
@@ -898,5 +896,44 @@ mod tests {
             Connect::decode(Bytes::from_static(&[0x00, 0x04]), v311()),
             Err(Error::PacketTooShort)
         );
+    }
+
+    // ---- field length limits ----
+
+    #[test]
+    fn test_connect_encode_client_id_too_long_errors() {
+        let id: String = core::iter::repeat_n('c', 65_536).collect();
+        let c = Connect::new(true, id);
+        let mut dst = BytesMut::new();
+        assert_eq!(c.encode(&mut dst, v5()), Err(Error::StringTooLong));
+    }
+
+    #[test]
+    fn test_connect_encode_will_payload_too_long_errors() {
+        let mut c = Connect::new(true, "c");
+        c.will = Some(Will::new(
+            "w",
+            Bytes::from(alloc::vec![0u8; 65_536]),
+            QoS::QoS0,
+            false,
+        ));
+        let mut dst = BytesMut::new();
+        assert_eq!(c.encode(&mut dst, v5()), Err(Error::BinaryTooLong));
+    }
+
+    #[test]
+    fn test_connect_encode_password_too_long_errors() {
+        let mut c = Connect::new(true, "c");
+        c.password = Some(Bytes::from(alloc::vec![0u8; 65_536]));
+        let mut dst = BytesMut::new();
+        assert_eq!(c.encode(&mut dst, v5()), Err(Error::BinaryTooLong));
+    }
+
+    #[test]
+    fn test_connect_encode_username_too_long_errors() {
+        let mut c = Connect::new(true, "c");
+        c.username = Some(core::iter::repeat_n('u', 65_536).collect());
+        let mut dst = BytesMut::new();
+        assert_eq!(c.encode(&mut dst, v5()), Err(Error::StringTooLong));
     }
 }

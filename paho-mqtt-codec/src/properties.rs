@@ -30,7 +30,7 @@
 
 use crate::{
     Error, MqttVersion, Result, String, Vec, varlen,
-    wire::{get_binary, get_utf8, put_utf8},
+    wire::{get_binary, get_utf8, put_binary, put_utf8},
 };
 use bytes::{Buf, BufMut, Bytes};
 
@@ -218,14 +218,11 @@ impl PropertyValue {
             PropertyValue::U16(n) => dst.put_u16(*n),
             PropertyValue::U32(n) => dst.put_u32(*n),
             PropertyValue::VarInt(n) => varlen::encode(*n, dst)?,
-            PropertyValue::Binary(b) => {
-                dst.put_u16(b.len() as u16);
-                dst.put_slice(b);
-            }
-            PropertyValue::String(s) => put_utf8(s, dst),
+            PropertyValue::Binary(b) => put_binary(b, dst)?,
+            PropertyValue::String(s) => put_utf8(s, dst)?,
             PropertyValue::StringPair(k, v) => {
-                put_utf8(k, dst);
-                put_utf8(v, dst);
+                put_utf8(k, dst)?;
+                put_utf8(v, dst)?;
             }
         }
         Ok(())
@@ -728,5 +725,42 @@ mod tests {
             Ok(PropertyId::PayloadFormatIndicator)
         );
         assert_eq!(PropertyId::try_from(0x26), Ok(PropertyId::UserProperty));
+    }
+
+    // ---- field length limits ----
+
+    #[test]
+    fn test_encode_binary_too_long_errors() {
+        let mut props = Properties::new();
+        props.push(Property::new(
+            PropertyId::CorrelationData,
+            PropertyValue::Binary(Bytes::from(alloc::vec![0u8; 65_536])),
+        ));
+        let mut dst = BytesMut::new();
+        assert_eq!(props.encode(&mut dst, v5()), Err(Error::BinaryTooLong));
+    }
+
+    #[test]
+    fn test_encode_string_too_long_errors() {
+        let s: String = core::iter::repeat_n('x', 65_536).collect();
+        let mut props = Properties::new();
+        props.push(Property::new(
+            PropertyId::ContentType,
+            PropertyValue::String(s),
+        ));
+        let mut dst = BytesMut::new();
+        assert_eq!(props.encode(&mut dst, v5()), Err(Error::StringTooLong));
+    }
+
+    #[test]
+    fn test_encode_string_pair_value_too_long_errors() {
+        let v: String = core::iter::repeat_n('x', 65_536).collect();
+        let mut props = Properties::new();
+        props.push(Property::new(
+            PropertyId::UserProperty,
+            PropertyValue::StringPair("k".to_string(), v),
+        ));
+        let mut dst = BytesMut::new();
+        assert_eq!(props.encode(&mut dst, v5()), Err(Error::StringTooLong));
     }
 }

@@ -200,7 +200,19 @@ impl Packet {
     }
 
     /// Encodes this packet into `dst`.
+    ///
+    /// On error nothing is appended to `dst`: any bytes written before the
+    /// failure was detected are removed.
     pub fn encode(&self, dst: &mut BytesMut, ver: MqttVersion) -> Result<()> {
+        let start = dst.len();
+        let res = self.encode_inner(dst, ver);
+        if res.is_err() {
+            dst.truncate(start);
+        }
+        res
+    }
+
+    fn encode_inner(&self, dst: &mut BytesMut, ver: MqttVersion) -> Result<()> {
         use Packet::*;
         match self {
             Connect(conn) => {
@@ -299,7 +311,10 @@ impl Packet {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{MQTT_VERSION_3_1_1, MQTT_VERSION_5};
+    use crate::{
+        QoS, String,
+        types::{MQTT_VERSION_3_1_1, MQTT_VERSION_5},
+    };
 
     fn v311() -> MqttVersion {
         MqttVersion::from(MQTT_VERSION_3_1_1)
@@ -432,5 +447,35 @@ mod tests {
     #[test]
     fn test_round_trip_pingresp_v5() {
         round_trip(Packet::PingResp, v5());
+    }
+
+    // ---- all-or-nothing encode ----
+
+    #[test]
+    fn test_encode_error_leaves_dst_untouched_string_too_long() {
+        let topic: String = core::iter::repeat_n('x', 70_000).collect();
+        let pkt = Packet::Publish(Publish::new(topic, Bytes::new()));
+        let mut dst = BytesMut::from(&b"existing"[..]);
+        assert_eq!(pkt.encode(&mut dst, v5()), Err(Error::StringTooLong));
+        assert_eq!(&dst[..], b"existing");
+    }
+
+    #[test]
+    fn test_encode_error_leaves_dst_untouched_varlen_overflow() {
+        let payload = Bytes::from(alloc::vec![0u8; varlen::MAX_VARLEN as usize + 1]);
+        let pkt = Packet::Publish(Publish::new("t", payload));
+        let mut dst = BytesMut::from(&b"existing"[..]);
+        assert_eq!(pkt.encode(&mut dst, v5()), Err(Error::VarLenOverflow));
+        assert_eq!(&dst[..], b"existing");
+    }
+
+    #[test]
+    fn test_encode_error_leaves_dst_untouched_missing_packet_id() {
+        let mut p = Publish::new("t", Bytes::new());
+        p.qos = QoS::QoS1; // packet_id is None
+        let pkt = Packet::Publish(p);
+        let mut dst = BytesMut::from(&b"existing"[..]);
+        assert_eq!(pkt.encode(&mut dst, v5()), Err(Error::MalformedPacket));
+        assert_eq!(&dst[..], b"existing");
     }
 }

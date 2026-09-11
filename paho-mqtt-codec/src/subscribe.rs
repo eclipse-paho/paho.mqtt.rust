@@ -136,7 +136,7 @@ impl Subscribe {
         dst.put_u16(self.packet_id);
         self.properties.encode(dst, ver)?;
         for sub in &self.subscriptions {
-            put_utf8(&sub.topic_filter, dst);
+            put_utf8(&sub.topic_filter, dst)?;
             dst.put_u8(sub.options_byte(ver));
         }
         Ok(())

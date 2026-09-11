@@ -43,6 +43,12 @@ pub enum Error {
     /// A packet field contained an invalid or reserved value.
     #[error("malformed packet")]
     MalformedPacket,
+    /// A UTF-8 string field exceeded the 65,535-byte wire limit.
+    #[error("UTF-8 string exceeds 65,535 bytes")]
+    StringTooLong,
+    /// A binary data field exceeded the 65,535-byte wire limit.
+    #[error("binary data exceeds 65,535 bytes")]
+    BinaryTooLong,
 }
 
 /// The result type for codec operations.

@@ -70,7 +70,7 @@ impl Unsubscribe {
         dst.put_u16(self.packet_id);
         self.properties.encode(dst, ver)?;
         for filter in &self.topic_filters {
-            put_utf8(filter, dst);
+            put_utf8(filter, dst)?;
         }
         Ok(())
     }

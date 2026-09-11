@@ -84,7 +84,7 @@ impl Publish {
     /// Returns [`Error::MalformedPacket`] if `qos > 0` but `packet_id` is `None`.
     pub fn encode<B: BufMut>(&self, dst: &mut B, ver: MqttVersion) -> Result<()> {
         // Topic
-        put_utf8(&self.topic, dst);
+        put_utf8(&self.topic, dst)?;
         // Packet ID (QoS 1 and 2 only)
         if self.qos != QoS::QoS0 {
             let id = self.packet_id.ok_or(Error::MalformedPacket)?;
@@ -467,6 +467,23 @@ mod tests {
         };
         let mut dst = BytesMut::new();
         assert_eq!(pub_.encode(&mut dst, v311()), Err(Error::MalformedPacket));
+    }
+
+    #[test]
+    fn test_publish_encode_topic_too_long() {
+        let topic: String = core::iter::repeat_n('x', 65_536).collect();
+        let p = Publish::new(topic, Bytes::new());
+        let mut dst = BytesMut::new();
+        assert_eq!(p.encode(&mut dst, v5()), Err(Error::StringTooLong));
+    }
+
+    #[test]
+    fn test_publish_encode_topic_at_limit_ok() {
+        let topic: String = core::iter::repeat_n('x', 65_535).collect();
+        let p = Publish::new(topic, Bytes::new());
+        let mut dst = BytesMut::new();
+        assert!(p.encode(&mut dst, v5()).is_ok());
+        assert_eq!(&dst[..2], &[0xFF, 0xFF]);
     }
 
     #[test]
