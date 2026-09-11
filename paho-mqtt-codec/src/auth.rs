@@ -85,7 +85,13 @@ impl Auth {
             return Ok(Auth::default());
         }
         let reason_code = ReasonCode::from(payload.get_u8());
-        let properties = Properties::decode(&mut payload, MqttVersion::V5)?;
+        // Property length is omitted when the remaining length < 2.
+        let properties = if payload.is_empty() {
+            Properties::new()
+        }
+        else {
+            Properties::decode(&mut payload, MqttVersion::V5)?
+        };
         Ok(Self {
             reason_code,
             properties,
@@ -110,6 +116,15 @@ mod tests {
         assert_eq!(dst.len(), a.encoded_size());
         let decoded = Auth::decode(dst.freeze()).unwrap();
         assert_eq!(decoded, a);
+    }
+
+    #[test]
+    fn test_auth_decode_reason_code_no_props() {
+        // Remaining length 1: reason code only, no property length.
+        let payload = Bytes::from_static(&[0x18]);
+        let a = Auth::decode(payload).unwrap();
+        assert_eq!(a.reason_code, ReasonCode::ContinueAuthentication);
+        assert!(a.properties.is_empty());
     }
 
     // ---- shorthand (Success + no props) ----

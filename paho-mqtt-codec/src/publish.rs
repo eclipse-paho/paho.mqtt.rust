@@ -223,7 +223,13 @@ impl PubAck {
                 }
                 else {
                     let rc = ReasonCode::from(payload.get_u8());
-                    let props = Properties::decode(&mut payload, ver)?;
+                    // Property length is omitted when the remaining length < 4.
+                    let props = if payload.is_empty() {
+                        Properties::new()
+                    }
+                    else {
+                        Properties::decode(&mut payload, ver)?
+                    };
                     (rc, props)
                 }
             }
@@ -577,6 +583,16 @@ mod tests {
         let ack = PubAck::decode(payload, v5()).unwrap();
         assert_eq!(ack.packet_id, 5);
         assert_eq!(ack.reason_code, ReasonCode::Success);
+        assert!(ack.properties.is_empty());
+    }
+
+    #[test]
+    fn test_puback_v5_decode_reason_code_no_props() {
+        // Remaining length 3: packet ID + reason code, no property length.
+        let payload = Bytes::from_static(&[0x00, 0x05, 0x10]);
+        let ack = PubAck::decode(payload, v5()).unwrap();
+        assert_eq!(ack.packet_id, 5);
+        assert_eq!(ack.reason_code, ReasonCode::NoMatchingSubscribers);
         assert!(ack.properties.is_empty());
     }
 

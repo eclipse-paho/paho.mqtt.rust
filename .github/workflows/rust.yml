@@ -180,6 +180,15 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+          targets: riscv32imac-unknown-none-elf
+
+      # A bare-metal target has no std at all, so this catches any
+      # dependency that pulls std in through default features.
+      - name: Codec build (bare-metal no_std target)
+        run: cargo build -p paho-mqtt-codec --no-default-features --target riscv32imac-unknown-none-elf
+
+      - name: Codec build (bare-metal no_std target + serde)
+        run: cargo build -p paho-mqtt-codec --no-default-features --features serde --target riscv32imac-unknown-none-elf
 
       - name: Codec tests (no_std)
         run: cargo test -p paho-mqtt-codec --no-default-features --no-fail-fast

@@ -100,7 +100,13 @@ impl Disconnect {
         }
 
         let reason_code = ReasonCode::from(payload.get_u8());
-        let properties = Properties::decode(&mut payload, ver)?;
+        // Property length is omitted when the remaining length < 2.
+        let properties = if payload.is_empty() {
+            Properties::new()
+        }
+        else {
+            Properties::decode(&mut payload, ver)?
+        };
 
         Ok(Disconnect {
             reason_code,
@@ -132,6 +138,15 @@ mod tests {
         d.encode(&mut dst, ver).unwrap();
         let decoded = Disconnect::decode(dst.freeze(), ver).unwrap();
         assert_eq!(decoded, d);
+    }
+
+    #[test]
+    fn test_disconnect_v5_decode_reason_code_no_props() {
+        // Remaining length 1: reason code only, no property length.
+        let payload = Bytes::from_static(&[0x8E]);
+        let d = Disconnect::decode(payload, v5()).unwrap();
+        assert_eq!(d.reason_code, ReasonCode::SessionTakenOver);
+        assert!(d.properties.is_empty());
     }
 
     // ---- v3.1.1 ----

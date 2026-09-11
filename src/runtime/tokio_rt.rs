@@ -244,8 +244,6 @@ struct Session {
     /// QoS 1/2 publish commands deferred because the in-flight limit was
     /// reached.  Drained one-for-one as PUBACK/PUBCOMP ACKs arrive.
     inflight_deferred: VecDeque<Command>,
-    /// Set when the broker sends a DISCONNECT packet; suppresses ConnectionLost.
-    broker_disconnected: bool,
     /// Set by `send()` to indicate a packet was written since the last
     /// keep-alive timer reset. Checked in `run()` to reset the deadline.
     sent_packet: bool,
@@ -276,7 +274,6 @@ impl Session {
             persist,
             max_inflight,
             inflight_deferred: VecDeque::new(),
-            broker_disconnected: false,
             sent_packet: false,
         }
     }
@@ -641,8 +638,9 @@ impl Session {
             }
 
             // ---- Broker-initiated disconnect (v5) ----
+            // As in the C library, this also fires ConnectionLost and
+            // triggers auto-reconnect once the session loop unwinds.
             Packet::Disconnect(disc) => {
-                self.broker_disconnected = true;
                 let _ = self
                     .event_tx
                     .send(Event::Disconnected {
@@ -1235,19 +1233,12 @@ pub(crate) async fn run_event_loop(
         }
 
         let first_result = session.run(&mut reader, &cmd_rx).await;
-        let broker_disc = session.broker_disconnected;
         if let Some(p) = &session.persist {
             let _ = p.lock().unwrap().close();
         }
 
         match first_result {
             Ok(()) => continue 'outer, // clean disconnect
-            Err(_) if broker_disc => {
-                // Broker sent DISCONNECT: Disconnected event already emitted;
-                // do not fire ConnectionLost and do not auto-reconnect.
-                job.connected_flag.store(false, Ordering::SeqCst);
-                continue 'outer;
-            }
             Err(e) => {
                 job.connected_flag.store(false, Ordering::SeqCst);
                 let _ = event_tx.send(Event::ConnectionLost(e)).await;
@@ -1331,18 +1322,12 @@ pub(crate) async fn run_event_loop(
                     }
 
                     let result = session.run(&mut reader, &cmd_rx).await;
-                    let broker_disc = session.broker_disconnected;
                     if let Some(p) = &session.persist {
                         let _ = p.lock().unwrap().close();
                     }
 
                     match result {
                         Ok(()) => break 'retry, // clean disconnect
-                        Err(_) if broker_disc => {
-                            // Broker sent DISCONNECT: Disconnected event already emitted.
-                            job.connected_flag.store(false, Ordering::SeqCst);
-                            break 'retry;
-                        }
                         Err(e) => {
                             job.connected_flag.store(false, Ordering::SeqCst);
                             let _ = event_tx.send(Event::ConnectionLost(e)).await;
