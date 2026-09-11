@@ -24,7 +24,7 @@
 //! internal [`Session`] event loop.  Transport types live in
 //! [`super::tokio_conn`].
 
-#[cfg(feature = "openssl")]
+#[cfg(all(feature = "openssl", not(feature = "tls")))]
 use std::pin::Pin;
 use std::{
     collections::{HashMap, VecDeque},
@@ -52,7 +52,7 @@ use tokio_rustls::TlsConnector;
 
 #[cfg(unix)]
 use super::tokio_conn::UnixConnection;
-#[cfg(feature = "openssl")]
+#[cfg(all(feature = "openssl", not(feature = "tls")))]
 use super::tokio_conn::{OpenSslConnection, make_openssl_config};
 #[cfg(feature = "tls")]
 use super::tokio_conn::{TlsConnection, make_tls_config};
@@ -129,18 +129,18 @@ pub(crate) fn resolve_runtime(
 /// the existing runtime is returned unchanged.
 fn get_or_create_shared_runtime(num_threads: usize) -> Arc<tokio::runtime::Runtime> {
     let mut guard = SHARED_RT.lock().unwrap();
-    if let Some(weak) = guard.as_ref() {
-        if let Some(rt) = weak.upgrade() {
-            let existing = rt.metrics().num_workers();
-            let requested = num_threads.max(1);
-            if requested != existing {
-                warn!(
-                    "Ignoring num_threads={} — shared runtime already has {} worker(s)",
-                    num_threads, existing
-                );
-            }
-            return rt;
+    if let Some(weak) = guard.as_ref()
+        && let Some(rt) = weak.upgrade()
+    {
+        let existing = rt.metrics().num_workers();
+        let requested = num_threads.max(1);
+        if requested != existing {
+            warn!(
+                "Ignoring num_threads={} — shared runtime already has {} worker(s)",
+                num_threads, existing
+            );
         }
+        return rt;
     }
     let rt = Arc::new(build_runtime(num_threads));
     *guard = Some(Arc::downgrade(&rt));

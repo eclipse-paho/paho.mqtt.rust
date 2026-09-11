@@ -1510,13 +1510,13 @@ mod tests {
             Err(Error::TlsNotSupported)
         ));
         // Without the websocket feature ws:// maps to plain TCP.
-        #[cfg(not(feature = "websocket"))]
+        #[cfg(not(any(feature = "websocket", feature = "smol-websocket")))]
         assert!(matches!(
             parse_server_uri("ws://localhost:8080/mqtt").unwrap(),
             ServerAddr::Tcp { host, port } if host == "localhost" && port == 8080
         ));
         // With the websocket feature ws:// maps to a WebSocket address.
-        #[cfg(feature = "websocket")]
+        #[cfg(any(feature = "websocket", feature = "smol-websocket"))]
         assert!(matches!(
             parse_server_uri("ws://localhost:8080/mqtt").unwrap(),
             ServerAddr::Ws { ref host, port, ref path }

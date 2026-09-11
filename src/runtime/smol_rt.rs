@@ -348,12 +348,12 @@ impl Session {
                     }
                 }
             }
-            else if key.starts_with('r') {
-                if let Packet::Publish(pub_pkt) = pkt {
-                    let id = pub_pkt.packet_id.unwrap_or(0);
-                    let msg = Message::from(pub_pkt);
-                    self.pending_pub2_in.insert(id, msg);
-                }
+            else if key.starts_with('r')
+                && let Packet::Publish(pub_pkt) = pkt
+            {
+                let id = pub_pkt.packet_id.unwrap_or(0);
+                let msg = Message::from(pub_pkt);
+                self.pending_pub2_in.insert(id, msg);
             }
         }
 

@@ -31,7 +31,7 @@ use std::{
     task::{Context, Poll},
 };
 
-#[cfg(feature = "openssl")]
+#[cfg(all(feature = "openssl", not(feature = "tls")))]
 use openssl::ssl::{
     SslConnector, SslFiletype, SslMethod, SslVerifyMode, SslVersion as OpenSslProtoVersion,
 };
@@ -157,19 +157,19 @@ type TlsResult<T> = std::result::Result<T, rustls::Error>;
 /////////////////////////////////////////////////////////////////////////////
 
 /// An OpenSSL TLS transport (requires the `openssl` feature).
-#[cfg(feature = "openssl")]
+#[cfg(all(feature = "openssl", not(feature = "tls")))]
 pub(crate) struct OpenSslConnection {
     stream: tokio_openssl::SslStream<TcpStream>,
 }
 
-#[cfg(feature = "openssl")]
+#[cfg(all(feature = "openssl", not(feature = "tls")))]
 impl OpenSslConnection {
     pub(super) fn new(stream: tokio_openssl::SslStream<TcpStream>) -> Self {
         Self { stream }
     }
 }
 
-#[cfg(feature = "openssl")]
+#[cfg(all(feature = "openssl", not(feature = "tls")))]
 impl_connection!(OpenSslConnection);
 
 /////////////////////////////////////////////////////////////////////////////
@@ -242,7 +242,7 @@ impl rustls::client::danger::ServerCertVerifier for NoCertVerifier {
 fn filter_cipher_suites(spec: &str) -> Result<Vec<rustls::SupportedCipherSuite>> {
     let provider = rustls::crypto::ring::default_provider();
     let requested: std::collections::HashSet<String> = spec
-        .split(|c: char| c == ':' || c == ',')
+        .split([':', ','])
         .map(|s| s.trim().to_ascii_uppercase())
         .filter(|s| !s.is_empty())
         .collect();
@@ -323,12 +323,12 @@ pub(super) fn make_tls_config(
     if !tls.ca_path.as_os_str().is_empty() {
         for entry in std::fs::read_dir(&tls.ca_path).map_err(Error::Io)? {
             let path = entry.map_err(Error::Io)?.path();
-            if path.is_file() {
-                if let Ok(f) = std::fs::File::open(&path) {
-                    let mut r = BufReader::new(f);
-                    for cert in rustls_pemfile::certs(&mut r).flatten() {
-                        let _ = root_store.add(cert);
-                    }
+            if path.is_file()
+                && let Ok(f) = std::fs::File::open(&path)
+            {
+                let mut r = BufReader::new(f);
+                for cert in rustls_pemfile::certs(&mut r).flatten() {
+                    let _ = root_store.add(cert);
                 }
             }
         }
@@ -417,7 +417,7 @@ pub(super) fn make_tls_config(
 /// * `enabled_cipher_suites` — OpenSSL cipher list string (TLS 1.2 and below).
 /// * `protos` — ALPN protocol list.
 /// * `disable_default_trust_store` — when `true`, skips loading system CA.
-#[cfg(feature = "openssl")]
+#[cfg(all(feature = "openssl", not(feature = "tls")))]
 pub(super) fn make_openssl_config(
     tls: &crate::TlsOptions,
 ) -> Result<openssl::ssl::SslConnector> {
@@ -450,12 +450,11 @@ pub(super) fn make_openssl_config(
     if !tls.ca_path.as_os_str().is_empty() {
         for entry in std::fs::read_dir(&tls.ca_path).map_err(Error::Io)? {
             let path = entry.map_err(Error::Io)?.path();
-            if path.is_file() {
-                if let Ok(pem) = std::fs::read(&path) {
-                    if let Ok(cert) = openssl::x509::X509::from_pem(&pem) {
-                        let _ = builder.cert_store_mut().add_cert(cert);
-                    }
-                }
+            if path.is_file()
+                && let Ok(pem) = std::fs::read(&path)
+                && let Ok(cert) = openssl::x509::X509::from_pem(&pem)
+            {
+                let _ = builder.cert_store_mut().add_cert(cert);
             }
         }
     }

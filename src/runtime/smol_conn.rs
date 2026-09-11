@@ -33,14 +33,14 @@ use std::{
     task::{Context, Poll},
 };
 
-#[cfg(feature = "smol-tls")]
-use std::sync::Arc as StdArc;
 #[cfg(unix)]
 use smol::net::unix::UnixStream;
 use smol::{
     io::{AsyncRead, AsyncWrite},
     net::TcpStream,
 };
+#[cfg(feature = "smol-tls")]
+use std::sync::Arc as StdArc;
 
 use super::connection::Connection;
 #[cfg(any(feature = "smol-tls", feature = "smol-websocket"))]
@@ -415,7 +415,7 @@ impl rustls::client::danger::ServerCertVerifier for NoCertVerifier {
 fn filter_cipher_suites(spec: &str) -> Result<Vec<rustls::SupportedCipherSuite>> {
     let provider = rustls::crypto::ring::default_provider();
     let requested: std::collections::HashSet<String> = spec
-        .split(|c: char| c == ':' || c == ',')
+        .split([':', ','])
         .map(|s| s.trim().to_ascii_uppercase())
         .filter(|s| !s.is_empty())
         .collect();
@@ -444,7 +444,9 @@ fn filter_cipher_suites(spec: &str) -> Result<Vec<rustls::SupportedCipherSuite>>
 /// Identical logic to the tokio backend's `make_tls_config`; only the
 /// async wrapper crate differs (`futures-rustls` vs `tokio-rustls`).
 #[cfg(feature = "smol-tls")]
-pub(super) fn make_tls_config(tls: &crate::TlsOptions) -> Result<StdArc<rustls::ClientConfig>> {
+pub(super) fn make_tls_config(
+    tls: &crate::TlsOptions,
+) -> Result<StdArc<rustls::ClientConfig>> {
     use crate::TlsVersion;
     use rustls::RootCertStore;
     use std::io::BufReader;
@@ -478,12 +480,12 @@ pub(super) fn make_tls_config(tls: &crate::TlsOptions) -> Result<StdArc<rustls::
     if !tls.ca_path.as_os_str().is_empty() {
         for entry in std::fs::read_dir(&tls.ca_path).map_err(Error::Io)? {
             let path = entry.map_err(Error::Io)?.path();
-            if path.is_file() {
-                if let Ok(f) = std::fs::File::open(&path) {
-                    let mut r = BufReader::new(f);
-                    for cert in rustls_pemfile::certs(&mut r).flatten() {
-                        let _ = root_store.add(cert);
-                    }
+            if path.is_file()
+                && let Ok(f) = std::fs::File::open(&path)
+            {
+                let mut r = BufReader::new(f);
+                for cert in rustls_pemfile::certs(&mut r).flatten() {
+                    let _ = root_store.add(cert);
                 }
             }
         }

@@ -2,13 +2,13 @@ name: Paho MQTT Rust
 
 on:
   push:
-    branches: [ "master", "develop" ]
+    branches: [ "master", "develop", "v2" ]
   pull_request:
-    branches: [ "master", "develop" ]
+    branches: [ "master", "develop", "v2" ]
 
 env:
   CARGO_TERM_COLOR: always
-  MSRV: "1.75.0"
+  MSRV: "1.89.0"
 
 jobs:
   fmt:
@@ -16,10 +16,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: actions-rs/toolchain@v1
+      - uses: dtolnay/rust-toolchain@nightly
         with:
-          toolchain: nightly
-          override: true
           components: rustfmt
       - run: cargo fmt --all --check
 
@@ -35,44 +33,70 @@ jobs:
           - macos-latest
         rust:
           - stable
-          - "1.75.0"  # MSRV — keep in sync with env.MSRV
+          - "1.89.0"  # MSRV — keep in sync with env.MSRV
+        features:
+          - tokio
+          - tokio,tls,websocket,serde
+          - smol,smol-tls,smol-websocket,serde
         include:
-          - os: windows-latest
-            features: bundled,vendored-ssl
+          # OpenSSL backend is tokio-only; system OpenSSL on Linux,
+          # vendored build elsewhere.
           - os: ubuntu-latest
-            features: bundled,ssl
+            rust: stable
+            features: openssl,websocket
+          - os: windows-latest
+            rust: stable
+            features: openssl-vendored,websocket
           - os: macos-latest
-            features: bundled,ssl
+            rust: stable
+            features: openssl-vendored,websocket
     steps:
       - uses: actions/checkout@v6
-      - uses: actions-rs/toolchain@v1
+      - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ matrix.rust }}
-          override: true
 
       - uses: ./.github/actions/msrv-resolve
+        if: matrix.rust != 'stable'
 
       - name: Build check
-        run: cargo check --no-default-features --features ${{ matrix.features }} --all-targets
+        run: cargo check --workspace --no-default-features --features ${{ matrix.features }} --all-targets
 
   clippy:
     name: Rust Clippy
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        features:
+          - tokio
+          - tokio,tls,websocket,serde
+          - openssl,websocket
+          - smol,smol-tls,smol-websocket,serde
     steps:
       - uses: actions/checkout@v6
-      - uses: actions-rs/toolchain@v1
+      - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.MSRV }}
-          override: true
           components: clippy
 
       - uses: ./.github/actions/msrv-resolve
 
       - name: Clippy lints
-        run: cargo +${{ env.MSRV }} clippy --no-deps --all-targets -- -D warnings
+        run: cargo clippy --workspace --no-deps --all-targets --no-default-features --features ${{ matrix.features }} -- -D warnings
+
+  docs:
+    name: Rust Docs
+    runs-on: ubuntu-latest
+    env:
+      RUSTDOCFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo doc --workspace --no-deps --all-features
 
   test:
-    name: Rust Tests
+    name: Rust Unit Tests
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -83,23 +107,85 @@ jobs:
           - macos-latest
         rust:
           - stable
-          - "1.75.0"  # MSRV — keep in sync with env.MSRV
-        include:
-          - os: windows-latest
-            features: bundled,vendored-ssl
-          - os: ubuntu-latest
-            features: bundled,ssl
-          - os: macos-latest
-            features: bundled,ssl
+          - "1.89.0"  # MSRV — keep in sync with env.MSRV
+        features:
+          - tokio,tls,websocket,serde
+          - smol,smol-tls,smol-websocket,serde
     steps:
       - uses: actions/checkout@v6
-      - uses: actions-rs/toolchain@v1
+      - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ matrix.rust }}
-          override: true
 
       - uses: ./.github/actions/msrv-resolve
+        if: matrix.rust != 'stable'
 
-      - name: Run tests
-        run: cargo test --no-default-features --features ${{ matrix.features }} --no-fail-fast
+      - name: Unit tests
+        run: cargo test --workspace --lib --no-default-features --features ${{ matrix.features }} --no-fail-fast
 
+      - name: Doc tests
+        run: cargo test --workspace --doc --no-default-features --features ${{ matrix.features }} --no-fail-fast
+
+  integration:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        features:
+          - tokio,websocket
+          - smol,smol-websocket
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Mosquitto
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mosquitto
+
+      - name: Start Mosquitto
+        run: |
+          cat > mosquitto-ci.conf <<'EOF'
+          allow_anonymous true
+
+          listener 1883
+
+          listener 0 /tmp/mosquitto.sock
+
+          listener 9001
+          protocol websockets
+          EOF
+          mosquitto -c mosquitto-ci.conf -v > mosquitto.log 2>&1 &
+          for i in $(seq 1 20); do
+            if grep -q "mosquitto version .* running" mosquitto.log; then
+              break
+            fi
+            sleep 0.5
+          done
+          cat mosquitto.log
+
+      - name: Integration tests
+        run: cargo test --test integration --no-default-features --features ${{ matrix.features }} --no-fail-fast
+
+      - name: Mosquitto log
+        if: failure()
+        run: cat mosquitto.log
+
+  codec-no-std:
+    name: Codec no_std Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Codec tests (no_std)
+        run: cargo test -p paho-mqtt-codec --no-default-features --no-fail-fast
+
+      - name: Codec tests (no_std + serde)
+        run: cargo test -p paho-mqtt-codec --no-default-features --features serde --no-fail-fast
+
+      - name: Codec clippy (no_std)
+        run: cargo clippy -p paho-mqtt-codec --no-deps --all-targets --no-default-features -- -D warnings

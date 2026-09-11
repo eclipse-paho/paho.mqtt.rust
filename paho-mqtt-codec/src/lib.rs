@@ -48,42 +48,30 @@ pub type String = std::string::String;
 #[cfg(not(feature = "std"))]
 pub type String = alloc::string::String;
 
-/// Codec error and result types.
 pub mod error;
 
-/// Variable-byte integer encoding and decoding.
 pub mod varlen;
 
 pub(crate) mod wire;
 
-/// MQTT v5 properties.
 pub mod properties;
 
-/// MQTT packet framing and typed packet representation.
 pub mod packet;
 
-/// MQTT support types: [`QoS`], [`MqttVersion`], and related constants.
 pub mod types;
 
-/// MQTT v5 reason codes.
 pub mod reason_code;
 
-/// CONNECT and CONNACK packets.
 pub mod connect;
 
-/// PUBLISH packet and its acknowledgements.
 pub mod publish;
 
-/// SUBSCRIBE and SUBACK packets.
 pub mod subscribe;
 
-/// UNSUBSCRIBE and UNSUBACK packets.
 pub mod unsubscribe;
 
-/// DISCONNECT packet.
 pub mod disconnect;
 
-/// AUTH packet (MQTT v5 only).
 pub mod auth;
 
 pub use auth::Auth;

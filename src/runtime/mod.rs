@@ -41,6 +41,9 @@ pub(crate) mod tokio_conn;
 pub(crate) mod tokio_rt;
 
 #[cfg(all(feature = "smol", not(feature = "tokio")))]
+pub(crate) mod smol_conn;
+
+#[cfg(all(feature = "smol", not(feature = "tokio")))]
 pub(crate) mod smol_rt;
 
 #[cfg(any(feature = "tokio", feature = "smol"))]
