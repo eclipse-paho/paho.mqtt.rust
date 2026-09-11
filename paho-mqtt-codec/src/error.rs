@@ -49,6 +49,9 @@ pub enum Error {
     /// A binary data field exceeded the 65,535-byte wire limit.
     #[error("binary data exceeds 65,535 bytes")]
     BinaryTooLong,
+    /// An incoming packet's declared size exceeded the configured maximum.
+    #[error("packet exceeds maximum packet size")]
+    PacketTooLarge,
 }
 
 /// The result type for codec operations.

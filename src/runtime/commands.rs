@@ -31,7 +31,10 @@ use std::{
 };
 
 use bytes::Bytes;
-use paho_mqtt_codec::{MqttVersion, Properties as CodecProperties, QoS, ReasonCode, Will};
+use paho_mqtt_codec::{
+    MqttVersion, Properties as CodecProperties, PropertyId, PropertyValue, QoS, ReasonCode,
+    Will, packet::MAX_PACKET_SIZE,
+};
 
 use crate::{
     ClientPersistence, ConnectResponse, Error, Message, PublishResponse, SubscribeOptions,
@@ -166,6 +169,19 @@ impl ConnectParams {
     pub fn keep_alive_duration(&self) -> Duration {
         Duration::from_secs(self.keep_alive_secs as u64)
     }
+
+    /// Largest inbound packet the client will accept, in bytes.
+    ///
+    /// This is the v5 `MaximumPacketSize` CONNECT property when the caller
+    /// set one; otherwise the protocol maximum. The broker is required not to
+    /// exceed an advertised limit, so anything larger is rejected at the
+    /// framing layer before its body is buffered.
+    pub fn max_packet_size(&self) -> u32 {
+        match self.props.get(PropertyId::MaximumPacketSize) {
+            Some(PropertyValue::U32(n)) if *n > 0 => *n,
+            _ => MAX_PACKET_SIZE,
+        }
+    }
 }
 
 /////////////////////////////////////////////////////////////////////////////
@@ -256,4 +272,65 @@ pub(crate) enum Event {
     /// A TLS error occurred during connection setup (only when the `tls`
     /// feature is enabled and TLS is configured).
     TlsError(String),
+}
+
+/////////////////////////////////////////////////////////////////////////////
+//                              Unit Tests
+/////////////////////////////////////////////////////////////////////////////
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use paho_mqtt_codec::Property;
+
+    fn params_with(props: CodecProperties) -> ConnectParams {
+        ConnectParams {
+            servers: Vec::new(),
+            client_id: String::new(),
+            clean_start: true,
+            keep_alive_secs: 0,
+            user_name: None,
+            password: None,
+            will: None,
+            ver: MqttVersion::V5,
+            props,
+            #[cfg(any(feature = "tls", feature = "openssl", feature = "smol-tls"))]
+            tls: None,
+            #[cfg(any(feature = "websocket", feature = "smol-websocket"))]
+            http_headers: HashMap::new(),
+            auto_reconnect: false,
+            min_retry_interval: Duration::ZERO,
+            max_retry_interval: Duration::ZERO,
+            max_inflight: 0,
+        }
+    }
+
+    #[test]
+    fn test_max_packet_size_defaults_to_protocol_max() {
+        assert_eq!(
+            params_with(CodecProperties::new()).max_packet_size(),
+            MAX_PACKET_SIZE
+        );
+    }
+
+    #[test]
+    fn test_max_packet_size_from_connect_property() {
+        let mut props = CodecProperties::new();
+        props.push(Property::new(
+            PropertyId::MaximumPacketSize,
+            PropertyValue::U32(4096),
+        ));
+        assert_eq!(params_with(props).max_packet_size(), 4096);
+    }
+
+    #[test]
+    fn test_max_packet_size_zero_property_falls_back() {
+        // 0 is a protocol error on the wire; treat it as "not set".
+        let mut props = CodecProperties::new();
+        props.push(Property::new(
+            PropertyId::MaximumPacketSize,
+            PropertyValue::U32(0),
+        ));
+        assert_eq!(params_with(props).max_packet_size(), MAX_PACKET_SIZE);
+    }
 }

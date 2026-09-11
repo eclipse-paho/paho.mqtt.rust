@@ -54,6 +54,11 @@ const PKT_PINGRESP: u8 = 13;
 const PKT_DISCONNECT: u8 = 14;
 const PKT_AUTH: u8 = 15;
 
+/// Largest total packet size (fixed header + remaining length) representable
+/// on the wire: a 4-byte remaining-length field can encode [`varlen::MAX_VARLEN`]
+/// bytes, plus 1 byte for the packet-type header and 4 for the length itself.
+pub const MAX_PACKET_SIZE: u32 = varlen::MAX_VARLEN + 5;
+
 // ---- fixed header bytes ----
 
 const HDR_CONNECT: u8 = PKT_CONNECT << 4; // 0x10
@@ -76,6 +81,7 @@ const HDR_AUTH: u8 = PKT_AUTH << 4; // 0xF0
 /// The `header` byte carries the packet type (upper 4 bits) and flags
 /// (lower 4 bits). The `payload` contains exactly `remaining_length` bytes
 /// as decoded from the fixed header — no more, no less.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RawPacket {
     /// First fixed-header byte: packet type (bits 7–4) and flags (bits 3–0).
     pub header: u8,
@@ -88,7 +94,26 @@ impl RawPacket {
     ///
     /// Returns `Ok(None)` if `src` does not yet contain a complete packet.
     /// On success the consumed bytes are removed from `src`.
+    ///
+    /// No size limit is applied beyond the protocol maximum; see
+    /// [`decode_max`](Self::decode_max) to enforce a negotiated limit.
     pub fn decode(src: &mut BytesMut) -> Result<Option<Self>> {
+        Self::decode_max(src, MAX_PACKET_SIZE)
+    }
+
+    /// Attempts to decode one complete MQTT packet from `src`, rejecting any
+    /// packet whose total size (fixed header included) exceeds
+    /// `max_packet_size` bytes.
+    ///
+    /// The check is made as soon as the fixed header has been read, so an
+    /// oversize packet is rejected with [`Error::PacketTooLarge`] before its
+    /// body is buffered. This is the value a client advertises in the v5
+    /// CONNECT `MaximumPacketSize` property, and the peer is required not to
+    /// exceed it.
+    ///
+    /// Returns `Ok(None)` if `src` does not yet contain a complete packet.
+    /// On success the consumed bytes are removed from `src`.
+    pub fn decode_max(src: &mut BytesMut, max_packet_size: u32) -> Result<Option<Self>> {
         if src.is_empty() {
             return Ok(None);
         }
@@ -103,6 +128,10 @@ impl RawPacket {
         // Number of bytes consumed by the remaining_length field.
         let varlen_size = src.len() - 1 - peek.len();
         let total = 1 + varlen_size + remaining_len;
+
+        if total > max_packet_size as usize {
+            return Err(Error::PacketTooLarge);
+        }
 
         if src.len() < total {
             return Ok(None);
@@ -373,6 +402,56 @@ mod tests {
         let mut src = BytesMut::from(&[0x30u8, 0x05, 0x01, 0x02, 0x03][..]);
         assert!(RawPacket::decode(&mut src).unwrap().is_none());
         assert_eq!(src.len(), 5); // nothing consumed
+    }
+
+    // ---- RawPacket::decode_max ----
+
+    #[test]
+    fn test_raw_decode_max_rejects_oversize_before_body_arrives() {
+        // Header claims remaining_length = 100 (total 102) but only the
+        // header is present; the limit must be enforced without waiting.
+        let mut src = BytesMut::from(&[0x30u8, 0x64][..]);
+        assert_eq!(
+            RawPacket::decode_max(&mut src, 101),
+            Err(Error::PacketTooLarge)
+        );
+    }
+
+    #[test]
+    fn test_raw_decode_max_limit_is_total_packet_size() {
+        // total = 1 (hdr) + 1 (varlen) + 3 (payload) = 5
+        let bytes = [0x30u8, 0x03, 0x01, 0x02, 0x03];
+        let mut src = BytesMut::from(&bytes[..]);
+        assert_eq!(
+            RawPacket::decode_max(&mut src, 4),
+            Err(Error::PacketTooLarge)
+        );
+        let mut src = BytesMut::from(&bytes[..]);
+        let raw = RawPacket::decode_max(&mut src, 5).unwrap().unwrap();
+        assert_eq!(raw.payload.len(), 3);
+        assert!(src.is_empty());
+    }
+
+    #[test]
+    fn test_raw_decode_max_spec_maximum_header() {
+        // remaining_length = MAX_VARLEN encoded as 0xFF 0xFF 0xFF 0x7F.
+        let hdr = [0x30u8, 0xFF, 0xFF, 0xFF, 0x7F];
+        let mut src = BytesMut::from(&hdr[..]);
+        // At the protocol maximum this is merely incomplete, not rejected.
+        assert!(RawPacket::decode(&mut src).unwrap().is_none());
+        // One byte below the protocol maximum rejects it.
+        let mut src = BytesMut::from(&hdr[..]);
+        assert_eq!(
+            RawPacket::decode_max(&mut src, MAX_PACKET_SIZE - 1),
+            Err(Error::PacketTooLarge)
+        );
+    }
+
+    #[test]
+    fn test_raw_decode_max_does_not_consume_on_error() {
+        let mut src = BytesMut::from(&[0x30u8, 0x64, 0xAA][..]);
+        let _ = RawPacket::decode_max(&mut src, 10);
+        assert_eq!(&src[..], &[0x30, 0x64, 0xAA]);
     }
 
     // ---- Packet::from_raw ----

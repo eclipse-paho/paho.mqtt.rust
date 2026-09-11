@@ -144,6 +144,7 @@ async fn recv_connack(
     reader: &mut (impl AsyncRead + Unpin),
     buf: &mut BytesMut,
     ver: MqttVersion,
+    max_packet_size: u32,
 ) -> Result<ConnAck> {
     let mut tmp = [0u8; 512];
     loop {
@@ -152,7 +153,7 @@ async fn recv_connack(
             return Err(Error::Disconnected);
         }
         buf.extend_from_slice(&tmp[..n]);
-        if let Some(raw) = RawPacket::decode(buf)? {
+        if let Some(raw) = RawPacket::decode_max(buf, max_packet_size)? {
             match Packet::from_raw(raw, ver)? {
                 Packet::ConnAck(ack) => return Ok(ack),
                 _ => return Err(Error::General("expected CONNACK")),
@@ -194,6 +195,8 @@ struct Session {
     persist: Option<Arc<Mutex<Box<dyn ClientPersistence>>>>,
     /// Maximum concurrent outbound QoS 1/2 publishes; 0 means unlimited.
     max_inflight: usize,
+    /// Largest inbound packet accepted by the framing layer, in bytes.
+    max_packet_size: u32,
     /// QoS 1/2 publish commands deferred because the in-flight limit was reached.
     inflight_deferred: VecDeque<Command>,
     /// Set by `send()` to indicate a packet was written since the last
@@ -209,6 +212,7 @@ impl Session {
         event_tx: async_channel::Sender<Event>,
         persist: Option<Arc<Mutex<Box<dyn ClientPersistence>>>>,
         max_inflight: usize,
+        max_packet_size: u32,
     ) -> Self {
         Self {
             writer,
@@ -225,6 +229,7 @@ impl Session {
             ping_outstanding: false,
             persist,
             max_inflight,
+            max_packet_size,
             inflight_deferred: VecDeque::new(),
             sent_packet: false,
         }
@@ -409,7 +414,9 @@ impl Session {
                         return Err(Error::Disconnected);
                     }
                     read_buf.extend_from_slice(&tmp[..n]);
-                    while let Some(raw) = RawPacket::decode(&mut read_buf)? {
+                    while let Some(raw) =
+                        RawPacket::decode_max(&mut read_buf, self.max_packet_size)?
+                    {
                         let packet = Packet::from_raw(raw, self.ver)?;
                         self.handle_packet(packet).await?;
                     }
@@ -452,9 +459,10 @@ impl Session {
                                 DrainEv::Net(Ok(0)) | DrainEv::Net(Err(_)) => break 'drain,
                                 DrainEv::Net(Ok(n)) => {
                                     read_buf.extend_from_slice(&tmp[..n]);
-                                    while let Ok(Some(raw)) =
-                                        RawPacket::decode(&mut read_buf)
-                                    {
+                                    while let Ok(Some(raw)) = RawPacket::decode_max(
+                                        &mut read_buf,
+                                        self.max_packet_size,
+                                    ) {
                                         match Packet::from_raw(raw, self.ver) {
                                             Ok(pkt) => {
                                                 let _ = self.handle_packet(pkt).await;
@@ -877,7 +885,8 @@ async fn do_connect(
     writer.flush().await?;
 
     let mut read_buf = BytesMut::with_capacity(256);
-    let connack = recv_connack(&mut reader, &mut read_buf, p.ver).await?;
+    let connack =
+        recv_connack(&mut reader, &mut read_buf, p.ver, p.max_packet_size()).await?;
 
     Ok((reader, writer, connack))
 }
@@ -1091,6 +1100,7 @@ pub(crate) async fn run_event_loop(
             event_tx.clone(),
             job.persist.clone(),
             job.params.max_inflight,
+            job.params.max_packet_size(),
         );
 
         if buf_cfg.restore_msgs && session.restore().await.is_err() {
@@ -1172,6 +1182,7 @@ pub(crate) async fn run_event_loop(
                         event_tx.clone(),
                         job.persist.clone(),
                         job.params.max_inflight,
+                        job.params.max_packet_size(),
                     );
 
                     if buf_cfg.restore_msgs && session.restore().await.is_err() {
