@@ -222,7 +222,7 @@ impl PubAck {
                     (ReasonCode::Success, Properties::new())
                 }
                 else {
-                    let rc = ReasonCode::from(payload.get_u8());
+                    let rc = ReasonCode::try_from(payload.get_u8())?;
                     // Property length is omitted when the remaining length < 4.
                     let props = if payload.is_empty() {
                         Properties::new()
@@ -657,6 +657,19 @@ mod tests {
         assert_eq!(
             PubAck::decode(Bytes::from_static(&[0x00]), v311()),
             Err(Error::PacketTooShort)
+        );
+    }
+
+    #[test]
+    fn test_puback_v5_decode_unknown_reason_code_errors() {
+        // 0x05 is undefined; must not be reinterpreted as an error code.
+        assert_eq!(
+            PubAck::decode(Bytes::from_static(&[0x00, 0x01, 0x05]), v5()),
+            Err(Error::MalformedPacket)
+        );
+        assert_eq!(
+            PubAck::decode(Bytes::from_static(&[0x00, 0x01, 0xFF, 0x00]), v5()),
+            Err(Error::MalformedPacket)
         );
     }
 }

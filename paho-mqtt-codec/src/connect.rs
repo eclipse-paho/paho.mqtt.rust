@@ -360,7 +360,7 @@ impl ConnAck {
 
         let code_byte = payload.get_u8();
         let reason_code = match ver {
-            MqttVersion::V5 => ReasonCode::from(code_byte),
+            MqttVersion::V5 => ReasonCode::try_from(code_byte)?,
             _ => v311_code_to_reason(code_byte)?,
         };
         let properties = Properties::decode(&mut payload, ver)?;
@@ -620,6 +620,15 @@ mod tests {
         let ack = ConnAck::new(false, ReasonCode::Success);
         // 2 bytes variable header + 1 byte (VBI 0) for empty properties
         assert_eq!(ack.encoded_size(v5()), 3);
+    }
+
+    #[test]
+    fn test_connack_v5_decode_unknown_reason_code_errors() {
+        // flags=0, reason=0x05 (undefined), empty properties
+        assert_eq!(
+            ConnAck::decode(Bytes::from_static(&[0x00, 0x05, 0x00]), v5()),
+            Err(Error::MalformedPacket)
+        );
     }
 
     // ---- full packet encode (with fixed header) ----

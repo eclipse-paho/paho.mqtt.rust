@@ -245,7 +245,11 @@ impl SubAck {
         }
         let packet_id = payload.get_u16();
         let properties = Properties::decode(&mut payload, ver)?;
-        let reason_codes = payload.iter().copied().map(ReasonCode::from).collect();
+        let reason_codes = payload
+            .iter()
+            .copied()
+            .map(ReasonCode::try_from)
+            .collect::<Result<Vec<_>>>()?;
 
         Ok(SubAck {
             packet_id,
@@ -531,6 +535,19 @@ mod tests {
         assert_eq!(
             SubAck::decode(Bytes::from_static(&[0x00]), v311()),
             Err(Error::PacketTooShort)
+        );
+    }
+
+    #[test]
+    fn test_suback_decode_unknown_reason_code_errors() {
+        // Second code (0x03) is undefined in both versions.
+        assert_eq!(
+            SubAck::decode(Bytes::from_static(&[0x00, 0x01, 0x00, 0x03]), v311()),
+            Err(Error::MalformedPacket)
+        );
+        assert_eq!(
+            SubAck::decode(Bytes::from_static(&[0x00, 0x01, 0x00, 0x00, 0x03]), v5()),
+            Err(Error::MalformedPacket)
         );
     }
 

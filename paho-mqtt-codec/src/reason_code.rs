@@ -20,6 +20,7 @@
 
 //! MQTT v5 reason codes.
 
+use crate::error::Error;
 use core::fmt;
 
 /// MQTT v5 single-byte reason codes.
@@ -155,10 +156,16 @@ impl ReasonCode {
     }
 }
 
-impl From<u8> for ReasonCode {
-    fn from(code: u8) -> Self {
+impl TryFrom<u8> for ReasonCode {
+    type Error = Error;
+
+    /// Converts a wire byte into a reason code.
+    ///
+    /// Returns [`Error::MalformedPacket`] for any value not defined by the
+    /// MQTT v5 specification.
+    fn try_from(code: u8) -> Result<Self, Error> {
         use ReasonCode::*;
-        match code {
+        let rc = match code {
             0x00 => Success,
             0x01 => GrantedQos1,
             0x02 => GrantedQos2,
@@ -202,14 +209,9 @@ impl From<u8> for ReasonCode {
             0xA0 => MaximumConnectTime,
             0xA1 => SubscriptionIdentifiersNotSupported,
             0xA2 => WildcardSubscriptionsNotSupported,
-            _ => UnspecifiedError,
-        }
-    }
-}
-
-impl From<u32> for ReasonCode {
-    fn from(code: u32) -> Self {
-        Self::from(code as u8)
+            _ => return Err(Error::MalformedPacket),
+        };
+        Ok(rc)
     }
 }
 
@@ -275,21 +277,54 @@ mod tests {
     use alloc::string::ToString;
 
     #[test]
-    fn test_from_u8() {
-        assert_eq!(ReasonCode::from(0x00_u8), ReasonCode::Success);
+    fn test_try_from_u8_known() {
+        assert_eq!(ReasonCode::try_from(0x00_u8), Ok(ReasonCode::Success));
         assert_eq!(
-            ReasonCode::from(0x04_u8),
-            ReasonCode::DisconnectWithWillMessage
+            ReasonCode::try_from(0x04_u8),
+            Ok(ReasonCode::DisconnectWithWillMessage)
         );
-        assert_eq!(ReasonCode::from(0x80_u8), ReasonCode::UnspecifiedError);
-        assert_eq!(ReasonCode::from(0xA0_u8), ReasonCode::MaximumConnectTime);
-        assert_eq!(ReasonCode::from(0xFF_u8), ReasonCode::UnspecifiedError);
+        assert_eq!(
+            ReasonCode::try_from(0x80_u8),
+            Ok(ReasonCode::UnspecifiedError)
+        );
+        assert_eq!(
+            ReasonCode::try_from(0xA0_u8),
+            Ok(ReasonCode::MaximumConnectTime)
+        );
+        assert_eq!(
+            ReasonCode::try_from(0xA2_u8),
+            Ok(ReasonCode::WildcardSubscriptionsNotSupported)
+        );
     }
 
     #[test]
-    fn test_from_u32() {
-        assert_eq!(ReasonCode::from(0x00_u32), ReasonCode::Success);
-        assert_eq!(ReasonCode::from(0x87_u32), ReasonCode::NotAuthorized);
+    fn test_try_from_u8_unknown_is_err() {
+        // Gaps inside the success range must not be reinterpreted as errors.
+        for b in [0x03_u8, 0x05, 0x0F, 0x12, 0x17, 0x1A, 0x7F] {
+            assert_eq!(
+                ReasonCode::try_from(b),
+                Err(Error::MalformedPacket),
+                "{b:#x}"
+            );
+        }
+        // Undefined values above the last defined code.
+        for b in [0xA3_u8, 0xC0, 0xFF] {
+            assert_eq!(
+                ReasonCode::try_from(b),
+                Err(Error::MalformedPacket),
+                "{b:#x}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_try_from_u8_round_trips_every_variant() {
+        // Every defined code must survive `as u8` -> try_from.
+        for b in 0..=u8::MAX {
+            if let Ok(rc) = ReasonCode::try_from(b) {
+                assert_eq!(rc as u8, b);
+            }
+        }
     }
 
     #[test]

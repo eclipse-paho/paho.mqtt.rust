@@ -157,7 +157,11 @@ impl UnsubAck {
         let packet_id = payload.get_u16();
         let properties = Properties::decode(&mut payload, ver)?;
         let reason_codes = if ver == MqttVersion::V5 {
-            payload.iter().copied().map(ReasonCode::from).collect()
+            payload
+                .iter()
+                .copied()
+                .map(ReasonCode::try_from)
+                .collect::<Result<Vec<_>>>()?
         }
         else {
             Vec::new()
@@ -401,6 +405,14 @@ mod tests {
         assert_eq!(
             UnsubAck::decode(Bytes::from_static(&[0x00]), v311()),
             Err(Error::PacketTooShort)
+        );
+    }
+
+    #[test]
+    fn test_unsuback_v5_decode_unknown_reason_code_errors() {
+        assert_eq!(
+            UnsubAck::decode(Bytes::from_static(&[0x00, 0x01, 0x00, 0x00, 0x12]), v5()),
+            Err(Error::MalformedPacket)
         );
     }
 }

@@ -84,7 +84,7 @@ impl Auth {
         if payload.is_empty() {
             return Ok(Auth::default());
         }
-        let reason_code = ReasonCode::from(payload.get_u8());
+        let reason_code = ReasonCode::try_from(payload.get_u8())?;
         // Property length is omitted when the remaining length < 2.
         let properties = if payload.is_empty() {
             Properties::new()
@@ -106,7 +106,10 @@ impl Auth {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::properties::{Property, PropertyId, PropertyValue};
+    use crate::{
+        Error,
+        properties::{Property, PropertyId, PropertyValue},
+    };
     use alloc::string::ToString;
     use bytes::BytesMut;
 
@@ -125,6 +128,14 @@ mod tests {
         let a = Auth::decode(payload).unwrap();
         assert_eq!(a.reason_code, ReasonCode::ContinueAuthentication);
         assert!(a.properties.is_empty());
+    }
+
+    #[test]
+    fn test_auth_decode_unknown_reason_code_errors() {
+        assert_eq!(
+            Auth::decode(Bytes::from_static(&[0x1A])),
+            Err(Error::MalformedPacket)
+        );
     }
 
     // ---- shorthand (Success + no props) ----

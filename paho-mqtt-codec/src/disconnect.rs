@@ -99,7 +99,7 @@ impl Disconnect {
             return Ok(Disconnect::default());
         }
 
-        let reason_code = ReasonCode::from(payload.get_u8());
+        let reason_code = ReasonCode::try_from(payload.get_u8())?;
         // Property length is omitted when the remaining length < 2.
         let properties = if payload.is_empty() {
             Properties::new()
@@ -122,7 +122,10 @@ impl Disconnect {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{MQTT_VERSION_3_1_1, MQTT_VERSION_5};
+    use crate::{
+        Error,
+        types::{MQTT_VERSION_3_1_1, MQTT_VERSION_5},
+    };
     use bytes::BytesMut;
 
     fn v311() -> MqttVersion {
@@ -147,6 +150,14 @@ mod tests {
         let d = Disconnect::decode(payload, v5()).unwrap();
         assert_eq!(d.reason_code, ReasonCode::SessionTakenOver);
         assert!(d.properties.is_empty());
+    }
+
+    #[test]
+    fn test_disconnect_v5_decode_unknown_reason_code_errors() {
+        assert_eq!(
+            Disconnect::decode(Bytes::from_static(&[0xA3]), v5()),
+            Err(Error::MalformedPacket)
+        );
     }
 
     // ---- v3.1.1 ----
