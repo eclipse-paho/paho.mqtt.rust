@@ -870,6 +870,7 @@ async fn do_connect(
     let (mut reader, mut writer) = split(conn);
 
     let connect_pkt = paho_mqtt_codec::Connect {
+        version: p.ver,
         clean_start: p.clean_start,
         keep_alive: p.keep_alive_secs,
         client_id: p.client_id.clone(),

@@ -188,9 +188,12 @@ pub enum Packet {
 
 impl Packet {
     /// Parses a [`RawPacket`] into a typed [`Packet`] given `ver`.
+    ///
+    /// CONNECT is self-describing and ignores `ver`: its protocol version is
+    /// read from the wire into [`Connect::version`].
     pub fn from_raw(raw: RawPacket, ver: MqttVersion) -> Result<Self> {
         match raw.header >> 4 {
-            PKT_CONNECT => Ok(Packet::Connect(Connect::decode(raw.payload, ver)?)),
+            PKT_CONNECT => Ok(Packet::Connect(Connect::decode(raw.payload)?)),
             PKT_CONNACK => Ok(Packet::ConnAck(ConnAck::decode(raw.payload, ver)?)),
             PKT_PUBLISH => Ok(Packet::Publish(Publish::decode(
                 raw.header & 0x0F,
@@ -230,6 +233,8 @@ impl Packet {
 
     /// Encodes this packet into `dst`.
     ///
+    /// CONNECT ignores `ver` and encodes with [`Connect::version`].
+    ///
     /// On error nothing is appended to `dst`: any bytes written before the
     /// failure was detected are removed.
     pub fn encode(&self, dst: &mut BytesMut, ver: MqttVersion) -> Result<()> {
@@ -245,10 +250,10 @@ impl Packet {
         use Packet::*;
         match self {
             Connect(conn) => {
-                let remaining = conn.encoded_size(ver);
+                let remaining = conn.encoded_size();
                 dst.put_u8(HDR_CONNECT);
                 varlen::encode(remaining as u32, dst)?;
-                conn.encode(dst, ver)?;
+                conn.encode(dst)?;
             }
             ConnAck(ack) => {
                 let remaining = ack.encoded_size(ver);

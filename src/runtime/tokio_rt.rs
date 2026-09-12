@@ -958,6 +958,7 @@ async fn do_connect(
 
     // ---- Build and send CONNECT packet ----
     let connect_pkt = paho_mqtt_codec::Connect {
+        version: p.ver,
         clean_start: p.clean_start,
         keep_alive: p.keep_alive_secs,
         client_id: p.client_id.clone(),

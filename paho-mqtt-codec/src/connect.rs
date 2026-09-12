@@ -21,7 +21,9 @@
 //! MQTT CONNECT and CONNACK packets.
 
 use crate::{
-    Error, MqttVersion, Properties, QoS, ReasonCode, Result, String, varlen,
+    Error, MqttVersion, Properties, QoS, ReasonCode, Result, String,
+    types::{MQTT_VERSION_3_1_1, MQTT_VERSION_5},
+    varlen,
     wire::{binary_wire_size, get_binary, get_utf8, put_binary, put_utf8, utf8_wire_size},
 };
 use bytes::{Buf, BufMut, Bytes, BytesMut};
@@ -67,10 +69,17 @@ impl Will {
 
 /// A CONNECT packet, unified across MQTT v3.1.1 and v5.
 ///
+/// Unlike every other packet, CONNECT declares its own protocol version on
+/// the wire (the protocol-level byte), so it carries a [`version`](Self::version)
+/// field rather than taking one as a parameter. Encoding uses that field;
+/// decoding sets it from the wire.
+///
 /// The `properties` field and `will.properties` are always empty on v3.1.1
 /// connections and are not encoded on the wire for that version.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Connect {
+    /// Protocol version this CONNECT declares.
+    pub version: MqttVersion,
     /// Whether to start a clean session / discard any existing session state.
     pub clean_start: bool,
     /// Keep-alive interval in seconds (0 = disabled).
@@ -88,17 +97,20 @@ pub struct Connect {
 }
 
 impl Connect {
-    /// Creates a minimal `Connect` (no will, no credentials, keep-alive 0).
-    pub fn new(clean_start: bool, client_id: impl Into<String>) -> Self {
+    /// Creates a minimal `Connect` for protocol version `ver` (no will, no
+    /// credentials, keep-alive 0).
+    pub fn new(ver: MqttVersion, clean_start: bool, client_id: impl Into<String>) -> Self {
         Self {
+            version: ver,
             clean_start,
             client_id: client_id.into(),
             ..Self::default()
         }
     }
 
-    /// Returns the number of variable-header + payload bytes for version, `ver`.
-    pub fn encoded_size(&self, ver: MqttVersion) -> usize {
+    /// Returns the number of variable-header + payload bytes.
+    pub fn encoded_size(&self) -> usize {
+        let ver = self.version;
         // Variable header: 2+4 (proto name) + 1 (level) + 1 (flags) + 2 (keep-alive)
         let mut size = 10;
         size += self.properties.encoded_size(ver);
@@ -118,16 +130,15 @@ impl Connect {
         size
     }
 
-    /// Encodes the CONNECT variable header and payload into `dst`.
-    pub fn encode<B: BufMut>(&self, dst: &mut B, ver: MqttVersion) -> Result<()> {
+    /// Encodes the CONNECT variable header and payload into `dst`, using
+    /// the protocol version in [`version`](Self::version).
+    pub fn encode<B: BufMut>(&self, dst: &mut B) -> Result<()> {
+        let ver = self.version;
         // Protocol name
         dst.put_u16(4);
         dst.put_slice(b"MQTT");
         // Protocol level
-        dst.put_u8(match ver {
-            MqttVersion::V5 => 5,
-            _ => 4,
-        });
+        dst.put_u8(ver as u8);
         // Connect flags
         let mut flags: u8 = 0;
         if self.clean_start {
@@ -168,35 +179,36 @@ impl Connect {
         Ok(())
     }
 
-    /// Decodes a CONNECT from the raw `payload` bytes for the given version, `ver`.
-    pub fn decode(mut payload: Bytes, ver: MqttVersion) -> Result<Self> {
+    /// Decodes a CONNECT from the raw `payload` bytes.
+    ///
+    /// The protocol version is read from the packet itself and stored in
+    /// [`version`](Self::version). Returns [`Error::UnsupportedProtocolVersion`]
+    /// for MQTT v3.1 (`MQIsdp`) or an unknown protocol level, so a server can
+    /// reply with the appropriate CONNACK reason code.
+    pub fn decode(mut payload: Bytes) -> Result<Self> {
         // Protocol name
         if payload.remaining() < 2 {
             return Err(Error::PacketTooShort);
         }
         let name_len = payload.get_u16() as usize;
-        if name_len != 4 {
-            return Err(Error::MalformedPacket);
-        }
-        if payload.remaining() < 4 {
+        if payload.remaining() < name_len {
             return Err(Error::PacketTooShort);
         }
-        let name = payload.copy_to_bytes(4);
-        if &name[..] != b"MQTT" {
-            return Err(Error::MalformedPacket);
+        let name = payload.copy_to_bytes(name_len);
+        match &name[..] {
+            b"MQTT" => {}
+            b"MQIsdp" => return Err(Error::UnsupportedProtocolVersion),
+            _ => return Err(Error::MalformedPacket),
         }
         // Protocol level
         if payload.remaining() < 1 {
             return Err(Error::PacketTooShort);
         }
-        let level = payload.get_u8();
-        let expected = match ver {
-            MqttVersion::V5 => 5,
-            _ => 4,
+        let ver = match payload.get_u8() {
+            MQTT_VERSION_3_1_1 => MqttVersion::V3_1_1,
+            MQTT_VERSION_5 => MqttVersion::V5,
+            _ => return Err(Error::UnsupportedProtocolVersion),
         };
-        if level != expected {
-            return Err(Error::MalformedPacket);
-        }
         // Connect flags
         if payload.remaining() < 3 {
             return Err(Error::PacketTooShort);
@@ -251,6 +263,7 @@ impl Connect {
             None
         };
         Ok(Self {
+            version: ver,
             clean_start,
             keep_alive,
             client_id,
@@ -655,10 +668,17 @@ mod tests {
     // Connect tests
     // ======================================================================
 
-    fn round_trip_connect(conn: Connect, ver: MqttVersion) {
+    fn with_ver(conn: Connect, ver: MqttVersion) -> Connect {
+        Connect {
+            version: ver,
+            ..conn
+        }
+    }
+
+    fn round_trip_connect(conn: Connect) {
         let mut dst = BytesMut::new();
-        conn.encode(&mut dst, ver).unwrap();
-        let decoded = Connect::decode(dst.freeze(), ver).unwrap();
+        conn.encode(&mut dst).unwrap();
+        let decoded = Connect::decode(dst.freeze()).unwrap();
         assert_eq!(decoded, conn);
     }
 
@@ -666,9 +686,9 @@ mod tests {
 
     #[test]
     fn test_connect_encode_minimal_v311() {
-        let conn = Connect::new(true, "test-client");
+        let conn = Connect::new(v311(), true, "test-client");
         let mut dst = BytesMut::new();
-        conn.encode(&mut dst, v311()).unwrap();
+        conn.encode(&mut dst).unwrap();
         let bytes = &dst[..];
         // Protocol name: 0x00 0x04 "MQTT"
         assert_eq!(&bytes[0..6], &[0x00, 0x04, b'M', b'Q', b'T', b'T']);
@@ -685,9 +705,9 @@ mod tests {
 
     #[test]
     fn test_connect_encode_minimal_v5_has_properties_byte() {
-        let conn = Connect::new(false, "c");
+        let conn = Connect::new(v5(), false, "c");
         let mut dst = BytesMut::new();
-        conn.encode(&mut dst, v5()).unwrap();
+        conn.encode(&mut dst).unwrap();
         // Protocol level
         assert_eq!(dst[6], 0x05);
         // Properties length = 0x00 immediately after keep-alive (offset 10)
@@ -696,91 +716,91 @@ mod tests {
 
     #[test]
     fn test_connect_round_trip_minimal_v311() {
-        round_trip_connect(Connect::new(true, "test"), v311());
+        round_trip_connect(Connect::new(v311(), true, "test"));
     }
 
     #[test]
     fn test_connect_round_trip_minimal_v5() {
-        round_trip_connect(Connect::new(false, "test"), v5());
+        round_trip_connect(Connect::new(v5(), false, "test"));
     }
 
     #[test]
     fn test_connect_round_trip_empty_client_id() {
-        round_trip_connect(Connect::new(true, ""), v311());
+        round_trip_connect(Connect::new(v311(), true, ""));
     }
 
     // ---- keep-alive ----
 
     #[test]
     fn test_connect_round_trip_keep_alive() {
-        let mut conn = Connect::new(false, "c");
+        let mut conn = Connect::new(v5(), false, "c");
         conn.keep_alive = 60;
-        round_trip_connect(conn.clone(), v311());
-        round_trip_connect(conn, v5());
+        round_trip_connect(with_ver(conn.clone(), v311()));
+        round_trip_connect(with_ver(conn, v5()));
     }
 
     // ---- credentials ----
 
     #[test]
     fn test_connect_round_trip_with_username() {
-        let mut conn = Connect::new(true, "c");
+        let mut conn = Connect::new(v5(), true, "c");
         conn.username = Some("alice".into());
-        round_trip_connect(conn.clone(), v311());
-        round_trip_connect(conn, v5());
+        round_trip_connect(with_ver(conn.clone(), v311()));
+        round_trip_connect(with_ver(conn, v5()));
     }
 
     #[test]
     fn test_connect_round_trip_with_username_and_password() {
-        let mut conn = Connect::new(true, "c");
+        let mut conn = Connect::new(v5(), true, "c");
         conn.username = Some("alice".into());
         conn.password = Some(Bytes::from_static(b"secret"));
-        round_trip_connect(conn.clone(), v311());
-        round_trip_connect(conn, v5());
+        round_trip_connect(with_ver(conn.clone(), v311()));
+        round_trip_connect(with_ver(conn, v5()));
     }
 
     // ---- will ----
 
     #[test]
     fn test_connect_round_trip_with_will_qos0_v311() {
-        let mut conn = Connect::new(true, "c");
+        let mut conn = Connect::new(v311(), true, "c");
         conn.will = Some(Will::new(
             "lwt/topic",
             Bytes::from_static(b"gone"),
             QoS::AtMostOnce,
             false,
         ));
-        round_trip_connect(conn, v311());
+        round_trip_connect(conn);
     }
 
     #[test]
     fn test_connect_round_trip_with_will_qos1_retain_v311() {
-        let mut conn = Connect::new(false, "c");
+        let mut conn = Connect::new(v311(), false, "c");
         conn.will = Some(Will::new(
             "lwt/t",
             Bytes::from_static(b"payload"),
             QoS::AtLeastOnce,
             true,
         ));
-        round_trip_connect(conn, v311());
+        round_trip_connect(conn);
     }
 
     #[test]
     fn test_connect_round_trip_with_will_v5() {
-        let mut conn = Connect::new(true, "c");
+        let mut conn = Connect::new(v5(), true, "c");
         conn.will = Some(Will::new(
             "lwt/t",
             Bytes::from_static(b"msg"),
             QoS::ExactlyOnce,
             false,
         ));
-        round_trip_connect(conn, v5());
+        round_trip_connect(conn);
     }
 
     // ---- full kitchen-sink ----
 
     #[test]
     fn test_connect_round_trip_full_v311() {
-        let mut conn = Connect::new(true, "client-1");
+        let mut conn = Connect::new(v311(), true, "client-1");
         conn.keep_alive = 30;
         conn.username = Some("bob".into());
         conn.password = Some(Bytes::from_static(b"pass"));
@@ -790,12 +810,12 @@ mod tests {
             QoS::AtLeastOnce,
             true,
         ));
-        round_trip_connect(conn, v311());
+        round_trip_connect(conn);
     }
 
     #[test]
     fn test_connect_round_trip_full_v5() {
-        let mut conn = Connect::new(true, "client-1");
+        let mut conn = Connect::new(v5(), true, "client-1");
         conn.keep_alive = 30;
         conn.username = Some("bob".into());
         conn.password = Some(Bytes::from_static(b"pass"));
@@ -805,28 +825,28 @@ mod tests {
             QoS::AtLeastOnce,
             true,
         ));
-        round_trip_connect(conn, v5());
+        round_trip_connect(conn);
     }
 
     // ---- encoded_size ----
 
     #[test]
     fn test_connect_encoded_size_minimal_v311() {
-        let conn = Connect::new(false, "abc");
+        let conn = Connect::new(v311(), false, "abc");
         // 10 (header) + 2+3 (client_id)
-        assert_eq!(conn.encoded_size(v311()), 15);
+        assert_eq!(conn.encoded_size(), 15);
     }
 
     #[test]
     fn test_connect_encoded_size_minimal_v5() {
-        let conn = Connect::new(false, "abc");
+        let conn = Connect::new(v5(), false, "abc");
         // 10 + 1 (empty props VBI) + 2+3 (client_id)
-        assert_eq!(conn.encoded_size(v5()), 16);
+        assert_eq!(conn.encoded_size(), 16);
     }
 
     #[test]
     fn test_encoded_size_matches_encoded_len() {
-        let mut conn = Connect::new(true, "myclient");
+        let mut conn = Connect::new(v5(), true, "myclient");
         conn.keep_alive = 10;
         conn.username = Some("u".into());
         conn.password = Some(Bytes::from_static(b"pw"));
@@ -839,10 +859,10 @@ mod tests {
 
         for ver in [v311(), v5()] {
             let mut dst = BytesMut::new();
-            conn.encode(&mut dst, ver).unwrap();
+            with_ver(conn.clone(), ver).encode(&mut dst).unwrap();
             assert_eq!(
                 dst.len(),
-                conn.encoded_size(ver),
+                with_ver(conn.clone(), ver).encoded_size(),
                 "encoded_size mismatch for {ver:?}"
             );
         }
@@ -853,56 +873,82 @@ mod tests {
     #[test]
     fn test_connect_decode_bad_protocol_name_errors() {
         // Replace "MQTT" with "XQTT"
-        let conn = Connect::new(false, "c");
+        let conn = Connect::new(v311(), false, "c");
         let mut dst = BytesMut::new();
-        conn.encode(&mut dst, v311()).unwrap();
+        conn.encode(&mut dst).unwrap();
         dst[2] = b'X'; // corrupt first byte of protocol name
+        assert_eq!(Connect::decode(dst.freeze()), Err(Error::MalformedPacket));
+    }
+
+    #[test]
+    fn test_connect_decode_discovers_version_from_level_byte() {
+        for ver in [v311(), v5()] {
+            let conn = Connect::new(ver, false, "c");
+            let mut dst = BytesMut::new();
+            conn.encode(&mut dst).unwrap();
+            assert_eq!(dst[6], ver as u8);
+            let decoded = Connect::decode(dst.freeze()).unwrap();
+            assert_eq!(decoded.version, ver);
+        }
+    }
+
+    #[test]
+    fn test_connect_decode_unknown_protocol_level_errors() {
+        let conn = Connect::new(v311(), false, "c");
+        let mut dst = BytesMut::new();
+        conn.encode(&mut dst).unwrap();
+        dst[6] = 0x03; // MQTT v3.1 level with the v3.1.1 protocol name
         assert_eq!(
-            Connect::decode(dst.freeze(), v311()),
-            Err(Error::MalformedPacket)
+            Connect::decode(dst.freeze()),
+            Err(Error::UnsupportedProtocolVersion)
+        );
+        let mut dst = BytesMut::new();
+        conn.encode(&mut dst).unwrap();
+        dst[6] = 0x06;
+        assert_eq!(
+            Connect::decode(dst.freeze()),
+            Err(Error::UnsupportedProtocolVersion)
         );
     }
 
     #[test]
-    fn test_connect_decode_wrong_protocol_level_errors() {
-        let conn = Connect::new(false, "c");
-        let mut dst = BytesMut::new();
-        conn.encode(&mut dst, v311()).unwrap();
-        // Decode as v5 — level 4 doesn't match expected 5
+    fn test_connect_decode_mqisdp_is_unsupported_version() {
+        // MQTT v3.1: protocol name "MQIsdp", level 3.
+        let mut src = BytesMut::new();
+        src.put_u16(6);
+        src.put_slice(b"MQIsdp");
+        src.put_u8(0x03);
+        src.put_u8(0x02);
+        src.put_u16(0);
+        put_utf8("c", &mut src).unwrap();
         assert_eq!(
-            Connect::decode(dst.freeze(), v5()),
-            Err(Error::MalformedPacket)
+            Connect::decode(src.freeze()),
+            Err(Error::UnsupportedProtocolVersion)
         );
     }
 
     #[test]
     fn test_connect_decode_reserved_flag_bit_set_errors() {
-        let conn = Connect::new(false, "c");
+        let conn = Connect::new(v311(), false, "c");
         let mut dst = BytesMut::new();
-        conn.encode(&mut dst, v311()).unwrap();
+        conn.encode(&mut dst).unwrap();
         dst[7] |= 0x01; // set reserved bit 0 of connect flags
-        assert_eq!(
-            Connect::decode(dst.freeze(), v311()),
-            Err(Error::MalformedPacket)
-        );
+        assert_eq!(Connect::decode(dst.freeze()), Err(Error::MalformedPacket));
     }
 
     #[test]
     fn test_connect_decode_will_bits_set_without_will_flag_errors() {
-        let conn = Connect::new(false, "c");
+        let conn = Connect::new(v311(), false, "c");
         let mut dst = BytesMut::new();
-        conn.encode(&mut dst, v311()).unwrap();
+        conn.encode(&mut dst).unwrap();
         dst[7] |= 0x08; // set will-QoS bit without will flag
-        assert_eq!(
-            Connect::decode(dst.freeze(), v311()),
-            Err(Error::MalformedPacket)
-        );
+        assert_eq!(Connect::decode(dst.freeze()), Err(Error::MalformedPacket));
     }
 
     #[test]
     fn test_connect_decode_too_short_errors() {
         assert_eq!(
-            Connect::decode(Bytes::from_static(&[0x00, 0x04]), v311()),
+            Connect::decode(Bytes::from_static(&[0x00, 0x04])),
             Err(Error::PacketTooShort)
         );
     }
@@ -912,14 +958,14 @@ mod tests {
     #[test]
     fn test_connect_encode_client_id_too_long_errors() {
         let id: String = core::iter::repeat_n('c', 65_536).collect();
-        let c = Connect::new(true, id);
+        let c = Connect::new(v5(), true, id);
         let mut dst = BytesMut::new();
-        assert_eq!(c.encode(&mut dst, v5()), Err(Error::StringTooLong));
+        assert_eq!(c.encode(&mut dst), Err(Error::StringTooLong));
     }
 
     #[test]
     fn test_connect_encode_will_payload_too_long_errors() {
-        let mut c = Connect::new(true, "c");
+        let mut c = Connect::new(v5(), true, "c");
         c.will = Some(Will::new(
             "w",
             Bytes::from(alloc::vec![0u8; 65_536]),
@@ -927,22 +973,22 @@ mod tests {
             false,
         ));
         let mut dst = BytesMut::new();
-        assert_eq!(c.encode(&mut dst, v5()), Err(Error::BinaryTooLong));
+        assert_eq!(c.encode(&mut dst), Err(Error::BinaryTooLong));
     }
 
     #[test]
     fn test_connect_encode_password_too_long_errors() {
-        let mut c = Connect::new(true, "c");
+        let mut c = Connect::new(v5(), true, "c");
         c.password = Some(Bytes::from(alloc::vec![0u8; 65_536]));
         let mut dst = BytesMut::new();
-        assert_eq!(c.encode(&mut dst, v5()), Err(Error::BinaryTooLong));
+        assert_eq!(c.encode(&mut dst), Err(Error::BinaryTooLong));
     }
 
     #[test]
     fn test_connect_encode_username_too_long_errors() {
-        let mut c = Connect::new(true, "c");
+        let mut c = Connect::new(v5(), true, "c");
         c.username = Some(core::iter::repeat_n('u', 65_536).collect());
         let mut dst = BytesMut::new();
-        assert_eq!(c.encode(&mut dst, v5()), Err(Error::StringTooLong));
+        assert_eq!(c.encode(&mut dst), Err(Error::StringTooLong));
     }
 }

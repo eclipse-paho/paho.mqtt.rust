@@ -52,6 +52,10 @@ pub enum Error {
     /// An incoming packet's declared size exceeded the configured maximum.
     #[error("packet exceeds maximum packet size")]
     PacketTooLarge,
+    /// A CONNECT packet named a protocol or protocol level this codec does
+    /// not support (e.g. MQTT v3.1's `MQIsdp`).
+    #[error("unsupported protocol version")]
+    UnsupportedProtocolVersion,
 }
 
 /// The result type for codec operations.
