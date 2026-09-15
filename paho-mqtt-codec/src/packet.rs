@@ -192,41 +192,42 @@ impl Packet {
     /// CONNECT is self-describing and ignores `ver`: its protocol version is
     /// read from the wire into [`Connect::version`].
     pub fn from_raw(raw: RawPacket, ver: MqttVersion) -> Result<Self> {
-        match raw.header >> 4 {
+        let typ = raw.header >> 4;
+        let flags = raw.header & 0x0F;
+
+        // Every type except PUBLISH has fixed flag bits; a receiver must treat
+        // any other value as malformed (MQTT-2.2.2-2). PUBLISH flags are
+        // interpreted by `Publish::decode`.
+        let expected_flags = match typ {
+            PKT_PUBLISH => flags,
+            PKT_PUBREL | PKT_SUBSCRIBE | PKT_UNSUBSCRIBE => 0x02,
+            _ => 0x00,
+        };
+        if flags != expected_flags {
+            return Err(Error::MalformedPacket);
+        }
+
+        match typ {
             PKT_CONNECT => Ok(Packet::Connect(Connect::decode(raw.payload)?)),
             PKT_CONNACK => Ok(Packet::ConnAck(ConnAck::decode(raw.payload, ver)?)),
-            PKT_PUBLISH => Ok(Packet::Publish(Publish::decode(
-                raw.header & 0x0F,
-                raw.payload,
-                ver,
-            )?)),
+            PKT_PUBLISH => Ok(Packet::Publish(Publish::decode(flags, raw.payload, ver)?)),
             PKT_PUBACK => Ok(Packet::PubAck(PubAck::decode(raw.payload, ver)?)),
             PKT_PUBREC => Ok(Packet::PubRec(PubAck::decode(raw.payload, ver)?)),
-            PKT_PUBREL => {
-                if raw.header & 0x0F != 0x02 {
-                    return Err(Error::MalformedPacket);
-                }
-                Ok(Packet::PubRel(PubAck::decode(raw.payload, ver)?))
-            }
+            PKT_PUBREL => Ok(Packet::PubRel(PubAck::decode(raw.payload, ver)?)),
             PKT_PUBCOMP => Ok(Packet::PubComp(PubAck::decode(raw.payload, ver)?)),
-            PKT_SUBSCRIBE => {
-                if raw.header & 0x0F != 0x02 {
-                    return Err(Error::MalformedPacket);
-                }
-                Ok(Packet::Subscribe(Subscribe::decode(raw.payload, ver)?))
-            }
+            PKT_SUBSCRIBE => Ok(Packet::Subscribe(Subscribe::decode(raw.payload, ver)?)),
             PKT_SUBACK => Ok(Packet::SubAck(SubAck::decode(raw.payload, ver)?)),
             PKT_UNSUBSCRIBE => {
-                if raw.header & 0x0F != 0x02 {
-                    return Err(Error::MalformedPacket);
-                }
                 Ok(Packet::Unsubscribe(Unsubscribe::decode(raw.payload, ver)?))
             }
             PKT_UNSUBACK => Ok(Packet::UnsubAck(UnsubAck::decode(raw.payload, ver)?)),
             PKT_PINGREQ => Ok(Packet::PingReq),
             PKT_PINGRESP => Ok(Packet::PingResp),
             PKT_DISCONNECT => Ok(Packet::Disconnect(Disconnect::decode(raw.payload, ver)?)),
-            PKT_AUTH => Ok(Packet::Auth(Auth::decode(raw.payload)?)),
+            // Type 15 is reserved in v3.1.1; AUTH exists only in v5.
+            PKT_AUTH if ver == MqttVersion::V5 => {
+                Ok(Packet::Auth(Auth::decode(raw.payload)?))
+            }
             t => Err(Error::UnknownPacketType(t)),
         }
     }
@@ -549,6 +550,59 @@ mod tests {
             Packet::from_raw(raw, v311()),
             Err(Error::UnknownPacketType(0))
         );
+    }
+
+    #[test]
+    fn test_from_raw_reserved_flag_bits_rejected() {
+        // Every fixed-flag type must reject a non-canonical flag nibble.
+        let cases: [(u8, &[u8]); 12] = [
+            (PKT_CONNACK, &[0x00, 0x00]),
+            (PKT_PUBACK, &[0x00, 0x01]),
+            (PKT_PUBREC, &[0x00, 0x01]),
+            (PKT_PUBREL, &[0x00, 0x01]),
+            (PKT_PUBCOMP, &[0x00, 0x01]),
+            (PKT_SUBACK, &[0x00, 0x01, 0x00]),
+            (PKT_UNSUBACK, &[0x00, 0x01]),
+            (PKT_PINGREQ, &[]),
+            (PKT_PINGRESP, &[]),
+            (PKT_DISCONNECT, &[]),
+            (PKT_AUTH, &[]),
+            (PKT_CONNECT, &[]),
+        ];
+        for (typ, body) in cases {
+            let canonical = match typ {
+                PKT_PUBREL | PKT_SUBSCRIBE | PKT_UNSUBSCRIBE => 0x02,
+                _ => 0x00,
+            };
+            for bad in (0u8..16).filter(|&f| f != canonical) {
+                let raw = RawPacket {
+                    header: (typ << 4) | bad,
+                    payload: Bytes::copy_from_slice(body),
+                };
+                assert_eq!(
+                    Packet::from_raw(raw, v311()),
+                    Err(Error::MalformedPacket),
+                    "type {typ} flags {bad:#x}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_from_raw_auth_rejected_on_v311() {
+        let raw = RawPacket {
+            header: HDR_AUTH,
+            payload: Bytes::new(),
+        };
+        assert_eq!(
+            Packet::from_raw(raw, v311()),
+            Err(Error::UnknownPacketType(PKT_AUTH))
+        );
+        let raw = RawPacket {
+            header: HDR_AUTH,
+            payload: Bytes::new(),
+        };
+        assert!(matches!(Packet::from_raw(raw, v5()), Ok(Packet::Auth(_))));
     }
 
     // ---- Packet::encode ----

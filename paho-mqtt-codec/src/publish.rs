@@ -25,7 +25,7 @@
 //! a separate parameter extracted from [`crate::packet::RawPacket::header`].
 
 use crate::{
-    Error, MqttVersion, Properties, QoS, ReasonCode, Result, String,
+    Error, MqttVersion, Properties, PropertyId, QoS, ReasonCode, Result, String,
     wire::{get_utf8, put_utf8, utf8_wire_size},
 };
 use bytes::{Buf, BufMut, Bytes};
@@ -109,15 +109,26 @@ impl Publish {
         let qos = QoS::try_from((flags >> 1) & 0x03)?;
         let retain = flags & 0x01 != 0;
 
-        // Topic
-        let topic = get_utf8(&mut payload)?;
+        // DUP is meaningless without an acknowledgement (MQTT-3.3.1-2).
+        if dup && qos == QoS::QoS0 {
+            return Err(Error::MalformedPacket);
+        }
 
-        // Packet ID (QoS 1 and 2 only)
+        // Topic: wildcards are never allowed in a topic *name* (MQTT-3.3.2-2).
+        let topic = get_utf8(&mut payload)?;
+        if topic.bytes().any(|b| b == b'+' || b == b'#') {
+            return Err(Error::MalformedPacket);
+        }
+
+        // Packet ID (QoS 1 and 2 only); zero is reserved (MQTT-2.2.1-2).
         let packet_id = if qos != QoS::QoS0 {
             if payload.remaining() < 2 {
                 return Err(Error::PacketTooShort);
             }
-            Some(payload.get_u16())
+            match payload.get_u16() {
+                0 => return Err(Error::MalformedPacket),
+                id => Some(id),
+            }
         }
         else {
             None
@@ -125,6 +136,14 @@ impl Publish {
 
         // v5 properties
         let properties = Properties::decode(&mut payload, ver)?;
+
+        // An empty topic name is only allowed in v5, and only when a topic
+        // alias supplies the topic instead (MQTT-3.3.2-1, §3.3.2.3.4).
+        if topic.is_empty()
+            && (ver != MqttVersion::V5 || properties.get(PropertyId::TopicAlias).is_none())
+        {
+            return Err(Error::MalformedPacket);
+        }
 
         // Remainder is the application payload
         let msg_payload = payload;
@@ -469,6 +488,74 @@ mod tests {
     }
 
     // ---- error cases ----
+
+    #[test]
+    fn test_publish_decode_packet_id_zero_errors() {
+        // flags: QoS 1; body: topic "t", packet id 0
+        let payload = Bytes::from_static(&[0x00, 0x01, b't', 0x00, 0x00]);
+        assert_eq!(
+            Publish::decode(0x02, payload, v311()),
+            Err(Error::MalformedPacket)
+        );
+    }
+
+    #[test]
+    fn test_publish_decode_dup_with_qos0_errors() {
+        let payload = Bytes::from_static(&[0x00, 0x01, b't']);
+        assert_eq!(
+            Publish::decode(0x08, payload, v311()),
+            Err(Error::MalformedPacket)
+        );
+    }
+
+    #[test]
+    fn test_publish_decode_wildcard_in_topic_errors() {
+        for topic in [&b"a/#"[..], b"a/+/b", b"+", b"#"] {
+            let mut payload = BytesMut::new();
+            payload.put_u16(topic.len() as u16);
+            payload.put_slice(topic);
+            assert_eq!(
+                Publish::decode(0x00, payload.freeze(), v311()),
+                Err(Error::MalformedPacket),
+                "{}",
+                core::str::from_utf8(topic).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn test_publish_decode_empty_topic() {
+        // Never valid in v3.1.1.
+        assert_eq!(
+            Publish::decode(0x00, Bytes::from_static(&[0x00, 0x00]), v311()),
+            Err(Error::MalformedPacket)
+        );
+        // In v5 only with a topic alias: empty topic, empty properties -> error
+        assert_eq!(
+            Publish::decode(0x00, Bytes::from_static(&[0x00, 0x00, 0x00]), v5()),
+            Err(Error::MalformedPacket)
+        );
+        // ... but with TopicAlias(7) present it is accepted.
+        let payload = Bytes::from_static(&[0x00, 0x00, 0x03, 0x23, 0x00, 0x07, b'x']);
+        let p = Publish::decode(0x00, payload, v5()).unwrap();
+        assert!(p.topic.is_empty());
+        assert_eq!(p.payload, Bytes::from_static(b"x"));
+    }
+
+    #[test]
+    fn test_publish_topic_with_nul_rejected_both_directions() {
+        let p = Publish::new("a\0b", Bytes::new());
+        let mut dst = BytesMut::new();
+        assert_eq!(p.encode(&mut dst, v311()), Err(Error::MalformedPacket));
+        assert_eq!(
+            Publish::decode(
+                0x00,
+                Bytes::from_static(&[0x00, 0x03, b'a', 0x00, b'b']),
+                v311()
+            ),
+            Err(Error::MalformedPacket)
+        );
+    }
 
     #[test]
     fn test_publish_qos1_missing_packet_id_errors() {

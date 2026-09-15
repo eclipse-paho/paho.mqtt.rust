@@ -30,9 +30,14 @@ use bytes::{Buf, BufMut, Bytes};
 
 /// Writes a 2-byte big-endian length prefix followed by the UTF-8 bytes of `s`.
 ///
-/// Returns [`Error::StringTooLong`] if `s` exceeds 65,535 bytes.
+/// Returns [`Error::StringTooLong`] if `s` exceeds 65,535 bytes, or
+/// [`Error::MalformedPacket`] if it contains U+0000, which MQTT forbids in
+/// any string field (MQTT-1.5.4-2).
 pub(crate) fn put_utf8<B: BufMut>(s: &str, dst: &mut B) -> Result<()> {
     let len = u16::try_from(s.len()).map_err(|_| Error::StringTooLong)?;
+    if s.as_bytes().contains(&0) {
+        return Err(Error::MalformedPacket);
+    }
     dst.put_u16(len);
     dst.put_slice(s.as_bytes());
     Ok(())
@@ -49,6 +54,9 @@ pub(crate) fn put_binary<B: BufMut>(b: &[u8], dst: &mut B) -> Result<()> {
 }
 
 /// Reads a 2-byte big-endian length prefix then that many UTF-8 bytes from `src`.
+///
+/// Returns [`Error::MalformedPacket`] if the bytes are not valid UTF-8 or
+/// contain U+0000 (MQTT-1.5.4-2).
 pub(crate) fn get_utf8<B: Buf>(src: &mut B) -> Result<String> {
     if src.remaining() < 2 {
         return Err(Error::PacketTooShort);
@@ -58,6 +66,9 @@ pub(crate) fn get_utf8<B: Buf>(src: &mut B) -> Result<String> {
         return Err(Error::PacketTooShort);
     }
     let bytes = src.copy_to_bytes(len);
+    if bytes.contains(&0) {
+        return Err(Error::MalformedPacket);
+    }
     String::from_utf8(bytes.into()).map_err(|_| Error::MalformedPacket)
 }
 

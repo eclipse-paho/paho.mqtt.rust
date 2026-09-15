@@ -171,7 +171,12 @@ impl Subscribe {
                     };
                     (options & 0x04 != 0, options & 0x08 != 0, rh)
                 }
-                _ => (false, false, RetainHandling::SendOnSubscribe),
+                _ => {
+                    if options & 0xFC != 0 {
+                        return Err(Error::MalformedPacket); // bits 7-2 reserved in v3.1.1
+                    }
+                    (false, false, RetainHandling::SendOnSubscribe)
+                }
             };
 
             subscriptions.push(Subscription {
@@ -250,6 +255,9 @@ impl SubAck {
             .copied()
             .map(ReasonCode::try_from)
             .collect::<Result<Vec<_>>>()?;
+        if reason_codes.is_empty() {
+            return Err(Error::MalformedPacket); // one code per filter (MQTT-3.9.3-1)
+        }
 
         Ok(SubAck {
             packet_id,
@@ -442,6 +450,33 @@ mod tests {
         assert_eq!(
             Subscribe::decode(Bytes::from_static(&[0x00]), v311()),
             Err(Error::PacketTooShort)
+        );
+    }
+
+    #[test]
+    fn test_subscribe_v311_reserved_options_bits_error() {
+        // v3.1.1 options byte is QoS only; bits 7-2 are reserved (MQTT-3-8.3-4).
+        let s = Subscribe::new(1, vec![sub("t", QoS::AtMostOnce)]);
+        let mut dst = BytesMut::new();
+        s.encode(&mut dst, v311()).unwrap();
+        let last = dst.len() - 1;
+        dst[last] |= 0x04; // what v5 would call no_local
+        assert_eq!(
+            Subscribe::decode(dst.freeze(), v311()),
+            Err(Error::MalformedPacket)
+        );
+    }
+
+    #[test]
+    fn test_suback_decode_empty_reason_codes_errors() {
+        // packet_id only (v3.1.1) / packet_id + empty properties (v5).
+        assert_eq!(
+            SubAck::decode(Bytes::from_static(&[0x00, 0x01]), v311()),
+            Err(Error::MalformedPacket)
+        );
+        assert_eq!(
+            SubAck::decode(Bytes::from_static(&[0x00, 0x01, 0x00]), v5()),
+            Err(Error::MalformedPacket)
         );
     }
 

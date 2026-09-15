@@ -157,11 +157,15 @@ impl UnsubAck {
         let packet_id = payload.get_u16();
         let properties = Properties::decode(&mut payload, ver)?;
         let reason_codes = if ver == MqttVersion::V5 {
-            payload
+            let codes = payload
                 .iter()
                 .copied()
                 .map(ReasonCode::try_from)
-                .collect::<Result<Vec<_>>>()?
+                .collect::<Result<Vec<_>>>()?;
+            if codes.is_empty() {
+                return Err(Error::MalformedPacket); // one code per filter (§3.11.3)
+            }
+            codes
         }
         else {
             Vec::new()
@@ -371,9 +375,15 @@ mod tests {
     }
 
     #[test]
-    fn test_unsuback_v5_empty_reason_codes() {
-        // Zero reason codes is valid (though unusual).
-        round_trip_unsuback(UnsubAck::new(1, vec![]), v5());
+    fn test_unsuback_v5_decode_empty_reason_codes_errors() {
+        // UNSUBSCRIBE carries at least one filter, so UNSUBACK carries at least
+        // one reason code (§3.11.3): packet_id + empty properties only.
+        assert_eq!(
+            UnsubAck::decode(Bytes::from_static(&[0x00, 0x01, 0x00]), v5()),
+            Err(Error::MalformedPacket)
+        );
+        // v3.1.1 UNSUBACK has no reason codes at all, so this stays valid.
+        round_trip_unsuback(UnsubAck::new(1, vec![]), v311());
     }
 
     // ---- encoded_size ----
