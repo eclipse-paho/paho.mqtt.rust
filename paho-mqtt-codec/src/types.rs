@@ -19,6 +19,12 @@
  *******************************************************************************/
 
 //! MQTT support types.
+//!
+//! There are a number of redundancies in how common constants are defined,
+//! usually starting with an enum, then a number of overlapping constants.
+//! This is a holdover from the original Paho MQTT Rust library which wrapped
+//! the Paho C library and brought in it's declarations. At some point, these
+//! will be deprecated.
 
 use crate::error::Error;
 use core::fmt;
