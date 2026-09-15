@@ -83,18 +83,23 @@ impl Publish {
     ///
     /// Returns [`Error::MalformedPacket`] if `qos > 0` but `packet_id` is `None`.
     pub fn encode<B: BufMut>(&self, dst: &mut B, ver: MqttVersion) -> Result<()> {
-        // Topic
+        self.encode_header(dst, ver)?;
+        dst.put_slice(&self.payload);
+        Ok(())
+    }
+
+    /// Encodes only the PUBLISH variable header (topic, packet ID, and
+    /// properties) into `dst`, leaving the application payload to be written
+    /// separately by the caller.
+    ///
+    /// Returns [`Error::MalformedPacket`] if `qos > 0` but `packet_id` is `None`.
+    pub fn encode_header<B: BufMut>(&self, dst: &mut B, ver: MqttVersion) -> Result<()> {
         put_utf8(&self.topic, dst)?;
-        // Packet ID (QoS 1 and 2 only)
         if self.qos != QoS::QoS0 {
             let id = self.packet_id.ok_or(Error::MalformedPacket)?;
             dst.put_u16(id);
         }
-        // v5 properties
-        self.properties.encode(dst, ver)?;
-        // Payload
-        dst.put_slice(&self.payload);
-        Ok(())
+        self.properties.encode(dst, ver)
     }
 
     /// Decodes a PUBLISH from the fixed-header `flags` (lower 4 bits of the

@@ -35,7 +35,7 @@ use std::time::Duration;
 const HOST: &str = "tcp://localhost:1883";
 #[cfg(unix)]
 const UNIX_HOST: &str = "unix:///tmp/mosquitto.sock";
-#[cfg(feature = "websocket")]
+#[cfg(any(feature = "websocket", feature = "smol-websocket"))]
 const WS_HOST: &str = "ws://localhost:9001";
 #[cfg(any(feature = "tls", feature = "openssl"))]
 const TLS_HOST: &str = "tls://localhost:8883";
@@ -171,6 +171,54 @@ fn test_subscribe_receive_qos1() {
 #[test]
 fn test_subscribe_receive_qos2() {
     subscribe_and_receive(mqtt::QoS::QoS2);
+}
+
+// Payloads above the runtime's inline threshold are written from their own
+// buffer rather than copied into the header buffer; make sure that path
+// produces an intact frame at every QoS.
+fn subscribe_and_receive_large(qos: mqtt::QoS) {
+    let topic = match qos {
+        mqtt::QoS::QoS0 => topic!("sub_large_qos0"),
+        mqtt::QoS::QoS1 => topic!("sub_large_qos1"),
+        mqtt::QoS::QoS2 => topic!("sub_large_qos2"),
+    };
+    let payload: Vec<u8> = (0..256 * 1024).map(|i| (i % 251) as u8).collect();
+
+    let sub = mqtt::AsyncClient::new(HOST).unwrap();
+    sub.connect(None).wait().expect("sub connect failed");
+    let rx = sub.start_consuming();
+    sub.subscribe(topic, qos).wait().expect("subscribe failed");
+
+    let pub_cli = mqtt::AsyncClient::new(HOST).unwrap();
+    pub_cli.connect(None).wait().expect("pub connect failed");
+    let msg = mqtt::Message::new(topic, payload.clone(), qos);
+    pub_cli.publish(msg).wait().expect("publish failed");
+
+    let received = rx.recv_timeout(TIMEOUT).expect("recv timed out");
+    let received = received.expect("got None (connection lost) instead of message");
+
+    assert_eq!(received.topic(), topic);
+    assert_eq!(received.payload().len(), payload.len());
+    assert_eq!(received.payload(), &payload[..]);
+    assert_eq!(received.qos(), qos);
+
+    pub_cli.disconnect(None).wait().ok();
+    sub.disconnect(None).wait().ok();
+}
+
+#[test]
+fn test_subscribe_receive_large_qos0() {
+    subscribe_and_receive_large(mqtt::QoS::QoS0);
+}
+
+#[test]
+fn test_subscribe_receive_large_qos1() {
+    subscribe_and_receive_large(mqtt::QoS::QoS1);
+}
+
+#[test]
+fn test_subscribe_receive_large_qos2() {
+    subscribe_and_receive_large(mqtt::QoS::QoS2);
 }
 
 /////////////////////////////////////////////////////////////////////////////
@@ -1270,14 +1318,13 @@ fn test_keepalive() {
 /////////////////////////////////////////////////////////////////////////////
 // WebSocket transport
 //
-// Requires a Mosquitto listener on port 9001 with `protocol websockets`.
-// Marked `#[ignore]` — run with:
-//   cargo test --features websocket ws_ -- --ignored
+// Requires a Mosquitto listener on port 9001 with `protocol websockets`
+// (see the broker requirements at the top of this file). Compiled only with
+// the `websocket` / `smol-websocket` feature.
 /////////////////////////////////////////////////////////////////////////////
 
-#[cfg(feature = "websocket")]
+#[cfg(any(feature = "websocket", feature = "smol-websocket"))]
 #[test]
-#[ignore]
 fn test_ws_connect_v3() {
     let cli = mqtt::AsyncClient::new(WS_HOST).unwrap();
     let rsp = cli
@@ -1290,9 +1337,8 @@ fn test_ws_connect_v3() {
     assert!(!cli.is_connected());
 }
 
-#[cfg(feature = "websocket")]
+#[cfg(any(feature = "websocket", feature = "smol-websocket"))]
 #[test]
-#[ignore]
 fn test_ws_publish_subscribe() {
     let topic = topic!("ws/pub_sub");
 
@@ -1321,6 +1367,44 @@ fn test_ws_publish_subscribe() {
         .expect("ws connection lost");
     assert_eq!(msg.topic(), topic);
     assert_eq!(msg.payload_str(), "ws-payload");
+
+    pub_cli.disconnect(None).wait().ok();
+    sub.disconnect(None).wait().ok();
+}
+
+// A payload above the inline threshold is written to the transport in two
+// pieces; the WebSocket transport must still emit it as one frame.
+#[cfg(any(feature = "websocket", feature = "smol-websocket"))]
+#[test]
+fn test_ws_publish_subscribe_large() {
+    let topic = topic!("ws/pub_sub_large");
+    let payload: Vec<u8> = (0..256 * 1024).map(|i| (i % 253) as u8).collect();
+
+    let sub = mqtt::AsyncClient::new(WS_HOST).unwrap();
+    sub.connect(mqtt::ConnectOptions::new_ws())
+        .wait()
+        .expect("ws sub connect failed");
+    let rx = sub.start_consuming();
+    sub.subscribe(topic, mqtt::QOS_1)
+        .wait()
+        .expect("ws subscribe failed");
+
+    let pub_cli = mqtt::AsyncClient::new(WS_HOST).unwrap();
+    pub_cli
+        .connect(mqtt::ConnectOptions::new_ws())
+        .wait()
+        .expect("ws pub connect failed");
+    pub_cli
+        .publish(mqtt::Message::new(topic, payload.clone(), mqtt::QOS_1))
+        .wait()
+        .expect("ws publish failed");
+
+    let msg = rx
+        .recv_timeout(TIMEOUT)
+        .expect("ws recv timed out")
+        .expect("ws connection lost");
+    assert_eq!(msg.topic(), topic);
+    assert_eq!(msg.payload(), &payload[..]);
 
     pub_cli.disconnect(None).wait().ok();
     sub.disconnect(None).wait().ok();

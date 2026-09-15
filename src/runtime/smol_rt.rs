@@ -37,7 +37,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use paho_mqtt_codec::{
     ConnAck, Disconnect, MqttVersion, PubAck, QoS, RetainHandling as CodecRetainHandling,
     Subscribe, Subscription, Unsubscribe,
@@ -165,6 +165,11 @@ async fn recv_connack(
 /////////////////////////////////////////////////////////////////////////////
 // Session
 
+/// PUBLISH payloads up to this size are copied into the header buffer and
+/// sent as one contiguous write; larger ones are written from their own
+/// buffer to avoid the copy.
+const INLINE_PAYLOAD_MAX: usize = 16 * 1024;
+
 /// Holds all mutable state for a connected MQTT session.
 struct Session {
     /// Write half of the split transport.
@@ -261,9 +266,9 @@ impl Session {
         Ok(())
     }
 
-    fn persist_put(&self, key: &str, data: &[u8]) {
+    fn persist_put(&self, key: &str, data: Vec<&[u8]>) {
         if let Some(p) = &self.persist {
-            let _ = p.lock().unwrap().put(key, vec![data]);
+            let _ = p.lock().unwrap().put(key, data);
         }
     }
 
@@ -283,8 +288,28 @@ impl Session {
 
     async fn send(&mut self, packet: &Packet) -> Result<()> {
         self.write_buf.clear();
-        packet.encode(&mut self.write_buf, self.ver)?;
-        self.writer.write_all(&self.write_buf).await?;
+        let payload = packet.encode_split(&mut self.write_buf, self.ver)?;
+        self.write_frame(payload).await
+    }
+
+    /// Writes the packet header in `write_buf`, followed by `payload` if
+    /// present, as one flushed frame.
+    ///
+    /// Small payloads are appended to the header so the frame goes out in a
+    /// single write; larger ones are written from their own buffer to avoid
+    /// copying.
+    async fn write_frame(&mut self, payload: Option<Bytes>) -> Result<()> {
+        match payload {
+            Some(p) if p.len() > INLINE_PAYLOAD_MAX => {
+                self.writer.write_all(&self.write_buf).await?;
+                self.writer.write_all(&p).await?;
+            }
+            Some(p) => {
+                self.write_buf.extend_from_slice(&p);
+                self.writer.write_all(&self.write_buf).await?;
+            }
+            None => self.writer.write_all(&self.write_buf).await?,
+        }
         self.writer.flush().await?;
         self.sent_packet = true;
         Ok(())
@@ -571,7 +596,7 @@ impl Session {
                     let mut enc_buf = BytesMut::with_capacity(256);
                     let packet = Packet::Publish(pub_pkt);
                     if packet.encode(&mut enc_buf, self.ver).is_ok() {
-                        self.persist_put(&format!("r{id}"), &enc_buf);
+                        self.persist_put(&format!("r{id}"), vec![&enc_buf]);
                     }
                     let Packet::Publish(pub_pkt) = packet
                     else {
@@ -661,14 +686,21 @@ impl Session {
 
                 let packet = Packet::Publish(pub_pkt);
 
+                // Encode once: the header lands in `write_buf` and the payload
+                // is shared by reference, so persisting and sending both use
+                // the same bytes without a second encode or a copy.
+                self.write_buf.clear();
+                let payload = packet.encode_split(&mut self.write_buf, self.ver)?;
+
                 if let Some(pid) = id {
-                    let mut enc_buf = BytesMut::with_capacity(256);
-                    if packet.encode(&mut enc_buf, self.ver).is_ok() {
-                        self.persist_put(&format!("s{pid}"), &enc_buf);
+                    let mut parts = vec![&self.write_buf[..]];
+                    if let Some(p) = &payload {
+                        parts.push(&p[..]);
                     }
+                    self.persist_put(&format!("s{pid}"), parts);
                 }
 
-                self.send(&packet).await?;
+                self.write_frame(payload).await?;
 
                 match qos {
                     QoS::QoS0 => {

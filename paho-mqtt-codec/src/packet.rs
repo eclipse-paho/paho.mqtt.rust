@@ -292,36 +292,103 @@ impl Packet {
     /// failure was detected are removed.
     pub fn encode(&self, dst: &mut BytesMut, ver: MqttVersion) -> Result<()> {
         let start = dst.len();
-        let res = self.encode_inner(dst, ver);
+        let res = self.encode_inner(dst, ver, true);
+        if res.is_err() {
+            dst.truncate(start);
+        }
+        res.map(|_| ())
+    }
+
+    /// Encodes this packet into a freshly allocated, exactly sized [`Bytes`].
+    ///
+    /// Useful when the same encoding must be handed to more than one consumer
+    /// (e.g. persisted and transmitted): the returned `Bytes` can be cloned
+    /// and shared without re-encoding or copying.
+    pub fn encode_to_bytes(&self, ver: MqttVersion) -> Result<Bytes> {
+        let mut dst = BytesMut::new();
+        self.encode(&mut dst, ver)?;
+        Ok(dst.freeze())
+    }
+
+    /// Encodes everything except the application payload into `dst` and
+    /// returns the payload, if there is one, to be written after it.
+    ///
+    /// For a PUBLISH this appends the fixed header and variable header (topic,
+    /// packet ID, properties) to `dst` and returns a cheap reference-counted
+    /// handle to [`Publish::payload`], which the caller can write directly —
+    /// with a vectored write, say — instead of copying it into `dst`. For
+    /// every other packet type the whole packet is written to `dst` and
+    /// `None` is returned.
+    ///
+    /// The remaining-length field always accounts for the payload, so the
+    /// bytes in `dst` followed by the returned payload form one complete,
+    /// valid packet. `None` is also returned for a PUBLISH whose payload is
+    /// empty.
+    ///
+    /// On error nothing is appended to `dst`.
+    pub fn encode_split(
+        &self,
+        dst: &mut BytesMut,
+        ver: MqttVersion,
+    ) -> Result<Option<Bytes>> {
+        let start = dst.len();
+        let res = self.encode_inner(dst, ver, false);
         if res.is_err() {
             dst.truncate(start);
         }
         res
     }
 
-    fn encode_inner(&self, dst: &mut BytesMut, ver: MqttVersion) -> Result<()> {
+    /// Shared body of [`encode`](Self::encode) and
+    /// [`encode_split`](Self::encode_split). With `inline_payload` the PUBLISH
+    /// payload is copied into `dst`; otherwise it is returned.
+    fn encode_inner(
+        &self,
+        dst: &mut BytesMut,
+        ver: MqttVersion,
+        inline_payload: bool,
+    ) -> Result<Option<Bytes>> {
         use Packet::*;
 
         let (hdr, remaining) = self.header_and_remaining(ver);
         let remaining = Self::checked_remaining(remaining)?;
-        dst.reserve(1 + varlen::encoded_size(remaining) + remaining as usize);
+        let mut reserve = 1 + varlen::encoded_size(remaining) + remaining as usize;
+        if let Publish(pub_) = self
+            && !inline_payload
+        {
+            reserve -= pub_.payload.len();
+        }
+        dst.reserve(reserve);
 
         dst.put_u8(hdr);
         varlen::encode(remaining, dst)?;
 
         match self {
-            Connect(conn) => conn.encode(dst),
-            ConnAck(ack) => ack.encode(dst, ver),
-            Publish(pub_) => pub_.encode(dst, ver),
-            PubAck(ack) | PubRec(ack) | PubRel(ack) | PubComp(ack) => ack.encode(dst, ver),
-            Subscribe(s) => s.encode(dst, ver),
-            SubAck(sa) => sa.encode(dst, ver),
-            Unsubscribe(u) => u.encode(dst, ver),
-            UnsubAck(ua) => ua.encode(dst, ver),
-            PingReq | PingResp => Ok(()),
-            Disconnect(d) => d.encode(dst, ver),
-            Auth(a) => a.encode(dst),
+            Connect(conn) => conn.encode(dst)?,
+            ConnAck(ack) => ack.encode(dst, ver)?,
+            Publish(pub_) => {
+                if inline_payload {
+                    pub_.encode(dst, ver)?;
+                }
+                else {
+                    pub_.encode_header(dst, ver)?;
+                    if !pub_.payload.is_empty() {
+                        return Ok(Some(pub_.payload.clone()));
+                    }
+                }
+            }
+            PubAck(ack) | PubRec(ack) | PubRel(ack) | PubComp(ack) => {
+                ack.encode(dst, ver)?
+            }
+            Subscribe(s) => s.encode(dst, ver)?,
+            SubAck(sa) => sa.encode(dst, ver)?,
+            Unsubscribe(u) => u.encode(dst, ver)?,
+            UnsubAck(ua) => ua.encode(dst, ver)?,
+            PingReq | PingResp => {}
+            Disconnect(d) => d.encode(dst, ver)?,
+            Auth(a) => a.encode(dst)?,
         }
+        Ok(None)
     }
 }
 
@@ -333,7 +400,7 @@ impl Packet {
 mod tests {
     use super::*;
     use crate::{
-        QoS, String,
+        QoS, String, Subscription,
         types::{MQTT_VERSION_3_1_1, MQTT_VERSION_5},
     };
 
@@ -527,6 +594,94 @@ mod tests {
         let payload = Bytes::from(alloc::vec![0u8; varlen::MAX_VARLEN as usize + 1]);
         let pkt = Packet::Publish(Publish::new("t", payload));
         assert_eq!(pkt.encoded_size(v5()), Err(Error::VarLenOverflow));
+    }
+
+    // ---- encode_split / encode_to_bytes ----
+
+    fn sample_publish(payload: &'static [u8]) -> Packet {
+        let mut p = Publish::new("a/b", Bytes::from_static(payload));
+        p.qos = QoS::QoS1;
+        p.packet_id = Some(9);
+        Packet::Publish(p)
+    }
+
+    #[test]
+    fn test_encode_split_publish_returns_payload_without_copy() {
+        let payload: &'static [u8] = b"hello, world";
+        let pkt = sample_publish(payload);
+        let mut hdr = BytesMut::new();
+        let tail = pkt.encode_split(&mut hdr, v5()).unwrap().unwrap();
+        // The returned Bytes is the very same allocation as the packet's payload.
+        assert_eq!(tail.as_ptr(), payload.as_ptr());
+        // header + payload is byte-for-byte what `encode` produces.
+        let mut full = BytesMut::new();
+        pkt.encode(&mut full, v5()).unwrap();
+        let mut joined = hdr.clone();
+        joined.extend_from_slice(&tail);
+        assert_eq!(&joined[..], &full[..]);
+        // and the header alone is exactly `encoded_size - payload.len()` bytes.
+        assert_eq!(hdr.len(), pkt.encoded_size(v5()).unwrap() - payload.len());
+    }
+
+    #[test]
+    fn test_encode_split_publish_reserves_only_header() {
+        let pkt = sample_publish(&[0u8; 4096]);
+        let mut hdr = BytesMut::new();
+        pkt.encode_split(&mut hdr, v5()).unwrap();
+        assert_eq!(hdr.capacity(), hdr.len());
+        assert!(hdr.len() < 64);
+    }
+
+    #[test]
+    fn test_encode_split_empty_payload_returns_none() {
+        let pkt = sample_publish(b"");
+        let mut hdr = BytesMut::new();
+        assert!(pkt.encode_split(&mut hdr, v5()).unwrap().is_none());
+        let mut full = BytesMut::new();
+        pkt.encode(&mut full, v5()).unwrap();
+        assert_eq!(&hdr[..], &full[..]);
+    }
+
+    #[test]
+    fn test_encode_split_non_publish_writes_whole_packet() {
+        for pkt in [
+            Packet::PubAck(PubAck::new(1)),
+            Packet::Subscribe(Subscribe::new(
+                2,
+                alloc::vec![Subscription::new("t", QoS::QoS0)],
+            )),
+            Packet::PingReq,
+            Packet::Disconnect(Disconnect::default()),
+        ] {
+            let mut split = BytesMut::new();
+            assert!(pkt.encode_split(&mut split, v5()).unwrap().is_none());
+            let mut full = BytesMut::new();
+            pkt.encode(&mut full, v5()).unwrap();
+            assert_eq!(&split[..], &full[..]);
+        }
+    }
+
+    #[test]
+    fn test_encode_split_error_leaves_dst_untouched() {
+        let mut p = Publish::new("t", Bytes::from_static(b"x"));
+        p.qos = QoS::QoS2; // packet_id missing
+        let pkt = Packet::Publish(p);
+        let mut dst = BytesMut::from(&b"keep"[..]);
+        assert_eq!(
+            pkt.encode_split(&mut dst, v5()),
+            Err(Error::MalformedPacket)
+        );
+        assert_eq!(&dst[..], b"keep");
+    }
+
+    #[test]
+    fn test_encode_to_bytes_matches_encode() {
+        let pkt = sample_publish(b"payload");
+        let bytes = pkt.encode_to_bytes(v5()).unwrap();
+        let mut full = BytesMut::new();
+        pkt.encode(&mut full, v5()).unwrap();
+        assert_eq!(&bytes[..], &full[..]);
+        assert_eq!(bytes.len(), pkt.encoded_size(v5()).unwrap());
     }
 
     #[test]
