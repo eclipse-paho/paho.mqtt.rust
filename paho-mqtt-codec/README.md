@@ -75,6 +75,17 @@ Formatting uses nightly-only options, so format with:
 
     $ cargo +nightly fmt
 
+### Fuzzing
+
+The decoder is the crate's untrusted-input surface: a broker, or anything between it and the client, can put arbitrary bytes on the socket. A [cargo-fuzz](https://github.com/rust-fuzz/cargo-fuzz) target in the _fuzz_ directory feeds random, coverage-guided inputs through framing and parsing (`RawPacket::decode` then `Packet::from_raw`) for both protocol versions and checks that nothing panics. Anything that decodes successfully is also re-encoded and decoded again, which must reproduce the same packet.
+
+It needs a nightly toolchain and the `cargo-fuzz` tool:
+
+    $ cargo install cargo-fuzz
+    $ cargo +nightly fuzz run decode
+
+It runs until stopped or until it finds a failing input, which it saves under _fuzz/artifacts/_ along with the command to reproduce it. A few minutes is enough for a first pass; `-- -max_total_time=300` runs for five minutes. The fuzzer keeps the inputs it finds interesting in _fuzz/corpus/_, so later runs pick up where earlier ones left off. That directory is not committed — it regenerates itself within a minute or two of running — and can be trimmed with `cargo +nightly fuzz cmin decode`. The CI runs the target for a short, fixed time on every push and pull request.
+
 ## Example
 
 A small sample can be found in the _examples_ directory. Here is what encoding a packet and decoding it again looks like:
@@ -134,6 +145,6 @@ For sending, `Packet::encode_split` does the same as `encode` but returns the PU
 
 ## Relationship to the Paho Client
 
-Version 2 of the [`paho-mqtt`](https://crates.io/crates/paho-mqtt) crate uses this codec for all of its wire I/O and re-exports the shared types — `QoS`, `MqttVersion`, `ReasonCode`, and the property types — so applications using the client don't normally depend on this crate directly. (Version 1 of the Paho Rust client wrap the Paho C library and use it for all wire I/O; not this crate.
+Version 2 of the [`paho-mqtt`](https://crates.io/crates/paho-mqtt) crate uses this codec for all of its wire I/O and re-exports the shared types — `QoS`, `MqttVersion`, `ReasonCode`, and the property types — so applications using the client don't normally depend on this crate directly. (Version 1 of the Paho Rust client wraps the Paho C library and uses it for all wire I/O, not this crate.)
 
 Applications that only need to produce or consume MQTT packets, without a client, can use this crate alone.

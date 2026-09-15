@@ -80,9 +80,14 @@ pub fn encode<B: BufMut>(value: u32, dst: &mut B) -> Result<()> {
 /// Decodes a variable-byte integer from `src`.
 ///
 /// Returns `Ok(None)` if `src` contains a partial encoding (continuation
-/// bit set on the last available byte). Returns an error if a valid
-/// 4-byte sequence is followed by a continuation bit, or if the decoded
-/// value exceeds [`MAX_VARLEN`].
+/// bit set on the last available byte). Note that the bytes examined are
+/// consumed from `src` even in that case; callers that need to retry later
+/// should decode from a copy or a peek.
+///
+/// Returns [`Error::MalformedVarLen`] if a fourth byte has its continuation
+/// bit set, or if the encoding is not the shortest possible one — MQTT
+/// requires the minimum number of bytes (MQTT-1.5.5-1), so a trailing
+/// zero byte such as `0x80 0x00` is rejected rather than read as `0`.
 pub fn decode<B: Buf>(src: &mut B) -> Result<Option<u32>> {
     let mut value: u32 = 0;
     let mut shift: u32 = 0;
@@ -94,6 +99,11 @@ pub fn decode<B: Buf>(src: &mut B) -> Result<Option<u32>> {
         let byte = src.get_u8();
         value |= ((byte & 0x7F) as u32) << shift;
         if byte & 0x80 == 0 {
+            // A final byte of zero after a continuation is a non-minimal
+            // encoding (e.g. 0x80 0x00 for 0, or 0xAC 0x00 for 44).
+            if shift > 0 && byte == 0 {
+                return Err(Error::MalformedVarLen);
+            }
             return Ok(Some(value));
         }
         shift += 7;
@@ -220,6 +230,41 @@ mod tests {
         // Fifth byte still has continuation bit — malformed.
         let result = decode(&mut Bytes::from_static(&[0x80, 0x80, 0x80, 0x80, 0x01]));
         assert_eq!(result, Err(Error::MalformedVarLen));
+    }
+
+    #[test]
+    fn test_decode_non_minimal_encoding_is_malformed() {
+        // MQTT-1.5.5-1: an encoding longer than necessary is malformed.
+        for bytes in [
+            &[0x80u8, 0x00][..],       // 0 in two bytes
+            &[0xAC, 0x00][..],         // 44 in two bytes (found by fuzzing)
+            &[0xFF, 0x80, 0x00][..],   // 127 in three bytes
+            &[0x80, 0x80, 0x80, 0x00], // 0 in four bytes
+        ] {
+            assert_eq!(
+                decode(&mut Bytes::copy_from_slice(bytes)),
+                Err(Error::MalformedVarLen),
+                "{bytes:02x?}"
+            );
+        }
+        // Values whose top byte is legitimately small are still fine.
+        assert_eq!(
+            decode(&mut Bytes::from_static(&[0x80, 0x01])),
+            Ok(Some(128))
+        );
+        assert_eq!(decode(&mut Bytes::from_static(&[0x00])), Ok(Some(0)));
+    }
+
+    #[test]
+    fn test_every_encoding_is_minimal_and_round_trips() {
+        for value in [
+            0u32, 1, 127, 128, 16_383, 16_384, 2_097_151, 2_097_152, MAX_VARLEN,
+        ] {
+            let mut buf = BytesMut::new();
+            encode(value, &mut buf).unwrap();
+            assert_eq!(buf.len(), encoded_size(value));
+            assert_eq!(decode(&mut buf.freeze()), Ok(Some(value)));
+        }
     }
 
     // ---- round-trip ----

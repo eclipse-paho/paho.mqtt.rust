@@ -405,12 +405,10 @@ impl Properties {
         while payload.has_remaining() {
             props.push(Property::decode(&mut payload)?);
         }
-        // Every byte of the length-prefixed region was consumed by exactly
-        // one property, so the wire length is the payload size.
-        Ok(Self {
-            props,
-            payload_size: len,
-        })
+        // Size from the decoded values, not the wire length, so the cache
+        // is right by construction even if an encoding on the wire was
+        // longer than canonical.
+        Ok(Self::from(props))
     }
 }
 
@@ -814,6 +812,20 @@ mod tests {
         let decoded = Properties::decode(&mut dst.freeze(), v5()).unwrap();
         assert_eq!(decoded, src);
         assert_eq!(decoded.payload_size(), summed(&decoded));
+    }
+
+    #[test]
+    fn test_decode_rejects_non_minimal_varint_property() {
+        // SubscriptionIdentifier = 44 encoded as two bytes; regression for a
+        // fuzzer finding where the cached size came from the wire length.
+        let mut src = BytesMut::new();
+        src.put_u8(3); // property length
+        src.put_u8(0x0B);
+        src.put_slice(&[0xAC, 0x00]);
+        assert_eq!(
+            Properties::decode(&mut src.freeze(), v5()),
+            Err(Error::MalformedVarLen)
+        );
     }
 
     #[test]

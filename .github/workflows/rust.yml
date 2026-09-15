@@ -198,3 +198,28 @@ jobs:
 
       - name: Codec clippy (no_std)
         run: cargo clippy -p paho-mqtt-codec --no-deps --all-targets --no-default-features -- -D warnings
+
+  codec-fuzz:
+    name: Codec Fuzz (short run)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@nightly
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      # No committed corpus: the fuzzer bootstraps from nothing. A short
+      # bounded run on every change catches regressions in the decoder; run
+      # it locally for longer when changing framing or parsing code.
+      - name: Fuzz the decoder
+        working-directory: paho-mqtt-codec
+        run: cargo fuzz run decode -- -max_total_time=120 -max_len=2048
+
+      - name: Upload failing inputs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: paho-mqtt-codec/fuzz/artifacts/
+          if-no-files-found: ignore
