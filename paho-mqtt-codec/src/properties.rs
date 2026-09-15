@@ -313,7 +313,16 @@ impl Property {
 /// to the wire.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-pub struct Properties(Vec<Property>);
+#[cfg_attr(
+    feature = "serde",
+    serde(from = "Vec<Property>", into = "Vec<Property>")
+)]
+pub struct Properties {
+    props: Vec<Property>,
+    /// Sum of `encoded_size()` over `props`; kept in step by every mutator
+    /// so encoding never has to walk the list to size the length prefix.
+    payload_size: usize,
+}
 
 impl Properties {
     /// Creates an empty property list.
@@ -323,27 +332,33 @@ impl Properties {
 
     /// Returns `true` if there are no properties.
     pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.props.is_empty()
+    }
+
+    /// Returns the number of properties.
+    pub fn len(&self) -> usize {
+        self.props.len()
     }
 
     /// Appends `prop` to the end of the list.
     pub fn push(&mut self, prop: Property) {
-        self.0.push(prop);
+        self.payload_size += prop.encoded_size();
+        self.props.push(prop);
     }
 
     /// Returns the value of the first property with the given `id`, or `None`.
     pub fn get(&self, id: PropertyId) -> Option<&PropertyValue> {
-        self.0.iter().find(|p| p.id == id).map(|p| &p.value)
+        self.props.iter().find(|p| p.id == id).map(|p| &p.value)
     }
 
     /// Iterates over all properties in order.
     pub fn iter(&self) -> impl Iterator<Item = &Property> {
-        self.0.iter()
+        self.props.iter()
     }
 
     /// Total bytes occupied by all properties on the wire (excluding the VBI prefix).
     fn payload_size(&self) -> usize {
-        self.0.iter().map(|p| p.encoded_size()).sum()
+        self.payload_size
     }
 
     /// Number of bytes this encodes to on the wire, including the VBI length prefix.
@@ -365,7 +380,7 @@ impl Properties {
     pub fn encode<B: BufMut>(&self, dst: &mut B, ver: MqttVersion) -> Result<()> {
         if ver >= MqttVersion::V5 {
             varlen::encode(self.payload_size() as u32, dst)?;
-            for prop in &self.0 {
+            for prop in &self.props {
                 prop.encode(dst)?;
             }
         }
@@ -390,7 +405,60 @@ impl Properties {
         while payload.has_remaining() {
             props.push(Property::decode(&mut payload)?);
         }
-        Ok(Self(props))
+        // Every byte of the length-prefixed region was consumed by exactly
+        // one property, so the wire length is the payload size.
+        Ok(Self {
+            props,
+            payload_size: len,
+        })
+    }
+}
+
+impl From<Vec<Property>> for Properties {
+    fn from(props: Vec<Property>) -> Self {
+        let payload_size = props.iter().map(Property::encoded_size).sum();
+        Self {
+            props,
+            payload_size,
+        }
+    }
+}
+
+impl From<Properties> for Vec<Property> {
+    fn from(props: Properties) -> Self {
+        props.props
+    }
+}
+
+impl FromIterator<Property> for Properties {
+    fn from_iter<I: IntoIterator<Item = Property>>(iter: I) -> Self {
+        Self::from(iter.into_iter().collect::<Vec<_>>())
+    }
+}
+
+impl Extend<Property> for Properties {
+    fn extend<I: IntoIterator<Item = Property>>(&mut self, iter: I) {
+        for prop in iter {
+            self.push(prop);
+        }
+    }
+}
+
+impl IntoIterator for Properties {
+    type Item = Property;
+    type IntoIter = alloc::vec::IntoIter<Property>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.props.into_iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a Properties {
+    type Item = &'a Property;
+    type IntoIter = core::slice::Iter<'a, Property>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.props.iter()
     }
 }
 
@@ -688,6 +756,75 @@ mod tests {
         let mut dst = BytesMut::new();
         props.encode(&mut dst, v5()).unwrap();
         assert_eq!(dst.len(), props.encoded_size(v5()));
+    }
+
+    // ---- cached payload size ----
+
+    fn sample_props() -> alloc::vec::Vec<Property> {
+        alloc::vec![
+            prop(PropertyId::MaximumPacketSize, PropertyValue::U32(65536)),
+            prop(PropertyId::TopicAliasMaximum, PropertyValue::U16(10)),
+            prop(
+                PropertyId::UserProperty,
+                PropertyValue::StringPair("key".to_string(), "value".to_string()),
+            ),
+            prop(
+                PropertyId::CorrelationData,
+                PropertyValue::Binary(Bytes::from_static(b"abc")),
+            ),
+        ]
+    }
+
+    fn summed(props: &Properties) -> usize {
+        props.iter().map(Property::encoded_size).sum()
+    }
+
+    #[test]
+    fn test_cached_size_tracks_push() {
+        let mut props = Properties::new();
+        assert_eq!(props.payload_size(), 0);
+        for p in sample_props() {
+            props.push(p);
+            assert_eq!(props.payload_size(), summed(&props));
+        }
+        assert_eq!(props.len(), 4);
+    }
+
+    #[test]
+    fn test_cached_size_from_vec_and_collect() {
+        let a = Properties::from(sample_props());
+        assert_eq!(a.payload_size(), summed(&a));
+        let b: Properties = sample_props().into_iter().collect();
+        assert_eq!(b.payload_size(), summed(&b));
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn test_cached_size_tracks_extend() {
+        let mut props = Properties::new();
+        props.extend(sample_props());
+        assert_eq!(props.payload_size(), summed(&props));
+    }
+
+    #[test]
+    fn test_cached_size_after_decode() {
+        let src = Properties::from(sample_props());
+        let mut dst = BytesMut::new();
+        src.encode(&mut dst, v5()).unwrap();
+        let decoded = Properties::decode(&mut dst.freeze(), v5()).unwrap();
+        assert_eq!(decoded, src);
+        assert_eq!(decoded.payload_size(), summed(&decoded));
+    }
+
+    #[test]
+    fn test_into_vec_round_trip() {
+        let props = Properties::from(sample_props());
+        let v: alloc::vec::Vec<Property> = props.clone().into();
+        assert_eq!(v, sample_props());
+        assert_eq!(
+            props.into_iter().collect::<alloc::vec::Vec<_>>(),
+            sample_props()
+        );
     }
 
     // ---- error cases ----

@@ -231,7 +231,60 @@ impl Packet {
         }
     }
 
+    /// Returns the fixed-header byte and the remaining length for this packet.
+    fn header_and_remaining(&self, ver: MqttVersion) -> (u8, usize) {
+        use Packet::*;
+        match self {
+            Connect(conn) => (HDR_CONNECT, conn.encoded_size()),
+            ConnAck(ack) => (HDR_CONNACK, ack.encoded_size(ver)),
+            Publish(pub_) => {
+                let mut hdr = PKT_PUBLISH << 4;
+                if pub_.dup {
+                    hdr |= 0x08;
+                }
+                hdr |= (pub_.qos as u8) << 1;
+                if pub_.retain {
+                    hdr |= 0x01;
+                }
+                (hdr, pub_.encoded_size(ver))
+            }
+            PubAck(ack) => (HDR_PUBACK, ack.encoded_size(ver)),
+            PubRec(ack) => (HDR_PUBREC, ack.encoded_size(ver)),
+            PubRel(ack) => (HDR_PUBREL, ack.encoded_size(ver)),
+            PubComp(ack) => (HDR_PUBCOMP, ack.encoded_size(ver)),
+            Subscribe(s) => (HDR_SUBSCRIBE, s.encoded_size(ver)),
+            SubAck(sa) => (HDR_SUBACK, sa.encoded_size(ver)),
+            Unsubscribe(u) => (HDR_UNSUBSCRIBE, u.encoded_size(ver)),
+            UnsubAck(ua) => (HDR_UNSUBACK, ua.encoded_size(ver)),
+            PingReq => (HDR_PINGREQ, 0),
+            PingResp => (HDR_PINGRESP, 0),
+            Disconnect(d) => (HDR_DISCONNECT, d.encoded_size(ver)),
+            Auth(a) => (HDR_AUTH, a.encoded_size()),
+        }
+    }
+
+    /// Returns the total number of bytes this packet encodes to, including
+    /// the fixed header and the remaining-length field.
+    ///
+    /// Returns [`Error::VarLenOverflow`] if the body exceeds the protocol
+    /// maximum ([`varlen::MAX_VARLEN`]).
+    pub fn encoded_size(&self, ver: MqttVersion) -> Result<usize> {
+        let (_, remaining) = self.header_and_remaining(ver);
+        let remaining = Self::checked_remaining(remaining)?;
+        Ok(1 + varlen::encoded_size(remaining) + remaining as usize)
+    }
+
+    fn checked_remaining(remaining: usize) -> Result<u32> {
+        u32::try_from(remaining)
+            .ok()
+            .filter(|&n| n <= varlen::MAX_VARLEN)
+            .ok_or(Error::VarLenOverflow)
+    }
+
     /// Encodes this packet into `dst`.
+    ///
+    /// The exact output size is computed up front and reserved in `dst`, so
+    /// the encode performs at most one allocation.
     ///
     /// CONNECT ignores `ver` and encodes with [`Connect::version`].
     ///
@@ -248,93 +301,27 @@ impl Packet {
 
     fn encode_inner(&self, dst: &mut BytesMut, ver: MqttVersion) -> Result<()> {
         use Packet::*;
+
+        let (hdr, remaining) = self.header_and_remaining(ver);
+        let remaining = Self::checked_remaining(remaining)?;
+        dst.reserve(1 + varlen::encoded_size(remaining) + remaining as usize);
+
+        dst.put_u8(hdr);
+        varlen::encode(remaining, dst)?;
+
         match self {
-            Connect(conn) => {
-                let remaining = conn.encoded_size();
-                dst.put_u8(HDR_CONNECT);
-                varlen::encode(remaining as u32, dst)?;
-                conn.encode(dst)?;
-            }
-            ConnAck(ack) => {
-                let remaining = ack.encoded_size(ver);
-                dst.put_u8(HDR_CONNACK);
-                varlen::encode(remaining as u32, dst)?;
-                ack.encode(dst, ver)?;
-            }
-            Publish(pub_) => {
-                let remaining = pub_.encoded_size(ver);
-                let mut hdr = PKT_PUBLISH << 4;
-                if pub_.dup {
-                    hdr |= 0x08;
-                }
-                hdr |= (pub_.qos as u8) << 1;
-                if pub_.retain {
-                    hdr |= 0x01;
-                }
-                dst.put_u8(hdr);
-                varlen::encode(remaining as u32, dst)?;
-                pub_.encode(dst, ver)?;
-            }
-            PubAck(ack) => {
-                dst.put_u8(HDR_PUBACK);
-                varlen::encode(ack.encoded_size(ver) as u32, dst)?;
-                ack.encode(dst, ver)?;
-            }
-            PubRec(ack) => {
-                dst.put_u8(HDR_PUBREC);
-                varlen::encode(ack.encoded_size(ver) as u32, dst)?;
-                ack.encode(dst, ver)?;
-            }
-            PubRel(ack) => {
-                dst.put_u8(HDR_PUBREL);
-                varlen::encode(ack.encoded_size(ver) as u32, dst)?;
-                ack.encode(dst, ver)?;
-            }
-            PubComp(ack) => {
-                dst.put_u8(HDR_PUBCOMP);
-                varlen::encode(ack.encoded_size(ver) as u32, dst)?;
-                ack.encode(dst, ver)?;
-            }
-            Subscribe(s) => {
-                dst.put_u8(HDR_SUBSCRIBE);
-                varlen::encode(s.encoded_size(ver) as u32, dst)?;
-                s.encode(dst, ver)?;
-            }
-            SubAck(sa) => {
-                dst.put_u8(HDR_SUBACK);
-                varlen::encode(sa.encoded_size(ver) as u32, dst)?;
-                sa.encode(dst, ver)?;
-            }
-            Unsubscribe(u) => {
-                dst.put_u8(HDR_UNSUBSCRIBE);
-                varlen::encode(u.encoded_size(ver) as u32, dst)?;
-                u.encode(dst, ver)?;
-            }
-            UnsubAck(ua) => {
-                dst.put_u8(HDR_UNSUBACK);
-                varlen::encode(ua.encoded_size(ver) as u32, dst)?;
-                ua.encode(dst, ver)?;
-            }
-            PingReq => {
-                dst.put_u8(HDR_PINGREQ);
-                varlen::encode(0, dst)?;
-            }
-            PingResp => {
-                dst.put_u8(HDR_PINGRESP);
-                varlen::encode(0, dst)?;
-            }
-            Disconnect(d) => {
-                dst.put_u8(HDR_DISCONNECT);
-                varlen::encode(d.encoded_size(ver) as u32, dst)?;
-                d.encode(dst, ver)?;
-            }
-            Auth(a) => {
-                dst.put_u8(HDR_AUTH);
-                varlen::encode(a.encoded_size() as u32, dst)?;
-                a.encode(dst)?;
-            }
+            Connect(conn) => conn.encode(dst),
+            ConnAck(ack) => ack.encode(dst, ver),
+            Publish(pub_) => pub_.encode(dst, ver),
+            PubAck(ack) | PubRec(ack) | PubRel(ack) | PubComp(ack) => ack.encode(dst, ver),
+            Subscribe(s) => s.encode(dst, ver),
+            SubAck(sa) => sa.encode(dst, ver),
+            Unsubscribe(u) => u.encode(dst, ver),
+            UnsubAck(ua) => ua.encode(dst, ver),
+            PingReq | PingResp => Ok(()),
+            Disconnect(d) => d.encode(dst, ver),
+            Auth(a) => a.encode(dst),
         }
-        Ok(())
     }
 }
 
@@ -518,9 +505,37 @@ mod tests {
     fn round_trip(pkt: Packet, ver: MqttVersion) {
         let mut dst = BytesMut::new();
         pkt.encode(&mut dst, ver).unwrap();
+        assert_eq!(pkt.encoded_size(ver).unwrap(), dst.len());
         let raw = RawPacket::decode(&mut dst).unwrap().unwrap();
         // from_raw must not error for these known-good packets
         Packet::from_raw(raw, ver).unwrap();
+    }
+
+    #[test]
+    fn test_encoded_size_includes_fixed_header() {
+        // PUBLISH "t" with a 200-byte payload: remaining = 2+1+1(props)+200 = 204,
+        // which needs a 2-byte varlen, so total = 1 + 2 + 204.
+        let pkt = Packet::Publish(Publish::new("t", Bytes::from(alloc::vec![0u8; 200])));
+        assert_eq!(pkt.encoded_size(v5()).unwrap(), 207);
+        let mut dst = BytesMut::new();
+        pkt.encode(&mut dst, v5()).unwrap();
+        assert_eq!(dst.len(), 207);
+    }
+
+    #[test]
+    fn test_encoded_size_overflow_errors() {
+        let payload = Bytes::from(alloc::vec![0u8; varlen::MAX_VARLEN as usize + 1]);
+        let pkt = Packet::Publish(Publish::new("t", payload));
+        assert_eq!(pkt.encoded_size(v5()), Err(Error::VarLenOverflow));
+    }
+
+    #[test]
+    fn test_encode_reserves_exact_capacity() {
+        let pkt = Packet::Publish(Publish::new("topic", Bytes::from_static(b"payload")));
+        let mut dst = BytesMut::new();
+        pkt.encode(&mut dst, v5()).unwrap();
+        // A fresh buffer is sized in one reservation to exactly what was written.
+        assert_eq!(dst.capacity(), dst.len());
     }
 
     #[test]

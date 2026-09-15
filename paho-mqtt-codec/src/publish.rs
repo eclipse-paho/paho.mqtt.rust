@@ -145,10 +145,11 @@ impl Publish {
 /// They are distinguished only by their packet-type nibble in the fixed
 /// header, which is handled by the [`Packet`](crate::packet::Packet) enum.
 ///
-/// **v5 shorthand encoding**: when `reason_code` is [`ReasonCode::Success`]
-/// and `properties` is empty the remaining length is 2 (packet ID only),
-/// omitting both the reason code and the properties length byte. Both the
-/// shorthand and the full form are accepted on decode.
+/// **v5 shorthand encodings**: when `reason_code` is [`ReasonCode::Success`]
+/// and `properties` is empty the remaining length is 2 (packet ID only). When
+/// only `properties` is empty the remaining length is 3 (packet ID + reason
+/// code), omitting the property-length byte. All three forms are accepted on
+/// decode.
 ///
 /// Type aliases [`PubRec`], [`PubRel`], and [`PubComp`] are provided for
 /// readability at call sites.
@@ -181,29 +182,33 @@ impl PubAck {
 
     /// Returns the remaining-length byte count for version, `ver`.
     ///
-    /// Uses the v5 shorthand (2 bytes, packet ID only) when possible.
+    /// Uses the shortest v5 form permitted: 2 bytes when the reason code is
+    /// `Success` and there are no properties, 3 bytes when there are no
+    /// properties, otherwise the full form.
     pub fn encoded_size(&self, ver: MqttVersion) -> usize {
-        match ver {
-            MqttVersion::V5 => {
-                if self.reason_code == ReasonCode::Success && self.properties.is_empty() {
-                    2 // shorthand: omit reason code + properties
-                }
-                else {
-                    2 + 1 + self.properties.encoded_size(ver)
-                }
-            }
-            _ => 2,
+        if ver != MqttVersion::V5 {
+            return 2;
+        }
+        match (self.reason_code, self.properties.is_empty()) {
+            (ReasonCode::Success, true) => 2,
+            (_, true) => 3,
+            _ => 3 + self.properties.encoded_size(ver),
         }
     }
 
     /// Encodes the variable header into `dst`.
     pub fn encode<B: BufMut>(&self, dst: &mut B, ver: MqttVersion) -> Result<()> {
         dst.put_u16(self.packet_id);
-        if ver == MqttVersion::V5
-            && (self.reason_code != ReasonCode::Success || !self.properties.is_empty())
-        {
-            dst.put_u8(self.reason_code as u8);
-            self.properties.encode(dst, ver)?;
+        if ver != MqttVersion::V5 {
+            return Ok(());
+        }
+        match (self.reason_code, self.properties.is_empty()) {
+            (ReasonCode::Success, true) => {}
+            (rc, true) => dst.put_u8(rc as u8),
+            (rc, false) => {
+                dst.put_u8(rc as u8);
+                self.properties.encode(dst, ver)?;
+            }
         }
         Ok(())
     }
@@ -251,7 +256,10 @@ impl PubAck {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{MQTT_VERSION_3_1_1, MQTT_VERSION_5};
+    use crate::{
+        properties::{Property, PropertyId, PropertyValue},
+        types::{MQTT_VERSION_3_1_1, MQTT_VERSION_5},
+    };
     use bytes::BytesMut;
 
     fn v311() -> MqttVersion {
@@ -577,8 +585,8 @@ mod tests {
         };
         let mut dst = BytesMut::new();
         ack.encode(&mut dst, v5()).unwrap();
-        // packet_id(2) + reason(1) + props_len(1=0x00)
-        assert_eq!(&dst[..], &[0x00, 0x03, 0x87, 0x00]);
+        // packet_id(2) + reason(1); the property length is omitted when empty.
+        assert_eq!(&dst[..], &[0x00, 0x03, 0x87]);
     }
 
     #[test]
@@ -589,6 +597,24 @@ mod tests {
             properties: Properties::new(),
         };
         round_trip_puback(ack, v5());
+    }
+
+    #[test]
+    fn test_puback_v5_full_form_with_properties_encode() {
+        let mut ack = PubAck::new(3);
+        ack.reason_code = ReasonCode::NotAuthorized;
+        ack.properties.push(Property::new(
+            PropertyId::ReasonString,
+            PropertyValue::String("no".into()),
+        ));
+        let mut dst = BytesMut::new();
+        ack.encode(&mut dst, v5()).unwrap();
+        // id(2) + reason(1) + props_len(1=5) + [0x1F, 0x00, 0x02, 'n', 'o']
+        assert_eq!(
+            &dst[..],
+            &[0x00, 0x03, 0x87, 0x05, 0x1F, 0x00, 0x02, b'n', b'o']
+        );
+        assert_eq!(ack.encoded_size(v5()), dst.len());
     }
 
     // ---- v5: shorthand decode (payload == 2 bytes) ----
@@ -627,8 +653,8 @@ mod tests {
             reason_code: ReasonCode::UnspecifiedError,
             properties: Properties::new(),
         };
-        // 2 (id) + 1 (reason) + 1 (props VBI 0x00)
-        assert_eq!(ack.encoded_size(v5()), 4);
+        // 2 (id) + 1 (reason); the property length is omitted when empty.
+        assert_eq!(ack.encoded_size(v5()), 3);
     }
 
     #[test]

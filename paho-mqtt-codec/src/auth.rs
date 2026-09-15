@@ -62,19 +62,26 @@ impl Auth {
     /// Uses the shorthand form (0) when `reason_code` is `Success` and
     /// `properties` is empty.
     pub fn encoded_size(&self) -> usize {
-        if self.reason_code == ReasonCode::Success && self.properties.is_empty() {
-            0
-        }
-        else {
-            1 + self.properties.encoded_size(MqttVersion::V5)
+        match (self.reason_code, self.properties.is_empty()) {
+            (ReasonCode::Success, true) => 0,
+            (_, true) => 1,
+            _ => 1 + self.properties.encoded_size(MqttVersion::V5),
         }
     }
 
     /// Encodes the variable header and payload into `dst`.
+    ///
+    /// Uses the shortest form permitted: nothing for `Success` with no
+    /// properties, just the reason code when there are no properties,
+    /// otherwise the full form.
     pub fn encode<B: BufMut>(&self, dst: &mut B) -> Result<()> {
-        if !(self.reason_code == ReasonCode::Success && self.properties.is_empty()) {
-            dst.put_u8(self.reason_code as u8);
-            self.properties.encode(dst, MqttVersion::V5)?;
+        match (self.reason_code, self.properties.is_empty()) {
+            (ReasonCode::Success, true) => {}
+            (rc, true) => dst.put_u8(rc as u8),
+            (rc, false) => {
+                dst.put_u8(rc as u8);
+                self.properties.encode(dst, MqttVersion::V5)?;
+            }
         }
         Ok(())
     }
@@ -163,8 +170,8 @@ mod tests {
     #[test]
     fn test_auth_continue_encoded_size() {
         let a = Auth::new(ReasonCode::ContinueAuthentication);
-        // 1 (reason) + 1 (empty props VBI) = 2
-        assert_eq!(a.encoded_size(), 2);
+        // Reason code only; the property length is omitted when empty.
+        assert_eq!(a.encoded_size(), 1);
     }
 
     #[test]
@@ -172,7 +179,7 @@ mod tests {
         let a = Auth::new(ReasonCode::ContinueAuthentication);
         let mut dst = BytesMut::new();
         a.encode(&mut dst).unwrap();
-        assert_eq!(&dst[..], &[0x18, 0x00]);
+        assert_eq!(&dst[..], &[0x18]);
     }
 
     #[test]
@@ -192,7 +199,7 @@ mod tests {
         let a = Auth::new(ReasonCode::ReAuthenticate);
         let mut dst = BytesMut::new();
         a.encode(&mut dst).unwrap();
-        assert_eq!(&dst[..], &[0x19, 0x00]);
+        assert_eq!(&dst[..], &[0x19]);
     }
 
     // ---- with properties ----

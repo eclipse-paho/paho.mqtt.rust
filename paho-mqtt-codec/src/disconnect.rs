@@ -71,23 +71,32 @@ impl Disconnect {
     /// When `reason_code` is `NormalDisconnection` and `properties` is empty,
     /// returns 0 regardless of version (shorthand form).
     pub fn encoded_size(&self, ver: MqttVersion) -> usize {
-        if ver != MqttVersion::V5
-            || (self.reason_code == ReasonCode::NormalDisconnection
-                && self.properties.is_empty())
-        {
+        if ver != MqttVersion::V5 {
             return 0;
         }
-        1 + self.properties.encoded_size(ver)
+        match (self.reason_code, self.properties.is_empty()) {
+            (ReasonCode::NormalDisconnection, true) => 0,
+            (_, true) => 1,
+            _ => 1 + self.properties.encoded_size(ver),
+        }
     }
 
     /// Encodes the variable header and payload into `dst`.
+    ///
+    /// Uses the shortest v5 form permitted: nothing for a normal disconnect
+    /// with no properties, just the reason code when there are no
+    /// properties, otherwise the full form.
     pub fn encode<B: BufMut>(&self, dst: &mut B, ver: MqttVersion) -> Result<()> {
-        if ver == MqttVersion::V5
-            && !(self.reason_code == ReasonCode::NormalDisconnection
-                && self.properties.is_empty())
-        {
-            dst.put_u8(self.reason_code as u8);
-            self.properties.encode(dst, ver)?;
+        if ver != MqttVersion::V5 {
+            return Ok(());
+        }
+        match (self.reason_code, self.properties.is_empty()) {
+            (ReasonCode::NormalDisconnection, true) => {}
+            (rc, true) => dst.put_u8(rc as u8),
+            (rc, false) => {
+                dst.put_u8(rc as u8);
+                self.properties.encode(dst, ver)?;
+            }
         }
         Ok(())
     }
@@ -219,15 +228,15 @@ mod tests {
         let d = Disconnect::new(ReasonCode::SessionTakenOver);
         let mut dst = BytesMut::new();
         d.encode(&mut dst, v5()).unwrap();
-        // reason_code byte + empty props VBI
-        assert_eq!(&dst[..], &[ReasonCode::SessionTakenOver as u8, 0x00]);
+        // Reason code only; the property length is omitted when empty.
+        assert_eq!(&dst[..], &[ReasonCode::SessionTakenOver as u8]);
     }
 
     #[test]
     fn test_disconnect_v5_encoded_size_with_reason() {
         let d = Disconnect::new(ReasonCode::SessionTakenOver);
-        // 1 (reason) + 1 (props VBI=0) = 2
-        assert_eq!(d.encoded_size(v5()), 2);
+        // Reason code only; the property length is omitted when empty.
+        assert_eq!(d.encoded_size(v5()), 1);
     }
 
     #[test]
