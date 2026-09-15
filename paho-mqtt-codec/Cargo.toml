@@ -19,3 +19,10 @@ serde = ["dep:serde", "bytes/serde"]
 bytes = { version = "1", default-features = false }
 thiserror = { version = "2.0", default-features = false }
 serde = { version = "1.0", default-features = false, features = ["derive", "alloc"], optional = true }
+
+[dev-dependencies]
+criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "codec"
+harness = false

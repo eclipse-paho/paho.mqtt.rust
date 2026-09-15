@@ -75,6 +75,21 @@ Formatting uses nightly-only options, so format with:
 
     $ cargo +nightly fmt
 
+### Benchmarks
+
+`benches/codec.rs` is a [Criterion](https://github.com/bheisler/criterion.rs) suite that times encoding and decoding of every packet type for both protocol versions, PUBLISH at payload sizes from 16 bytes to 1 MiB (including the header-only `encode_split` path), and framing of a buffer holding many small packets. Run all of it, or a subset by name:
+
+    $ cargo bench
+    $ cargo bench -- decode/publish
+
+To see how a change affects performance, save a baseline before making it and compare afterwards; Criterion reports the difference for each benchmark with a significance estimate:
+
+    $ cargo bench -- --save-baseline before
+    ... make changes ...
+    $ cargo bench -- --baseline before
+
+Encode benchmarks reuse one output buffer across iterations, as the client runtime does, so they measure the codec rather than the allocator. Decode benchmarks work on a fresh copy of the wire bytes each iteration (the copy is excluded from the timing) because framing consumes its input; freeing that buffer is included, so small-packet decode times carry a fixed allocation cost that is part of any real decode as well.
+
 ### Fuzzing
 
 The decoder is the crate's untrusted-input surface: a broker, or anything between it and the client, can put arbitrary bytes on the socket. A [cargo-fuzz](https://github.com/rust-fuzz/cargo-fuzz) target in the _fuzz_ directory feeds random, coverage-guided inputs through framing and parsing (`RawPacket::decode` then `Packet::from_raw`) for both protocol versions and checks that nothing panics. Anything that decodes successfully is also re-encoded and decoded again, which must reproduce the same packet.
