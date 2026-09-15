@@ -1,0 +1,27 @@
+[package]
+name = "paho-mqtt-codec-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+bytes = "1"
+
+[dependencies.paho-mqtt-codec]
+path = ".."
+
+[[bin]]
+name = "decode"
+path = "fuzz_targets/decode.rs"
+test = false
+doc = false
+bench = false
+
+[profile.release]
+debug = 1
+
+[workspace]
