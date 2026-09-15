@@ -201,13 +201,14 @@ impl Client {
     /// * `topics` The collection of topic names
     /// * `qos` The quality of service requested for all messages
     ///
-    pub fn subscribe_many_same_qos<T>(
+    pub fn subscribe_many_same_qos<T, Q>(
         &self,
         topics: &[T],
-        qos: i32,
+        qos: Q,
     ) -> Result<SubscribeResponse>
     where
         T: AsRef<str>,
+        Q: Into<QoS>,
     {
         self.cli
             .subscribe_many_same_qos(topics, qos)

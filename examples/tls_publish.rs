@@ -111,7 +111,7 @@ fn main() -> mqtt::Result<()> {
         let msg = mqtt::MessageBuilder::new()
             .topic("test")
             .payload("Hello Rust MQTT secure world!")
-            .qos(1)
+            .qos(mqtt::QOS_1)
             .finalize();
 
         cli.publish(msg).await?;

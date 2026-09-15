@@ -567,6 +567,7 @@ impl ConnectOptionsBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::QOS_1;
 
     const NAME: &str = "some-random-name";
     const PSWD: &str = "some-random-password";
@@ -606,7 +607,7 @@ mod tests {
 
     #[test]
     fn test_set_and_clear() {
-        let msg = Message::new("lwt", "disconnected", 1);
+        let msg = Message::new("lwt", "disconnected", QOS_1);
         let ssl = TlsOptions::default();
 
         // user_name: set then clear

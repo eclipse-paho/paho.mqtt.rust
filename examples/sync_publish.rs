@@ -60,7 +60,7 @@ fn main() {
     let msg = mqtt::MessageBuilder::new()
         .topic("test")
         .payload("Hello synchronous world!")
-        .qos(1)
+        .qos(mqtt::QOS_1)
         .finalize();
 
     if let Err(e) = cli.publish(msg) {

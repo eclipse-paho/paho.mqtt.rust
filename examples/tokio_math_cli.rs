@@ -56,7 +56,7 @@ async fn main() -> mqtt::Result<()> {
         process::exit(1);
     }
 
-    const QOS: i32 = 1;
+    const QOS: mqtt::QoS = mqtt::QOS_1;
 
     const REQ_TOPIC_HDR: &str = "requests/math";
     const REP_TOPIC_HDR: &str = "replies/math";

@@ -26,37 +26,18 @@ use core::fmt;
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
-/// Connect with the default MQTT version (currently v5).
-pub const MQTT_VERSION_DEFAULT: u8 = 5;
-
-/// Connect with MQTT v3.1.1.
-pub const MQTT_VERSION_3_1_1: u8 = 4;
-
-/// Connect with MQTT v3.1.1.
-pub const MQTT_VERSION_3: u8 = MQTT_VERSION_3_1_1;
-
-/// Connect with MQTT v5.
-pub const MQTT_VERSION_5: u8 = 5;
-
-/// Quality of Service Zero: At most once.
-pub const QOS_0: i32 = 0;
-
-/// Quality of Service One: At least once.
-pub const QOS_1: i32 = 1;
-
-/// Quality of Service Two: Exactly once.
-pub const QOS_2: i32 = 2;
-
 /// Supported MQTT protocol versions.
+///
+/// The discriminant is the protocol-level byte sent in CONNECT.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[repr(u8)]
 pub enum MqttVersion {
     /// Version 3.1.1 (protocol byte 4).
-    V3_1_1 = MQTT_VERSION_3_1_1,
+    V3_1_1 = 4,
     /// Version 5 (protocol byte 5).
     #[default]
-    V5 = MQTT_VERSION_5,
+    V5 = 5,
 }
 
 impl MqttVersion {
@@ -67,26 +48,51 @@ impl MqttVersion {
     pub const Default: MqttVersion = Self::V5;
 }
 
-impl From<u8> for MqttVersion {
-    fn from(ver: u8) -> Self {
-        use MqttVersion::*;
+/// Connect with the default MQTT version (currently v5).
+pub const MQTT_VERSION_DEFAULT: MqttVersion = MqttVersion::Default;
+
+/// Connect with MQTT v3.1.1.
+pub const MQTT_VERSION_3_1_1: MqttVersion = MqttVersion::V3_1_1;
+
+/// Connect with MQTT v3.1.1.
+pub const MQTT_VERSION_3: MqttVersion = MqttVersion::V3_1_1;
+
+/// Connect with MQTT v5.
+pub const MQTT_VERSION_5: MqttVersion = MqttVersion::V5;
+
+impl TryFrom<u8> for MqttVersion {
+    type Error = Error;
+
+    /// Converts a protocol-level byte into a version.
+    ///
+    /// Returns [`Error::UnsupportedProtocolVersion`] for anything other than
+    /// 4 (v3.1.1) or 5 (v5).
+    fn try_from(ver: u8) -> Result<Self, Error> {
         match ver {
-            MQTT_VERSION_3_1_1 => V3_1_1,
-            MQTT_VERSION_5 => V5,
-            _ => Self::Default,
+            4 => Ok(Self::V3_1_1),
+            5 => Ok(Self::V5),
+            _ => Err(Error::UnsupportedProtocolVersion),
         }
     }
 }
 
-impl From<u32> for MqttVersion {
-    fn from(ver: u32) -> Self {
-        Self::from(ver as u8)
+impl TryFrom<u32> for MqttVersion {
+    type Error = Error;
+
+    fn try_from(ver: u32) -> Result<Self, Error> {
+        u8::try_from(ver)
+            .map_err(|_| Error::UnsupportedProtocolVersion)
+            .and_then(Self::try_from)
     }
 }
 
-impl From<i32> for MqttVersion {
-    fn from(ver: i32) -> Self {
-        Self::from(ver as u8)
+impl TryFrom<i32> for MqttVersion {
+    type Error = Error;
+
+    fn try_from(ver: i32) -> Result<Self, Error> {
+        u8::try_from(ver)
+            .map_err(|_| Error::UnsupportedProtocolVersion)
+            .and_then(Self::try_from)
     }
 }
 
@@ -122,6 +128,15 @@ impl QoS {
     pub const QoS2: QoS = QoS::ExactlyOnce;
 }
 
+/// Quality of Service Zero: At most once.
+pub const QOS_0: QoS = QoS::AtMostOnce;
+
+/// Quality of Service One: At least once.
+pub const QOS_1: QoS = QoS::AtLeastOnce;
+
+/// Quality of Service Two: Exactly once.
+pub const QOS_2: QoS = QoS::ExactlyOnce;
+
 impl fmt::Display for QoS {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", *self as u8)
@@ -131,6 +146,7 @@ impl fmt::Display for QoS {
 impl TryFrom<u8> for QoS {
     type Error = Error;
 
+    /// Returns [`Error::BadQoS`] for any value other than 0, 1, or 2.
     fn try_from(qos: u8) -> Result<Self, Error> {
         use QoS::*;
         match qos {
@@ -142,15 +158,23 @@ impl TryFrom<u8> for QoS {
     }
 }
 
-impl From<i32> for QoS {
-    fn from(qos: i32) -> Self {
-        Self::try_from(qos as u8).unwrap_or_default()
+impl TryFrom<u32> for QoS {
+    type Error = Error;
+
+    fn try_from(qos: u32) -> Result<Self, Error> {
+        u8::try_from(qos)
+            .map_err(|_| Error::BadQoS)
+            .and_then(Self::try_from)
     }
 }
 
-impl From<u32> for QoS {
-    fn from(qos: u32) -> Self {
-        Self::try_from(qos as u8).unwrap_or_default()
+impl TryFrom<i32> for QoS {
+    type Error = Error;
+
+    fn try_from(qos: i32) -> Result<Self, Error> {
+        u8::try_from(qos)
+            .map_err(|_| Error::BadQoS)
+            .and_then(Self::try_from)
     }
 }
 
@@ -171,21 +195,41 @@ mod tests {
     }
 
     #[test]
-    fn test_mqtt_version_from_u8() {
-        assert_eq!(MqttVersion::from(3_u8), MqttVersion::Default);
-        assert_eq!(MqttVersion::from(4_u8), MqttVersion::V3_1_1);
-        assert_eq!(MqttVersion::from(5_u8), MqttVersion::V5);
-        assert_eq!(MqttVersion::from(0_u8), MqttVersion::Default);
-        assert_eq!(MqttVersion::from(99_u8), MqttVersion::Default);
+    fn test_mqtt_version_try_from_u8() {
+        assert_eq!(MqttVersion::try_from(4_u8), Ok(MqttVersion::V3_1_1));
+        assert_eq!(MqttVersion::try_from(5_u8), Ok(MqttVersion::V5));
+        for bad in [0_u8, 3, 6, 99, 255] {
+            assert_eq!(
+                MqttVersion::try_from(bad),
+                Err(Error::UnsupportedProtocolVersion),
+                "{bad}"
+            );
+        }
     }
 
     #[test]
-    fn test_mqtt_version_from_u32() {
-        assert_eq!(MqttVersion::from(3_u32), MqttVersion::Default);
-        assert_eq!(MqttVersion::from(4_u32), MqttVersion::V3_1_1);
-        assert_eq!(MqttVersion::from(5_u32), MqttVersion::V5);
-        assert_eq!(MqttVersion::from(0_u32), MqttVersion::Default);
-        assert_eq!(MqttVersion::from(99_u32), MqttVersion::Default);
+    fn test_mqtt_version_try_from_wider_ints() {
+        assert_eq!(MqttVersion::try_from(4_u32), Ok(MqttVersion::V3_1_1));
+        assert_eq!(MqttVersion::try_from(5_i32), Ok(MqttVersion::V5));
+        // Out-of-range values must not be truncated into a valid byte.
+        assert_eq!(
+            MqttVersion::try_from(0x105_u32),
+            Err(Error::UnsupportedProtocolVersion)
+        );
+        assert_eq!(
+            MqttVersion::try_from(-1_i32),
+            Err(Error::UnsupportedProtocolVersion)
+        );
+    }
+
+    #[test]
+    fn test_mqtt_version_constants() {
+        assert_eq!(MQTT_VERSION_3_1_1, MqttVersion::V3_1_1);
+        assert_eq!(MQTT_VERSION_3, MqttVersion::V3_1_1);
+        assert_eq!(MQTT_VERSION_5, MqttVersion::V5);
+        assert_eq!(MQTT_VERSION_DEFAULT, MqttVersion::default());
+        assert_eq!(MQTT_VERSION_3_1_1 as u8, 4);
+        assert_eq!(MQTT_VERSION_5 as u8, 5);
     }
 
     #[test]
@@ -204,10 +248,20 @@ mod tests {
     }
 
     #[test]
-    fn test_qos_from_i32() {
-        assert_eq!(QoS::from(0_i32), QoS::AtMostOnce);
-        assert_eq!(QoS::from(1_i32), QoS::AtLeastOnce);
-        assert_eq!(QoS::from(2_i32), QoS::ExactlyOnce);
-        assert_eq!(QoS::from(99_i32), QoS::AtMostOnce); // invalid → default
+    fn test_qos_try_from_wider_ints() {
+        assert_eq!(QoS::try_from(0_i32), Ok(QoS::AtMostOnce));
+        assert_eq!(QoS::try_from(1_u32), Ok(QoS::AtLeastOnce));
+        assert_eq!(QoS::try_from(2_i32), Ok(QoS::ExactlyOnce));
+        assert_eq!(QoS::try_from(3_i32), Err(Error::BadQoS));
+        assert_eq!(QoS::try_from(-1_i32), Err(Error::BadQoS));
+        assert_eq!(QoS::try_from(0x100_u32), Err(Error::BadQoS));
+    }
+
+    #[test]
+    fn test_qos_constants() {
+        assert_eq!(QOS_0, QoS::AtMostOnce);
+        assert_eq!(QOS_1, QoS::AtLeastOnce);
+        assert_eq!(QOS_2, QoS::ExactlyOnce);
+        assert_eq!(QOS_1, QoS::QoS1);
     }
 }

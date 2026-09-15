@@ -40,7 +40,7 @@ use std::{env, process, thread, time::Duration};
 
 // The topics to which we subscribe.
 const TOPICS: &[&str] = &["test", "hello"];
-const QOS: &[i32] = &[1, 1];
+const QOS: &[mqtt::QoS] = &[mqtt::QOS_1, mqtt::QOS_1];
 
 // Min & max reconnect backoff times (2x each time till max).
 const MIN_RECONNECT: Duration = Duration::from_secs(1);
@@ -93,7 +93,11 @@ fn main() {
     });
 
     // Define the set of options for the connection
-    let lwt = mqtt::Message::new("test/lwt", "[LWT] Async subscriber lost connection", 1);
+    let lwt = mqtt::Message::new(
+        "test/lwt",
+        "[LWT] Async subscriber lost connection",
+        mqtt::QOS_1,
+    );
 
     let conn_opts = mqtt::ConnectOptionsBuilder::new_v3()
         .keep_alive_interval(Duration::from_secs(20))

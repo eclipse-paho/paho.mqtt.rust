@@ -279,11 +279,11 @@ mod tests {
     use bytes::BytesMut;
 
     fn v311() -> MqttVersion {
-        MqttVersion::from(MQTT_VERSION_3_1_1)
+        MQTT_VERSION_3_1_1
     }
 
     fn v5() -> MqttVersion {
-        MqttVersion::from(MQTT_VERSION_5)
+        MQTT_VERSION_5
     }
 
     fn sub(filter: &str, qos: QoS) -> Subscription {

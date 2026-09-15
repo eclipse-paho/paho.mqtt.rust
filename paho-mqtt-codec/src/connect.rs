@@ -21,9 +21,7 @@
 //! MQTT CONNECT and CONNACK packets.
 
 use crate::{
-    Error, MqttVersion, Properties, QoS, ReasonCode, Result, String,
-    types::{MQTT_VERSION_3_1_1, MQTT_VERSION_5},
-    varlen,
+    Error, MqttVersion, Properties, QoS, ReasonCode, Result, String, varlen,
     wire::{binary_wire_size, get_binary, get_utf8, put_binary, put_utf8, utf8_wire_size},
 };
 use bytes::{Buf, BufMut, Bytes, BytesMut};
@@ -204,11 +202,7 @@ impl Connect {
         if payload.remaining() < 1 {
             return Err(Error::PacketTooShort);
         }
-        let ver = match payload.get_u8() {
-            MQTT_VERSION_3_1_1 => MqttVersion::V3_1_1,
-            MQTT_VERSION_5 => MqttVersion::V5,
-            _ => return Err(Error::UnsupportedProtocolVersion),
-        };
+        let ver = MqttVersion::try_from(payload.get_u8())?;
         // Connect flags
         if payload.remaining() < 3 {
             return Err(Error::PacketTooShort);
@@ -415,11 +409,11 @@ mod tests {
     use bytes::BytesMut;
 
     fn v311() -> MqttVersion {
-        MqttVersion::from(MQTT_VERSION_3_1_1)
+        MQTT_VERSION_3_1_1
     }
 
     fn v5() -> MqttVersion {
-        MqttVersion::from(MQTT_VERSION_5)
+        MQTT_VERSION_5
     }
 
     // ---- v311 encode ----

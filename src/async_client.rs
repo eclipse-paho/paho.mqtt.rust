@@ -536,11 +536,12 @@ impl AsyncClient {
     /// * `topics` The collection of topic names
     /// * `qos` The quality of service requested for all messages
     ///
-    pub fn subscribe_many_same_qos<T>(&self, topics: &[T], qos: i32) -> SubscribeManyToken
+    pub fn subscribe_many_same_qos<T, Q>(&self, topics: &[T], qos: Q) -> SubscribeManyToken
     where
         T: AsRef<str>,
+        Q: Into<QoS>,
     {
-        let qos = vec![qos; topics.len()];
+        let qos = vec![qos.into(); topics.len()];
         self.subscribe_many(topics, &qos)
     }
 
@@ -857,7 +858,8 @@ impl AsyncClient {
 impl AsyncClient {
     /// Gets the most recent MQTT version for the client.
     pub fn mqtt_version(&self) -> MqttVersion {
-        MqttVersion::from(self.mqtt_version_raw())
+        MqttVersion::try_from(self.mqtt_version_raw())
+            .expect("stored MQTT version always originates from a valid MqttVersion")
     }
 
     /// The raw, integer value of the MQTT version.

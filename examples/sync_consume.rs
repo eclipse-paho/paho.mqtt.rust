@@ -97,7 +97,7 @@ fn main() {
         .finalize();
 
     let subscriptions = ["test", "hello"];
-    let qos = 1;
+    let qos = mqtt::QOS_1;
 
     // Make the connection to the broker
     match cli.connect(conn_opts) {

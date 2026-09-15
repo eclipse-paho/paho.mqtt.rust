@@ -48,7 +48,7 @@ use std::{env, process, sync::RwLock, thread, time::Duration};
 
 // The topics to which we subscribe.
 const DFLT_TOPICS: &[&str] = &["requests/subscription/add", "test", "hello"];
-const QOS: i32 = 1;
+const QOS: mqtt::QoS = mqtt::QOS_1;
 
 // The type we'll use to keep our dynamic list of topics inside the
 // MQTT client. Since we want to update it after creating the client,
@@ -131,7 +131,11 @@ fn main() {
     });
 
     // Define the set of options for the connection
-    let lwt = mqtt::Message::new("test/lwt", "[LWT] Dynamic subscriber lost connection", 1);
+    let lwt = mqtt::Message::new(
+        "test/lwt",
+        "[LWT] Dynamic subscriber lost connection",
+        mqtt::QOS_1,
+    );
 
     // The connect options. Defaults to an MQTT v3.x connection.
     let conn_opts = mqtt::ConnectOptionsBuilder::new()

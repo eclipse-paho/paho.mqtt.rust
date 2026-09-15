@@ -34,7 +34,7 @@ use paho_mqtt as mqtt;
 use std::{collections::HashMap, env, process};
 
 // Use a non-zero QOS to exercise the persistence store
-const QOS: i32 = 1;
+const QOS: mqtt::QoS = mqtt::QOS_1;
 
 /////////////////////////////////////////////////////////////////////////////
 

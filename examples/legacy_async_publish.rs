@@ -60,7 +60,7 @@ fn main() {
 
     // Create a message and publish it
     println!("Publishing a message on the 'test' topic");
-    let msg = mqtt::Message::new("test", "Hello Rust MQTT world!", 0);
+    let msg = mqtt::Message::new("test", "Hello Rust MQTT world!", mqtt::QOS_0);
     let tok = cli.publish(msg);
 
     if let Err(e) = tok.wait() {

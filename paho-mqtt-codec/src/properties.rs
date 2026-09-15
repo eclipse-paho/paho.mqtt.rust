@@ -474,7 +474,7 @@ mod tests {
     use bytes::BytesMut;
 
     fn v5() -> MqttVersion {
-        MqttVersion::from(MQTT_VERSION_5)
+        MQTT_VERSION_5
     }
 
     fn round_trip(props: &Properties) {

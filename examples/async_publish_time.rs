@@ -100,7 +100,7 @@ fn main() {
 
         let tf = 0.01 * (t as f64);
 
-        let msg = mqtt::Message::new(topic, format!("{:.3}", tf), 1);
+        let msg = mqtt::Message::new(topic, format!("{:.3}", tf), mqtt::QOS_1);
 
         // We don't need to use `try_publish()` here since we just wait on
         // the token, but this shows how we could use it.

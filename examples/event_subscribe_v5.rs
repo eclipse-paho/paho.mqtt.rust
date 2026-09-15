@@ -44,7 +44,7 @@ use std::{env, process, time::Duration};
 
 // The topics to which we subscribe.
 const TOPICS: &[&str] = &["test", "hello"];
-const QOS: &[i32] = &[1, 1];
+const QOS: &[mqtt::QoS] = &[mqtt::QOS_1, mqtt::QOS_1];
 
 const RECONN_RETRY_PERIOD: Duration = Duration::from_secs(1);
 

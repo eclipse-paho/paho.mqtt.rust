@@ -159,8 +159,8 @@ fn main() -> mqtt::Result<()> {
     else {
         // Register subscriptions on the server, using Subscription ID's.
         println!(r#"Subscribing to topics ["data/#", "command"]..."#);
-        cli.subscribe_with_options("data/#", 0, None, sub_id(1))?;
-        cli.subscribe_with_options("command", 1, None, sub_id(2))?;
+        cli.subscribe_with_options("data/#", mqtt::QOS_0, None, sub_id(1))?;
+        cli.subscribe_with_options("command", mqtt::QOS_1, None, sub_id(2))?;
     }
 
     // ^C handler will stop the consumer, breaking us out of the loop, below

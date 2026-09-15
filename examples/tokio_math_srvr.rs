@@ -43,7 +43,7 @@ use std::{
 };
 
 // The default QoS
-const QOS: i32 = 1;
+const QOS: mqtt::QoS = mqtt::QOS_1;
 
 /////////////////////////////////////////////////////////////////////////////
 

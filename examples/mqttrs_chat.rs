@@ -58,7 +58,7 @@ fn main() -> mqtt::Result<()> {
 
     let client_id = format!("mqttrs_chat-{}-{}", chat_user, chat_group);
 
-    const QOS: i32 = 1;
+    const QOS: mqtt::QoS = mqtt::QOS_1;
     const NO_LOCAL: bool = true;
 
     // The LWT is broadcast to the group if our connection is lost

@@ -48,31 +48,20 @@ pub type String = std::string::String;
 #[cfg(not(feature = "std"))]
 pub type String = alloc::string::String;
 
-pub mod error;
-
-pub mod varlen;
-
 pub(crate) mod wire;
 
-pub mod properties;
-
-pub mod packet;
-
-pub mod types;
-
-pub mod reason_code;
-
-pub mod connect;
-
-pub mod publish;
-
-pub mod subscribe;
-
-pub mod unsubscribe;
-
-pub mod disconnect;
-
 pub mod auth;
+pub mod connect;
+pub mod disconnect;
+pub mod error;
+pub mod packet;
+pub mod properties;
+pub mod publish;
+pub mod reason_code;
+pub mod subscribe;
+pub mod types;
+pub mod unsubscribe;
+pub mod varlen;
 
 pub use auth::Auth;
 pub use connect::{ConnAck, Connect, Will};

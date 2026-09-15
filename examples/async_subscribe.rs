@@ -44,7 +44,7 @@ use std::{env, process, time::Duration};
 const DEFAULT_TOPIC: &str = "test/#";
 
 /// The QoS for the subscription(s)
-const QOS: i32 = 1;
+const QOS: mqtt::QoS = mqtt::QOS_1;
 
 const RECONN_RETRY_PERIOD: Duration = Duration::from_secs(1);
 
@@ -67,7 +67,7 @@ fn main() {
     else {
         topics.iter().map(String::as_str).collect()
     };
-    let qos: Vec<i32> = vec![QOS; topics.len()];
+    let qos = vec![QOS; topics.len()];
 
     println!("Connecting to the MQTT server at '{}'...", host);
 
