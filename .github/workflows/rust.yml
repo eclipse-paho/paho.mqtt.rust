@@ -202,6 +202,12 @@ jobs:
   codec-fuzz:
     name: Codec Fuzz (short run)
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - decode     # arbitrary bytes through framing + parsing
+          - roundtrip  # valid packets through encode -> decode
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@nightly
@@ -210,16 +216,16 @@ jobs:
         run: cargo install cargo-fuzz --locked
 
       # No committed corpus: the fuzzer bootstraps from nothing. A short
-      # bounded run on every change catches regressions in the decoder; run
-      # it locally for longer when changing framing or parsing code.
-      - name: Fuzz the decoder
+      # bounded run on every change catches regressions; run it locally for
+      # longer when changing framing, parsing, or encoding code.
+      - name: Fuzz (${{ matrix.target }})
         working-directory: paho-mqtt-codec
-        run: cargo fuzz run decode -- -max_total_time=120 -max_len=2048
+        run: cargo fuzz run ${{ matrix.target }} -- -max_total_time=120 -max_len=4096
 
       - name: Upload failing inputs
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: fuzz-artifacts
+          name: fuzz-artifacts-${{ matrix.target }}
           path: paho-mqtt-codec/fuzz/artifacts/
           if-no-files-found: ignore

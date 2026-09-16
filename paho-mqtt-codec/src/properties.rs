@@ -136,6 +136,15 @@ impl PropertyId {
             UserProperty => StringPair,
         }
     }
+
+    /// Returns `true` if this property may appear more than once in a packet.
+    ///
+    /// Only `UserProperty` and `SubscriptionIdentifier` may repeat; the
+    /// specification makes a second occurrence of any other property a
+    /// Protocol Error.
+    pub fn is_repeatable(self) -> bool {
+        matches!(self, Self::UserProperty | Self::SubscriptionIdentifier)
+    }
 }
 
 impl TryFrom<u8> for PropertyId {
@@ -199,6 +208,19 @@ pub enum PropertyValue {
 }
 
 impl PropertyValue {
+    /// Returns the wire encoding type of this value.
+    pub fn property_type(&self) -> PropertyType {
+        match self {
+            PropertyValue::Byte(_) => PropertyType::Byte,
+            PropertyValue::U16(_) => PropertyType::U16,
+            PropertyValue::U32(_) => PropertyType::U32,
+            PropertyValue::VarInt(_) => PropertyType::VarInt,
+            PropertyValue::Binary(_) => PropertyType::Binary,
+            PropertyValue::String(_) => PropertyType::String,
+            PropertyValue::StringPair(..) => PropertyType::StringPair,
+        }
+    }
+
     /// Number of bytes this value occupies on the wire (excluding the property-ID byte).
     pub fn encoded_size(&self) -> usize {
         match self {
@@ -286,6 +308,52 @@ impl Property {
         1 + self.value.encoded_size()
     }
 
+    /// Checks that the value has the wire type the identifier requires and
+    /// is within the range the specification allows for that property.
+    ///
+    /// Several properties restrict the value beyond its type: the one-byte
+    /// flags must be 0 or 1; `ReceiveMaximum`, `MaximumPacketSize`,
+    /// `TopicAlias`, and `SubscriptionIdentifier` must be non-zero; and a
+    /// `ResponseTopic` may not contain wildcards. Returns
+    /// [`Error::MalformedPacket`] on any violation.
+    pub fn validate(&self) -> Result<()> {
+        if self.value.property_type() != self.id.value_type() {
+            return Err(Error::MalformedPacket);
+        }
+        self.check_range()
+    }
+
+    /// The value-range half of [`validate`](Self::validate), for values whose
+    /// type is already known to match (i.e. just decoded from the wire).
+    #[inline]
+    fn check_range(&self) -> Result<()> {
+        use PropertyId::*;
+        use PropertyValue::*;
+        let ok = match self.id {
+            PayloadFormatIndicator
+            | RequestProblemInformation
+            | RequestResponseInformation
+            | MaximumQoS
+            | RetainAvailable
+            | WildcardSubscriptionAvailable
+            | SubscriptionIdentifierAvailable
+            | SharedSubscriptionAvailable => matches!(self.value, Byte(0 | 1)),
+            ReceiveMaximum | TopicAlias => matches!(self.value, U16(1..)),
+            MaximumPacketSize => matches!(self.value, U32(1..)),
+            SubscriptionIdentifier => matches!(self.value, VarInt(1..)),
+            ResponseTopic => {
+                matches!(&self.value, String(s) if !s.bytes().any(|b| b == b'+' || b == b'#'))
+            }
+            _ => true,
+        };
+        if ok {
+            Ok(())
+        }
+        else {
+            Err(Error::MalformedPacket)
+        }
+    }
+
     fn encode<B: BufMut>(&self, dst: &mut B) -> Result<()> {
         dst.put_u8(self.id as u8);
         self.value.encode(dst)
@@ -297,11 +365,50 @@ impl Property {
         }
         let id = PropertyId::try_from(src.get_u8())?;
         let value = PropertyValue::decode_typed(id.value_type(), src)?;
-        Ok(Property { id, value })
+        let prop = Property { id, value };
+        // The type is right by construction; only the range needs checking.
+        prop.check_range()?;
+        Ok(prop)
     }
 }
 
 /////////////////////////////////////////////////////////////////////////////
+
+/// Tracks which non-repeatable property identifiers have been seen while
+/// walking a property list, and whether the list has been found invalid.
+///
+/// Identifiers are all below 0x2B, so one bit each; bits for repeatable
+/// identifiers are simply never set. Bit 63 is the "invalid" flag, kept
+/// here rather than in a separate field so [`Properties`] stays small
+/// enough to embed in error types.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct SeenIds(u64);
+
+impl SeenIds {
+    const REPEATABLE: u64 = (1 << PropertyId::UserProperty as u8)
+        | (1 << PropertyId::SubscriptionIdentifier as u8);
+    const INVALID: u64 = 1 << 63;
+
+    /// Records `id`; returns [`Error::MalformedPacket`] if a non-repeatable
+    /// identifier has already been recorded.
+    #[inline]
+    fn note(&mut self, id: PropertyId) -> Result<()> {
+        let bit = 1u64 << (id as u8);
+        if self.0 & bit != 0 {
+            return Err(Error::MalformedPacket);
+        }
+        self.0 |= bit & !Self::REPEATABLE;
+        Ok(())
+    }
+
+    fn mark_invalid(&mut self) {
+        self.0 |= Self::INVALID;
+    }
+
+    fn is_invalid(&self) -> bool {
+        self.0 & Self::INVALID != 0
+    }
+}
 
 /// MQTT v5 properties: an ordered list of [`Property`] pairs.
 ///
@@ -322,6 +429,10 @@ pub struct Properties {
     /// Sum of `encoded_size()` over `props`; kept in step by every mutator
     /// so encoding never has to walk the list to size the length prefix.
     payload_size: usize,
+    /// Non-repeatable identifiers pushed so far (for duplicate detection),
+    /// plus a flag set if any pushed property failed validation or repeated
+    /// a non-repeatable identifier; `encode` then refuses the whole list.
+    seen: SeenIds,
 }
 
 impl Properties {
@@ -341,7 +452,15 @@ impl Properties {
     }
 
     /// Appends `prop` to the end of the list.
+    ///
+    /// The property is checked here rather than on every encode: if its
+    /// value is out of range for its identifier (see [`Property::validate`])
+    /// or it repeats a non-repeatable identifier, the list is marked invalid
+    /// and [`encode`](Self::encode) will return [`Error::MalformedPacket`].
     pub fn push(&mut self, prop: Property) {
+        if prop.validate().is_err() || self.seen.note(prop.id).is_err() {
+            self.seen.mark_invalid();
+        }
         self.payload_size += prop.encoded_size();
         self.props.push(prop);
     }
@@ -379,6 +498,9 @@ impl Properties {
     /// No bytes are written for v3.1.1 connections.
     pub fn encode<B: BufMut>(&self, dst: &mut B, ver: MqttVersion) -> Result<()> {
         if ver >= MqttVersion::V5 {
+            if self.seen.is_invalid() {
+                return Err(Error::MalformedPacket);
+            }
             varlen::encode(self.payload_size() as u32, dst)?;
             for prop in &self.props {
                 prop.encode(dst)?;
@@ -402,23 +524,32 @@ impl Properties {
         }
         let mut payload = src.copy_to_bytes(len);
         let mut props = Vec::new();
+        let mut seen = SeenIds::default();
+        let mut payload_size = 0;
         while payload.has_remaining() {
-            props.push(Property::decode(&mut payload)?);
+            let prop = Property::decode(&mut payload)?; // validated
+            seen.note(prop.id)?;
+            // Size from the decoded value, not the wire length, so the cache
+            // is right by construction even for a non-canonical encoding.
+            payload_size += prop.encoded_size();
+            props.push(prop);
         }
-        // Size from the decoded values, not the wire length, so the cache
-        // is right by construction even if an encoding on the wire was
-        // longer than canonical.
-        Ok(Self::from(props))
+        Ok(Self {
+            props,
+            payload_size,
+            seen,
+        })
     }
 }
 
 impl From<Vec<Property>> for Properties {
     fn from(props: Vec<Property>) -> Self {
-        let payload_size = props.iter().map(Property::encoded_size).sum();
-        Self {
-            props,
-            payload_size,
-        }
+        let mut out = Self {
+            props: Vec::with_capacity(props.len()),
+            ..Self::default()
+        };
+        out.extend(props);
+        out
     }
 }
 
@@ -754,6 +885,192 @@ mod tests {
         let mut dst = BytesMut::new();
         props.encode(&mut dst, v5()).unwrap();
         assert_eq!(dst.len(), props.encoded_size(v5()));
+    }
+
+    // ---- value validation (B8 f) ----
+
+    fn encode_one(p: Property) -> Result<()> {
+        let mut props = Properties::new();
+        props.push(p);
+        let mut dst = BytesMut::new();
+        props.encode(&mut dst, v5())
+    }
+
+    fn decode_raw(body: &[u8]) -> Result<Properties> {
+        let mut src = BytesMut::new();
+        src.put_u8(body.len() as u8);
+        src.put_slice(body);
+        Properties::decode(&mut src.freeze(), v5())
+    }
+
+    #[test]
+    fn test_validate_flag_properties_must_be_0_or_1() {
+        for id in [
+            PropertyId::PayloadFormatIndicator,
+            PropertyId::RequestProblemInformation,
+            PropertyId::RequestResponseInformation,
+            PropertyId::MaximumQoS,
+            PropertyId::RetainAvailable,
+            PropertyId::WildcardSubscriptionAvailable,
+            PropertyId::SubscriptionIdentifierAvailable,
+            PropertyId::SharedSubscriptionAvailable,
+        ] {
+            assert!(Property::new(id, PropertyValue::Byte(0)).validate().is_ok());
+            assert!(Property::new(id, PropertyValue::Byte(1)).validate().is_ok());
+            assert_eq!(
+                Property::new(id, PropertyValue::Byte(2)).validate(),
+                Err(Error::MalformedPacket),
+                "{id:?}"
+            );
+            // ... and on the wire
+            assert_eq!(decode_raw(&[id as u8, 0x07]), Err(Error::MalformedPacket));
+            assert_eq!(
+                encode_one(Property::new(id, PropertyValue::Byte(7))),
+                Err(Error::MalformedPacket)
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_non_zero_properties() {
+        assert_eq!(
+            Property::new(PropertyId::ReceiveMaximum, PropertyValue::U16(0)).validate(),
+            Err(Error::MalformedPacket)
+        );
+        assert_eq!(
+            Property::new(PropertyId::TopicAlias, PropertyValue::U16(0)).validate(),
+            Err(Error::MalformedPacket)
+        );
+        assert_eq!(
+            Property::new(PropertyId::MaximumPacketSize, PropertyValue::U32(0)).validate(),
+            Err(Error::MalformedPacket)
+        );
+        assert_eq!(
+            Property::new(PropertyId::SubscriptionIdentifier, PropertyValue::VarInt(0))
+                .validate(),
+            Err(Error::MalformedPacket)
+        );
+        // Wire forms: ReceiveMaximum = 0, MaximumPacketSize = 0, TopicAlias = 0, SubId = 0
+        assert_eq!(decode_raw(&[0x21, 0x00, 0x00]), Err(Error::MalformedPacket));
+        assert_eq!(
+            decode_raw(&[0x27, 0x00, 0x00, 0x00, 0x00]),
+            Err(Error::MalformedPacket)
+        );
+        assert_eq!(decode_raw(&[0x23, 0x00, 0x00]), Err(Error::MalformedPacket));
+        assert_eq!(decode_raw(&[0x0B, 0x00]), Err(Error::MalformedPacket));
+        // Minimum legal values are fine.
+        assert!(decode_raw(&[0x21, 0x00, 0x01]).is_ok());
+        assert!(decode_raw(&[0x0B, 0x01]).is_ok());
+        // TopicAliasMaximum = 0 is explicitly allowed (means "no aliases").
+        assert!(decode_raw(&[0x22, 0x00, 0x00]).is_ok());
+    }
+
+    #[test]
+    fn test_validate_response_topic_rejects_wildcards() {
+        for t in ["a/#", "a/+/b", "+", "#"] {
+            assert_eq!(
+                Property::new(PropertyId::ResponseTopic, PropertyValue::String(t.into()))
+                    .validate(),
+                Err(Error::MalformedPacket),
+                "{t}"
+            );
+        }
+        assert!(
+            Property::new(
+                PropertyId::ResponseTopic,
+                PropertyValue::String("a/b".into())
+            )
+            .validate()
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn test_validate_value_type_must_match_id() {
+        // A U32 where the id calls for a Byte can only be built via the API,
+        // never decoded; encode must refuse it.
+        assert_eq!(
+            Property::new(PropertyId::MaximumQoS, PropertyValue::U32(1)).validate(),
+            Err(Error::MalformedPacket)
+        );
+        assert_eq!(
+            encode_one(Property::new(
+                PropertyId::ContentType,
+                PropertyValue::Binary(Bytes::from_static(b"x"))
+            )),
+            Err(Error::MalformedPacket)
+        );
+    }
+
+    // ---- duplicate detection (B8 g) ----
+
+    #[test]
+    fn test_decode_rejects_duplicate_non_repeatable_property() {
+        // SessionExpiryInterval twice
+        assert_eq!(
+            decode_raw(&[0x11, 0, 0, 0, 1, 0x11, 0, 0, 0, 2]),
+            Err(Error::MalformedPacket)
+        );
+        // ContentType twice
+        assert_eq!(
+            decode_raw(&[0x03, 0, 1, b'a', 0x03, 0, 1, b'b']),
+            Err(Error::MalformedPacket)
+        );
+    }
+
+    #[test]
+    fn test_decode_allows_repeatable_properties() {
+        // Two user properties and two subscription identifiers.
+        let props = decode_raw(&[
+            0x26, 0, 1, b'k', 0, 1, b'v', 0x26, 0, 1, b'k', 0, 1, b'w', 0x0B, 0x01, 0x0B,
+            0x02,
+        ])
+        .unwrap();
+        assert_eq!(props.len(), 4);
+    }
+
+    #[test]
+    fn test_encode_rejects_duplicate_non_repeatable_property() {
+        let mut props = Properties::new();
+        props.push(prop(PropertyId::ReceiveMaximum, PropertyValue::U16(1)));
+        props.push(prop(PropertyId::ReceiveMaximum, PropertyValue::U16(2)));
+        let mut dst = BytesMut::new();
+        assert_eq!(props.encode(&mut dst, v5()), Err(Error::MalformedPacket));
+        // Not written at all on v3.1.1, so nothing to reject.
+        assert!(props.encode(&mut dst, MqttVersion::V3_1_1).is_ok());
+    }
+
+    #[test]
+    fn test_encode_allows_repeatable_properties() {
+        let mut props = Properties::new();
+        props.push(prop(
+            PropertyId::UserProperty,
+            PropertyValue::StringPair("a".to_string(), "1".to_string()),
+        ));
+        props.push(prop(
+            PropertyId::UserProperty,
+            PropertyValue::StringPair("a".to_string(), "2".to_string()),
+        ));
+        props.push(prop(
+            PropertyId::SubscriptionIdentifier,
+            PropertyValue::VarInt(1),
+        ));
+        props.push(prop(
+            PropertyId::SubscriptionIdentifier,
+            PropertyValue::VarInt(2),
+        ));
+        let mut dst = BytesMut::new();
+        props.encode(&mut dst, v5()).unwrap();
+        let back = Properties::decode(&mut dst.freeze(), v5()).unwrap();
+        assert_eq!(back, props);
+    }
+
+    #[test]
+    fn test_is_repeatable() {
+        assert!(PropertyId::UserProperty.is_repeatable());
+        assert!(PropertyId::SubscriptionIdentifier.is_repeatable());
+        assert!(!PropertyId::SessionExpiryInterval.is_repeatable());
+        assert!(!PropertyId::ContentType.is_repeatable());
     }
 
     // ---- cached payload size ----

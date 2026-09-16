@@ -50,8 +50,11 @@ pub enum Error {
     #[error("{0}")]
     Protocol(#[from] paho_mqtt_codec::Error),
     /// A synchronous error when publishing: creating or queuing the message.
+    ///
+    /// The message is boxed to keep `Error` small enough to return by value
+    /// cheaply.
     #[error("{0}")]
-    Publish(String, Message),
+    Publish(String, Box<Message>),
     /// An MQTT v5 error from a reason code.
     /// Any reason code >= 0x80 indicates an error.
     #[error("{0}")]

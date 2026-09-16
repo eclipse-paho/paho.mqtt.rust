@@ -92,14 +92,18 @@ Encode benchmarks reuse one output buffer across iterations, as the client runti
 
 ### Fuzzing
 
-The decoder is the crate's untrusted-input surface: a broker, or anything between it and the client, can put arbitrary bytes on the socket. A [cargo-fuzz](https://github.com/rust-fuzz/cargo-fuzz) target in the _fuzz_ directory feeds random, coverage-guided inputs through framing and parsing (`RawPacket::decode` then `Packet::from_raw`) for both protocol versions and checks that nothing panics. Anything that decodes successfully is also re-encoded and decoded again, which must reproduce the same packet.
+The decoder is the crate's untrusted-input surface: a broker, or anything between it and the client, can put arbitrary bytes on the socket. The _fuzz_ directory holds two [cargo-fuzz](https://github.com/rust-fuzz/cargo-fuzz) targets:
 
-It needs a nightly toolchain and the `cargo-fuzz` tool:
+- `decode` feeds random, coverage-guided bytes through framing and parsing (`RawPacket::decode` then `Packet::from_raw`) for both protocol versions and checks that nothing panics. Anything that decodes successfully is also re-encoded and decoded again, which must reproduce the same packet.
+- `roundtrip` is structure-aware: it builds *valid* packets of every type from the random input and checks the encoder's invariants — `encode`, `encode_to_bytes`, and `encode_split` agree byte for byte, `encoded_size` is exact, and decoding gives back an equal packet. It reaches the encoder paths that mutating bytes rarely does.
+
+They need a nightly toolchain and the `cargo-fuzz` tool:
 
     $ cargo install cargo-fuzz
     $ cargo +nightly fuzz run decode
+    $ cargo +nightly fuzz run roundtrip
 
-It runs until stopped or until it finds a failing input, which it saves under _fuzz/artifacts/_ along with the command to reproduce it. A few minutes is enough for a first pass; `-- -max_total_time=300` runs for five minutes. The fuzzer keeps the inputs it finds interesting in _fuzz/corpus/_, so later runs pick up where earlier ones left off. That directory is not committed — it regenerates itself within a minute or two of running — and can be trimmed with `cargo +nightly fuzz cmin decode`. The CI runs the target for a short, fixed time on every push and pull request.
+It runs until stopped or until it finds a failing input, which it saves under _fuzz/artifacts/_ along with the command to reproduce it. A few minutes is enough for a first pass; `-- -max_total_time=300` runs for five minutes. The fuzzer keeps the inputs it finds interesting in _fuzz/corpus/_, so later runs pick up where earlier ones left off. That directory is not committed — it regenerates itself within a minute or two of running — and can be trimmed with `cargo +nightly fuzz cmin decode`. The CI runs both targets for a short, fixed time on every push and pull request.
 
 ## Example
 
