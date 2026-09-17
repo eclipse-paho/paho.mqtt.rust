@@ -34,6 +34,7 @@ use crate::{
     Auth, ConnAck, Connect, Disconnect, Error, MqttVersion, PubAck, Publish, Result,
     SubAck, Subscribe, UnsubAck, Unsubscribe, varlen,
 };
+use alloc::boxed::Box;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 #[cfg(feature = "serde")]
@@ -221,15 +222,19 @@ impl RawPacket {
 
 /// A typed MQTT packet.
 ///
-/// This enum covers all packet types for both MQTT v3.1.1 and v5. v5-only
-/// packets (e.g. `Auth`) are present but will not appear on v3.1.1
-/// connections. v5 fields (reason codes, properties) are present on all
-/// applicable structs and default to empty/success on v3.1.1 connections.
+/// This enum covers all packet types for MQTT v3.1, v3.1.1, and v5. v5-only
+/// packets (e.g. `Auth`) are present but will not appear on v3 connections.
+/// v5 fields (reason codes, properties) are present on all applicable structs
+/// and default to empty/success on v3 connections.
+///
+/// `Connect` is boxed: it is by far the largest packet struct and occurs once
+/// per connection, while every other variant is moved around per message, so
+/// keeping the enum small is worth one allocation per CONNECT.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum Packet {
     /// `CONNECT` — client connection request.
-    Connect(Connect),
+    Connect(Box<Connect>),
     /// `CONNACK` — connection acknowledgement from broker to client.
     ConnAck(ConnAck),
     /// `PUBLISH` — application message from client or broker.
@@ -309,7 +314,7 @@ impl Packet {
         }
 
         let pkt = match ty {
-            T::Connect => Packet::Connect(Connect::decode(raw.payload)?),
+            T::Connect => Packet::Connect(Box::new(Connect::decode(raw.payload)?)),
             T::ConnAck => Packet::ConnAck(ConnAck::decode(raw.payload, ver)?),
             T::Publish => Packet::Publish(Publish::decode(flags, raw.payload, ver)?),
             T::PubAck => Packet::PubAck(PubAck::decode(raw.payload, ver)?),

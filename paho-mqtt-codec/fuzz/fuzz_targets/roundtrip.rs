@@ -416,7 +416,7 @@ fn auth(u: &mut Unstructured) -> AResult<Auth> {
 fn packet(u: &mut Unstructured, ver: MqttVersion) -> AResult<Packet> {
     let n_types = if ver == MqttVersion::V5 { 15 } else { 14 };
     Ok(match u.int_in_range(0..=n_types - 1)? {
-        0 => Packet::Connect(connect(u, ver)?),
+        0 => Packet::Connect(Box::new(connect(u, ver)?)),
         1 => Packet::ConnAck(connack(u, ver)?),
         2 => Packet::Publish(publish(u, ver)?),
         3 => Packet::PubAck(puback(u, ver, PacketType::PubAck)?),

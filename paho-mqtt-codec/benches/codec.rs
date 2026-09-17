@@ -195,7 +195,7 @@ fn packets(ver: MqttVersion) -> Vec<(&'static str, Packet)> {
     }
 
     let mut pkts = vec![
-        ("connect", Packet::Connect(connect)),
+        ("connect", Packet::Connect(Box::new(connect))),
         ("connack", Packet::ConnAck(connack)),
         ("publish_qos0_16B", {
             let mut p = Publish::new("t", Bytes::from_static(b"0123456789abcdef"));

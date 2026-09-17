@@ -1001,7 +1001,7 @@ async fn do_connect(
 
     let mut buf = BytesMut::with_capacity(256);
     buf.clear();
-    Packet::Connect(connect_pkt).encode(&mut buf, p.ver)?;
+    Packet::Connect(Box::new(connect_pkt)).encode(&mut buf, p.ver)?;
     writer.write_all(&buf).await?;
     writer.flush().await?;
 
