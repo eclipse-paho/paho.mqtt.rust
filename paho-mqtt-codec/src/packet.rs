@@ -111,9 +111,10 @@ impl RawPacket {
     ///
     /// The check is made as soon as the fixed header has been read, so an
     /// oversize packet is rejected with [`Error::PacketTooLarge`] before its
-    /// body is buffered. This is the value a client advertises in the v5
-    /// CONNECT `MaximumPacketSize` property, and the peer is required not to
-    /// exceed it.
+    /// body is buffered. In MQTT v5 each side advertises the largest packet
+    /// it will accept (the `MaximumPacketSize` property in CONNECT for a
+    /// client, in CONNACK for a server) and the peer is required not to
+    /// exceed it; pass that value here.
     ///
     /// Returns `Ok(None)` if `src` does not yet contain a complete packet.
     /// On success the consumed bytes are removed from `src`.

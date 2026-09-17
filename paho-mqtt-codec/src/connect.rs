@@ -383,10 +383,10 @@ impl ConnAck {
         };
         let properties = Properties::decode(&mut payload, ver)?;
 
-        // A broker must clear Session Present on a refused connection
+        // A server must clear Session Present on a refused connection
         // (MQTT-3.2.2-4). If one doesn't, the flag is meaningless anyway;
         // rejecting the packet here would only hide the reason code from
-        // the client, which is the one thing it needs. Be lenient: clear
+        // the receiver, which is the one thing it needs. Be lenient: clear
         // the flag and keep the code.
         let session_present = session_present && reason_code == ReasonCode::Success;
 

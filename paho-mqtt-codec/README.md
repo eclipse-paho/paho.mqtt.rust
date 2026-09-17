@@ -2,7 +2,7 @@
 
 A pure-Rust encoder and decoder for MQTT control packets, covering protocol versions 3.1.1 and 5.0, for the [Eclipse Paho](http://eclipse.org/paho) project.
 
-This crate is the wire-format layer of the [Eclipse Paho MQTT Rust client](https://github.com/eclipse/paho.mqtt.rust), but it has no dependency on the client, on any I/O, or on an async runtime. It converts between typed Rust structs and the bytes that go on the network, and nothing else. Of particular note, the library is usable in a `no_std` environment, and presents a single representation of each packet that can be encoded or decoded based on the client's active version (v3 or v5).
+This crate is a wire-format layer and nothing else: it converts between typed Rust structs and the bytes that go on the network, with no dependency on I/O, on an async runtime, or on any particular role in the protocol. Every packet type can be both encoded and decoded, so it serves a client, a broker, a proxy, a protocol analyzer, or an embedded device equally. It is the codec used by the [Eclipse Paho MQTT Rust client](https://github.com/eclipse/paho.mqtt.rust), and is usable in a `no_std` environment. Each packet has a single representation that is encoded or decoded according to the connection's negotiated version (v3.1.1 or v5).
 
 ## Features
 
@@ -88,11 +88,11 @@ To see how a change affects performance, save a baseline before making it and co
     ... make changes ...
     $ cargo bench -- --baseline before
 
-Encode benchmarks reuse one output buffer across iterations, as the client runtime does, so they measure the codec rather than the allocator. Decode benchmarks work on a fresh copy of the wire bytes each iteration (the copy is excluded from the timing) because framing consumes its input; freeing that buffer is included, so small-packet decode times carry a fixed allocation cost that is part of any real decode as well.
+Encode benchmarks reuse one output buffer across iterations, as a network runtime would, so they measure the codec rather than the allocator. Decode benchmarks work on a fresh copy of the wire bytes each iteration (the copy is excluded from the timing) because framing consumes its input; freeing that buffer is included, so small-packet decode times carry a fixed allocation cost that is part of any real decode as well.
 
 ### Fuzzing
 
-The decoder is the crate's untrusted-input surface: a broker, or anything between it and the client, can put arbitrary bytes on the socket. The _fuzz_ directory holds two [cargo-fuzz](https://github.com/rust-fuzz/cargo-fuzz) targets:
+The decoder is the crate's untrusted-input surface: whatever is on the other end of the socket, or anything in between, can put arbitrary bytes on it. The _fuzz_ directory holds two [cargo-fuzz](https://github.com/rust-fuzz/cargo-fuzz) targets:
 
 - `decode` feeds random, coverage-guided bytes through framing and parsing (`RawPacket::decode` then `Packet::from_raw`) for both protocol versions and checks that nothing panics. Anything that decodes successfully is also re-encoded and decoded again, which must reproduce the same packet.
 - `roundtrip` is structure-aware: it builds *valid* packets of every type from the random input and checks the encoder's invariants — `encode`, `encode_to_bytes`, and `encode_split` agree byte for byte, `encoded_size` is exact, and decoding gives back an equal packet. It reaches the encoder paths that mutating bytes rarely does.
@@ -162,8 +162,22 @@ Running it prints the 28 bytes of the encoded packet followed by the decoded fie
 
 For sending, `Packet::encode_split` does the same as `encode` but returns the PUBLISH payload as a separate `Bytes` instead of copying it into the buffer, so the header and payload can be handed to a vectored write.
 
+## Using it in a server
+
+Nothing in the crate assumes which side of the connection it is on. A server decodes the same way a client does, with one wrinkle: the protocol version is not known until the first packet arrives. CONNECT is self-describing, so decode it without a version and read the one it declares:
+
+```rust
+let raw = RawPacket::decode(&mut read_buf)?.expect("complete packet");
+let ver = match Packet::from_raw(raw, MqttVersion::V5)? {   // version is ignored for CONNECT
+    Packet::Connect(c) => c.version,                           // use this for the rest of the session
+    _ => return Err(/* first packet must be CONNECT */),
+};
+```
+
+A CONNECT for a version the crate does not speak (MQTT v3.1, `MQIsdp`) decodes to `Error::UnsupportedProtocolVersion`, distinct from a malformed packet, so a server can answer with a CONNACK carrying `UnsupportedProtocolVersion` rather than dropping the connection. `RawPacket::decode_max` takes the server's own maximum packet size for the same reason a client would pass its own.
+
 ## Relationship to the Paho Client
 
-Version 2 of the [`paho-mqtt`](https://crates.io/crates/paho-mqtt) crate uses this codec for all of its wire I/O and re-exports the shared types — `QoS`, `MqttVersion`, `ReasonCode`, and the property types — so applications using the client don't normally depend on this crate directly. (Version 1 of the Paho Rust client wraps the Paho C library and uses it for all wire I/O, not this crate.)
+Version 2 of the [`paho-mqtt`](https://crates.io/crates/paho-mqtt) crate uses this codec for all of its wire I/O and re-exports the shared types — `QoS`, `MqttVersion`, `ReasonCode`, and the property types — so applications using that client don't normally depend on this crate directly. (Version 1 of the Paho Rust client wraps the Paho C library and uses it for all wire I/O, not this crate.)
 
-Applications that only need to produce or consume MQTT packets, without a client, can use this crate alone.
+The codec is developed in the Paho repository but is not tied to the Paho client: any client library, broker, or tool can use it alone.

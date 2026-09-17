@@ -18,11 +18,18 @@
  *    Frank Pagliughi - initial implementation and documentation
  *******************************************************************************/
 
-//! MQTT packet codec for the Eclipse Paho Rust client library.
+//! Pure-Rust encoding and decoding of MQTT control packets for protocol
+//! versions 3.1.1 and 5.0.
 //!
-//! This crate provides pure-Rust encoding and decoding of MQTT packets
-//! for protocol versions 3.1.1 and 5.0. It has no I/O dependency — all
-//! types are pure data transformations.
+//! The crate is a wire-format layer only: it converts between typed packet
+//! structs and bytes, and has no dependency on I/O, an async runtime, or any
+//! particular role in the protocol. It is used by the Eclipse Paho MQTT Rust
+//! client, and is equally suited to a broker, a proxy, a protocol analyzer,
+//! or an embedded device (`no_std` with `alloc`).
+//!
+//! Every packet type can be both encoded and decoded, so a program can sit
+//! on either end of a connection. Decoding is strict: input that violates
+//! the specification is rejected with an [`Error`] rather than reinterpreted.
 
 #![no_std]
 #![deny(missing_docs)]

@@ -8,7 +8,7 @@ homepage = "https://github.com/eclipse/paho.mqtt.rust"
 repository = "https://github.com/eclipse/paho.mqtt.rust"
 keywords = ["MQTT", "IoT", "Paho", "messaging", "codec"]
 license = "EPL-2.0"
-description = "MQTT packet codec for the Eclipse Paho Rust client library."
+description = "Pure-Rust, no_std MQTT v3.1.1 and v5 packet encoder/decoder for clients, brokers, and tools."
 
 [features]
 default = ["std"]
