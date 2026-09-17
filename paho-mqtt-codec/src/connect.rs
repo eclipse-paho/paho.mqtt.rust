@@ -539,7 +539,7 @@ mod tests {
     #[test]
     fn test_decode_session_present_with_refused_code_is_cleared() {
         // A non-compliant broker sets session_present on a refused connection.
-        // The reason code is what matters to the client; keep it and clear the
+        // The reason code is what matters to the receiver; keep it and clear the
         // meaningless flag rather than failing the whole packet.
         let payload = Bytes::from_static(&[0x01, 0x05]); // session_present=1, NotAuthorized
         let ack = ConnAck::decode(payload, v311()).unwrap();

@@ -18,13 +18,14 @@
  *    Frank Pagliughi - initial implementation and documentation
  *******************************************************************************/
 
-//! MQTT support types.
+//! MQTT support types: protocol version and quality of service.
 //!
-//! There are a number of redundancies in how common constants are defined,
-//! usually starting with an enum, then a number of overlapping constants.
-//! This is a holdover from the original Paho MQTT Rust library which wrapped
-//! the Paho C library and brought in it's declarations. At some point, these
-//! will be deprecated.
+//! Each concept is an enum ([`MqttVersion`], [`QoS`]) with a few named
+//! constants of the same type (`MQTT_VERSION_5`, `QOS_1`, …) as a second
+//! spelling. The constants exist for compatibility with the Paho MQTT Rust
+//! client's earlier API, whose values came from the Paho C library; new code
+//! should prefer the enum variants. The constants may be deprecated in a
+//! future release.
 
 use crate::error::Error;
 use core::fmt;

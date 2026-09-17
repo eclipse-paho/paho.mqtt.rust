@@ -28,7 +28,7 @@
 //!     cargo bench -- --baseline before
 //!
 //! Encode benchmarks reuse one output buffer across iterations, which is
-//! what the client runtime does; they measure the codec, not the allocator.
+//! what a network runtime does; they measure the codec, not the allocator.
 //! Decode benchmarks take a fresh copy of the wire bytes per iteration (the
 //! copy is excluded from the timing) because framing consumes its input.
 
