@@ -315,10 +315,10 @@ impl Property {
     /// flags must be 0 or 1; `ReceiveMaximum`, `MaximumPacketSize`,
     /// `TopicAlias`, and `SubscriptionIdentifier` must be non-zero; and a
     /// `ResponseTopic` may not contain wildcards. Returns
-    /// [`Error::MalformedPacket`] on any violation.
+    /// [`Error::ProtocolError`] on any violation.
     pub fn validate(&self) -> Result<()> {
         if self.value.property_type() != self.id.value_type() {
-            return Err(Error::MalformedPacket);
+            return Err(Error::ProtocolError);
         }
         self.check_range()
     }
@@ -350,7 +350,7 @@ impl Property {
             Ok(())
         }
         else {
-            Err(Error::MalformedPacket)
+            Err(Error::ProtocolError)
         }
     }
 
@@ -389,13 +389,13 @@ impl SeenIds {
         | (1 << PropertyId::SubscriptionIdentifier as u8);
     const INVALID: u64 = 1 << 63;
 
-    /// Records `id`; returns [`Error::MalformedPacket`] if a non-repeatable
+    /// Records `id`; returns [`Error::ProtocolError`] if a non-repeatable
     /// identifier has already been recorded.
     #[inline]
     fn note(&mut self, id: PropertyId) -> Result<()> {
         let bit = 1u64 << (id as u8);
         if self.0 & bit != 0 {
-            return Err(Error::MalformedPacket);
+            return Err(Error::ProtocolError);
         }
         self.0 |= bit & !Self::REPEATABLE;
         Ok(())
@@ -456,7 +456,7 @@ impl Properties {
     /// The property is checked here rather than on every encode: if its
     /// value is out of range for its identifier (see [`Property::validate`])
     /// or it repeats a non-repeatable identifier, the list is marked invalid
-    /// and [`encode`](Self::encode) will return [`Error::MalformedPacket`].
+    /// and [`encode`](Self::encode) will return [`Error::ProtocolError`].
     pub fn push(&mut self, prop: Property) {
         if prop.validate().is_err() || self.seen.note(prop.id).is_err() {
             self.seen.mark_invalid();
@@ -499,7 +499,7 @@ impl Properties {
     pub fn encode<B: BufMut>(&self, dst: &mut B, ver: MqttVersion) -> Result<()> {
         if ver >= MqttVersion::V5 {
             if self.seen.is_invalid() {
-                return Err(Error::MalformedPacket);
+                return Err(Error::ProtocolError);
             }
             varlen::encode(self.payload_size() as u32, dst)?;
             for prop in &self.props {
@@ -919,14 +919,14 @@ mod tests {
             assert!(Property::new(id, PropertyValue::Byte(1)).validate().is_ok());
             assert_eq!(
                 Property::new(id, PropertyValue::Byte(2)).validate(),
-                Err(Error::MalformedPacket),
+                Err(Error::ProtocolError),
                 "{id:?}"
             );
             // ... and on the wire
-            assert_eq!(decode_raw(&[id as u8, 0x07]), Err(Error::MalformedPacket));
+            assert_eq!(decode_raw(&[id as u8, 0x07]), Err(Error::ProtocolError));
             assert_eq!(
                 encode_one(Property::new(id, PropertyValue::Byte(7))),
-                Err(Error::MalformedPacket)
+                Err(Error::ProtocolError)
             );
         }
     }
@@ -935,29 +935,29 @@ mod tests {
     fn test_validate_non_zero_properties() {
         assert_eq!(
             Property::new(PropertyId::ReceiveMaximum, PropertyValue::U16(0)).validate(),
-            Err(Error::MalformedPacket)
+            Err(Error::ProtocolError)
         );
         assert_eq!(
             Property::new(PropertyId::TopicAlias, PropertyValue::U16(0)).validate(),
-            Err(Error::MalformedPacket)
+            Err(Error::ProtocolError)
         );
         assert_eq!(
             Property::new(PropertyId::MaximumPacketSize, PropertyValue::U32(0)).validate(),
-            Err(Error::MalformedPacket)
+            Err(Error::ProtocolError)
         );
         assert_eq!(
             Property::new(PropertyId::SubscriptionIdentifier, PropertyValue::VarInt(0))
                 .validate(),
-            Err(Error::MalformedPacket)
+            Err(Error::ProtocolError)
         );
         // Wire forms: ReceiveMaximum = 0, MaximumPacketSize = 0, TopicAlias = 0, SubId = 0
-        assert_eq!(decode_raw(&[0x21, 0x00, 0x00]), Err(Error::MalformedPacket));
+        assert_eq!(decode_raw(&[0x21, 0x00, 0x00]), Err(Error::ProtocolError));
         assert_eq!(
             decode_raw(&[0x27, 0x00, 0x00, 0x00, 0x00]),
-            Err(Error::MalformedPacket)
+            Err(Error::ProtocolError)
         );
-        assert_eq!(decode_raw(&[0x23, 0x00, 0x00]), Err(Error::MalformedPacket));
-        assert_eq!(decode_raw(&[0x0B, 0x00]), Err(Error::MalformedPacket));
+        assert_eq!(decode_raw(&[0x23, 0x00, 0x00]), Err(Error::ProtocolError));
+        assert_eq!(decode_raw(&[0x0B, 0x00]), Err(Error::ProtocolError));
         // Minimum legal values are fine.
         assert!(decode_raw(&[0x21, 0x00, 0x01]).is_ok());
         assert!(decode_raw(&[0x0B, 0x01]).is_ok());
@@ -971,7 +971,7 @@ mod tests {
             assert_eq!(
                 Property::new(PropertyId::ResponseTopic, PropertyValue::String(t.into()))
                     .validate(),
-                Err(Error::MalformedPacket),
+                Err(Error::ProtocolError),
                 "{t}"
             );
         }
@@ -991,14 +991,14 @@ mod tests {
         // never decoded; encode must refuse it.
         assert_eq!(
             Property::new(PropertyId::MaximumQoS, PropertyValue::U32(1)).validate(),
-            Err(Error::MalformedPacket)
+            Err(Error::ProtocolError)
         );
         assert_eq!(
             encode_one(Property::new(
                 PropertyId::ContentType,
                 PropertyValue::Binary(Bytes::from_static(b"x"))
             )),
-            Err(Error::MalformedPacket)
+            Err(Error::ProtocolError)
         );
     }
 
@@ -1009,12 +1009,12 @@ mod tests {
         // SessionExpiryInterval twice
         assert_eq!(
             decode_raw(&[0x11, 0, 0, 0, 1, 0x11, 0, 0, 0, 2]),
-            Err(Error::MalformedPacket)
+            Err(Error::ProtocolError)
         );
         // ContentType twice
         assert_eq!(
             decode_raw(&[0x03, 0, 1, b'a', 0x03, 0, 1, b'b']),
-            Err(Error::MalformedPacket)
+            Err(Error::ProtocolError)
         );
     }
 
@@ -1035,7 +1035,7 @@ mod tests {
         props.push(prop(PropertyId::ReceiveMaximum, PropertyValue::U16(1)));
         props.push(prop(PropertyId::ReceiveMaximum, PropertyValue::U16(2)));
         let mut dst = BytesMut::new();
-        assert_eq!(props.encode(&mut dst, v5()), Err(Error::MalformedPacket));
+        assert_eq!(props.encode(&mut dst, v5()), Err(Error::ProtocolError));
         // Not written at all on v3.1.1, so nothing to reject.
         assert!(props.encode(&mut dst, MqttVersion::V3_1_1).is_ok());
     }

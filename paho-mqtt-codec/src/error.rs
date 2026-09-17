@@ -19,7 +19,21 @@
  *******************************************************************************/
 
 //! Error types for the MQTT codec.
+//!
+//! MQTT v5 distinguishes two kinds of bad input, and a receiver that reports
+//! the problem to its peer must say which (§4.13):
+//!
+//! - a **Malformed Packet** cannot be parsed — bad lengths, invalid UTF-8,
+//!   reserved bits set, an unknown packet type or property identifier. The
+//!   receiver sends DISCONNECT with reason code `0x81`.
+//! - a **Protocol Error** parses fine but breaks a rule — a packet ID of 0,
+//!   a property out of range or repeated, a topic name with a wildcard. The
+//!   receiver sends DISCONNECT with reason code `0x82`, or a more specific
+//!   code where the specification defines one.
+//!
+//! [`Error::reason_code`] maps every variant to the code to report.
 
+use crate::ReasonCode;
 use thiserror::Error;
 
 /// MQTT encoding and protocol errors.
@@ -31,7 +45,8 @@ pub enum Error {
     /// A variable-byte integer exceeded the maximum allowed value (268,435,455).
     #[error("variable-length integer overflow")]
     VarLenOverflow,
-    /// A variable-byte integer had a continuation bit set on the fourth byte.
+    /// A variable-byte integer had a continuation bit set on the fourth byte,
+    /// or used more bytes than its value requires.
     #[error("malformed variable-length integer")]
     MalformedVarLen,
     /// An unrecognized MQTT packet type nibble was encountered.
@@ -40,9 +55,18 @@ pub enum Error {
     /// The packet payload was shorter than expected.
     #[error("packet payload too short")]
     PacketTooShort,
-    /// A packet field contained an invalid or reserved value.
+    /// The packet could not be parsed: a reserved bit was set, a field held a
+    /// value with no defined meaning, or the structure was inconsistent.
     #[error("malformed packet")]
     MalformedPacket,
+    /// The packet parsed but violates a protocol rule: a zero packet
+    /// identifier, a property out of range or repeated, a required field
+    /// missing, an empty subscription list, and so on.
+    #[error("protocol error")]
+    ProtocolError,
+    /// A topic name was empty where one is required, or contained a wildcard.
+    #[error("topic name invalid")]
+    TopicNameInvalid,
     /// A UTF-8 string field exceeded the 65,535-byte wire limit.
     #[error("UTF-8 string exceeds 65,535 bytes")]
     StringTooLong,
@@ -58,5 +82,100 @@ pub enum Error {
     UnsupportedProtocolVersion,
 }
 
+impl Error {
+    /// The MQTT v5 reason code that describes this error to the peer.
+    ///
+    /// For a decode failure this is the code to put in the DISCONNECT (or,
+    /// for [`UnsupportedProtocolVersion`](Self::UnsupportedProtocolVersion),
+    /// the CONNACK) that a receiver sends before closing the connection.
+    /// Errors that can only arise while *encoding* a locally built packet
+    /// ([`VarLenOverflow`](Self::VarLenOverflow),
+    /// [`StringTooLong`](Self::StringTooLong),
+    /// [`BinaryTooLong`](Self::BinaryTooLong)) are never reported to a peer;
+    /// they map to `MalformedPacket` for completeness.
+    pub fn reason_code(&self) -> ReasonCode {
+        use Error::*;
+        match self {
+            BadQoS | VarLenOverflow | MalformedVarLen | UnknownPacketType(_)
+            | PacketTooShort | MalformedPacket | StringTooLong | BinaryTooLong => {
+                ReasonCode::MalformedPacket
+            }
+            ProtocolError => ReasonCode::ProtocolError,
+            TopicNameInvalid => ReasonCode::TopicNameInvalid,
+            PacketTooLarge => ReasonCode::PacketTooLarge,
+            UnsupportedProtocolVersion => ReasonCode::UnsupportedProtocolVersion,
+        }
+    }
+
+    /// Returns `true` if the input could not be parsed at all (DISCONNECT
+    /// reason `0x81`), as opposed to parsing but breaking a rule.
+    pub fn is_malformed(&self) -> bool {
+        self.reason_code() == ReasonCode::MalformedPacket
+    }
+}
+
 /// The result type for codec operations.
 pub type Result<T> = core::result::Result<T, Error>;
+
+/////////////////////////////////////////////////////////////////////////////
+//                              Unit Tests
+/////////////////////////////////////////////////////////////////////////////
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_reason_code_mapping() {
+        use Error::*;
+        for e in [
+            BadQoS,
+            VarLenOverflow,
+            MalformedVarLen,
+            UnknownPacketType(0),
+            PacketTooShort,
+            MalformedPacket,
+            StringTooLong,
+            BinaryTooLong,
+        ] {
+            assert_eq!(e.reason_code(), ReasonCode::MalformedPacket, "{e:?}");
+            assert!(e.is_malformed(), "{e:?}");
+        }
+        assert_eq!(ProtocolError.reason_code(), ReasonCode::ProtocolError);
+        assert_eq!(TopicNameInvalid.reason_code(), ReasonCode::TopicNameInvalid);
+        assert_eq!(PacketTooLarge.reason_code(), ReasonCode::PacketTooLarge);
+        assert_eq!(
+            UnsupportedProtocolVersion.reason_code(),
+            ReasonCode::UnsupportedProtocolVersion
+        );
+        for e in [
+            ProtocolError,
+            TopicNameInvalid,
+            PacketTooLarge,
+            UnsupportedProtocolVersion,
+        ] {
+            assert!(!e.is_malformed(), "{e:?}");
+        }
+    }
+
+    #[test]
+    fn test_every_reported_code_is_an_error_code() {
+        use Error::*;
+        for e in [
+            BadQoS,
+            VarLenOverflow,
+            MalformedVarLen,
+            UnknownPacketType(0),
+            PacketTooShort,
+            MalformedPacket,
+            ProtocolError,
+            TopicNameInvalid,
+            StringTooLong,
+            BinaryTooLong,
+            PacketTooLarge,
+            UnsupportedProtocolVersion,
+        ] {
+            assert!(e.reason_code().is_err(), "{e:?}");
+        }
+    }
+}

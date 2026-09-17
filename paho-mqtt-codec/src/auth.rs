@@ -145,7 +145,7 @@ mod tests {
     fn test_auth_decode_unknown_reason_code_errors() {
         assert_eq!(
             Auth::decode(Bytes::from_static(&[0x1A])),
-            Err(Error::MalformedPacket)
+            Err(Error::ProtocolError)
         );
     }
 

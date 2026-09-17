@@ -165,7 +165,7 @@ impl TryFrom<u8> for ReasonCode {
 
     /// Converts a wire byte into a reason code.
     ///
-    /// Returns [`Error::MalformedPacket`] for any value not defined by the
+    /// Returns [`Error::ProtocolError`] for any value not defined by the
     /// MQTT v5 specification.
     fn try_from(code: u8) -> Result<Self, Error> {
         use ReasonCode::*;
@@ -213,7 +213,7 @@ impl TryFrom<u8> for ReasonCode {
             0xA0 => MaximumConnectTime,
             0xA1 => SubscriptionIdentifiersNotSupported,
             0xA2 => WildcardSubscriptionsNotSupported,
-            _ => return Err(Error::MalformedPacket),
+            _ => return Err(Error::ProtocolError),
         };
         Ok(rc)
     }
@@ -305,19 +305,11 @@ mod tests {
     fn test_try_from_u8_unknown_is_err() {
         // Gaps inside the success range must not be reinterpreted as errors.
         for b in [0x03_u8, 0x05, 0x0F, 0x12, 0x17, 0x1A, 0x7F] {
-            assert_eq!(
-                ReasonCode::try_from(b),
-                Err(Error::MalformedPacket),
-                "{b:#x}"
-            );
+            assert_eq!(ReasonCode::try_from(b), Err(Error::ProtocolError), "{b:#x}");
         }
         // Undefined values above the last defined code.
         for b in [0xA3_u8, 0xC0, 0xFF] {
-            assert_eq!(
-                ReasonCode::try_from(b),
-                Err(Error::MalformedPacket),
-                "{b:#x}"
-            );
+            assert_eq!(ReasonCode::try_from(b), Err(Error::ProtocolError), "{b:#x}");
         }
     }
 

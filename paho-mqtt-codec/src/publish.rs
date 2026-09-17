@@ -85,7 +85,7 @@ impl Publish {
 
     /// Encodes the PUBLISH variable header and payload into `dst`.
     ///
-    /// Returns [`Error::MalformedPacket`] if `qos > 0` but `packet_id` is `None`.
+    /// Returns [`Error::ProtocolError`] if `qos > 0` but `packet_id` is `None`.
     pub fn encode<B: BufMut>(&self, dst: &mut B, ver: MqttVersion) -> Result<()> {
         self.encode_header(dst, ver)?;
         dst.put_slice(&self.payload);
@@ -96,11 +96,11 @@ impl Publish {
     /// properties) into `dst`, leaving the application payload to be written
     /// separately by the caller.
     ///
-    /// Returns [`Error::MalformedPacket`] if `qos > 0` but `packet_id` is `None`.
+    /// Returns [`Error::ProtocolError`] if `qos > 0` but `packet_id` is `None`.
     pub fn encode_header<B: BufMut>(&self, dst: &mut B, ver: MqttVersion) -> Result<()> {
         put_utf8(&self.topic, dst)?;
         if self.qos != QoS::QoS0 {
-            let id = self.packet_id.ok_or(Error::MalformedPacket)?;
+            let id = self.packet_id.ok_or(Error::ProtocolError)?;
             dst.put_u16(id);
         }
         self.properties.encode(dst, ver)
@@ -115,13 +115,13 @@ impl Publish {
 
         // DUP is meaningless without an acknowledgement (MQTT-3.3.1-2).
         if dup && qos == QoS::QoS0 {
-            return Err(Error::MalformedPacket);
+            return Err(Error::ProtocolError);
         }
 
         // Topic: wildcards are never allowed in a topic *name* (MQTT-3.3.2-2).
         let topic = get_utf8(&mut payload)?;
         if topic.bytes().any(|b| b == b'+' || b == b'#') {
-            return Err(Error::MalformedPacket);
+            return Err(Error::TopicNameInvalid);
         }
 
         // Packet ID (QoS 1 and 2 only); zero is reserved (MQTT-2.2.1-2).
@@ -130,7 +130,7 @@ impl Publish {
                 return Err(Error::PacketTooShort);
             }
             match payload.get_u16() {
-                0 => return Err(Error::MalformedPacket),
+                0 => return Err(Error::ProtocolError),
                 id => Some(id),
             }
         }
@@ -146,7 +146,7 @@ impl Publish {
         if topic.is_empty()
             && (ver != MqttVersion::V5 || properties.get(PropertyId::TopicAlias).is_none())
         {
-            return Err(Error::MalformedPacket);
+            return Err(Error::TopicNameInvalid);
         }
 
         // Remainder is the application payload
@@ -500,7 +500,7 @@ mod tests {
         let payload = Bytes::from_static(&[0x00, 0x01, b't', 0x00, 0x00]);
         assert_eq!(
             Publish::decode(0x02, payload, v311()),
-            Err(Error::MalformedPacket)
+            Err(Error::ProtocolError)
         );
     }
 
@@ -509,7 +509,7 @@ mod tests {
         let payload = Bytes::from_static(&[0x00, 0x01, b't']);
         assert_eq!(
             Publish::decode(0x08, payload, v311()),
-            Err(Error::MalformedPacket)
+            Err(Error::ProtocolError)
         );
     }
 
@@ -521,7 +521,7 @@ mod tests {
             payload.put_slice(topic);
             assert_eq!(
                 Publish::decode(0x00, payload.freeze(), v311()),
-                Err(Error::MalformedPacket),
+                Err(Error::TopicNameInvalid),
                 "{}",
                 core::str::from_utf8(topic).unwrap()
             );
@@ -533,12 +533,12 @@ mod tests {
         // Never valid in v3.1.1.
         assert_eq!(
             Publish::decode(0x00, Bytes::from_static(&[0x00, 0x00]), v311()),
-            Err(Error::MalformedPacket)
+            Err(Error::TopicNameInvalid)
         );
         // In v5 only with a topic alias: empty topic, empty properties -> error
         assert_eq!(
             Publish::decode(0x00, Bytes::from_static(&[0x00, 0x00, 0x00]), v5()),
-            Err(Error::MalformedPacket)
+            Err(Error::TopicNameInvalid)
         );
         // ... but with TopicAlias(7) present it is accepted.
         let payload = Bytes::from_static(&[0x00, 0x00, 0x03, 0x23, 0x00, 0x07, b'x']);
@@ -571,7 +571,7 @@ mod tests {
             ..Default::default()
         };
         let mut dst = BytesMut::new();
-        assert_eq!(pub_.encode(&mut dst, v311()), Err(Error::MalformedPacket));
+        assert_eq!(pub_.encode(&mut dst, v311()), Err(Error::ProtocolError));
     }
 
     #[test]
@@ -788,11 +788,11 @@ mod tests {
         // 0x05 is undefined; must not be reinterpreted as an error code.
         assert_eq!(
             PubAck::decode(Bytes::from_static(&[0x00, 0x01, 0x05]), v5()),
-            Err(Error::MalformedPacket)
+            Err(Error::ProtocolError)
         );
         assert_eq!(
             PubAck::decode(Bytes::from_static(&[0x00, 0x01, 0xFF, 0x00]), v5()),
-            Err(Error::MalformedPacket)
+            Err(Error::ProtocolError)
         );
     }
 }

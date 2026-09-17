@@ -229,7 +229,7 @@ impl Connect {
         // v3.1.1 requires a username whenever a password is present
         // (MQTT-3.1.2-22); v5 lifted that restriction.
         if ver == MqttVersion::V3_1_1 && password_flag && !username_flag {
-            return Err(Error::MalformedPacket);
+            return Err(Error::ProtocolError);
         }
         let will_qos = QoS::try_from(will_qos_bits)?;
         let keep_alive = payload.get_u16();
@@ -644,7 +644,7 @@ mod tests {
         // flags=0, reason=0x05 (undefined), empty properties
         assert_eq!(
             ConnAck::decode(Bytes::from_static(&[0x00, 0x05, 0x00]), v5()),
-            Err(Error::MalformedPacket)
+            Err(Error::ProtocolError)
         );
     }
 
@@ -927,7 +927,7 @@ mod tests {
         let mut dst = BytesMut::new();
         conn.encode(&mut dst).unwrap();
         // Forbidden in v3.1.1 (MQTT-3.1.2-22) ...
-        assert_eq!(Connect::decode(dst.freeze()), Err(Error::MalformedPacket));
+        assert_eq!(Connect::decode(dst.freeze()), Err(Error::ProtocolError));
         // ... but allowed in v5.
         let conn = with_ver(conn, v5());
         let mut dst = BytesMut::new();

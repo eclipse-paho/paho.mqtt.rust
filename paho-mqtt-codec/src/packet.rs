@@ -727,10 +727,7 @@ mod tests {
         p.qos = QoS::QoS2; // packet_id missing
         let pkt = Packet::Publish(p);
         let mut dst = BytesMut::from(&b"keep"[..]);
-        assert_eq!(
-            pkt.encode_split(&mut dst, v5()),
-            Err(Error::MalformedPacket)
-        );
+        assert_eq!(pkt.encode_split(&mut dst, v5()), Err(Error::ProtocolError));
         assert_eq!(&dst[..], b"keep");
     }
 
@@ -789,7 +786,7 @@ mod tests {
         p.qos = QoS::QoS1; // packet_id is None
         let pkt = Packet::Publish(p);
         let mut dst = BytesMut::from(&b"existing"[..]);
-        assert_eq!(pkt.encode(&mut dst, v5()), Err(Error::MalformedPacket));
+        assert_eq!(pkt.encode(&mut dst, v5()), Err(Error::ProtocolError));
         assert_eq!(&dst[..], b"existing");
     }
 }

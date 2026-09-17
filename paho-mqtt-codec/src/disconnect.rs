@@ -169,7 +169,7 @@ mod tests {
     fn test_disconnect_v5_decode_unknown_reason_code_errors() {
         assert_eq!(
             Disconnect::decode(Bytes::from_static(&[0xA3]), v5()),
-            Err(Error::MalformedPacket)
+            Err(Error::ProtocolError)
         );
     }
 

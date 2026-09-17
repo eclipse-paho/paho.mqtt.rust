@@ -92,7 +92,7 @@ impl Unsubscribe {
         }
 
         if topic_filters.is_empty() {
-            return Err(Error::MalformedPacket); // UNSUBSCRIBE must have ≥1 filter
+            return Err(Error::ProtocolError); // UNSUBSCRIBE must have ≥1 filter (MQTT-3.10.3-2)
         }
 
         Ok(Self {
@@ -168,7 +168,7 @@ impl UnsubAck {
                 .map(ReasonCode::try_from)
                 .collect::<Result<Vec<_>>>()?;
             if codes.is_empty() {
-                return Err(Error::MalformedPacket); // one code per filter (§3.11.3)
+                return Err(Error::ProtocolError); // one code per filter (§3.11.3)
             }
             codes
         }
@@ -287,7 +287,7 @@ mod tests {
         let payload = Bytes::from_static(&[0x00, 0x01]); // id only, no filters
         assert_eq!(
             Unsubscribe::decode(payload, v311()),
-            Err(Error::MalformedPacket)
+            Err(Error::ProtocolError)
         );
     }
 
@@ -385,7 +385,7 @@ mod tests {
         // one reason code (§3.11.3): packet_id + empty properties only.
         assert_eq!(
             UnsubAck::decode(Bytes::from_static(&[0x00, 0x01, 0x00]), v5()),
-            Err(Error::MalformedPacket)
+            Err(Error::ProtocolError)
         );
         // v3.1.1 UNSUBACK has no reason codes at all, so this stays valid.
         round_trip_unsuback(UnsubAck::new(1, vec![]), v311());
@@ -427,7 +427,7 @@ mod tests {
     fn test_unsuback_v5_decode_unknown_reason_code_errors() {
         assert_eq!(
             UnsubAck::decode(Bytes::from_static(&[0x00, 0x01, 0x00, 0x00, 0x12]), v5()),
-            Err(Error::MalformedPacket)
+            Err(Error::ProtocolError)
         );
     }
 }

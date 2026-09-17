@@ -173,7 +173,7 @@ impl Subscribe {
                         0 => RetainHandling::SendOnSubscribe,
                         1 => RetainHandling::SendIfNew,
                         2 => RetainHandling::DoNotSend,
-                        _ => return Err(Error::MalformedPacket),
+                        _ => return Err(Error::ProtocolError), // retain handling 3 (§3.8.3.1)
                     };
                     (options & 0x04 != 0, options & 0x08 != 0, rh)
                 }
@@ -195,7 +195,7 @@ impl Subscribe {
         }
 
         if subscriptions.is_empty() {
-            return Err(Error::MalformedPacket); // SUBSCRIBE must have ≥1 filter
+            return Err(Error::ProtocolError); // SUBSCRIBE must have ≥1 filter (MQTT-3.8.3-2)
         }
 
         Ok(Subscribe {
@@ -263,7 +263,7 @@ impl SubAck {
             .map(ReasonCode::try_from)
             .collect::<Result<Vec<_>>>()?;
         if reason_codes.is_empty() {
-            return Err(Error::MalformedPacket); // one code per filter (MQTT-3.9.3-1)
+            return Err(Error::ProtocolError); // one code per filter (MQTT-3.9.3-1)
         }
 
         Ok(SubAck {
@@ -448,7 +448,7 @@ mod tests {
         let payload = Bytes::from_static(&[0x00, 0x01]);
         assert_eq!(
             Subscribe::decode(payload, v311()),
-            Err(Error::MalformedPacket)
+            Err(Error::ProtocolError)
         );
     }
 
@@ -479,11 +479,11 @@ mod tests {
         // packet_id only (v3.1.1) / packet_id + empty properties (v5).
         assert_eq!(
             SubAck::decode(Bytes::from_static(&[0x00, 0x01]), v311()),
-            Err(Error::MalformedPacket)
+            Err(Error::ProtocolError)
         );
         assert_eq!(
             SubAck::decode(Bytes::from_static(&[0x00, 0x01, 0x00]), v5()),
-            Err(Error::MalformedPacket)
+            Err(Error::ProtocolError)
         );
     }
 
@@ -585,11 +585,11 @@ mod tests {
         // Second code (0x03) is undefined in both versions.
         assert_eq!(
             SubAck::decode(Bytes::from_static(&[0x00, 0x01, 0x00, 0x03]), v311()),
-            Err(Error::MalformedPacket)
+            Err(Error::ProtocolError)
         );
         assert_eq!(
             SubAck::decode(Bytes::from_static(&[0x00, 0x01, 0x00, 0x00, 0x03]), v5()),
-            Err(Error::MalformedPacket)
+            Err(Error::ProtocolError)
         );
     }
 
