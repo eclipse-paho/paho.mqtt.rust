@@ -30,6 +30,9 @@ use crate::{
 };
 use bytes::{Buf, BufMut, Bytes};
 
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
+
 /////////////////////////////////////////////////////////////////////////////
 
 /// A PUBLISH packet, unified across MQTT v3.1.1 and v5.
@@ -37,6 +40,7 @@ use bytes::{Buf, BufMut, Bytes};
 /// The `properties` field is always empty on v3.1.1 connections and is not
 /// encoded on the wire for that version.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct Publish {
     /// Duplicate delivery flag — set when re-sending an unacknowledged packet.
     pub dup: bool,
@@ -178,6 +182,7 @@ impl Publish {
 /// Type aliases [`PubRec`], [`PubRel`], and [`PubComp`] are provided for
 /// readability at call sites.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct PubAck {
     /// Packet identifier matching the original PUBLISH.
     pub packet_id: u16,

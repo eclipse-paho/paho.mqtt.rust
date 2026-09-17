@@ -39,9 +39,8 @@ use std::{
 
 use bytes::{Bytes, BytesMut};
 use paho_mqtt_codec::{
-    ConnAck, Disconnect, MqttVersion, PubAck, QoS, RetainHandling as CodecRetainHandling,
-    Subscribe, Subscription, Unsubscribe,
-    packet::{Packet, RawPacket},
+    ConnAck, Disconnect, MqttVersion, Packet, PubAck, QoS, RawPacket,
+    RetainHandling as CodecRetainHandling, Subscribe, Subscription, Unsubscribe,
 };
 use smol::io::split;
 use smol::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};

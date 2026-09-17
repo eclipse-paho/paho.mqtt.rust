@@ -29,24 +29,9 @@
 
 extern crate alloc;
 
-#[cfg(feature = "std")]
-extern crate std;
-
-/// The Vec type for the 'std' build.
-#[cfg(feature = "std")]
-pub type Vec<T> = std::vec::Vec<T>;
-
-/// The Vec type for the 'no_std' build.
-#[cfg(not(feature = "std"))]
-pub type Vec<T> = alloc::vec::Vec<T>;
-
-/// The String type for the 'std' build.
-#[cfg(feature = "std")]
-pub type String = std::string::String;
-
-/// The String type for the 'no_std' build.
-#[cfg(not(feature = "std"))]
-pub type String = alloc::string::String;
+// `alloc`'s `String` and `Vec` are the same types `std` re-exports, so one
+// import serves both configurations.
+pub(crate) use alloc::{string::String, vec::Vec};
 
 pub(crate) mod wire;
 
@@ -67,6 +52,7 @@ pub use auth::Auth;
 pub use connect::{ConnAck, Connect, Will};
 pub use disconnect::Disconnect;
 pub use error::{Error, Result};
+pub use packet::{MAX_PACKET_SIZE, Packet, RawPacket};
 pub use properties::{Properties, Property, PropertyId, PropertyType, PropertyValue};
 pub use publish::{PubAck, PubComp, PubRec, PubRel, Publish};
 pub use reason_code::ReasonCode;

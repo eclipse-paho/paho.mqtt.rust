@@ -41,10 +41,9 @@ use arbitrary::{Result as AResult, Unstructured};
 use bytes::{Bytes, BytesMut};
 use libfuzzer_sys::fuzz_target;
 use paho_mqtt_codec::{
-    Auth, ConnAck, Connect, Disconnect, MqttVersion, Properties, Property, PropertyId,
-    PropertyType, PropertyValue, PubAck, Publish, QoS, ReasonCode, RetainHandling, SubAck,
-    Subscribe, Subscription, UnsubAck, Unsubscribe, Will,
-    packet::{Packet, RawPacket},
+    Auth, ConnAck, Connect, Disconnect, MqttVersion, Packet, Properties, Property,
+    PropertyId, PropertyType, PropertyValue, PubAck, Publish, QoS, RawPacket, ReasonCode,
+    RetainHandling, SubAck, Subscribe, Subscription, UnsubAck, Unsubscribe, Will,
 };
 
 // ---- primitive generators ------------------------------------------------
@@ -54,7 +53,12 @@ use paho_mqtt_codec::{
 const MAX_BLOB: usize = 4096;
 
 fn version(u: &mut Unstructured) -> AResult<MqttVersion> {
-    Ok(if u.arbitrary()? { MqttVersion::V5 } else { MqttVersion::V3_1_1 })
+    Ok(if u.arbitrary()? {
+        MqttVersion::V5
+    }
+    else {
+        MqttVersion::V3_1_1
+    })
 }
 
 fn qos(u: &mut Unstructured) -> AResult<QoS> {
@@ -108,9 +112,10 @@ fn packet_id(u: &mut Unstructured) -> AResult<u16> {
 fn reason_code(u: &mut Unstructured) -> AResult<ReasonCode> {
     // Every defined code; unknown bytes are not representable.
     const CODES: [u8; 44] = [
-        0x00, 0x01, 0x02, 0x04, 0x10, 0x11, 0x18, 0x19, 0x80, 0x81, 0x82, 0x83, 0x84, 0x85, 0x86,
-        0x87, 0x88, 0x89, 0x8A, 0x8B, 0x8C, 0x8D, 0x8E, 0x8F, 0x90, 0x91, 0x92, 0x93, 0x94, 0x95,
-        0x96, 0x97, 0x98, 0x99, 0x9A, 0x9B, 0x9C, 0x9D, 0x9E, 0x9F, 0xA0, 0xA1, 0xA2, 0x00,
+        0x00, 0x01, 0x02, 0x04, 0x10, 0x11, 0x18, 0x19, 0x80, 0x81, 0x82, 0x83, 0x84, 0x85,
+        0x86, 0x87, 0x88, 0x89, 0x8A, 0x8B, 0x8C, 0x8D, 0x8E, 0x8F, 0x90, 0x91, 0x92, 0x93,
+        0x94, 0x95, 0x96, 0x97, 0x98, 0x99, 0x9A, 0x9B, 0x9C, 0x9D, 0x9E, 0x9F, 0xA0, 0xA1,
+        0xA2, 0x00,
     ];
     Ok(ReasonCode::try_from(*u.choose(&CODES)?).unwrap())
 }
@@ -210,7 +215,12 @@ fn properties(u: &mut Unstructured, ver: MqttVersion) -> AResult<Properties> {
 fn connect(u: &mut Unstructured, ver: MqttVersion) -> AResult<Connect> {
     let mut c = Connect::new(ver, u.arbitrary()?, utf8(u, 256)?);
     c.keep_alive = u.arbitrary()?;
-    c.username = if u.arbitrary()? { Some(utf8(u, 256)?) } else { None };
+    c.username = if u.arbitrary()? {
+        Some(utf8(u, 256)?)
+    }
+    else {
+        None
+    };
     // v3.1.1 forbids a password without a username.
     c.password = if u.arbitrary()? && (ver == MqttVersion::V5 || c.username.is_some()) {
         Some(blob(u, 256)?)
@@ -376,8 +386,14 @@ fn packet(u: &mut Unstructured, ver: MqttVersion) -> AResult<Packet> {
 
 fuzz_target!(|data: &[u8]| {
     let mut u = Unstructured::new(data);
-    let Ok(ver) = version(&mut u) else { return };
-    let Ok(pkt) = packet(&mut u, ver) else { return };
+    let Ok(ver) = version(&mut u)
+    else {
+        return;
+    };
+    let Ok(pkt) = packet(&mut u, ver)
+    else {
+        return;
+    };
 
     // encode
     let mut wire = BytesMut::new();
@@ -391,7 +407,11 @@ fuzz_target!(|data: &[u8]| {
 
     // encode_to_bytes
     let via_bytes = pkt.encode_to_bytes(ver).unwrap();
-    assert_eq!(&via_bytes[..], &wire[..], "encode_to_bytes differs from encode");
+    assert_eq!(
+        &via_bytes[..],
+        &wire[..],
+        "encode_to_bytes differs from encode"
+    );
 
     // encode_split: header + payload must equal encode
     let mut head = BytesMut::new();
@@ -413,7 +433,11 @@ fuzz_target!(|data: &[u8]| {
     let raw = RawPacket::decode(&mut wire)
         .expect("framing failed on valid encoding")
         .expect("encoding incomplete");
-    assert!(wire.is_empty(), "framing left {} trailing bytes", wire.len());
+    assert!(
+        wire.is_empty(),
+        "framing left {} trailing bytes",
+        wire.len()
+    );
     let back = Packet::from_raw(raw, ver)
         .unwrap_or_else(|e| panic!("valid encoding failed to decode: {e}\n{pkt:#?}"));
     assert_eq!(back, pkt, "packet changed across a round trip");

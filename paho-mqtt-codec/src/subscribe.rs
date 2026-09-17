@@ -32,12 +32,16 @@ use crate::{
 };
 use bytes::{Buf, BufMut, Bytes};
 
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
+
 /////////////////////////////////////////////////////////////////////////////
 
 /// How the broker should send retained messages when a subscription is created.
 ///
 /// Carried in the [`Subscription`] options byte (v5 only, bits 5–4).
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[repr(u8)]
 pub enum RetainHandling {
     /// Send retained messages at subscribe time (v3.1.1 behaviour).
@@ -57,6 +61,7 @@ pub enum RetainHandling {
 /// `retain_as_published`, `retain_handling`) are ignored during encode and
 /// left at their defaults during decode.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct Subscription {
     /// Topic filter, may contain `+` and `#` wildcards.
     pub topic_filter: String,
@@ -102,6 +107,7 @@ impl Subscription {
 
 /// A SUBSCRIBE packet, unified across MQTT v3.1.1 and v5.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct Subscribe {
     /// Packet identifier.
     pub packet_id: u16,
@@ -209,6 +215,7 @@ impl Subscribe {
 /// [`ReasonCode::GrantedQos0`] / `GrantedQos1` / `GrantedQos2` /
 /// [`ReasonCode::UnspecifiedError`], so no translation is needed.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct SubAck {
     /// Packet identifier matching the original SUBSCRIBE.
     pub packet_id: u16,

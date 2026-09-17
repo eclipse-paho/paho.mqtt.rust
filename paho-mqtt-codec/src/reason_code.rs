@@ -23,6 +23,9 @@
 use crate::error::Error;
 use core::fmt;
 
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
+
 /// MQTT v5 single-byte reason codes.
 ///
 /// These are used in MQTT v5 packets to indicate the result of an operation.
@@ -31,6 +34,7 @@ use core::fmt;
 /// reason code.
 #[repr(u8)]
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum ReasonCode {
     /// The operation completed successfully.
     /// Also used as `NormalDisconnection` and `GrantedQos0`.
@@ -147,12 +151,12 @@ impl ReasonCode {
 
     /// Returns `true` for codes below 0x80, which indicate success.
     pub fn is_ok(&self) -> bool {
-        (*self as u32) < 0x80
+        (*self as u8) < 0x80
     }
 
     /// Returns `true` for codes of 0x80 or greater, which indicate failure.
     pub fn is_err(&self) -> bool {
-        (*self as u32) >= 0x80
+        (*self as u8) >= 0x80
     }
 }
 

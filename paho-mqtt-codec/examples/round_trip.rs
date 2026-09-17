@@ -23,8 +23,8 @@
 
 use bytes::{Bytes, BytesMut};
 use paho_mqtt_codec::{
-    MqttVersion, Property, PropertyId, PropertyValue, Publish, QoS, Result,
-    packet::{Packet, RawPacket},
+    MqttVersion, Packet, Property, PropertyId, PropertyValue, Publish, QoS, RawPacket,
+    Result,
 };
 
 fn main() -> Result<()> {

@@ -37,9 +37,8 @@ use std::{
 
 use bytes::{Buf, Bytes, BytesMut};
 use paho_mqtt_codec::{
-    ConnAck, Disconnect, MqttVersion, PubAck, QoS, RetainHandling as CodecRetainHandling,
-    Subscribe, Subscription, Unsubscribe,
-    packet::{Packet, RawPacket},
+    ConnAck, Disconnect, MqttVersion, Packet, PubAck, QoS, RawPacket,
+    RetainHandling as CodecRetainHandling, Subscribe, Subscription, Unsubscribe,
 };
 #[cfg(any(feature = "tls", feature = "openssl", feature = "websocket"))]
 use tokio::net::TcpStream;

@@ -36,6 +36,9 @@ use crate::{
 };
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
+
 // ---- packet type nibbles (upper 4 bits of fixed header) ----
 
 const PKT_CONNECT: u8 = 1;
@@ -82,6 +85,7 @@ const HDR_AUTH: u8 = PKT_AUTH << 4; // 0xF0
 /// (lower 4 bits). The `payload` contains exactly `remaining_length` bytes
 /// as decoded from the fixed header — no more, no less.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct RawPacket {
     /// First fixed-header byte: packet type (bits 7–4) and flags (bits 3–0).
     pub header: u8,
@@ -152,7 +156,8 @@ impl RawPacket {
 /// packets (e.g. `Auth`) are present but will not appear on v3.1.1
 /// connections. v5 fields (reason codes, properties) are present on all
 /// applicable structs and default to empty/success on v3.1.1 connections.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum Packet {
     /// `CONNECT` — client connection request.
     Connect(Connect),

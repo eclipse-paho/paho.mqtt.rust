@@ -32,6 +32,9 @@
 use crate::{MqttVersion, Properties, ReasonCode, Result};
 use bytes::{Buf, BufMut, Bytes};
 
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
+
 /////////////////////////////////////////////////////////////////////////////
 
 /// A DISCONNECT packet, unified across MQTT v3.1.1 and v5.
@@ -41,6 +44,7 @@ use bytes::{Buf, BufMut, Bytes};
 /// In v5, a reason code and optional properties may be present, but if both
 /// are absent the wire form is identical to v3.1.1.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct Disconnect {
     /// Disconnect reason code (v5 only; always `NormalDisconnection` for v3.1.1).
     pub reason_code: ReasonCode,

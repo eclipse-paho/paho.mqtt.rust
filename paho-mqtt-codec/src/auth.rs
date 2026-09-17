@@ -36,10 +36,14 @@
 use crate::{MqttVersion, Properties, ReasonCode, Result};
 use bytes::{Buf, BufMut, Bytes};
 
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
+
 /////////////////////////////////////////////////////////////////////////////
 
 /// An AUTH packet (MQTT v5 only).
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct Auth {
     /// Authentication reason code.
     pub reason_code: ReasonCode,

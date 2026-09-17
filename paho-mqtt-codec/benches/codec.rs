@@ -37,10 +37,9 @@ use criterion::{
     BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main,
 };
 use paho_mqtt_codec::{
-    Auth, ConnAck, Connect, Disconnect, MqttVersion, Properties, Property, PropertyId,
-    PropertyValue, PubAck, Publish, QoS, ReasonCode, RetainHandling, SubAck, Subscribe,
-    Subscription, UnsubAck, Unsubscribe, Will,
-    packet::{Packet, RawPacket},
+    Auth, ConnAck, Connect, Disconnect, MqttVersion, Packet, Properties, Property,
+    PropertyId, PropertyValue, PubAck, Publish, QoS, RawPacket, ReasonCode, RetainHandling,
+    SubAck, Subscribe, Subscription, UnsubAck, Unsubscribe, Will,
 };
 use std::hint::black_box;
 

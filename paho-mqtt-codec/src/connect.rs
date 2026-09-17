@@ -21,10 +21,13 @@
 //! MQTT CONNECT and CONNACK packets.
 
 use crate::{
-    Error, MqttVersion, Properties, QoS, ReasonCode, Result, String, varlen,
+    Error, MqttVersion, Properties, QoS, ReasonCode, Result, String,
     wire::{binary_wire_size, get_binary, get_utf8, put_binary, put_utf8, utf8_wire_size},
 };
-use bytes::{Buf, BufMut, Bytes, BytesMut};
+use bytes::{Buf, BufMut, Bytes};
+
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
 
 /////////////////////////////////////////////////////////////////////////////
 
@@ -32,6 +35,7 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 ///
 /// On v3.1.1 connections `properties` is always empty.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct Will {
     /// Topic on which the Will message is published.
     pub topic: String,
@@ -75,6 +79,7 @@ impl Will {
 /// The `properties` field and `will.properties` are always empty on v3.1.1
 /// connections and are not encoded on the wire for that version.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct Connect {
     /// Protocol version this CONNECT declares.
     pub version: MqttVersion,
@@ -315,6 +320,7 @@ fn reason_to_v311_code(rc: ReasonCode) -> Result<u8> {
 /// connect return code is translated to the nearest [`ReasonCode`] on
 /// decode, and the reverse mapping is applied on encode.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct ConnAck {
     /// Whether the broker is resuming an existing session for this client.
     pub session_present: bool,
@@ -377,10 +383,12 @@ impl ConnAck {
         };
         let properties = Properties::decode(&mut payload, ver)?;
 
-        // MQTT §3.2.2.1: session_present MUST be 0 when the connection is refused.
-        if session_present && reason_code != ReasonCode::Success {
-            return Err(Error::MalformedPacket);
-        }
+        // A broker must clear Session Present on a refused connection
+        // (MQTT-3.2.2-4). If one doesn't, the flag is meaningless anyway;
+        // rejecting the packet here would only hide the reason code from
+        // the client, which is the one thing it needs. Be lenient: clear
+        // the flag and keep the code.
+        let session_present = session_present && reason_code == ReasonCode::Success;
 
         Ok(Self {
             session_present,
@@ -388,14 +396,6 @@ impl ConnAck {
             properties,
         })
     }
-}
-
-/// Encodes a complete CONNACK packet (fixed header + remaining-length + variable header).
-pub fn encode_connack(ack: &ConnAck, dst: &mut BytesMut, ver: MqttVersion) -> Result<()> {
-    let remaining = ack.encoded_size(ver);
-    dst.put_u8(0x20); // fixed header: CONNACK, flags=0
-    varlen::encode(remaining as u32, dst)?;
-    ack.encode(dst, ver)
 }
 
 /////////////////////////////////////////////////////////////////////////////
@@ -529,20 +529,25 @@ mod tests {
     }
 
     #[test]
-    fn test_decode_session_present_with_nonzero_code_errors() {
-        // session_present=1 combined with a refused reason code is malformed.
+    fn test_decode_session_present_with_refused_code_is_cleared() {
+        // A non-compliant broker sets session_present on a refused connection.
+        // The reason code is what matters to the client; keep it and clear the
+        // meaningless flag rather than failing the whole packet.
         let payload = Bytes::from_static(&[0x01, 0x05]); // session_present=1, NotAuthorized
-        assert_eq!(
-            ConnAck::decode(payload, v311()),
-            Err(Error::MalformedPacket)
-        );
+        let ack = ConnAck::decode(payload, v311()).unwrap();
+        assert!(!ack.session_present);
+        assert_eq!(ack.reason_code, ReasonCode::NotAuthorized);
     }
 
     #[test]
-    fn test_decode_v5_session_present_with_refused_errors() {
-        // Same rule applies on v5.
+    fn test_decode_v5_session_present_with_refused_code_is_cleared() {
         let payload = Bytes::from_static(&[0x01, 0x87, 0x00]); // session_present=1, NotAuthorized
-        assert_eq!(ConnAck::decode(payload, v5()), Err(Error::MalformedPacket));
+        let ack = ConnAck::decode(payload, v5()).unwrap();
+        assert!(!ack.session_present);
+        assert_eq!(ack.reason_code, ReasonCode::NotAuthorized);
+        // ... and a compliant success + session_present is untouched.
+        let payload = Bytes::from_static(&[0x01, 0x00, 0x00]);
+        assert!(ConnAck::decode(payload, v5()).unwrap().session_present);
     }
 
     // ---- v5 decode ----
@@ -641,26 +646,6 @@ mod tests {
             ConnAck::decode(Bytes::from_static(&[0x00, 0x05, 0x00]), v5()),
             Err(Error::MalformedPacket)
         );
-    }
-
-    // ---- full packet encode (with fixed header) ----
-
-    #[test]
-    fn test_encode_connack_packet_v311() {
-        let ack = ConnAck::new(false, ReasonCode::Success);
-        let mut dst = BytesMut::new();
-        encode_connack(&ack, &mut dst, v311()).unwrap();
-        // 0x20=CONNACK, 0x02=remaining_length, 0x00=flags, 0x00=return_code
-        assert_eq!(&dst[..], &[0x20, 0x02, 0x00, 0x00]);
-    }
-
-    #[test]
-    fn test_encode_connack_packet_v5() {
-        let ack = ConnAck::new(false, ReasonCode::Success);
-        let mut dst = BytesMut::new();
-        encode_connack(&ack, &mut dst, v5()).unwrap();
-        // 0x20, remaining=3, flags=0, reason=0, props_len=0
-        assert_eq!(&dst[..], &[0x20, 0x03, 0x00, 0x00, 0x00]);
     }
 
     // ======================================================================

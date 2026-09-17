@@ -32,8 +32,8 @@ use std::{
 
 use bytes::Bytes;
 use paho_mqtt_codec::{
-    MqttVersion, Properties as CodecProperties, PropertyId, PropertyValue, QoS, ReasonCode,
-    Will, packet::MAX_PACKET_SIZE,
+    MAX_PACKET_SIZE, MqttVersion, Properties as CodecProperties, PropertyId, PropertyValue,
+    QoS, ReasonCode, Will,
 };
 
 use crate::{

@@ -33,10 +33,14 @@ use crate::{
 };
 use bytes::{Buf, BufMut, Bytes};
 
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
+
 /////////////////////////////////////////////////////////////////////////////
 
 /// An UNSUBSCRIBE packet, unified across MQTT v3.1.1 and v5.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct Unsubscribe {
     /// Packet identifier.
     pub packet_id: u16,
@@ -107,6 +111,7 @@ impl Unsubscribe {
 /// and `properties` are always empty and are not encoded on the wire.
 /// In v5, one reason code is present per topic filter from the UNSUBSCRIBE.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct UnsubAck {
     /// Packet identifier matching the original UNSUBSCRIBE.
     pub packet_id: u16,

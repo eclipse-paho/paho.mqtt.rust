@@ -112,8 +112,8 @@ A small sample can be found in the _examples_ directory. Here is what encoding a
 ```rust
 use bytes::{Bytes, BytesMut};
 use paho_mqtt_codec::{
-    MqttVersion, Property, PropertyId, PropertyValue, Publish, QoS, Result,
-    packet::{Packet, RawPacket},
+    MqttVersion, Packet, Property, PropertyId, PropertyValue, Publish, QoS, RawPacket,
+    Result,
 };
 
 fn main() -> Result<()> {
