@@ -39,45 +39,101 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
-// ---- packet type nibbles (upper 4 bits of fixed header) ----
+/// The MQTT control packet types, as carried in the upper four bits of the
+/// fixed-header byte.
+///
+/// Available from a [`RawPacket`] before it is parsed, so a receiver can
+/// dispatch on — or reject — a packet without decoding its body.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub enum PacketType {
+    /// Client connection request.
+    Connect = 1,
+    /// Connection acknowledgement.
+    ConnAck = 2,
+    /// Application message.
+    Publish = 3,
+    /// QoS 1 publish acknowledgement.
+    PubAck = 4,
+    /// QoS 2 publish received.
+    PubRec = 5,
+    /// QoS 2 publish release.
+    PubRel = 6,
+    /// QoS 2 publish complete.
+    PubComp = 7,
+    /// Subscription request.
+    Subscribe = 8,
+    /// Subscription acknowledgement.
+    SubAck = 9,
+    /// Unsubscription request.
+    Unsubscribe = 10,
+    /// Unsubscription acknowledgement.
+    UnsubAck = 11,
+    /// Keep-alive ping.
+    PingReq = 12,
+    /// Keep-alive ping response.
+    PingResp = 13,
+    /// Connection shutdown.
+    Disconnect = 14,
+    /// Extended authentication exchange (v5 only).
+    Auth = 15,
+}
 
-const PKT_CONNECT: u8 = 1;
-const PKT_CONNACK: u8 = 2;
-const PKT_PUBLISH: u8 = 3;
-const PKT_PUBACK: u8 = 4;
-const PKT_PUBREC: u8 = 5;
-const PKT_PUBREL: u8 = 6;
-const PKT_PUBCOMP: u8 = 7;
-const PKT_SUBSCRIBE: u8 = 8;
-const PKT_SUBACK: u8 = 9;
-const PKT_UNSUBSCRIBE: u8 = 10;
-const PKT_UNSUBACK: u8 = 11;
-const PKT_PINGREQ: u8 = 12;
-const PKT_PINGRESP: u8 = 13;
-const PKT_DISCONNECT: u8 = 14;
-const PKT_AUTH: u8 = 15;
+impl PacketType {
+    /// The fixed-header flag bits every packet of this type must carry, or
+    /// `None` for PUBLISH, whose flags are data (DUP, QoS, RETAIN).
+    #[inline]
+    fn fixed_flags(self) -> Option<u8> {
+        use PacketType::*;
+        match self {
+            Publish => None,
+            PubRel | Subscribe | Unsubscribe => Some(0x02),
+            _ => Some(0x00),
+        }
+    }
+
+    /// The fixed-header byte for this type with its fixed flags (PUBLISH
+    /// gets zero flags; the caller ORs in DUP/QoS/RETAIN).
+    #[inline]
+    fn header_byte(self) -> u8 {
+        ((self as u8) << 4) | self.fixed_flags().unwrap_or(0)
+    }
+}
+
+impl TryFrom<u8> for PacketType {
+    type Error = Error;
+
+    /// Converts a type nibble (1–15). Returns
+    /// [`Error::UnknownPacketType`] for 0, which is reserved.
+    #[inline]
+    fn try_from(nibble: u8) -> Result<Self> {
+        use PacketType::*;
+        Ok(match nibble {
+            1 => Connect,
+            2 => ConnAck,
+            3 => Publish,
+            4 => PubAck,
+            5 => PubRec,
+            6 => PubRel,
+            7 => PubComp,
+            8 => Subscribe,
+            9 => SubAck,
+            10 => Unsubscribe,
+            11 => UnsubAck,
+            12 => PingReq,
+            13 => PingResp,
+            14 => Disconnect,
+            15 => Auth,
+            t => return Err(Error::UnknownPacketType(t)),
+        })
+    }
+}
 
 /// Largest total packet size (fixed header + remaining length) representable
 /// on the wire: a 4-byte remaining-length field can encode [`varlen::MAX_VARLEN`]
 /// bytes, plus 1 byte for the packet-type header and 4 for the length itself.
 pub const MAX_PACKET_SIZE: u32 = varlen::MAX_VARLEN + 5;
-
-// ---- fixed header bytes ----
-
-const HDR_CONNECT: u8 = PKT_CONNECT << 4; // 0x10
-const HDR_CONNACK: u8 = PKT_CONNACK << 4; // 0x20
-const HDR_PUBACK: u8 = PKT_PUBACK << 4; // 0x40
-const HDR_PUBREC: u8 = PKT_PUBREC << 4; // 0x50
-const HDR_PUBREL: u8 = (PKT_PUBREL << 4) | 0x02; // 0x62  (reserved flags = 0b0010)
-const HDR_PUBCOMP: u8 = PKT_PUBCOMP << 4; // 0x70
-const HDR_SUBSCRIBE: u8 = (PKT_SUBSCRIBE << 4) | 0x02; // 0x82 (reserved flags = 0b0010)
-const HDR_SUBACK: u8 = PKT_SUBACK << 4; // 0x90
-const HDR_UNSUBSCRIBE: u8 = (PKT_UNSUBSCRIBE << 4) | 0x02; // 0xA2 (reserved flags = 0b0010)
-const HDR_UNSUBACK: u8 = PKT_UNSUBACK << 4; // 0xB0
-const HDR_PINGREQ: u8 = PKT_PINGREQ << 4;
-const HDR_PINGRESP: u8 = PKT_PINGRESP << 4;
-const HDR_DISCONNECT: u8 = PKT_DISCONNECT << 4; // 0xE0
-const HDR_AUTH: u8 = PKT_AUTH << 4; // 0xF0
 
 /// A raw, uninterpreted MQTT packet produced by the framing layer.
 ///
@@ -94,6 +150,18 @@ pub struct RawPacket {
 }
 
 impl RawPacket {
+    /// The packet type from the fixed header, without parsing the body.
+    #[inline]
+    pub fn packet_type(&self) -> Result<PacketType> {
+        PacketType::try_from(self.header >> 4)
+    }
+
+    /// The flag bits (lower nibble) of the fixed header.
+    #[inline]
+    pub fn flags(&self) -> u8 {
+        self.header & 0x0F
+    }
+
     /// Attempts to decode one complete MQTT packet from `src`.
     ///
     /// Returns `Ok(None)` if `src` does not yet contain a complete packet.
@@ -193,59 +261,113 @@ pub enum Packet {
 }
 
 impl Packet {
+    /// The type of this packet.
+    #[inline]
+    pub fn packet_type(&self) -> PacketType {
+        use Packet::*;
+        match self {
+            Connect(_) => PacketType::Connect,
+            ConnAck(_) => PacketType::ConnAck,
+            Publish(_) => PacketType::Publish,
+            PubAck(_) => PacketType::PubAck,
+            PubRec(_) => PacketType::PubRec,
+            PubRel(_) => PacketType::PubRel,
+            PubComp(_) => PacketType::PubComp,
+            Subscribe(_) => PacketType::Subscribe,
+            SubAck(_) => PacketType::SubAck,
+            Unsubscribe(_) => PacketType::Unsubscribe,
+            UnsubAck(_) => PacketType::UnsubAck,
+            PingReq => PacketType::PingReq,
+            PingResp => PacketType::PingResp,
+            Disconnect(_) => PacketType::Disconnect,
+            Auth(_) => PacketType::Auth,
+        }
+    }
+
     /// Parses a [`RawPacket`] into a typed [`Packet`] given `ver`.
     ///
     /// CONNECT is self-describing and ignores `ver`: its protocol version is
     /// read from the wire into [`Connect::version`].
     pub fn from_raw(raw: RawPacket, ver: MqttVersion) -> Result<Self> {
-        let typ = raw.header >> 4;
-        let flags = raw.header & 0x0F;
+        use PacketType as T;
+
+        let ty = raw.packet_type()?;
+        let flags = raw.flags();
 
         // Every type except PUBLISH has fixed flag bits; a receiver must treat
         // any other value as malformed (MQTT-2.2.2-2). PUBLISH flags are
         // interpreted by `Publish::decode`.
-        let expected_flags = match typ {
-            PKT_PUBLISH => flags,
-            PKT_PUBREL | PKT_SUBSCRIBE | PKT_UNSUBSCRIBE => 0x02,
-            _ => 0x00,
-        };
-        if flags != expected_flags {
+        if let Some(expected) = ty.fixed_flags()
+            && flags != expected
+        {
             return Err(Error::MalformedPacket);
         }
 
-        match typ {
-            PKT_CONNECT => Ok(Packet::Connect(Connect::decode(raw.payload)?)),
-            PKT_CONNACK => Ok(Packet::ConnAck(ConnAck::decode(raw.payload, ver)?)),
-            PKT_PUBLISH => Ok(Packet::Publish(Publish::decode(flags, raw.payload, ver)?)),
-            PKT_PUBACK => Ok(Packet::PubAck(PubAck::decode(raw.payload, ver)?)),
-            PKT_PUBREC => Ok(Packet::PubRec(PubAck::decode(raw.payload, ver)?)),
-            PKT_PUBREL => Ok(Packet::PubRel(PubAck::decode(raw.payload, ver)?)),
-            PKT_PUBCOMP => Ok(Packet::PubComp(PubAck::decode(raw.payload, ver)?)),
-            PKT_SUBSCRIBE => Ok(Packet::Subscribe(Subscribe::decode(raw.payload, ver)?)),
-            PKT_SUBACK => Ok(Packet::SubAck(SubAck::decode(raw.payload, ver)?)),
-            PKT_UNSUBSCRIBE => {
-                Ok(Packet::Unsubscribe(Unsubscribe::decode(raw.payload, ver)?))
+        // Type 15 is reserved in v3.1.1; AUTH exists only in v5.
+        if ty == T::Auth && ver != MqttVersion::V5 {
+            return Err(Error::UnknownPacketType(ty as u8));
+        }
+
+        let pkt = match ty {
+            T::Connect => Packet::Connect(Connect::decode(raw.payload)?),
+            T::ConnAck => Packet::ConnAck(ConnAck::decode(raw.payload, ver)?),
+            T::Publish => Packet::Publish(Publish::decode(flags, raw.payload, ver)?),
+            T::PubAck => Packet::PubAck(PubAck::decode(raw.payload, ver)?),
+            T::PubRec => Packet::PubRec(PubAck::decode(raw.payload, ver)?),
+            T::PubRel => Packet::PubRel(PubAck::decode(raw.payload, ver)?),
+            T::PubComp => Packet::PubComp(PubAck::decode(raw.payload, ver)?),
+            T::Subscribe => Packet::Subscribe(Subscribe::decode(raw.payload, ver)?),
+            T::SubAck => Packet::SubAck(SubAck::decode(raw.payload, ver)?),
+            T::Unsubscribe => Packet::Unsubscribe(Unsubscribe::decode(raw.payload, ver)?),
+            T::UnsubAck => Packet::UnsubAck(UnsubAck::decode(raw.payload, ver)?),
+            T::PingReq => Packet::PingReq,
+            T::PingResp => Packet::PingResp,
+            T::Disconnect => Packet::Disconnect(Disconnect::decode(raw.payload, ver)?),
+            T::Auth => Packet::Auth(Auth::decode(raw.payload)?),
+        };
+        pkt.check_reason_codes(ty)?;
+        Ok(pkt)
+    }
+
+    /// Checks that every reason code in this packet is one the specification
+    /// lists for this packet type (MQTT v5 §2.4); each acknowledgement has
+    /// its own allowed set. Returns [`Error::ProtocolError`] otherwise.
+    ///
+    /// Not version-gated: on v3.1.1 the only codes that can be present are
+    /// the CONNACK return codes and SUBACK granted-QoS values, which are in
+    /// their respective sets.
+    #[inline]
+    fn check_reason_codes(&self, ty: PacketType) -> Result<()> {
+        use Packet::*;
+        let ok = match self {
+            ConnAck(a) => a.reason_code.is_allowed_in(ty),
+            PubAck(a) | PubRec(a) | PubRel(a) | PubComp(a) => {
+                a.reason_code.is_allowed_in(ty)
             }
-            PKT_UNSUBACK => Ok(Packet::UnsubAck(UnsubAck::decode(raw.payload, ver)?)),
-            PKT_PINGREQ => Ok(Packet::PingReq),
-            PKT_PINGRESP => Ok(Packet::PingResp),
-            PKT_DISCONNECT => Ok(Packet::Disconnect(Disconnect::decode(raw.payload, ver)?)),
-            // Type 15 is reserved in v3.1.1; AUTH exists only in v5.
-            PKT_AUTH if ver == MqttVersion::V5 => {
-                Ok(Packet::Auth(Auth::decode(raw.payload)?))
-            }
-            t => Err(Error::UnknownPacketType(t)),
+            SubAck(a) => a.reason_codes.iter().all(|rc| rc.is_allowed_in(ty)),
+            UnsubAck(a) => a.reason_codes.iter().all(|rc| rc.is_allowed_in(ty)),
+            Disconnect(d) => d.reason_code.is_allowed_in(ty),
+            Auth(a) => a.reason_code.is_allowed_in(ty),
+            Connect(_) | Publish(_) | Subscribe(_) | Unsubscribe(_) | PingReq
+            | PingResp => true,
+        };
+        if ok {
+            Ok(())
+        }
+        else {
+            Err(Error::ProtocolError)
         }
     }
 
     /// Returns the fixed-header byte and the remaining length for this packet.
-    fn header_and_remaining(&self, ver: MqttVersion) -> (u8, usize) {
+    fn header_and_remaining(&self, ty: PacketType, ver: MqttVersion) -> (u8, usize) {
         use Packet::*;
+        let hdr = ty.header_byte();
         match self {
-            Connect(conn) => (HDR_CONNECT, conn.encoded_size()),
-            ConnAck(ack) => (HDR_CONNACK, ack.encoded_size(ver)),
+            Connect(conn) => (hdr, conn.encoded_size()),
+            ConnAck(ack) => (hdr, ack.encoded_size(ver)),
             Publish(pub_) => {
-                let mut hdr = PKT_PUBLISH << 4;
+                let mut hdr = hdr;
                 if pub_.dup {
                     hdr |= 0x08;
                 }
@@ -255,18 +377,16 @@ impl Packet {
                 }
                 (hdr, pub_.encoded_size(ver))
             }
-            PubAck(ack) => (HDR_PUBACK, ack.encoded_size(ver)),
-            PubRec(ack) => (HDR_PUBREC, ack.encoded_size(ver)),
-            PubRel(ack) => (HDR_PUBREL, ack.encoded_size(ver)),
-            PubComp(ack) => (HDR_PUBCOMP, ack.encoded_size(ver)),
-            Subscribe(s) => (HDR_SUBSCRIBE, s.encoded_size(ver)),
-            SubAck(sa) => (HDR_SUBACK, sa.encoded_size(ver)),
-            Unsubscribe(u) => (HDR_UNSUBSCRIBE, u.encoded_size(ver)),
-            UnsubAck(ua) => (HDR_UNSUBACK, ua.encoded_size(ver)),
-            PingReq => (HDR_PINGREQ, 0),
-            PingResp => (HDR_PINGRESP, 0),
-            Disconnect(d) => (HDR_DISCONNECT, d.encoded_size(ver)),
-            Auth(a) => (HDR_AUTH, a.encoded_size()),
+            PubAck(ack) | PubRec(ack) | PubRel(ack) | PubComp(ack) => {
+                (hdr, ack.encoded_size(ver))
+            }
+            Subscribe(s) => (hdr, s.encoded_size(ver)),
+            SubAck(sa) => (hdr, sa.encoded_size(ver)),
+            Unsubscribe(u) => (hdr, u.encoded_size(ver)),
+            UnsubAck(ua) => (hdr, ua.encoded_size(ver)),
+            PingReq | PingResp => (hdr, 0),
+            Disconnect(d) => (hdr, d.encoded_size(ver)),
+            Auth(a) => (hdr, a.encoded_size()),
         }
     }
 
@@ -276,7 +396,7 @@ impl Packet {
     /// Returns [`Error::VarLenOverflow`] if the body exceeds the protocol
     /// maximum ([`varlen::MAX_VARLEN`]).
     pub fn encoded_size(&self, ver: MqttVersion) -> Result<usize> {
-        let (_, remaining) = self.header_and_remaining(ver);
+        let (_, remaining) = self.header_and_remaining(self.packet_type(), ver);
         let remaining = Self::checked_remaining(remaining)?;
         Ok(1 + varlen::encoded_size(remaining) + remaining as usize)
     }
@@ -357,7 +477,9 @@ impl Packet {
     ) -> Result<Option<Bytes>> {
         use Packet::*;
 
-        let (hdr, remaining) = self.header_and_remaining(ver);
+        let ty = self.packet_type();
+        self.check_reason_codes(ty)?;
+        let (hdr, remaining) = self.header_and_remaining(ty, ver);
         let remaining = Self::checked_remaining(remaining)?;
         let mut reserve = 1 + varlen::encoded_size(remaining) + remaining as usize;
         if let Publish(pub_) = self
@@ -407,7 +529,7 @@ impl Packet {
 mod tests {
     use super::*;
     use crate::{
-        QoS, String, Subscription,
+        QoS, ReasonCode, String, Subscription,
         types::{MQTT_VERSION_3_1_1, MQTT_VERSION_5},
     };
 
@@ -430,25 +552,25 @@ mod tests {
     #[test]
     fn test_raw_decode_partial_header_returns_none() {
         // Only the fixed header byte, no remaining_length byte yet.
-        let mut src = BytesMut::from(&[HDR_PINGREQ][..]);
+        let mut src = BytesMut::from(&[PacketType::PingReq.header_byte()][..]);
         assert!(RawPacket::decode(&mut src).unwrap().is_none());
         assert_eq!(src.len(), 1); // not consumed
     }
 
     #[test]
     fn test_raw_decode_pingreq() {
-        let mut src = BytesMut::from(&[HDR_PINGREQ, 0x00][..]);
+        let mut src = BytesMut::from(&[PacketType::PingReq.header_byte(), 0x00][..]);
         let raw = RawPacket::decode(&mut src).unwrap().unwrap();
-        assert_eq!(raw.header, HDR_PINGREQ);
+        assert_eq!(raw.header, PacketType::PingReq.header_byte());
         assert!(raw.payload.is_empty());
         assert!(src.is_empty());
     }
 
     #[test]
     fn test_raw_decode_pingresp() {
-        let mut src = BytesMut::from(&[HDR_PINGRESP, 0x00][..]);
+        let mut src = BytesMut::from(&[PacketType::PingResp.header_byte(), 0x00][..]);
         let raw = RawPacket::decode(&mut src).unwrap().unwrap();
-        assert_eq!(raw.header, HDR_PINGRESP);
+        assert_eq!(raw.header, PacketType::PingResp.header_byte());
         assert!(raw.payload.is_empty());
         assert!(src.is_empty());
     }
@@ -456,9 +578,16 @@ mod tests {
     #[test]
     fn test_raw_decode_leaves_trailing_bytes() {
         // Two back-to-back PINGREQ frames.
-        let mut src = BytesMut::from(&[HDR_PINGREQ, 0x00, HDR_PINGRESP, 0x00][..]);
+        let mut src = BytesMut::from(
+            &[
+                PacketType::PingReq.header_byte(),
+                0x00,
+                PacketType::PingResp.header_byte(),
+                0x00,
+            ][..],
+        );
         let raw = RawPacket::decode(&mut src).unwrap().unwrap();
-        assert_eq!(raw.header, HDR_PINGREQ);
+        assert_eq!(raw.header, PacketType::PingReq.header_byte());
         assert_eq!(src.len(), 2); // second packet still in buffer
     }
 
@@ -525,7 +654,7 @@ mod tests {
     #[test]
     fn test_from_raw_pingreq() {
         let raw = RawPacket {
-            header: HDR_PINGREQ,
+            header: PacketType::PingReq.header_byte(),
             payload: Bytes::new(),
         };
         assert!(matches!(
@@ -537,7 +666,7 @@ mod tests {
     #[test]
     fn test_from_raw_pingresp() {
         let raw = RawPacket {
-            header: HDR_PINGRESP,
+            header: PacketType::PingResp.header_byte(),
             payload: Bytes::new(),
         };
         assert!(matches!(
@@ -561,34 +690,32 @@ mod tests {
     #[test]
     fn test_from_raw_reserved_flag_bits_rejected() {
         // Every fixed-flag type must reject a non-canonical flag nibble.
-        let cases: [(u8, &[u8]); 12] = [
-            (PKT_CONNACK, &[0x00, 0x00]),
-            (PKT_PUBACK, &[0x00, 0x01]),
-            (PKT_PUBREC, &[0x00, 0x01]),
-            (PKT_PUBREL, &[0x00, 0x01]),
-            (PKT_PUBCOMP, &[0x00, 0x01]),
-            (PKT_SUBACK, &[0x00, 0x01, 0x00]),
-            (PKT_UNSUBACK, &[0x00, 0x01]),
-            (PKT_PINGREQ, &[]),
-            (PKT_PINGRESP, &[]),
-            (PKT_DISCONNECT, &[]),
-            (PKT_AUTH, &[]),
-            (PKT_CONNECT, &[]),
+        use PacketType as T;
+        let cases: [(PacketType, &[u8]); 12] = [
+            (T::ConnAck, &[0x00, 0x00]),
+            (T::PubAck, &[0x00, 0x01]),
+            (T::PubRec, &[0x00, 0x01]),
+            (T::PubRel, &[0x00, 0x01]),
+            (T::PubComp, &[0x00, 0x01]),
+            (T::SubAck, &[0x00, 0x01, 0x00]),
+            (T::UnsubAck, &[0x00, 0x01]),
+            (T::PingReq, &[]),
+            (T::PingResp, &[]),
+            (T::Disconnect, &[]),
+            (T::Auth, &[]),
+            (T::Connect, &[]),
         ];
-        for (typ, body) in cases {
-            let canonical = match typ {
-                PKT_PUBREL | PKT_SUBSCRIBE | PKT_UNSUBSCRIBE => 0x02,
-                _ => 0x00,
-            };
+        for (ty, body) in cases {
+            let canonical = ty.fixed_flags().unwrap();
             for bad in (0u8..16).filter(|&f| f != canonical) {
                 let raw = RawPacket {
-                    header: (typ << 4) | bad,
+                    header: ((ty as u8) << 4) | bad,
                     payload: Bytes::copy_from_slice(body),
                 };
                 assert_eq!(
                     Packet::from_raw(raw, v311()),
                     Err(Error::MalformedPacket),
-                    "type {typ} flags {bad:#x}"
+                    "type {ty:?} flags {bad:#x}"
                 );
             }
         }
@@ -597,18 +724,105 @@ mod tests {
     #[test]
     fn test_from_raw_auth_rejected_on_v311() {
         let raw = RawPacket {
-            header: HDR_AUTH,
+            header: PacketType::Auth.header_byte(),
             payload: Bytes::new(),
         };
         assert_eq!(
             Packet::from_raw(raw, v311()),
-            Err(Error::UnknownPacketType(PKT_AUTH))
+            Err(Error::UnknownPacketType(PacketType::Auth as u8))
         );
         let raw = RawPacket {
-            header: HDR_AUTH,
+            header: PacketType::Auth.header_byte(),
             payload: Bytes::new(),
         };
         assert!(matches!(Packet::from_raw(raw, v5()), Ok(Packet::Auth(_))));
+    }
+
+    // ---- reason codes per packet type (G3) ----
+
+    #[test]
+    fn test_from_raw_rejects_reason_code_from_wrong_packet() {
+        // PUBACK carrying SessionTakenOver (0x8E): a DISCONNECT-only code.
+        let raw = RawPacket {
+            header: PacketType::PubAck.header_byte(),
+            payload: Bytes::from_static(&[0x00, 0x01, 0x8E]),
+        };
+        assert_eq!(Packet::from_raw(raw, v5()), Err(Error::ProtocolError));
+        // PUBREL may only say Success or PacketIdentifierNotFound.
+        let raw = RawPacket {
+            header: PacketType::PubRel.header_byte(),
+            payload: Bytes::from_static(&[0x00, 0x01, 0x10]), // NoMatchingSubscribers
+        };
+        assert_eq!(Packet::from_raw(raw, v5()), Err(Error::ProtocolError));
+        // ... but PUBACK may say NoMatchingSubscribers.
+        let raw = RawPacket {
+            header: PacketType::PubAck.header_byte(),
+            payload: Bytes::from_static(&[0x00, 0x01, 0x10]),
+        };
+        assert!(Packet::from_raw(raw, v5()).is_ok());
+        // SUBACK with a CONNACK-only code (BadUserNameOrPassword)
+        let raw = RawPacket {
+            header: PacketType::SubAck.header_byte(),
+            payload: Bytes::from_static(&[0x00, 0x01, 0x00, 0x86]),
+        };
+        assert_eq!(Packet::from_raw(raw, v5()), Err(Error::ProtocolError));
+        // AUTH with anything but Success/Continue/ReAuthenticate
+        let raw = RawPacket {
+            header: PacketType::Auth.header_byte(),
+            payload: Bytes::from_static(&[0x80]),
+        };
+        assert_eq!(Packet::from_raw(raw, v5()), Err(Error::ProtocolError));
+    }
+
+    #[test]
+    fn test_encode_rejects_reason_code_from_wrong_packet() {
+        let mut ack = PubAck::new(1);
+        ack.reason_code = ReasonCode::SessionTakenOver;
+        let mut dst = BytesMut::new();
+        assert_eq!(
+            Packet::PubComp(ack).encode(&mut dst, v5()),
+            Err(Error::ProtocolError)
+        );
+        assert!(dst.is_empty());
+    }
+
+    // ---- PacketType ----
+
+    #[test]
+    fn test_packet_type_round_trips_nibble() {
+        for n in 1u8..=15 {
+            let ty = PacketType::try_from(n).unwrap();
+            assert_eq!(ty as u8, n);
+        }
+        assert_eq!(PacketType::try_from(0), Err(Error::UnknownPacketType(0)));
+    }
+
+    #[test]
+    fn test_raw_packet_type_and_flags() {
+        let raw = RawPacket {
+            header: 0x3D, // PUBLISH, dup + qos2 + retain
+            payload: Bytes::new(),
+        };
+        assert_eq!(raw.packet_type(), Ok(PacketType::Publish));
+        assert_eq!(raw.flags(), 0x0D);
+        let raw = RawPacket {
+            header: 0x0F,
+            payload: Bytes::new(),
+        };
+        assert_eq!(raw.packet_type(), Err(Error::UnknownPacketType(0)));
+    }
+
+    #[test]
+    fn test_packet_packet_type() {
+        assert_eq!(Packet::PingReq.packet_type(), PacketType::PingReq);
+        assert_eq!(
+            Packet::PubRec(PubAck::new(1)).packet_type(),
+            PacketType::PubRec
+        );
+        assert_eq!(
+            Packet::Publish(Publish::new("t", Bytes::new())).packet_type(),
+            PacketType::Publish
+        );
     }
 
     // ---- Packet::encode ----
@@ -617,14 +831,14 @@ mod tests {
     fn test_encode_pingreq() {
         let mut dst = BytesMut::new();
         Packet::PingReq.encode(&mut dst, v311()).unwrap();
-        assert_eq!(&dst[..], &[HDR_PINGREQ, 0x00]);
+        assert_eq!(&dst[..], &[PacketType::PingReq.header_byte(), 0x00]);
     }
 
     #[test]
     fn test_encode_pingresp() {
         let mut dst = BytesMut::new();
         Packet::PingResp.encode(&mut dst, v5()).unwrap();
-        assert_eq!(&dst[..], &[HDR_PINGRESP, 0x00]);
+        assert_eq!(&dst[..], &[PacketType::PingResp.header_byte(), 0x00]);
     }
 
     // ---- round-trip ----

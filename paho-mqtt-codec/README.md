@@ -11,7 +11,7 @@ This crate is a wire-format layer and nothing else: it converts between typed Ru
 - Full MQTT v5 property support with typed values, including the shorthand encodings the specification permits when a reason code or property list is absent.
 - Two-phase decoding: a version-independent framing step that pulls one complete packet out of a read buffer (returning `None` until enough bytes have arrived), followed by version-aware parsing.
 - Zero-copy where the protocol allows it. Decoded PUBLISH payloads are slices of the receive buffer, and a PUBLISH can be encoded with its header and payload kept separate so the payload need never be copied into the send buffer.
-- Strict on input. Malformed packets — bad lengths, reserved bits, undefined reason codes, forbidden characters, oversize fields — are reported as errors rather than silently accepted or reinterpreted.
+- Strict on input, and classified. Malformed packets (bad lengths, reserved bits, invalid UTF-8) and protocol errors (a property or reason code that the specification does not allow in that packet, a misplaced wildcard in a topic filter, a repeated property, a zero packet identifier) are distinguished as the specification distinguishes them, and `Error::reason_code()` gives the DISCONNECT reason to send back. The same rules are applied when encoding, so a badly built packet fails locally instead of at the peer.
 - A configurable maximum packet size that rejects an oversized frame as soon as its header is read, before any of its body is buffered.
 - `no_std` compatible. Only `alloc` is required; `std` is an optional feature.
 - Built on the [`bytes`](https://crates.io/crates/bytes) crate, so buffers interoperate with the rest of the Rust networking ecosystem.
@@ -175,6 +175,8 @@ let ver = match Packet::from_raw(raw, MqttVersion::V5)? {   // version is ignore
 ```
 
 A CONNECT for a version the crate does not speak (MQTT v3.1, `MQIsdp`) decodes to `Error::UnsupportedProtocolVersion`, distinct from a malformed packet, so a server can answer with a CONNACK carrying `UnsupportedProtocolVersion` rather than dropping the connection. `RawPacket::decode_max` takes the server's own maximum packet size for the same reason a client would pass its own.
+
+`RawPacket::packet_type()` gives the type before the body is parsed, for routing or for rejecting a packet the session state does not permit. When a decode fails, `Error::reason_code()` is the code for the DISCONNECT (or CONNACK) to send before closing. The `topic` module exposes the filter and name validation the decoder uses — including `topic::split_shared` for `$share/{name}/{filter}` subscriptions — so a server can apply the same rules to its own subscription table.
 
 ## Relationship to the Paho Client
 

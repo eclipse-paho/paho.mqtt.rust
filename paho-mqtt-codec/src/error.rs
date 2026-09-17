@@ -67,6 +67,10 @@ pub enum Error {
     /// A topic name was empty where one is required, or contained a wildcard.
     #[error("topic name invalid")]
     TopicNameInvalid,
+    /// A topic filter was empty, misplaced a wildcard, or had a malformed
+    /// shared-subscription prefix.
+    #[error("topic filter invalid")]
+    TopicFilterInvalid,
     /// A UTF-8 string field exceeded the 65,535-byte wire limit.
     #[error("UTF-8 string exceeds 65,535 bytes")]
     StringTooLong,
@@ -102,6 +106,7 @@ impl Error {
             }
             ProtocolError => ReasonCode::ProtocolError,
             TopicNameInvalid => ReasonCode::TopicNameInvalid,
+            TopicFilterInvalid => ReasonCode::TopicFilterInvalid,
             PacketTooLarge => ReasonCode::PacketTooLarge,
             UnsupportedProtocolVersion => ReasonCode::UnsupportedProtocolVersion,
         }
@@ -143,6 +148,10 @@ mod tests {
         }
         assert_eq!(ProtocolError.reason_code(), ReasonCode::ProtocolError);
         assert_eq!(TopicNameInvalid.reason_code(), ReasonCode::TopicNameInvalid);
+        assert_eq!(
+            TopicFilterInvalid.reason_code(),
+            ReasonCode::TopicFilterInvalid
+        );
         assert_eq!(PacketTooLarge.reason_code(), ReasonCode::PacketTooLarge);
         assert_eq!(
             UnsupportedProtocolVersion.reason_code(),
@@ -151,6 +160,7 @@ mod tests {
         for e in [
             ProtocolError,
             TopicNameInvalid,
+            TopicFilterInvalid,
             PacketTooLarge,
             UnsupportedProtocolVersion,
         ] {
@@ -170,6 +180,7 @@ mod tests {
             MalformedPacket,
             ProtocolError,
             TopicNameInvalid,
+            TopicFilterInvalid,
             StringTooLong,
             BinaryTooLong,
             PacketTooLarge,

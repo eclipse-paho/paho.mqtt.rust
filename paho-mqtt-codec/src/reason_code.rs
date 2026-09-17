@@ -20,7 +20,7 @@
 
 //! MQTT v5 reason codes.
 
-use crate::error::Error;
+use crate::{PacketType, error::Error};
 use core::fmt;
 
 #[cfg(feature = "serde")]
@@ -158,7 +158,143 @@ impl ReasonCode {
     pub fn is_err(&self) -> bool {
         (*self as u8) >= 0x80
     }
+
+    /// Returns `true` if the specification lists this code for packets of
+    /// type `ty`.
+    ///
+    /// Each packet type that carries a reason code has its own allowed set
+    /// (MQTT v5 §2.4 and the per-packet tables): a PUBACK cannot say
+    /// `SessionTakenOver`, a DISCONNECT cannot say `GrantedQos1`, and so on.
+    /// Packet types that never carry a reason code return `false` for every
+    /// code.
+    ///
+    /// The sets are compile-time bitsets; this is one load and one shift.
+    #[inline]
+    pub fn is_allowed_in(self, ty: PacketType) -> bool {
+        let code = self as u8;
+        let set = &ALLOWED[ty as usize];
+        (set[(code >> 6) as usize] >> (code & 63)) & 1 != 0
+    }
 }
+
+/// A 256-bit set of reason-code values.
+type CodeSet = [u64; 4];
+
+const fn code_set(codes: &[ReasonCode]) -> CodeSet {
+    let mut set = [0u64; 4];
+    let mut i = 0;
+    while i < codes.len() {
+        let c = codes[i] as u8;
+        set[(c >> 6) as usize] |= 1 << (c & 63);
+        i += 1;
+    }
+    set
+}
+
+/// Allowed reason codes per packet type, indexed by `PacketType as usize`
+/// (index 0 unused). MQTT v5 §3.2.2.2, 3.4.2.1, 3.5.2.1, 3.6.2.1, 3.7.2.1,
+/// 3.9.3, 3.11.3, 3.14.2.1, 3.15.2.1.
+const ALLOWED: [CodeSet; 16] = {
+    use ReasonCode::*;
+    let mut t = [[0u64; 4]; 16];
+    t[PacketType::ConnAck as usize] = code_set(&[
+        Success,
+        UnspecifiedError,
+        MalformedPacket,
+        ProtocolError,
+        ImplementationSpecificError,
+        UnsupportedProtocolVersion,
+        ClientIdentifierNotValid,
+        BadUserNameOrPassword,
+        NotAuthorized,
+        ServerUnavailable,
+        ServerBusy,
+        Banned,
+        BadAuthenticationMethod,
+        TopicNameInvalid,
+        PacketTooLarge,
+        QuotaExceeded,
+        PayloadFormatInvalid,
+        RetainNotSupported,
+        QosNotSupported,
+        UseAnotherServer,
+        ServerMoved,
+        ConnectionRateExceeded,
+    ]);
+    let pub_ack = code_set(&[
+        Success,
+        NoMatchingSubscribers,
+        UnspecifiedError,
+        ImplementationSpecificError,
+        NotAuthorized,
+        TopicNameInvalid,
+        PacketIdentifierInUse,
+        QuotaExceeded,
+        PayloadFormatInvalid,
+    ]);
+    t[PacketType::PubAck as usize] = pub_ack;
+    t[PacketType::PubRec as usize] = pub_ack;
+    let pub_rel = code_set(&[Success, PacketIdentifierNotFound]);
+    t[PacketType::PubRel as usize] = pub_rel;
+    t[PacketType::PubComp as usize] = pub_rel;
+    t[PacketType::SubAck as usize] = code_set(&[
+        Success,
+        GrantedQos1,
+        GrantedQos2,
+        UnspecifiedError,
+        ImplementationSpecificError,
+        NotAuthorized,
+        TopicFilterInvalid,
+        PacketIdentifierInUse,
+        QuotaExceeded,
+        SharedSubscriptionsNotSupported,
+        SubscriptionIdentifiersNotSupported,
+        WildcardSubscriptionsNotSupported,
+    ]);
+    t[PacketType::UnsubAck as usize] = code_set(&[
+        Success,
+        NoSubscriptionFound,
+        UnspecifiedError,
+        ImplementationSpecificError,
+        NotAuthorized,
+        TopicFilterInvalid,
+        PacketIdentifierInUse,
+    ]);
+    t[PacketType::Disconnect as usize] = code_set(&[
+        Success,
+        DisconnectWithWillMessage,
+        UnspecifiedError,
+        MalformedPacket,
+        ProtocolError,
+        ImplementationSpecificError,
+        NotAuthorized,
+        ServerBusy,
+        ServerShuttingDown,
+        KeepAliveTimeout,
+        SessionTakenOver,
+        TopicFilterInvalid,
+        TopicNameInvalid,
+        ReceiveMaximumExceeded,
+        TopicAliasInvalid,
+        PacketTooLarge,
+        MessageRateTooHigh,
+        QuotaExceeded,
+        AdministrativeAction,
+        PayloadFormatInvalid,
+        RetainNotSupported,
+        QosNotSupported,
+        UseAnotherServer,
+        ServerMoved,
+        SharedSubscriptionsNotSupported,
+        ConnectionRateExceeded,
+        MaximumConnectTime,
+        SubscriptionIdentifiersNotSupported,
+        WildcardSubscriptionsNotSupported,
+    ]);
+    t[PacketType::Auth as usize] =
+        code_set(&[Success, ContinueAuthentication, ReAuthenticate]);
+    t
+};
 
 impl TryFrom<u8> for ReasonCode {
     type Error = Error;

@@ -51,6 +51,7 @@ pub mod properties;
 pub mod publish;
 pub mod reason_code;
 pub mod subscribe;
+pub mod topic;
 pub mod types;
 pub mod unsubscribe;
 pub mod varlen;
@@ -59,8 +60,10 @@ pub use auth::Auth;
 pub use connect::{ConnAck, Connect, Will};
 pub use disconnect::Disconnect;
 pub use error::{Error, Result};
-pub use packet::{MAX_PACKET_SIZE, Packet, RawPacket};
-pub use properties::{Properties, Property, PropertyId, PropertyType, PropertyValue};
+pub use packet::{MAX_PACKET_SIZE, Packet, PacketType, RawPacket};
+pub use properties::{
+    Properties, Property, PropertyContext, PropertyId, PropertyType, PropertyValue,
+};
 pub use publish::{PubAck, PubComp, PubRec, PubRel, Publish};
 pub use reason_code::ReasonCode;
 pub use subscribe::{RetainHandling, SubAck, Subscribe, Subscription};

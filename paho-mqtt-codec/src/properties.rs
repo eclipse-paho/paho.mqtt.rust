@@ -29,7 +29,7 @@
 //! or read from the wire.
 
 use crate::{
-    Error, MqttVersion, Result, String, Vec, varlen,
+    Error, MqttVersion, PacketType, Result, String, Vec, varlen,
     wire::{get_binary, get_utf8, put_binary, put_utf8},
 };
 use bytes::{Buf, BufMut, Bytes};
@@ -144,6 +144,149 @@ impl PropertyId {
     /// Protocol Error.
     pub fn is_repeatable(self) -> bool {
         matches!(self, Self::UserProperty | Self::SubscriptionIdentifier)
+    }
+}
+
+/// Where a property appears: in a packet of a given type, or in the Will
+/// section of a CONNECT, which has its own allowed set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PropertyContext {
+    /// The properties of a packet of this type.
+    Packet(PacketType),
+    /// The Will properties inside a CONNECT.
+    Will,
+}
+
+impl From<PacketType> for PropertyContext {
+    fn from(ty: PacketType) -> Self {
+        Self::Packet(ty)
+    }
+}
+
+/// Bitmask of property identifiers (bit `n` = identifier `n`).
+const fn ids(list: &[PropertyId]) -> u64 {
+    let mut mask = 0u64;
+    let mut i = 0;
+    while i < list.len() {
+        mask |= 1 << (list[i] as u8);
+        i += 1;
+    }
+    mask
+}
+
+impl PropertyContext {
+    /// The set of property identifiers the specification allows here
+    /// (MQTT v5 §2.2.2.2, Table 2-4), as a bitmask over identifier values.
+    fn allowed_ids(self) -> u64 {
+        use PacketType as T;
+        use PropertyId::*;
+        match self {
+            Self::Packet(T::Connect) => {
+                const {
+                    ids(&[
+                        SessionExpiryInterval,
+                        AuthenticationMethod,
+                        AuthenticationData,
+                        RequestProblemInformation,
+                        RequestResponseInformation,
+                        ReceiveMaximum,
+                        TopicAliasMaximum,
+                        UserProperty,
+                        MaximumPacketSize,
+                    ])
+                }
+            }
+            Self::Packet(T::ConnAck) => {
+                const {
+                    ids(&[
+                        SessionExpiryInterval,
+                        AssignedClientIdentifier,
+                        ServerKeepAlive,
+                        AuthenticationMethod,
+                        AuthenticationData,
+                        ResponseInformation,
+                        ServerReference,
+                        ReasonString,
+                        ReceiveMaximum,
+                        TopicAliasMaximum,
+                        MaximumQoS,
+                        RetainAvailable,
+                        UserProperty,
+                        MaximumPacketSize,
+                        WildcardSubscriptionAvailable,
+                        SubscriptionIdentifierAvailable,
+                        SharedSubscriptionAvailable,
+                    ])
+                }
+            }
+            Self::Packet(T::Publish) => {
+                const {
+                    ids(&[
+                        PayloadFormatIndicator,
+                        MessageExpiryInterval,
+                        ContentType,
+                        ResponseTopic,
+                        CorrelationData,
+                        SubscriptionIdentifier,
+                        TopicAlias,
+                        UserProperty,
+                    ])
+                }
+            }
+            Self::Will => {
+                const {
+                    ids(&[
+                        PayloadFormatIndicator,
+                        MessageExpiryInterval,
+                        ContentType,
+                        ResponseTopic,
+                        CorrelationData,
+                        WillDelayInterval,
+                        UserProperty,
+                    ])
+                }
+            }
+            Self::Packet(T::PubAck | T::PubRec | T::PubRel | T::PubComp) => {
+                const { ids(&[ReasonString, UserProperty]) }
+            }
+            Self::Packet(T::Subscribe) => {
+                const { ids(&[SubscriptionIdentifier, UserProperty]) }
+            }
+            Self::Packet(T::SubAck) => const { ids(&[ReasonString, UserProperty]) },
+            Self::Packet(T::Unsubscribe) => const { ids(&[UserProperty]) },
+            Self::Packet(T::UnsubAck) => const { ids(&[ReasonString, UserProperty]) },
+            Self::Packet(T::Disconnect) => {
+                const {
+                    ids(&[
+                        SessionExpiryInterval,
+                        ServerReference,
+                        ReasonString,
+                        UserProperty,
+                    ])
+                }
+            }
+            Self::Packet(T::Auth) => {
+                const {
+                    ids(&[
+                        AuthenticationMethod,
+                        AuthenticationData,
+                        ReasonString,
+                        UserProperty,
+                    ])
+                }
+            }
+            Self::Packet(T::PingReq | T::PingResp) => 0,
+        }
+    }
+}
+
+impl PropertyId {
+    /// Returns `true` if the specification allows this property in the
+    /// given context (MQTT v5 §2.2.2.2, Table 2-4). Including a property
+    /// where it is not allowed is a Protocol Error.
+    #[inline]
+    pub fn is_allowed_in(self, ctx: impl Into<PropertyContext>) -> bool {
+        ctx.into().allowed_ids() & (1 << (self as u8)) != 0
     }
 }
 
@@ -509,11 +652,49 @@ impl Properties {
         Ok(())
     }
 
+    /// Checks that every property is allowed in `ctx` (MQTT v5 §2.2.2.2).
+    /// Returns [`Error::ProtocolError`] otherwise.
+    ///
+    /// Packet encoders call this; use it directly when assembling properties
+    /// for a packet to catch a misplaced one early.
+    #[inline]
+    pub fn check_context(&self, ctx: impl Into<PropertyContext>) -> Result<()> {
+        let allowed = ctx.into().allowed_ids();
+        if self
+            .props
+            .iter()
+            .all(|p| allowed & (1 << (p.id as u8)) != 0)
+        {
+            Ok(())
+        }
+        else {
+            Err(Error::ProtocolError)
+        }
+    }
+
     /// Decodes the properties from the wire: reads the VBI length prefix, then
     /// parses each property from exactly that many bytes.
     ///
-    /// Returns an empty collection for v3.1.1 connections without consuming any bytes.
+    /// Accepts any property identifier in any position; see
+    /// [`decode_in`](Self::decode_in) to also enforce which properties may
+    /// appear in a given packet. Returns an empty collection for v3.1.1
+    /// connections without consuming any bytes.
     pub fn decode<B: Buf>(src: &mut B, ver: MqttVersion) -> Result<Self> {
+        Self::decode_allowed(src, ver, u64::MAX)
+    }
+
+    /// Decodes the properties from the wire as [`decode`](Self::decode) does,
+    /// and additionally rejects with [`Error::ProtocolError`] any property the
+    /// specification does not allow in `ctx` (MQTT v5 §2.2.2.2).
+    pub fn decode_in<B: Buf>(
+        src: &mut B,
+        ver: MqttVersion,
+        ctx: impl Into<PropertyContext>,
+    ) -> Result<Self> {
+        Self::decode_allowed(src, ver, ctx.into().allowed_ids())
+    }
+
+    fn decode_allowed<B: Buf>(src: &mut B, ver: MqttVersion, allowed: u64) -> Result<Self> {
         if ver < MqttVersion::V5 {
             return Ok(Self::new());
         }
@@ -528,6 +709,9 @@ impl Properties {
         let mut payload_size = 0;
         while payload.has_remaining() {
             let prop = Property::decode(&mut payload)?; // validated
+            if allowed & (1 << (prop.id as u8)) == 0 {
+                return Err(Error::ProtocolError);
+            }
             seen.note(prop.id)?;
             // Size from the decoded value, not the wire length, so the cache
             // is right by construction even for a non-canonical encoding.
@@ -998,6 +1182,89 @@ mod tests {
                 PropertyId::ContentType,
                 PropertyValue::Binary(Bytes::from_static(b"x"))
             )),
+            Err(Error::ProtocolError)
+        );
+    }
+
+    // ---- property-to-packet context (G2) ----
+
+    #[test]
+    fn test_is_allowed_in_matches_spec_table() {
+        use PacketType as T;
+        use PropertyId::*;
+        // A few cells from Table 2-4, positive and negative.
+        assert!(SessionExpiryInterval.is_allowed_in(T::Connect));
+        assert!(SessionExpiryInterval.is_allowed_in(T::ConnAck));
+        assert!(SessionExpiryInterval.is_allowed_in(T::Disconnect));
+        assert!(!SessionExpiryInterval.is_allowed_in(T::Publish));
+        assert!(MaximumQoS.is_allowed_in(T::ConnAck));
+        assert!(!MaximumQoS.is_allowed_in(T::Connect));
+        assert!(TopicAlias.is_allowed_in(T::Publish));
+        assert!(!TopicAlias.is_allowed_in(PropertyContext::Will));
+        assert!(WillDelayInterval.is_allowed_in(PropertyContext::Will));
+        assert!(!WillDelayInterval.is_allowed_in(T::Connect));
+        assert!(SubscriptionIdentifier.is_allowed_in(T::Subscribe));
+        assert!(SubscriptionIdentifier.is_allowed_in(T::Publish));
+        assert!(!SubscriptionIdentifier.is_allowed_in(T::SubAck));
+        assert!(ReasonString.is_allowed_in(T::PubAck));
+        assert!(ReasonString.is_allowed_in(T::PubComp));
+        assert!(!ReasonString.is_allowed_in(T::Subscribe));
+        assert!(!ReasonString.is_allowed_in(T::Unsubscribe));
+        assert!(AuthenticationMethod.is_allowed_in(T::Auth));
+        assert!(!AuthenticationMethod.is_allowed_in(T::Publish));
+        // UserProperty is allowed everywhere properties exist, and nowhere
+        // they don't.
+        for ty in [
+            T::Connect,
+            T::ConnAck,
+            T::Publish,
+            T::PubAck,
+            T::PubRec,
+            T::PubRel,
+            T::PubComp,
+            T::Subscribe,
+            T::SubAck,
+            T::Unsubscribe,
+            T::UnsubAck,
+            T::Disconnect,
+            T::Auth,
+        ] {
+            assert!(UserProperty.is_allowed_in(ty), "{ty:?}");
+        }
+        assert!(UserProperty.is_allowed_in(PropertyContext::Will));
+        assert!(!UserProperty.is_allowed_in(T::PingReq));
+        assert!(!UserProperty.is_allowed_in(T::PingResp));
+    }
+
+    #[test]
+    fn test_decode_in_rejects_property_from_wrong_packet() {
+        // MaximumQoS = 1 is a valid property, but not in a CONNECT.
+        let mut src = BytesMut::new();
+        src.put_u8(2);
+        src.put_slice(&[0x24, 0x01]);
+        let bytes = src.freeze();
+        assert_eq!(
+            Properties::decode_in(&mut bytes.clone(), v5(), PacketType::Connect),
+            Err(Error::ProtocolError)
+        );
+        assert!(
+            Properties::decode_in(&mut bytes.clone(), v5(), PacketType::ConnAck).is_ok()
+        );
+        // The context-free decoder still accepts it.
+        assert!(Properties::decode(&mut bytes.clone(), v5()).is_ok());
+    }
+
+    #[test]
+    fn test_check_context() {
+        let mut props = Properties::new();
+        props.push(prop(PropertyId::TopicAlias, PropertyValue::U16(3)));
+        assert!(props.check_context(PacketType::Publish).is_ok());
+        assert_eq!(
+            props.check_context(PropertyContext::Will),
+            Err(Error::ProtocolError)
+        );
+        assert_eq!(
+            props.check_context(PacketType::Connect),
             Err(Error::ProtocolError)
         );
     }

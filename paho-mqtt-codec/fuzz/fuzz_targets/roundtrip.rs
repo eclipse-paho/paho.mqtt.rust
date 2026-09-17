@@ -41,9 +41,10 @@ use arbitrary::{Result as AResult, Unstructured};
 use bytes::{Bytes, BytesMut};
 use libfuzzer_sys::fuzz_target;
 use paho_mqtt_codec::{
-    Auth, ConnAck, Connect, Disconnect, MqttVersion, Packet, Properties, Property,
-    PropertyId, PropertyType, PropertyValue, PubAck, Publish, QoS, RawPacket, ReasonCode,
-    RetainHandling, SubAck, Subscribe, Subscription, UnsubAck, Unsubscribe, Will,
+    Auth, ConnAck, Connect, Disconnect, MqttVersion, Packet, PacketType, Properties,
+    Property, PropertyContext, PropertyId, PropertyType, PropertyValue, PubAck, Publish,
+    QoS, RawPacket, ReasonCode, RetainHandling, SubAck, Subscribe, Subscription, UnsubAck,
+    Unsubscribe, Will, topic,
 };
 
 // ---- primitive generators ------------------------------------------------
@@ -91,13 +92,47 @@ fn topic_name(u: &mut Unstructured) -> AResult<String> {
     Ok(t)
 }
 
-/// A topic filter: non-empty, wildcards allowed.
+/// A valid topic filter: levels of wildcard-free text, `+`, or a trailing
+/// `#`, optionally wrapped as a shared subscription.
 fn topic_filter(u: &mut Unstructured) -> AResult<String> {
-    let mut t = utf8(u, 256)?;
-    if t.is_empty() {
-        t.push_str("a/#");
+    let n_levels = u.int_in_range(1..=5)?;
+    let mut levels: Vec<String> = Vec::with_capacity(n_levels);
+    for i in 0..n_levels {
+        let last = i + 1 == n_levels;
+        levels.push(match u.int_in_range(0u8..=3)? {
+            0 => "+".to_string(),
+            1 if last => "#".to_string(),
+            _ => utf8(u, 32)?
+                .chars()
+                .filter(|&c| c != '+' && c != '#' && c != '/')
+                .collect(),
+        });
     }
-    Ok(t)
+    let mut f = levels.join("/");
+    if f.is_empty() {
+        // A lone empty level is the one shape that is not a valid filter.
+        f.push('t');
+    }
+    if f.starts_with(topic::SHARE_PREFIX) {
+        // Anything starting with "$share/" is parsed as a shared subscription;
+        // a first level that happens to be "$share" must not masquerade as one.
+        f.insert(0, 'x');
+    }
+    if u.arbitrary()? {
+        let share: String = utf8(u, 16)?
+            .chars()
+            .filter(|&c| c != '+' && c != '#' && c != '/')
+            .collect();
+        let share = if share.is_empty() {
+            "g".to_string()
+        }
+        else {
+            share
+        };
+        f = format!("{}{share}/{f}", topic::SHARE_PREFIX);
+    }
+    debug_assert!(topic::validate_filter(&f).is_ok(), "{f:?}");
+    Ok(f)
 }
 
 fn blob(u: &mut Unstructured, max: usize) -> AResult<Bytes> {
@@ -109,15 +144,21 @@ fn packet_id(u: &mut Unstructured) -> AResult<u16> {
     u.int_in_range(1..=u16::MAX)
 }
 
-fn reason_code(u: &mut Unstructured) -> AResult<ReasonCode> {
-    // Every defined code; unknown bytes are not representable.
-    const CODES: [u8; 44] = [
+/// A reason code the specification allows in packets of type `ty`.
+fn reason_code(u: &mut Unstructured, ty: PacketType) -> AResult<ReasonCode> {
+    // Every defined code, filtered to the packet's allowed set.
+    const CODES: [u8; 43] = [
         0x00, 0x01, 0x02, 0x04, 0x10, 0x11, 0x18, 0x19, 0x80, 0x81, 0x82, 0x83, 0x84, 0x85,
         0x86, 0x87, 0x88, 0x89, 0x8A, 0x8B, 0x8C, 0x8D, 0x8E, 0x8F, 0x90, 0x91, 0x92, 0x93,
         0x94, 0x95, 0x96, 0x97, 0x98, 0x99, 0x9A, 0x9B, 0x9C, 0x9D, 0x9E, 0x9F, 0xA0, 0xA1,
-        0xA2, 0x00,
+        0xA2,
     ];
-    Ok(ReasonCode::try_from(*u.choose(&CODES)?).unwrap())
+    let allowed: Vec<ReasonCode> = CODES
+        .iter()
+        .map(|&b| ReasonCode::try_from(b).unwrap())
+        .filter(|rc| rc.is_allowed_in(ty))
+        .collect();
+    Ok(*u.choose(&allowed)?)
 }
 
 // ---- properties ------------------------------------------------------------
@@ -188,17 +229,31 @@ fn property(u: &mut Unstructured, id: PropertyId) -> AResult<Property> {
     Ok(Property::new(id, value))
 }
 
-/// A property list with no repeated non-repeatable identifiers. Empty for
+/// A property list valid for `ctx`: only identifiers the specification
+/// allows there, with no repeated non-repeatable identifiers. Empty for
 /// v3.1.1, where properties are never on the wire.
-fn properties(u: &mut Unstructured, ver: MqttVersion) -> AResult<Properties> {
+fn properties(
+    u: &mut Unstructured,
+    ver: MqttVersion,
+    ctx: impl Into<PropertyContext>,
+) -> AResult<Properties> {
+    let ctx = ctx.into();
     let mut props = Properties::new();
     if ver != MqttVersion::V5 {
+        return Ok(props);
+    }
+    let allowed: Vec<PropertyId> = ALL_IDS
+        .iter()
+        .copied()
+        .filter(|id| id.is_allowed_in(ctx))
+        .collect();
+    if allowed.is_empty() {
         return Ok(props);
     }
     let n = u.int_in_range(0..=8)?;
     let mut used = [false; 64];
     for _ in 0..n {
-        let id = *u.choose(&ALL_IDS)?;
+        let id = *u.choose(&allowed)?;
         if !id.is_repeatable() {
             if used[id as usize] {
                 continue;
@@ -230,10 +285,10 @@ fn connect(u: &mut Unstructured, ver: MqttVersion) -> AResult<Connect> {
     };
     if u.arbitrary()? {
         let mut will = Will::new(topic_name(u)?, blob(u, 1024)?, qos(u)?, u.arbitrary()?);
-        will.properties = properties(u, ver)?;
+        will.properties = properties(u, ver, PropertyContext::Will)?;
         c.will = Some(will);
     }
-    c.properties = properties(u, ver)?;
+    c.properties = properties(u, ver, PacketType::Connect)?;
     Ok(c)
 }
 
@@ -241,7 +296,7 @@ fn connack(u: &mut Unstructured, ver: MqttVersion) -> AResult<ConnAck> {
     // v3.1.1 has only six return codes; session_present must be false on
     // a refused connection.
     let rc = match ver {
-        MqttVersion::V5 => reason_code(u)?,
+        MqttVersion::V5 => reason_code(u, PacketType::ConnAck)?,
         _ => *u.choose(&[
             ReasonCode::Success,
             ReasonCode::UnsupportedProtocolVersion,
@@ -253,7 +308,7 @@ fn connack(u: &mut Unstructured, ver: MqttVersion) -> AResult<ConnAck> {
     };
     let session_present = rc == ReasonCode::Success && u.arbitrary()?;
     let mut a = ConnAck::new(session_present, rc);
-    a.properties = properties(u, ver)?;
+    a.properties = properties(u, ver, PacketType::ConnAck)?;
     Ok(a)
 }
 
@@ -265,15 +320,15 @@ fn publish(u: &mut Unstructured, ver: MqttVersion) -> AResult<Publish> {
         p.packet_id = Some(packet_id(u)?);
         p.dup = u.arbitrary()?;
     }
-    p.properties = properties(u, ver)?;
+    p.properties = properties(u, ver, PacketType::Publish)?;
     Ok(p)
 }
 
-fn puback(u: &mut Unstructured, ver: MqttVersion) -> AResult<PubAck> {
+fn puback(u: &mut Unstructured, ver: MqttVersion, ty: PacketType) -> AResult<PubAck> {
     let mut a = PubAck::new(packet_id(u)?);
     if ver == MqttVersion::V5 {
-        a.reason_code = reason_code(u)?;
-        a.properties = properties(u, ver)?;
+        a.reason_code = reason_code(u, ty)?;
+        a.properties = properties(u, ver, ty)?;
     }
     Ok(a)
 }
@@ -295,7 +350,7 @@ fn subscribe(u: &mut Unstructured, ver: MqttVersion) -> AResult<Subscribe> {
         subs.push(s);
     }
     let mut s = Subscribe::new(packet_id(u)?, subs);
-    s.properties = properties(u, ver)?;
+    s.properties = properties(u, ver, PacketType::Subscribe)?;
     Ok(s)
 }
 
@@ -304,7 +359,7 @@ fn suback(u: &mut Unstructured, ver: MqttVersion) -> AResult<SubAck> {
     let mut codes = Vec::with_capacity(n);
     for _ in 0..n {
         codes.push(match ver {
-            MqttVersion::V5 => reason_code(u)?,
+            MqttVersion::V5 => reason_code(u, PacketType::SubAck)?,
             _ => *u.choose(&[
                 ReasonCode::GrantedQos0,
                 ReasonCode::GrantedQos1,
@@ -314,7 +369,7 @@ fn suback(u: &mut Unstructured, ver: MqttVersion) -> AResult<SubAck> {
         });
     }
     let mut s = SubAck::new(packet_id(u)?, codes);
-    s.properties = properties(u, ver)?;
+    s.properties = properties(u, ver, PacketType::SubAck)?;
     Ok(s)
 }
 
@@ -325,7 +380,7 @@ fn unsubscribe(u: &mut Unstructured, ver: MqttVersion) -> AResult<Unsubscribe> {
         filters.push(topic_filter(u)?);
     }
     let mut s = Unsubscribe::new(packet_id(u)?, filters);
-    s.properties = properties(u, ver)?;
+    s.properties = properties(u, ver, PacketType::Unsubscribe)?;
     Ok(s)
 }
 
@@ -335,29 +390,29 @@ fn unsuback(u: &mut Unstructured, ver: MqttVersion) -> AResult<UnsubAck> {
             let n = u.int_in_range(1..=6)?;
             let mut v = Vec::with_capacity(n);
             for _ in 0..n {
-                v.push(reason_code(u)?);
+                v.push(reason_code(u, PacketType::UnsubAck)?);
             }
             v
         }
         _ => Vec::new(),
     };
     let mut s = UnsubAck::new(packet_id(u)?, codes);
-    s.properties = properties(u, ver)?;
+    s.properties = properties(u, ver, PacketType::UnsubAck)?;
     Ok(s)
 }
 
 fn disconnect(u: &mut Unstructured, ver: MqttVersion) -> AResult<Disconnect> {
     let mut d = Disconnect::default();
     if ver == MqttVersion::V5 {
-        d.reason_code = reason_code(u)?;
-        d.properties = properties(u, ver)?;
+        d.reason_code = reason_code(u, PacketType::Disconnect)?;
+        d.properties = properties(u, ver, PacketType::Disconnect)?;
     }
     Ok(d)
 }
 
 fn auth(u: &mut Unstructured) -> AResult<Auth> {
-    let mut a = Auth::new(reason_code(u)?);
-    a.properties = properties(u, MqttVersion::V5)?;
+    let mut a = Auth::new(reason_code(u, PacketType::Auth)?);
+    a.properties = properties(u, MqttVersion::V5, PacketType::Auth)?;
     Ok(a)
 }
 
@@ -367,10 +422,10 @@ fn packet(u: &mut Unstructured, ver: MqttVersion) -> AResult<Packet> {
         0 => Packet::Connect(connect(u, ver)?),
         1 => Packet::ConnAck(connack(u, ver)?),
         2 => Packet::Publish(publish(u, ver)?),
-        3 => Packet::PubAck(puback(u, ver)?),
-        4 => Packet::PubRec(puback(u, ver)?),
-        5 => Packet::PubRel(puback(u, ver)?),
-        6 => Packet::PubComp(puback(u, ver)?),
+        3 => Packet::PubAck(puback(u, ver, PacketType::PubAck)?),
+        4 => Packet::PubRec(puback(u, ver, PacketType::PubRec)?),
+        5 => Packet::PubRel(puback(u, ver, PacketType::PubRel)?),
+        6 => Packet::PubComp(puback(u, ver, PacketType::PubComp)?),
         7 => Packet::Subscribe(subscribe(u, ver)?),
         8 => Packet::SubAck(suback(u, ver)?),
         9 => Packet::Unsubscribe(unsubscribe(u, ver)?),

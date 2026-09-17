@@ -33,7 +33,7 @@
 //! `properties` is empty, `remaining_length` is 0 and the payload is
 //! omitted entirely.
 
-use crate::{MqttVersion, Properties, ReasonCode, Result};
+use crate::{MqttVersion, PacketType, Properties, ReasonCode, Result};
 use bytes::{Buf, BufMut, Bytes};
 
 #[cfg(feature = "serde")]
@@ -84,6 +84,7 @@ impl Auth {
             (rc, true) => dst.put_u8(rc as u8),
             (rc, false) => {
                 dst.put_u8(rc as u8);
+                self.properties.check_context(PacketType::Auth)?;
                 self.properties.encode(dst, MqttVersion::V5)?;
             }
         }
@@ -101,7 +102,7 @@ impl Auth {
             Properties::new()
         }
         else {
-            Properties::decode(&mut payload, MqttVersion::V5)?
+            Properties::decode_in(&mut payload, MqttVersion::V5, PacketType::Auth)?
         };
         Ok(Self {
             reason_code,

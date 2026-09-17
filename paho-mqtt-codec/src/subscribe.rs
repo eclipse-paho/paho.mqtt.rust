@@ -27,7 +27,8 @@
 //! the QoS bits and v3.1.1 decode leaves the v5 fields at their defaults.
 
 use crate::{
-    Error, MqttVersion, Properties, QoS, ReasonCode, Result, String, Vec,
+    Error, MqttVersion, PacketType, Properties, QoS, ReasonCode, Result, String, Vec,
+    topic,
     wire::{get_utf8, put_utf8, utf8_wire_size},
 };
 use bytes::{Buf, BufMut, Bytes};
@@ -140,8 +141,10 @@ impl Subscribe {
     /// Encodes the variable header and payload into `dst`.
     pub fn encode<B: BufMut>(&self, dst: &mut B, ver: MqttVersion) -> Result<()> {
         dst.put_u16(self.packet_id);
+        self.properties.check_context(PacketType::Subscribe)?;
         self.properties.encode(dst, ver)?;
         for sub in &self.subscriptions {
+            topic::validate_filter(&sub.topic_filter)?;
             put_utf8(&sub.topic_filter, dst)?;
             dst.put_u8(sub.options_byte(ver));
         }
@@ -154,10 +157,11 @@ impl Subscribe {
             return Err(Error::PacketTooShort);
         }
         let packet_id = payload.get_u16();
-        let properties = Properties::decode(&mut payload, ver)?;
+        let properties = Properties::decode_in(&mut payload, ver, PacketType::Subscribe)?;
         let mut subscriptions = Vec::new();
         while payload.has_remaining() {
             let topic_filter = get_utf8(&mut payload)?;
+            topic::validate_filter(&topic_filter)?;
             if !payload.has_remaining() {
                 return Err(Error::PacketTooShort);
             }
@@ -243,6 +247,7 @@ impl SubAck {
     /// Encodes the variable header and payload into `dst`.
     pub fn encode<B: BufMut>(&self, dst: &mut B, ver: MqttVersion) -> Result<()> {
         dst.put_u16(self.packet_id);
+        self.properties.check_context(PacketType::SubAck)?;
         self.properties.encode(dst, ver)?;
         for &rc in &self.reason_codes {
             dst.put_u8(rc as u8);
@@ -256,7 +261,7 @@ impl SubAck {
             return Err(Error::PacketTooShort);
         }
         let packet_id = payload.get_u16();
-        let properties = Properties::decode(&mut payload, ver)?;
+        let properties = Properties::decode_in(&mut payload, ver, PacketType::SubAck)?;
         let reason_codes = payload
             .iter()
             .copied()
@@ -458,6 +463,35 @@ mod tests {
             Subscribe::decode(Bytes::from_static(&[0x00]), v311()),
             Err(Error::PacketTooShort)
         );
+    }
+
+    #[test]
+    fn test_subscribe_rejects_invalid_filter_both_directions() {
+        for bad in ["", "a/#/b", "sport+", "$share//x"] {
+            let s = Subscribe::new(1, vec![sub(bad, QoS::AtMostOnce)]);
+            let mut dst = BytesMut::new();
+            assert_eq!(
+                s.encode(&mut dst, v5()),
+                Err(Error::TopicFilterInvalid),
+                "{bad:?}"
+            );
+        }
+        // On the wire: packet_id=1, no props, filter "a/#/b", options 0
+        let mut src = BytesMut::new();
+        src.put_u16(1);
+        src.put_u8(0);
+        put_utf8("a/#/b", &mut src).unwrap();
+        src.put_u8(0);
+        assert_eq!(
+            Subscribe::decode(src.freeze(), v5()),
+            Err(Error::TopicFilterInvalid)
+        );
+    }
+
+    #[test]
+    fn test_subscribe_shared_filter_round_trips() {
+        let s = Subscribe::new(1, vec![sub("$share/group1/sport/#", QoS::AtLeastOnce)]);
+        round_trip_subscribe(s, v5());
     }
 
     #[test]

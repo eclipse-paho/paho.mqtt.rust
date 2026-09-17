@@ -28,7 +28,7 @@
 //! both — `reason_codes` is an empty `Vec` on v3.1.1 connections.
 
 use crate::{
-    Error, MqttVersion, Properties, ReasonCode, Result, String, Vec,
+    Error, MqttVersion, PacketType, Properties, ReasonCode, Result, String, Vec, topic,
     wire::{get_utf8, put_utf8, utf8_wire_size},
 };
 use bytes::{Buf, BufMut, Bytes};
@@ -72,8 +72,10 @@ impl Unsubscribe {
     /// Encodes the variable header and payload into `dst`.
     pub fn encode<B: BufMut>(&self, dst: &mut B, ver: MqttVersion) -> Result<()> {
         dst.put_u16(self.packet_id);
+        self.properties.check_context(PacketType::Unsubscribe)?;
         self.properties.encode(dst, ver)?;
         for filter in &self.topic_filters {
+            topic::validate_filter(filter)?;
             put_utf8(filter, dst)?;
         }
         Ok(())
@@ -85,10 +87,12 @@ impl Unsubscribe {
             return Err(Error::PacketTooShort);
         }
         let packet_id = payload.get_u16();
-        let properties = Properties::decode(&mut payload, ver)?;
+        let properties = Properties::decode_in(&mut payload, ver, PacketType::Unsubscribe)?;
         let mut topic_filters = Vec::new();
         while payload.has_remaining() {
-            topic_filters.push(get_utf8(&mut payload)?);
+            let filter = get_utf8(&mut payload)?;
+            topic::validate_filter(&filter)?;
+            topic_filters.push(filter);
         }
 
         if topic_filters.is_empty() {
@@ -145,6 +149,7 @@ impl UnsubAck {
     /// Encodes the variable header and payload into `dst`.
     pub fn encode<B: BufMut>(&self, dst: &mut B, ver: MqttVersion) -> Result<()> {
         dst.put_u16(self.packet_id);
+        self.properties.check_context(PacketType::UnsubAck)?;
         self.properties.encode(dst, ver)?;
         if ver == MqttVersion::V5 {
             for &rc in &self.reason_codes {
@@ -160,7 +165,7 @@ impl UnsubAck {
             return Err(Error::PacketTooShort);
         }
         let packet_id = payload.get_u16();
-        let properties = Properties::decode(&mut payload, ver)?;
+        let properties = Properties::decode_in(&mut payload, ver, PacketType::UnsubAck)?;
         let reason_codes = if ver == MqttVersion::V5 {
             let codes = payload
                 .iter()
@@ -280,6 +285,21 @@ mod tests {
             u.encode(&mut dst, ver).unwrap();
             assert_eq!(dst.len(), u.encoded_size(ver));
         }
+    }
+
+    #[test]
+    fn test_unsubscribe_rejects_invalid_filter_both_directions() {
+        let u = Unsubscribe::new(1, vec!["a/+b".to_string()]);
+        let mut dst = BytesMut::new();
+        assert_eq!(u.encode(&mut dst, v5()), Err(Error::TopicFilterInvalid));
+        let mut src = BytesMut::new();
+        src.put_u16(1);
+        src.put_u8(0);
+        put_utf8("a/+b", &mut src).unwrap();
+        assert_eq!(
+            Unsubscribe::decode(src.freeze(), v5()),
+            Err(Error::TopicFilterInvalid)
+        );
     }
 
     #[test]

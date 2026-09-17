@@ -25,7 +25,8 @@
 //! a separate parameter extracted from [`crate::packet::RawPacket::header`].
 
 use crate::{
-    Error, MqttVersion, Properties, PropertyId, QoS, ReasonCode, Result, String,
+    Error, MqttVersion, PacketType, Properties, PropertyId, QoS, ReasonCode, Result,
+    String, topic,
     wire::{get_utf8, put_utf8, utf8_wire_size},
 };
 use bytes::{Buf, BufMut, Bytes};
@@ -98,11 +99,20 @@ impl Publish {
     ///
     /// Returns [`Error::ProtocolError`] if `qos > 0` but `packet_id` is `None`.
     pub fn encode_header<B: BufMut>(&self, dst: &mut B, ver: MqttVersion) -> Result<()> {
+        // Same rules as decode: no wildcards; empty only with a v5 alias.
+        if topic::has_wildcards(&self.topic)
+            || (self.topic.is_empty()
+                && (ver != MqttVersion::V5
+                    || self.properties.get(PropertyId::TopicAlias).is_none()))
+        {
+            return Err(Error::TopicNameInvalid);
+        }
         put_utf8(&self.topic, dst)?;
         if self.qos != QoS::QoS0 {
             let id = self.packet_id.ok_or(Error::ProtocolError)?;
             dst.put_u16(id);
         }
+        self.properties.check_context(PacketType::Publish)?;
         self.properties.encode(dst, ver)
     }
 
@@ -119,8 +129,9 @@ impl Publish {
         }
 
         // Topic: wildcards are never allowed in a topic *name* (MQTT-3.3.2-2).
+        // Emptiness is checked below, once the properties are known.
         let topic = get_utf8(&mut payload)?;
-        if topic.bytes().any(|b| b == b'+' || b == b'#') {
+        if topic::has_wildcards(&topic) {
             return Err(Error::TopicNameInvalid);
         }
 
@@ -139,7 +150,7 @@ impl Publish {
         };
 
         // v5 properties
-        let properties = Properties::decode(&mut payload, ver)?;
+        let properties = Properties::decode_in(&mut payload, ver, PacketType::Publish)?;
 
         // An empty topic name is only allowed in v5, and only when a topic
         // alias supplies the topic instead (MQTT-3.3.2-1, §3.3.2.3.4).
@@ -236,6 +247,7 @@ impl PubAck {
             (rc, true) => dst.put_u8(rc as u8),
             (rc, false) => {
                 dst.put_u8(rc as u8);
+                self.properties.check_context(PacketType::PubAck)?;
                 self.properties.encode(dst, ver)?;
             }
         }
@@ -262,7 +274,7 @@ impl PubAck {
                         Properties::new()
                     }
                     else {
-                        Properties::decode(&mut payload, ver)?
+                        Properties::decode_in(&mut payload, ver, PacketType::PubAck)?
                     };
                     (rc, props)
                 }

@@ -159,7 +159,24 @@ fn packets(ver: MqttVersion) -> Vec<(&'static str, Packet)> {
     };
 
     let mut disconnect_rc = Disconnect::new(ReasonCode::SessionTakenOver);
-    disconnect_rc.properties = props_for(ver);
+    if ver == MqttVersion::V5 {
+        disconnect_rc.properties.push(Property::new(
+            PropertyId::SessionExpiryInterval,
+            PropertyValue::U32(0),
+        ));
+        disconnect_rc.properties.push(Property::new(
+            PropertyId::ReasonString,
+            PropertyValue::String("session taken over".into()),
+        ));
+        disconnect_rc.properties.push(Property::new(
+            PropertyId::UserProperty,
+            PropertyValue::StringPair("client".into(), "bench".into()),
+        ));
+        disconnect_rc.properties.push(Property::new(
+            PropertyId::UserProperty,
+            PropertyValue::StringPair("region".into(), "us-east-1".into()),
+        ));
+    }
 
     let mut pkts = vec![
         ("connect", Packet::Connect(connect)),

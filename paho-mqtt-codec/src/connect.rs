@@ -21,7 +21,8 @@
 //! MQTT CONNECT and CONNACK packets.
 
 use crate::{
-    Error, MqttVersion, Properties, QoS, ReasonCode, Result, String,
+    Error, MqttVersion, PacketType, Properties, PropertyContext, QoS, ReasonCode, Result,
+    String,
     wire::{binary_wire_size, get_binary, get_utf8, put_binary, put_utf8, utf8_wire_size},
 };
 use bytes::{Buf, BufMut, Bytes};
@@ -163,11 +164,13 @@ impl Connect {
         dst.put_u8(flags);
         dst.put_u16(self.keep_alive);
         // v5 connect properties
+        self.properties.check_context(PacketType::Connect)?;
         self.properties.encode(dst, ver)?;
         // Payload: client ID
         put_utf8(&self.client_id, dst)?;
         // Will
         if let Some(will) = &self.will {
+            will.properties.check_context(PropertyContext::Will)?;
             will.properties.encode(dst, ver)?;
             put_utf8(&will.topic, dst)?;
             put_binary(&will.payload, dst)?;
@@ -234,12 +237,13 @@ impl Connect {
         let will_qos = QoS::try_from(will_qos_bits)?;
         let keep_alive = payload.get_u16();
         // v5 connect properties
-        let properties = Properties::decode(&mut payload, ver)?;
+        let properties = Properties::decode_in(&mut payload, ver, PacketType::Connect)?;
         // Payload: client ID
         let client_id = get_utf8(&mut payload)?;
         // Will
         let will = if will_flag {
-            let will_props = Properties::decode(&mut payload, ver)?;
+            let will_props =
+                Properties::decode_in(&mut payload, ver, PropertyContext::Will)?;
             let topic = get_utf8(&mut payload)?;
             let will_payload = get_binary(&mut payload)?;
             Some(Will {
@@ -358,6 +362,7 @@ impl ConnAck {
             MqttVersion::V5 => dst.put_u8(self.reason_code as u8),
             _ => dst.put_u8(reason_to_v311_code(self.reason_code)?),
         }
+        self.properties.check_context(PacketType::ConnAck)?;
         self.properties.encode(dst, ver)?;
         Ok(())
     }
@@ -381,7 +386,7 @@ impl ConnAck {
             MqttVersion::V5 => ReasonCode::try_from(code_byte)?,
             _ => v311_code_to_reason(code_byte)?,
         };
-        let properties = Properties::decode(&mut payload, ver)?;
+        let properties = Properties::decode_in(&mut payload, ver, PacketType::ConnAck)?;
 
         // A server must clear Session Present on a refused connection
         // (MQTT-3.2.2-4). If one doesn't, the flag is meaningless anyway;
@@ -405,7 +410,10 @@ impl ConnAck {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{MQTT_VERSION_3_1_1, MQTT_VERSION_5};
+    use crate::{
+        Property, PropertyId, PropertyValue,
+        types::{MQTT_VERSION_3_1_1, MQTT_VERSION_5},
+    };
     use bytes::BytesMut;
 
     fn v311() -> MqttVersion {
@@ -950,6 +958,62 @@ mod tests {
             Connect::decode(Bytes::from_static(&[0x00, 0x04])),
             Err(Error::PacketTooShort)
         );
+    }
+
+    // ---- property context (G2) ----
+
+    #[test]
+    fn test_connect_rejects_connack_only_property() {
+        let mut c = Connect::new(v5(), true, "c");
+        c.properties.push(Property::new(
+            PropertyId::MaximumQoS,
+            PropertyValue::Byte(1),
+        ));
+        let mut dst = BytesMut::new();
+        assert_eq!(c.encode(&mut dst), Err(Error::ProtocolError));
+    }
+
+    #[test]
+    fn test_will_rejects_publish_only_property() {
+        let mut c = Connect::new(v5(), true, "c");
+        let mut will = Will::new("w", Bytes::new(), QoS::QoS0, false);
+        // TopicAlias is a PUBLISH property, never a Will property.
+        will.properties
+            .push(Property::new(PropertyId::TopicAlias, PropertyValue::U16(1)));
+        c.will = Some(will);
+        let mut dst = BytesMut::new();
+        assert_eq!(c.encode(&mut dst), Err(Error::ProtocolError));
+        // ... while WillDelayInterval belongs there and round-trips.
+        let mut c = Connect::new(v5(), true, "c");
+        let mut will = Will::new("w", Bytes::new(), QoS::QoS0, false);
+        will.properties.push(Property::new(
+            PropertyId::WillDelayInterval,
+            PropertyValue::U32(5),
+        ));
+        c.will = Some(will);
+        round_trip_connect(c);
+    }
+
+    #[test]
+    fn test_connect_decode_rejects_misplaced_property_on_wire() {
+        // A valid v5 CONNECT, then splice MaximumQoS (0x24 0x01) into its
+        // property block by re-encoding with the context check bypassed.
+        let mut c = Connect::new(v5(), true, "c");
+        c.properties = alloc::vec![Property::new(
+            PropertyId::MaximumQoS,
+            PropertyValue::Byte(1)
+        )]
+        .into();
+        let mut dst = BytesMut::new();
+        // Bypass Connect::encode's context check by writing the pieces by hand.
+        dst.put_u16(4);
+        dst.put_slice(b"MQTT");
+        dst.put_u8(5);
+        dst.put_u8(0x02);
+        dst.put_u16(0);
+        c.properties.encode(&mut dst, v5()).unwrap(); // Properties::encode has no context
+        put_utf8("c", &mut dst).unwrap();
+        assert_eq!(Connect::decode(dst.freeze()), Err(Error::ProtocolError));
     }
 
     // ---- field length limits ----

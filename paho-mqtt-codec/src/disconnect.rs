@@ -29,7 +29,7 @@
 //! v3.1.1 DISCONNECT and a v5 normal-disconnect are byte-identical on the
 //! wire.
 
-use crate::{MqttVersion, Properties, ReasonCode, Result};
+use crate::{MqttVersion, PacketType, Properties, ReasonCode, Result};
 use bytes::{Buf, BufMut, Bytes};
 
 #[cfg(feature = "serde")]
@@ -99,6 +99,7 @@ impl Disconnect {
             (rc, true) => dst.put_u8(rc as u8),
             (rc, false) => {
                 dst.put_u8(rc as u8);
+                self.properties.check_context(PacketType::Disconnect)?;
                 self.properties.encode(dst, ver)?;
             }
         }
@@ -118,7 +119,7 @@ impl Disconnect {
             Properties::new()
         }
         else {
-            Properties::decode(&mut payload, ver)?
+            Properties::decode_in(&mut payload, ver, PacketType::Disconnect)?
         };
 
         Ok(Disconnect {
