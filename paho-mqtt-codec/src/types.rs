@@ -35,11 +35,19 @@ use serde::{Deserialize, Serialize};
 
 /// Supported MQTT protocol versions.
 ///
-/// The discriminant is the protocol-level byte sent in CONNECT.
+/// The discriminant is the protocol-level byte sent in CONNECT. Versions
+/// order chronologically, so `ver < MqttVersion::V5` selects both v3 variants.
+///
+/// MQTT v3.1 differs from v3.1.1 only in the CONNECT packet — protocol name
+/// `MQIsdp` and level 3 instead of `MQTT` and level 4 — and in having no
+/// Session Present flag in CONNACK. Every other packet is identical on the
+/// wire, so the two are handled alike everywhere else.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[repr(u8)]
 pub enum MqttVersion {
+    /// Version 3.1 (protocol byte 3, protocol name `MQIsdp`).
+    V3_1 = 3,
     /// Version 3.1.1 (protocol byte 4).
     V3_1_1 = 4,
     /// Version 5 (protocol byte 5).
@@ -48,20 +56,37 @@ pub enum MqttVersion {
 }
 
 impl MqttVersion {
-    /// The only supported v3 is v3.1.1
+    /// The current v3 revision, v3.1.1.
     pub const V3: MqttVersion = Self::V3_1_1;
     /// Default: (currently v5)
     #[allow(non_upper_case_globals)]
     pub const Default: MqttVersion = Self::V5;
+
+    /// The protocol name carried in CONNECT for this version.
+    pub fn protocol_name(self) -> &'static str {
+        match self {
+            Self::V3_1 => "MQIsdp",
+            Self::V3_1_1 | Self::V5 => "MQTT",
+        }
+    }
+
+    /// Returns `true` for the MQTT v5 protocol, which adds properties and
+    /// reason codes to most packets.
+    pub fn is_v5(self) -> bool {
+        self == Self::V5
+    }
 }
 
 /// Connect with the default MQTT version (currently v5).
 pub const MQTT_VERSION_DEFAULT: MqttVersion = MqttVersion::Default;
 
+/// Connect with MQTT v3.1.
+pub const MQTT_VERSION_3_1: MqttVersion = MqttVersion::V3_1;
+
 /// Connect with MQTT v3.1.1.
 pub const MQTT_VERSION_3_1_1: MqttVersion = MqttVersion::V3_1_1;
 
-/// Connect with MQTT v3.1.1.
+/// Connect with MQTT v3.1.1, the current v3 revision.
 pub const MQTT_VERSION_3: MqttVersion = MqttVersion::V3_1_1;
 
 /// Connect with MQTT v5.
@@ -73,9 +98,10 @@ impl TryFrom<u8> for MqttVersion {
     /// Converts a protocol-level byte into a version.
     ///
     /// Returns [`Error::UnsupportedProtocolVersion`] for anything other than
-    /// 4 (v3.1.1) or 5 (v5).
+    /// 3 (v3.1), 4 (v3.1.1), or 5 (v5).
     fn try_from(ver: u8) -> Result<Self, Error> {
         match ver {
+            3 => Ok(Self::V3_1),
             4 => Ok(Self::V3_1_1),
             5 => Ok(Self::V5),
             _ => Err(Error::UnsupportedProtocolVersion),
@@ -203,9 +229,10 @@ mod tests {
 
     #[test]
     fn test_mqtt_version_try_from_u8() {
+        assert_eq!(MqttVersion::try_from(3_u8), Ok(MqttVersion::V3_1));
         assert_eq!(MqttVersion::try_from(4_u8), Ok(MqttVersion::V3_1_1));
         assert_eq!(MqttVersion::try_from(5_u8), Ok(MqttVersion::V5));
-        for bad in [0_u8, 3, 6, 99, 255] {
+        for bad in [0_u8, 2, 6, 99, 255] {
             assert_eq!(
                 MqttVersion::try_from(bad),
                 Err(Error::UnsupportedProtocolVersion),
@@ -231,12 +258,25 @@ mod tests {
 
     #[test]
     fn test_mqtt_version_constants() {
+        assert_eq!(MQTT_VERSION_3_1, MqttVersion::V3_1);
+        assert_eq!(MQTT_VERSION_3_1 as u8, 3);
         assert_eq!(MQTT_VERSION_3_1_1, MqttVersion::V3_1_1);
         assert_eq!(MQTT_VERSION_3, MqttVersion::V3_1_1);
         assert_eq!(MQTT_VERSION_5, MqttVersion::V5);
         assert_eq!(MQTT_VERSION_DEFAULT, MqttVersion::default());
         assert_eq!(MQTT_VERSION_3_1_1 as u8, 4);
         assert_eq!(MQTT_VERSION_5 as u8, 5);
+    }
+
+    #[test]
+    fn test_mqtt_version_ordering_and_helpers() {
+        assert!(MqttVersion::V3_1 < MqttVersion::V3_1_1);
+        assert!(MqttVersion::V3_1_1 < MqttVersion::V5);
+        assert_eq!(MqttVersion::V3_1.protocol_name(), "MQIsdp");
+        assert_eq!(MqttVersion::V3_1_1.protocol_name(), "MQTT");
+        assert_eq!(MqttVersion::V5.protocol_name(), "MQTT");
+        assert!(!MqttVersion::V3_1.is_v5());
+        assert!(MqttVersion::V5.is_v5());
     }
 
     #[test]

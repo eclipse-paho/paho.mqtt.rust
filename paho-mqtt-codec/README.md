@@ -1,12 +1,12 @@
 # Eclipse Paho MQTT Rust Codec
 
-A pure-Rust encoder and decoder for MQTT control packets, covering protocol versions 3.1.1 and 5.0, for the [Eclipse Paho](http://eclipse.org/paho) project.
+A pure-Rust encoder and decoder for MQTT control packets, covering protocol versions 3.1, 3.1.1, and 5.0, for the [Eclipse Paho](http://eclipse.org/paho) project.
 
-This crate is a wire-format layer and nothing else: it converts between typed Rust structs and the bytes that go on the network, with no dependency on I/O, on an async runtime, or on any particular role in the protocol. Every packet type can be both encoded and decoded, so it serves a client, a broker, a proxy, a protocol analyzer, or an embedded device equally. It is the codec used by the [Eclipse Paho MQTT Rust client](https://github.com/eclipse/paho.mqtt.rust), and is usable in a `no_std` environment. Each packet has a single representation that is encoded or decoded according to the connection's negotiated version (v3.1.1 or v5).
+This crate is a wire-format layer and nothing else: it converts between typed Rust structs and the bytes that go on the network, with no dependency on I/O, on an async runtime, or on any particular role in the protocol. Every packet type can be both encoded and decoded, so it serves a client, a broker, a proxy, a protocol analyzer, or an embedded device equally. It is the codec used by the [Eclipse Paho MQTT Rust client](https://github.com/eclipse/paho.mqtt.rust), and is usable in a `no_std` environment. Each packet has a single representation that is encoded or decoded according to the connection's negotiated version (v3.1, v3.1.1, or v5).
 
 ## Features
 
-- Every control packet in MQTT v3.1.1 and v5.0: CONNECT, CONNACK, PUBLISH, PUBACK, PUBREC, PUBREL, PUBCOMP, SUBSCRIBE, SUBACK, UNSUBSCRIBE, UNSUBACK, PINGREQ, PINGRESP, DISCONNECT, and AUTH.
+- Every control packet in MQTT v3.1, v3.1.1, and v5.0: CONNECT, CONNACK, PUBLISH, PUBACK, PUBREC, PUBREL, PUBCOMP, SUBSCRIBE, SUBACK, UNSUBSCRIBE, UNSUBACK, PINGREQ, PINGRESP, DISCONNECT, and AUTH. v3.1 (protocol name `MQIsdp`, level 3) differs from v3.1.1 only in CONNECT and CONNACK and is handled alongside it, so a server can still accept the older clients found in the field.
 - One set of packet types for both protocol versions. Fields that only exist in v5 (reason codes, properties) are present on every packet and are simply not written to the wire on a v3.1.1 connection. CONNECT carries its own version and is decoded without knowing it in advance.
 - Full MQTT v5 property support with typed values, including the shorthand encodings the specification permits when a reason code or property list is absent.
 - Two-phase decoding: a version-independent framing step that pulls one complete packet out of a read buffer (returning `None` until enough bytes have arrived), followed by version-aware parsing.
@@ -174,7 +174,7 @@ let ver = match Packet::from_raw(raw, MqttVersion::V5)? {   // version is ignore
 };
 ```
 
-A CONNECT for a version the crate does not speak (MQTT v3.1, `MQIsdp`) decodes to `Error::UnsupportedProtocolVersion`, distinct from a malformed packet, so a server can answer with a CONNACK carrying `UnsupportedProtocolVersion` rather than dropping the connection. `RawPacket::decode_max` takes the server's own maximum packet size for the same reason a client would pass its own.
+A CONNECT whose protocol name and level do not name a version the crate speaks decodes to `Error::UnsupportedProtocolVersion`, distinct from a malformed packet, so a server can answer with a CONNACK carrying `UnsupportedProtocolVersion` rather than dropping the connection. (MQTT v3.1 clients — protocol name `MQIsdp`, level 3 — are supported and decode to `MqttVersion::V3_1`.) `RawPacket::decode_max` takes the server's own maximum packet size for the same reason a client would pass its own.
 
 `RawPacket::packet_type()` gives the type before the body is parsed, for routing or for rejecting a packet the session state does not permit. When a decode fails, `Error::reason_code()` is the code for the DISCONNECT (or CONNACK) to send before closing. The `topic` module exposes the filter and name validation the decoder uses — including `topic::split_shared` for `$share/{name}/{filter}` subscriptions — so a server can apply the same rules to its own subscription table.
 

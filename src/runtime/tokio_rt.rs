@@ -1122,12 +1122,7 @@ fn build_connect_response(job: &ConnectJob, connack: ConnAck) -> ConnectResponse
     let server_uri = job.params.servers[job.server_idx].1.clone();
     ConnectResponse {
         server_uri,
-        mqtt_version: if job.params.ver == MqttVersion::V5 {
-            5
-        }
-        else {
-            4
-        },
+        mqtt_version: job.params.ver as u32,
         session_present: connack.session_present,
         reason_code: connack.reason_code,
         properties: connack.properties,

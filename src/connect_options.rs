@@ -129,17 +129,11 @@ impl ConnectOptions {
     }
 
     /// Creates a new set of connect options for the specified MQTT
-    /// protocol version.
-    ///
-    /// Note that this will return the options with the requested version,
-    /// even if it's not currently known. The server will likely reject a
-    /// request with a bad protocol version, however.
+    /// protocol version (v3.1, v3.1.1, or v5).
     pub fn with_mqtt_version<V: Into<MqttVersion>>(ver: V) -> Self {
-        if ver.into() < MqttVersion::V5 {
-            Self::new()
-        }
-        else {
-            Self::new_v5()
+        Self {
+            mqtt_version: ver.into(),
+            ..Self::default()
         }
     }
 
@@ -594,6 +588,19 @@ mod tests {
         assert_eq!(MqttVersion::V5, opts.mqtt_version());
         assert!(!opts.clean_session());
         assert!(opts.clean_start());
+    }
+
+    #[test]
+    fn test_with_mqtt_version_stores_requested_version() {
+        for ver in [MqttVersion::V3_1, MqttVersion::V3_1_1, MqttVersion::V5] {
+            assert_eq!(ConnectOptions::with_mqtt_version(ver).mqtt_version(), ver);
+            assert_eq!(
+                ConnectOptionsBuilder::with_mqtt_version(ver)
+                    .finalize()
+                    .mqtt_version(),
+                ver
+            );
+        }
     }
 
     // Determine that the options can be sent across threads.

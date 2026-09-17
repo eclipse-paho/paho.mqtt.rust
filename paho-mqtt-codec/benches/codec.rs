@@ -46,6 +46,22 @@ use std::hint::black_box;
 const VERSIONS: [(MqttVersion, &str); 2] =
     [(MqttVersion::V3_1_1, "v311"), (MqttVersion::V5, "v5")];
 
+/// v3.1 differs from v3.1.1 only in CONNECT/CONNACK, so only those two are
+/// benchmarked for it.
+const V31: (MqttVersion, &str) = (MqttVersion::V3_1, "v31");
+
+/// The packets to benchmark for `ver`: everything, or just CONNECT/CONNACK
+/// for v3.1.
+fn packets_for(ver: MqttVersion) -> Vec<(&'static str, Packet)> {
+    let pkts = packets(ver);
+    if ver == MqttVersion::V3_1 {
+        pkts.into_iter().take(2).collect()
+    }
+    else {
+        pkts
+    }
+}
+
 /// A representative v5 property set: two user properties and a few scalars.
 fn props() -> Properties {
     let mut p = Properties::new();
@@ -225,8 +241,8 @@ fn wire(pkt: &Packet, ver: MqttVersion) -> Bytes {
 
 fn bench_encode(c: &mut Criterion) {
     let mut g = c.benchmark_group("encode");
-    for (ver, tag) in VERSIONS {
-        for (name, pkt) in packets(ver) {
+    for (ver, tag) in VERSIONS.into_iter().chain([V31]) {
+        for (name, pkt) in packets_for(ver) {
             let mut buf = BytesMut::with_capacity(1024);
             g.bench_function(BenchmarkId::new(name, tag), |b| {
                 b.iter(|| {
@@ -269,8 +285,8 @@ fn bench_encode(c: &mut Criterion) {
 
 fn bench_decode(c: &mut Criterion) {
     let mut g = c.benchmark_group("decode");
-    for (ver, tag) in VERSIONS {
-        for (name, pkt) in packets(ver) {
+    for (ver, tag) in VERSIONS.into_iter().chain([V31]) {
+        for (name, pkt) in packets_for(ver) {
             let bytes = wire(&pkt, ver);
             g.bench_function(BenchmarkId::new(name, tag), |b| {
                 b.iter_batched(

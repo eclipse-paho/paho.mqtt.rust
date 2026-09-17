@@ -65,6 +65,70 @@ fn test_connect_disconnect_v3() {
     cli.disconnect(None).wait().expect("disconnect failed");
 }
 
+// MQTT v3.1 requires a client ID of 1-23 characters (no empty ID with clean
+// session as in v3.1.1), so these tests set one explicitly.
+fn v3_1_client(id: &str) -> mqtt::AsyncClient {
+    mqtt::AsyncClient::new(
+        mqtt::CreateOptionsBuilder::new()
+            .server_uri(HOST)
+            .client_id(id)
+            .finalize(),
+    )
+    .unwrap()
+}
+
+#[test]
+fn test_connect_disconnect_v3_1() {
+    // MQTT v3.1: protocol name "MQIsdp", level 3. Mosquitto still speaks it.
+    let cli = v3_1_client("paho-v31-connect");
+    let rsp = cli
+        .connect(mqtt::ConnectOptions::with_mqtt_version(
+            mqtt::MQTT_VERSION_3_1,
+        ))
+        .wait()
+        .expect("v3.1 connect failed");
+    assert_eq!(rsp.mqtt_version, 3);
+    assert!(!rsp.session_present);
+    cli.disconnect(None).wait().expect("disconnect failed");
+}
+
+#[test]
+fn test_publish_subscribe_v3_1() {
+    let topic = topic!("v31/pub_sub");
+    let sub = v3_1_client("paho-v31-sub");
+    sub.connect(mqtt::ConnectOptions::with_mqtt_version(
+        mqtt::MQTT_VERSION_3_1,
+    ))
+    .wait()
+    .expect("sub connect failed");
+    let rx = sub.start_consuming();
+    sub.subscribe(topic, mqtt::QOS_1)
+        .wait()
+        .expect("subscribe failed");
+
+    let pub_cli = v3_1_client("paho-v31-pub");
+    pub_cli
+        .connect(mqtt::ConnectOptions::with_mqtt_version(
+            mqtt::MQTT_VERSION_3_1,
+        ))
+        .wait()
+        .expect("pub connect failed");
+    pub_cli
+        .publish(mqtt::Message::new(topic, "hello 3.1", mqtt::QOS_1))
+        .wait()
+        .expect("publish failed");
+
+    let msg = rx
+        .recv_timeout(TIMEOUT)
+        .expect("recv timed out")
+        .expect("connection lost");
+    assert_eq!(msg.topic(), topic);
+    assert_eq!(msg.payload_str(), "hello 3.1");
+
+    pub_cli.disconnect(None).wait().ok();
+    sub.disconnect(None).wait().ok();
+}
+
 #[test]
 fn test_connect_disconnect_v5() {
     let cli = mqtt::AsyncClient::new(HOST).unwrap();

@@ -54,12 +54,7 @@ use paho_mqtt_codec::{
 const MAX_BLOB: usize = 4096;
 
 fn version(u: &mut Unstructured) -> AResult<MqttVersion> {
-    Ok(if u.arbitrary()? {
-        MqttVersion::V5
-    }
-    else {
-        MqttVersion::V3_1_1
-    })
+    Ok(*u.choose(&[MqttVersion::V3_1, MqttVersion::V3_1_1, MqttVersion::V5])?)
 }
 
 fn qos(u: &mut Unstructured) -> AResult<QoS> {
@@ -306,7 +301,9 @@ fn connack(u: &mut Unstructured, ver: MqttVersion) -> AResult<ConnAck> {
             ReasonCode::NotAuthorized,
         ])?,
     };
-    let session_present = rc == ReasonCode::Success && u.arbitrary()?;
+    // v3.1 CONNACK has no Session Present flag at all.
+    let session_present =
+        rc == ReasonCode::Success && ver != MqttVersion::V3_1 && u.arbitrary()?;
     let mut a = ConnAck::new(session_present, rc);
     a.properties = properties(u, ver, PacketType::ConnAck)?;
     Ok(a)

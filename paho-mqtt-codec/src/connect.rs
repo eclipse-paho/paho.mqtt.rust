@@ -115,8 +115,8 @@ impl Connect {
     /// Returns the number of variable-header + payload bytes.
     pub fn encoded_size(&self) -> usize {
         let ver = self.version;
-        // Variable header: 2+4 (proto name) + 1 (level) + 1 (flags) + 2 (keep-alive)
-        let mut size = 10;
+        // Variable header: protocol name + 1 (level) + 1 (flags) + 2 (keep-alive)
+        let mut size = utf8_wire_size(ver.protocol_name()) + 4;
         size += self.properties.encoded_size(ver);
         // Payload
         size += utf8_wire_size(&self.client_id);
@@ -138,10 +138,8 @@ impl Connect {
     /// the protocol version in [`version`](Self::version).
     pub fn encode<B: BufMut>(&self, dst: &mut B) -> Result<()> {
         let ver = self.version;
-        // Protocol name
-        dst.put_u16(4);
-        dst.put_slice(b"MQTT");
-        // Protocol level
+        // Protocol name and level identify the version on the wire.
+        put_utf8(ver.protocol_name(), dst)?;
         dst.put_u8(ver as u8);
         // Connect flags
         let mut flags: u8 = 0;
@@ -188,9 +186,11 @@ impl Connect {
     /// Decodes a CONNECT from the raw `payload` bytes.
     ///
     /// The protocol version is read from the packet itself and stored in
-    /// [`version`](Self::version). Returns [`Error::UnsupportedProtocolVersion`]
-    /// for MQTT v3.1 (`MQIsdp`) or an unknown protocol level, so a server can
-    /// reply with the appropriate CONNACK reason code.
+    /// [`version`](Self::version): `MQIsdp` level 3 is v3.1, `MQTT` level 4
+    /// is v3.1.1, `MQTT` level 5 is v5. Any other name/level combination
+    /// returns [`Error::UnsupportedProtocolVersion`], so a server can reply
+    /// with the appropriate CONNACK reason code; a name that is not a
+    /// protocol name at all is [`Error::MalformedPacket`].
     pub fn decode(mut payload: Bytes) -> Result<Self> {
         // Protocol name
         if payload.remaining() < 2 {
@@ -201,16 +201,17 @@ impl Connect {
             return Err(Error::PacketTooShort);
         }
         let name = payload.copy_to_bytes(name_len);
-        match &name[..] {
-            b"MQTT" => {}
-            b"MQIsdp" => return Err(Error::UnsupportedProtocolVersion),
-            _ => return Err(Error::MalformedPacket),
+        if !matches!(&name[..], b"MQTT" | b"MQIsdp") {
+            return Err(Error::MalformedPacket);
         }
-        // Protocol level
+        // Protocol level; must agree with the name.
         if payload.remaining() < 1 {
             return Err(Error::PacketTooShort);
         }
         let ver = MqttVersion::try_from(payload.get_u8())?;
+        if ver.protocol_name().as_bytes() != &name[..] {
+            return Err(Error::UnsupportedProtocolVersion);
+        }
         // Connect flags
         if payload.remaining() < 3 {
             return Err(Error::PacketTooShort);
@@ -229,9 +230,9 @@ impl Connect {
         if !will_flag && (flags & 0x38 != 0) {
             return Err(Error::MalformedPacket);
         }
-        // v3.1.1 requires a username whenever a password is present
+        // v3.1 and v3.1.1 require a username whenever a password is present
         // (MQTT-3.1.2-22); v5 lifted that restriction.
-        if ver == MqttVersion::V3_1_1 && password_flag && !username_flag {
+        if !ver.is_v5() && password_flag && !username_flag {
             return Err(Error::ProtocolError);
         }
         let will_qos = QoS::try_from(will_qos_bits)?;
@@ -354,8 +355,15 @@ impl ConnAck {
 
     /// Encodes the CONNACK variable header and payload into `dst`.
     pub fn encode<B: BufMut>(&self, dst: &mut B, ver: MqttVersion) -> Result<()> {
-        // Byte 1: connect acknowledge flags (bit 0 = session_present)
-        dst.put_u8(if self.session_present { 0x01 } else { 0x00 });
+        // Byte 1: connect acknowledge flags (bit 0 = session_present).
+        // v3.1 has no such flag; the byte is reserved and sent as zero.
+        let flags = if self.session_present && ver != MqttVersion::V3_1 {
+            0x01
+        }
+        else {
+            0x00
+        };
+        dst.put_u8(flags);
 
         // Byte 2: return/reason code
         match ver {
@@ -375,11 +383,17 @@ impl ConnAck {
         }
 
         let flags = payload.get_u8();
-        // Bits 7–1 are reserved and must be zero.
-        if flags & 0xFE != 0 {
-            return Err(Error::MalformedPacket);
-        }
-        let session_present = flags & 0x01 != 0;
+        // Bits 7–1 are reserved and must be zero. In v3.1 the whole byte is
+        // reserved (no Session Present flag) and is not validated.
+        let session_present = match ver {
+            MqttVersion::V3_1 => false,
+            _ => {
+                if flags & 0xFE != 0 {
+                    return Err(Error::MalformedPacket);
+                }
+                flags & 0x01 != 0
+            }
+        };
 
         let code_byte = payload.get_u8();
         let reason_code = match ver {
@@ -874,11 +888,12 @@ mod tests {
 
     #[test]
     fn test_connect_decode_discovers_version_from_level_byte() {
-        for ver in [v311(), v5()] {
+        for ver in [MqttVersion::V3_1, v311(), v5()] {
             let conn = Connect::new(ver, false, "c");
             let mut dst = BytesMut::new();
             conn.encode(&mut dst).unwrap();
-            assert_eq!(dst[6], ver as u8);
+            let level_at = 2 + ver.protocol_name().len();
+            assert_eq!(dst[level_at], ver as u8);
             let decoded = Connect::decode(dst.freeze()).unwrap();
             assert_eq!(decoded.version, ver);
         }
@@ -904,7 +919,7 @@ mod tests {
     }
 
     #[test]
-    fn test_connect_decode_mqisdp_is_unsupported_version() {
+    fn test_connect_decode_mqisdp_is_v3_1() {
         // MQTT v3.1: protocol name "MQIsdp", level 3.
         let mut src = BytesMut::new();
         src.put_u16(6);
@@ -913,9 +928,63 @@ mod tests {
         src.put_u8(0x02);
         src.put_u16(0);
         put_utf8("c", &mut src).unwrap();
+        let conn = Connect::decode(src.freeze()).unwrap();
+        assert_eq!(conn.version, MqttVersion::V3_1);
+        assert!(conn.clean_start);
+        assert_eq!(conn.client_id, "c");
+    }
+
+    #[test]
+    fn test_connect_v3_1_wire_format_and_round_trip() {
+        let mut conn = Connect::new(MqttVersion::V3_1, true, "client-1");
+        conn.keep_alive = 30;
+        conn.username = Some("u".into());
+        conn.password = Some(Bytes::from_static(b"p"));
+        conn.will = Some(Will::new("w", Bytes::from_static(b"bye"), QoS::QoS1, true));
+        let mut dst = BytesMut::new();
+        conn.encode(&mut dst).unwrap();
+        // Protocol name "MQIsdp" then level 3.
+        assert_eq!(&dst[..8], &[0x00, 0x06, b'M', b'Q', b'I', b's', b'd', b'p']);
+        assert_eq!(dst[8], 0x03);
+        assert_eq!(dst.len(), conn.encoded_size());
+        assert_eq!(Connect::decode(dst.freeze()).unwrap(), conn);
+    }
+
+    #[test]
+    fn test_connect_decode_name_level_mismatch_is_unsupported() {
+        // "MQIsdp" with level 4, and "MQTT" with level 3: neither is a version.
+        for (name, level) in [(&b"MQIsdp"[..], 4u8), (b"MQTT", 3), (b"MQIsdp", 5)] {
+            let mut src = BytesMut::new();
+            src.put_u16(name.len() as u16);
+            src.put_slice(name);
+            src.put_u8(level);
+            src.put_u8(0x02);
+            src.put_u16(0);
+            put_utf8("c", &mut src).unwrap();
+            assert_eq!(
+                Connect::decode(src.freeze()),
+                Err(Error::UnsupportedProtocolVersion),
+                "{name:?} level {level}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_connack_v3_1_has_no_session_present() {
+        // Encoding never sets the flag on v3.1 ...
+        let ack = ConnAck::new(true, ReasonCode::Success);
+        let mut dst = BytesMut::new();
+        ack.encode(&mut dst, MqttVersion::V3_1).unwrap();
+        assert_eq!(&dst[..], &[0x00, 0x00]);
+        // ... and decoding ignores the reserved byte entirely.
+        let ack =
+            ConnAck::decode(Bytes::from_static(&[0xFF, 0x00]), MqttVersion::V3_1).unwrap();
+        assert!(!ack.session_present);
+        assert_eq!(ack.reason_code, ReasonCode::Success);
+        // The same bytes are malformed on v3.1.1.
         assert_eq!(
-            Connect::decode(src.freeze()),
-            Err(Error::UnsupportedProtocolVersion)
+            ConnAck::decode(Bytes::from_static(&[0xFF, 0x00]), v311()),
+            Err(Error::MalformedPacket)
         );
     }
 

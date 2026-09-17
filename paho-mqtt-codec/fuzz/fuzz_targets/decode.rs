@@ -33,7 +33,7 @@ use libfuzzer_sys::fuzz_target;
 use paho_mqtt_codec::{MqttVersion, Packet, RawPacket};
 
 fuzz_target!(|data: &[u8]| {
-    for ver in [MqttVersion::V3_1_1, MqttVersion::V5] {
+    for ver in [MqttVersion::V3_1, MqttVersion::V3_1_1, MqttVersion::V5] {
         let mut buf = BytesMut::from(data);
 
         // A read buffer may hold several packets back to back.

@@ -52,8 +52,8 @@ pub use crossbeam_channel::{self as sync_channel, Receiver as SyncReceiver};
 
 /// Re-export the codec
 pub use paho_mqtt_codec::{
-    self, MQTT_VERSION_3, MQTT_VERSION_3_1_1, MQTT_VERSION_5, MQTT_VERSION_DEFAULT,
-    MqttVersion, QOS_0, QOS_1, QOS_2, QoS, ReasonCode,
+    self, MQTT_VERSION_3, MQTT_VERSION_3_1, MQTT_VERSION_3_1_1, MQTT_VERSION_5,
+    MQTT_VERSION_DEFAULT, MqttVersion, QOS_0, QOS_1, QOS_2, QoS, ReasonCode,
 };
 
 /// The asynchronous API
