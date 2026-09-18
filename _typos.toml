@@ -2,6 +2,7 @@
 [default.extend-identifiers]
 #pn = "pn"
 mosquitto = "mosquitto"
+Mosquitto = "Mosquitto"
 thr = "thr"
 typ = "typ"
 
