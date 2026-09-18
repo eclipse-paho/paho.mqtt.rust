@@ -32,8 +32,8 @@ use std::{
 
 use bytes::Bytes;
 use paho_mqtt_codec::{
-    MAX_PACKET_SIZE, MqttVersion, Properties as CodecProperties, PropertyId, PropertyValue,
-    QoS, ReasonCode, Will,
+    ConnAck, MAX_PACKET_SIZE, MqttVersion, Properties as CodecProperties, PropertyId,
+    PropertyValue, QoS, ReasonCode, Will,
 };
 
 use crate::{
@@ -184,6 +184,43 @@ impl ConnectParams {
     }
 }
 
+/// Per-session limits, fixed once the CONNACK has arrived.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SessionLimits {
+    /// Maximum concurrent outbound QoS 1/2 publishes; 0 means unlimited.
+    pub max_inflight: usize,
+    /// Largest inbound packet accepted by the framing layer, in bytes.
+    pub max_packet_size: u32,
+    /// Largest packet the server said it will accept (CONNACK
+    /// `MaximumPacketSize`), if any. Outbound packets above it are refused.
+    pub server_max_packet_size: Option<u32>,
+}
+
+impl SessionLimits {
+    /// Limits for a session on `params` whose CONNACK was `connack`.
+    pub fn new(params: &ConnectParams, connack: &ConnAck) -> Self {
+        Self {
+            max_inflight: params.max_inflight,
+            max_packet_size: params.max_packet_size(),
+            server_max_packet_size: server_max_packet_size(connack),
+        }
+    }
+}
+
+/// The largest packet the server will accept, from its CONNACK's v5
+/// `MaximumPacketSize` property; `None` if it did not advertise one (or the
+/// connection is v3), meaning the protocol maximum.
+///
+/// A client must not send a packet larger than this (MQTT-3.2.2-15); a
+/// server that receives one disconnects with `PacketTooLarge`, so the
+/// session refuses such a packet locally instead.
+pub(crate) fn server_max_packet_size(connack: &ConnAck) -> Option<u32> {
+    match connack.properties.get(PropertyId::MaximumPacketSize) {
+        Some(PropertyValue::U32(n)) if *n > 0 => Some(*n),
+        _ => None,
+    }
+}
+
 /////////////////////////////////////////////////////////////////////////////
 
 /// Commands sent from the public API to the internal event loop.
@@ -321,6 +358,18 @@ mod tests {
             PropertyValue::U32(4096),
         ));
         assert_eq!(params_with(props).max_packet_size(), 4096);
+    }
+
+    #[test]
+    fn test_server_max_packet_size_from_connack() {
+        use paho_mqtt_codec::ReasonCode;
+        let mut ack = ConnAck::new(false, ReasonCode::Success);
+        assert_eq!(server_max_packet_size(&ack), None);
+        ack.properties.push(Property::new(
+            PropertyId::MaximumPacketSize,
+            PropertyValue::U32(512),
+        ));
+        assert_eq!(server_max_packet_size(&ack), Some(512));
     }
 
     #[test]

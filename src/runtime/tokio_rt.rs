@@ -58,7 +58,7 @@ use super::tokio_conn::{TlsConnection, make_tls_config};
 #[cfg(feature = "websocket")]
 use super::tokio_conn::{WsConnection, build_ws_request};
 use super::{
-    commands::{BufConfig, Command, ConnectParams, Event, ServerAddr},
+    commands::{BufConfig, Command, ConnectParams, Event, ServerAddr, SessionLimits},
     connection::Connection,
     tokio_conn::TcpConnection,
 };
@@ -244,10 +244,8 @@ struct Session {
     ping_outstanding: bool,
     /// Persistence store for in-flight QoS 1/2 messages (if any).
     persist: Option<Arc<Mutex<Box<dyn ClientPersistence>>>>,
-    /// Maximum concurrent outbound QoS 1/2 publishes; 0 means unlimited.
-    max_inflight: usize,
-    /// Largest inbound packet accepted by the framing layer, in bytes.
-    max_packet_size: u32,
+    /// Limits fixed once the CONNACK arrived.
+    limits: SessionLimits,
     /// QoS 1/2 publish commands deferred because the in-flight limit was
     /// reached.  Drained one-for-one as PUBACK/PUBCOMP ACKs arrive.
     inflight_deferred: VecDeque<Command>,
@@ -263,8 +261,7 @@ impl Session {
         keep_alive: Duration,
         event_tx: async_channel::Sender<Event>,
         persist: Option<Arc<Mutex<Box<dyn ClientPersistence>>>>,
-        max_inflight: usize,
-        max_packet_size: u32,
+        limits: SessionLimits,
     ) -> Self {
         Self {
             writer,
@@ -280,8 +277,7 @@ impl Session {
             event_tx,
             ping_outstanding: false,
             persist,
-            max_inflight,
-            max_packet_size,
+            limits,
             inflight_deferred: VecDeque::new(),
             sent_packet: false,
         }
@@ -306,7 +302,9 @@ impl Session {
     /// count is below `max_inflight`.  A transport error propagates immediately.
     async fn drain_deferred(&mut self) -> Result<()> {
         loop {
-            if self.max_inflight != 0 && self.inflight_count() >= self.max_inflight {
+            if self.limits.max_inflight != 0
+                && self.inflight_count() >= self.limits.max_inflight
+            {
                 break;
             }
             let Some(cmd) = self.inflight_deferred.pop_front()
@@ -345,7 +343,20 @@ impl Session {
     async fn send(&mut self, packet: &Packet) -> Result<()> {
         self.write_buf.clear();
         let payload = packet.encode_split(&mut self.write_buf, self.ver)?;
+        self.check_outbound_size(payload.as_ref().map_or(0, Bytes::len))?;
         self.write_frame(payload).await
+    }
+
+    /// Refuses a frame larger than the server's advertised maximum packet
+    /// size. The header is already in `write_buf`; `payload_len` is the
+    /// separately held payload, if any.
+    fn check_outbound_size(&self, payload_len: usize) -> Result<()> {
+        if let Some(max) = self.limits.server_max_packet_size
+            && self.write_buf.len() + payload_len > max as usize
+        {
+            return Err(paho_mqtt_codec::Error::PacketTooLarge.into());
+        }
+        Ok(())
     }
 
     /// Writes the packet header in `write_buf`, followed by `payload` if
@@ -486,7 +497,7 @@ impl Session {
                         return Err(Error::Disconnected);
                     }
                     while let Some(raw) =
-                        RawPacket::decode_max(&mut read_buf, self.max_packet_size)?
+                        RawPacket::decode_max(&mut read_buf, self.limits.max_packet_size)?
                     {
                         let packet = Packet::from_raw(raw, self.ver)?;
                         self.handle_packet(packet).await?;
@@ -521,7 +532,7 @@ impl Session {
                                                 Ok(_) => {
                                                     while let Ok(Some(raw)) = RawPacket::decode_max(
                                                         &mut read_buf,
-                                                        self.max_packet_size,
+                                                        self.limits.max_packet_size,
                                                     ) {
                                                         match Packet::from_raw(raw, self.ver) {
                                                             Ok(pkt) => {
@@ -710,8 +721,8 @@ impl Session {
                 // QoS 1/2 publishes are deferred when the in-flight limit is
                 // reached.  QoS 0 is never gated (no ACK, no packet ID).
                 if qos != QoS::QoS0
-                    && self.max_inflight != 0
-                    && self.inflight_count() >= self.max_inflight
+                    && self.limits.max_inflight != 0
+                    && self.inflight_count() >= self.limits.max_inflight
                 {
                     self.inflight_deferred.push_back(Command::Publish {
                         topic,
@@ -744,8 +755,24 @@ impl Session {
                 // Encode once: the header lands in `write_buf` and the payload
                 // is shared by reference, so persisting and sending both use
                 // the same bytes without a second encode or a copy.
+                //
+                // A publish that cannot be encoded, or that exceeds the
+                // server's maximum packet size, is this publish's failure,
+                // not the connection's: fail its token and carry on.
                 self.write_buf.clear();
-                let payload = packet.encode_split(&mut self.write_buf, self.ver)?;
+                let payload = match packet.encode_split(&mut self.write_buf, self.ver) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        tx.complete(Err(e.into()));
+                        return Ok(false);
+                    }
+                };
+                if let Err(e) =
+                    self.check_outbound_size(payload.as_ref().map_or(0, Bytes::len))
+                {
+                    tx.complete(Err(e));
+                    return Ok(false);
+                }
 
                 // Persist QoS 1/2 PUBLISH before sending so we can
                 // re-transmit after a crash.
@@ -1238,6 +1265,7 @@ pub(crate) async fn run_event_loop(
             }
         };
 
+        let limits = SessionLimits::new(&job.params, &connack);
         let response = build_connect_response(&job, connack);
         // Set the flag before resolving the token so `is_connected()` is true
         // as soon as `wait()` / `.await` returns in the caller.
@@ -1253,8 +1281,7 @@ pub(crate) async fn run_event_loop(
             job.params.keep_alive_duration(),
             event_tx.clone(),
             job.persist.clone(),
-            job.params.max_inflight,
-            job.params.max_packet_size(),
+            limits,
         );
 
         // Restore persisted in-flight messages, then flush the disconnected
@@ -1329,6 +1356,7 @@ pub(crate) async fn run_event_loop(
                         continue 'retry;
                     }
 
+                    let limits = SessionLimits::new(&job.params, &connack);
                     let response = build_connect_response(&job, connack);
                     job.connected_flag.store(true, Ordering::SeqCst);
                     let _ = event_tx.send(Event::Connected(response.clone())).await;
@@ -1342,8 +1370,7 @@ pub(crate) async fn run_event_loop(
                         job.params.keep_alive_duration(),
                         event_tx.clone(),
                         job.persist.clone(),
-                        job.params.max_inflight,
-                        job.params.max_packet_size(),
+                        limits,
                     );
 
                     // Restore persisted in-flight messages, then flush the
