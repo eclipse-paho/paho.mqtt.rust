@@ -21,8 +21,8 @@
 //! MQTT CONNECT and CONNACK packets.
 
 use crate::{
-    Error, MqttVersion, PacketType, Properties, PropertyContext, QoS, ReasonCode, Result,
-    String,
+    DecodeOptions, Error, MqttVersion, PacketType, Properties, PropertyContext, QoS,
+    ReasonCode, Result, String,
     wire::{binary_wire_size, get_binary, get_utf8, put_binary, put_utf8, utf8_wire_size},
 };
 use bytes::{Buf, BufMut, Bytes};
@@ -377,7 +377,19 @@ impl ConnAck {
 
     /// Decodes a CONNACK from the raw `payload` bytes (i.e. the bytes after
     /// the remaining-length field) for the given version, `ver`.
-    pub fn decode(mut payload: Bytes, ver: MqttVersion) -> Result<Self> {
+    pub fn decode(payload: Bytes, ver: MqttVersion) -> Result<Self> {
+        Self::decode_with(payload, ver, DecodeOptions::LENIENT)
+    }
+
+    /// Decodes a CONNACK as [`decode`](Self::decode) does, with `opts`
+    /// deciding whether a refused connection that sets Session Present is a
+    /// [`ProtocolError`](Error::ProtocolError) (strict) or has the flag
+    /// cleared (default).
+    pub fn decode_with(
+        mut payload: Bytes,
+        ver: MqttVersion,
+        opts: DecodeOptions,
+    ) -> Result<Self> {
         if payload.remaining() < 2 {
             return Err(Error::PacketTooShort);
         }
@@ -404,9 +416,12 @@ impl ConnAck {
 
         // A server must clear Session Present on a refused connection
         // (MQTT-3.2.2-4). If one doesn't, the flag is meaningless anyway;
-        // rejecting the packet here would only hide the reason code from
-        // the receiver, which is the one thing it needs. Be lenient: clear
-        // the flag and keep the code.
+        // rejecting the packet would only hide the reason code from the
+        // receiver, which is the one thing it needs. By default clear the
+        // flag and keep the code; in strict mode report the violation.
+        if session_present && reason_code != ReasonCode::Success && opts.strict {
+            return Err(Error::ProtocolError);
+        }
         let session_present = session_present && reason_code == ReasonCode::Success;
 
         Ok(Self {
@@ -559,6 +574,27 @@ mod tests {
         let ack = ConnAck::decode(payload, v311()).unwrap();
         assert!(!ack.session_present);
         assert_eq!(ack.reason_code, ReasonCode::NotAuthorized);
+    }
+
+    #[test]
+    fn test_decode_strict_rejects_session_present_with_refused_code() {
+        // Same bytes as the lenient tests; strict mode reports the violation.
+        let payload = Bytes::from_static(&[0x01, 0x05]);
+        assert_eq!(
+            ConnAck::decode_with(payload, v311(), DecodeOptions::STRICT),
+            Err(Error::ProtocolError)
+        );
+        let payload = Bytes::from_static(&[0x01, 0x87, 0x00]);
+        assert_eq!(
+            ConnAck::decode_with(payload, v5(), DecodeOptions::STRICT),
+            Err(Error::ProtocolError)
+        );
+        // A compliant packet decodes identically in both modes.
+        let payload = Bytes::from_static(&[0x01, 0x00, 0x00]);
+        assert_eq!(
+            ConnAck::decode_with(payload.clone(), v5(), DecodeOptions::STRICT),
+            ConnAck::decode(payload, v5())
+        );
     }
 
     #[test]

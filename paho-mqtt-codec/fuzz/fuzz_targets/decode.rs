@@ -30,7 +30,7 @@
 
 use bytes::BytesMut;
 use libfuzzer_sys::fuzz_target;
-use paho_mqtt_codec::{MqttVersion, Packet, RawPacket};
+use paho_mqtt_codec::{DecodeOptions, MqttVersion, Packet, RawPacket};
 
 fuzz_target!(|data: &[u8]| {
     for ver in [MqttVersion::V3_1, MqttVersion::V3_1_1, MqttVersion::V5] {
@@ -38,10 +38,17 @@ fuzz_target!(|data: &[u8]| {
 
         // A read buffer may hold several packets back to back.
         while let Ok(Some(raw)) = RawPacket::decode(&mut buf) {
+            // Strict decoding must be at least as strict as the default, and
+            // must agree with it whenever both succeed.
+            let strict = Packet::from_raw_with(raw.clone(), ver, DecodeOptions::STRICT);
             let Ok(pkt) = Packet::from_raw(raw, ver)
             else {
+                assert!(strict.is_err(), "strict accepted what lenient rejected");
                 break;
             };
+            if let Ok(strict_pkt) = strict {
+                assert_eq!(strict_pkt, pkt, "strict and lenient decode differ");
+            }
 
             // Whatever decoded must survive a round trip unchanged.
             let mut wire = BytesMut::new();

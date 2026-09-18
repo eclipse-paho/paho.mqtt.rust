@@ -60,7 +60,7 @@ pub use auth::Auth;
 pub use connect::{ConnAck, Connect, Will};
 pub use disconnect::Disconnect;
 pub use error::{Error, Result};
-pub use packet::{MAX_PACKET_SIZE, Packet, PacketType, RawPacket};
+pub use packet::{DecodeOptions, MAX_PACKET_SIZE, Packet, PacketType, RawPacket};
 pub use properties::{
     Properties, Property, PropertyContext, PropertyId, PropertyType, PropertyValue,
 };

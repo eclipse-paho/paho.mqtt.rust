@@ -136,6 +136,50 @@ impl TryFrom<u8> for PacketType {
 /// bytes, plus 1 byte for the packet-type header and 4 for the length itself.
 pub const MAX_PACKET_SIZE: u32 = varlen::MAX_VARLEN + 5;
 
+/// Options controlling how leniently packets are decoded.
+///
+/// The decoder is strict by default about everything the specification
+/// calls a Malformed Packet or Protocol Error, with a small number of
+/// deliberate exceptions where a rule violation by the peer is harmless to
+/// the receiver and rejecting the packet would only lose information. Those
+/// exceptions can be turned into errors with [`DecodeOptions::strict`], which
+/// is what a conformance tester or protocol analyzer wants; a client or
+/// server keeping a connection alive wants the default.
+///
+/// Currently the only lenient case is a CONNACK that refuses the connection
+/// but sets Session Present (MQTT-3.2.2-4): by default the flag is cleared and
+/// the reason code kept; in strict mode it is [`Error::ProtocolError`].
+///
+/// The struct is `#[non_exhaustive]`; construct it with
+/// [`DecodeOptions::default`], [`DecodeOptions::strict`], or the builder
+/// methods.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[non_exhaustive]
+pub struct DecodeOptions {
+    /// Report every specification violation, including the cases the
+    /// default decoder tolerates.
+    pub strict: bool,
+}
+
+impl DecodeOptions {
+    /// The default: tolerate harmless violations.
+    pub const LENIENT: Self = Self { strict: false };
+    /// Report every violation.
+    pub const STRICT: Self = Self { strict: true };
+
+    /// Options that report every violation.
+    pub const fn strict() -> Self {
+        Self::STRICT
+    }
+
+    /// Sets whether every violation is reported.
+    pub const fn with_strict(mut self, strict: bool) -> Self {
+        self.strict = strict;
+        self
+    }
+}
+
 /// A raw, uninterpreted MQTT packet produced by the framing layer.
 ///
 /// The `header` byte carries the packet type (upper 4 bits) and flags
@@ -289,11 +333,22 @@ impl Packet {
         }
     }
 
-    /// Parses a [`RawPacket`] into a typed [`Packet`] given `ver`.
+    /// Parses a [`RawPacket`] into a typed [`Packet`] given `ver`, with the
+    /// default (lenient) [`DecodeOptions`].
     ///
     /// CONNECT is self-describing and ignores `ver`: its protocol version is
     /// read from the wire into [`Connect::version`].
     pub fn from_raw(raw: RawPacket, ver: MqttVersion) -> Result<Self> {
+        Self::from_raw_with(raw, ver, DecodeOptions::LENIENT)
+    }
+
+    /// Parses a [`RawPacket`] into a typed [`Packet`] given `ver` and
+    /// `opts`; see [`DecodeOptions`] for what the options affect.
+    pub fn from_raw_with(
+        raw: RawPacket,
+        ver: MqttVersion,
+        opts: DecodeOptions,
+    ) -> Result<Self> {
         use PacketType as T;
 
         let ty = raw.packet_type()?;
@@ -315,7 +370,7 @@ impl Packet {
 
         let pkt = match ty {
             T::Connect => Packet::Connect(Box::new(Connect::decode(raw.payload)?)),
-            T::ConnAck => Packet::ConnAck(ConnAck::decode(raw.payload, ver)?),
+            T::ConnAck => Packet::ConnAck(ConnAck::decode_with(raw.payload, ver, opts)?),
             T::Publish => Packet::Publish(Publish::decode(flags, raw.payload, ver)?),
             T::PubAck => Packet::PubAck(PubAck::decode(raw.payload, ver)?),
             T::PubRec => Packet::PubRec(PubAck::decode(raw.payload, ver)?),
@@ -789,6 +844,37 @@ mod tests {
             Err(Error::ProtocolError)
         );
         assert!(dst.is_empty());
+    }
+
+    // ---- DecodeOptions ----
+
+    #[test]
+    fn test_decode_options_constructors() {
+        assert!(!DecodeOptions::default().strict);
+        assert_eq!(DecodeOptions::default(), DecodeOptions::LENIENT);
+        assert!(DecodeOptions::strict().strict);
+        assert_eq!(DecodeOptions::strict(), DecodeOptions::STRICT);
+        assert!(!DecodeOptions::STRICT.with_strict(false).strict);
+    }
+
+    #[test]
+    fn test_from_raw_with_strict_reaches_connack() {
+        // CONNACK: session_present=1, NotAuthorized, no properties.
+        let raw = RawPacket {
+            header: PacketType::ConnAck.header_byte(),
+            payload: Bytes::from_static(&[0x01, 0x87, 0x00]),
+        };
+        assert_eq!(
+            Packet::from_raw_with(raw.clone(), v5(), DecodeOptions::STRICT),
+            Err(Error::ProtocolError)
+        );
+        match Packet::from_raw(raw, v5()) {
+            Ok(Packet::ConnAck(a)) => {
+                assert!(!a.session_present);
+                assert_eq!(a.reason_code, ReasonCode::NotAuthorized);
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     // ---- PacketType ----
