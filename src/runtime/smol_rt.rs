@@ -17,33 +17,28 @@
  * Contributors:
  *    Frank Pagliughi - initial implementation and documentation
  *******************************************************************************/
-
-//! Smol-based async event loop for the MQTT client.
+//! Smol backend for the MQTT event loop.
 //!
-//! Provides [`RuntimeHandle`] for cross-thread communication and the
-//! internal [`Session`] event loop.  Transport types live in
-//! [`super::smol_conn`].
+//! Supplies the runtime-specific pieces the shared [`super::session`] module
+//! is generic over — the [`Backend`] implementation (transport open, read,
+//! write, timer) — plus the process-wide smol executor.  Transport types
+//! live in [`super::smol_conn`].
 //!
 //! TLS is supported via the `smol-tls` feature (uses `futures-rustls`).
 //! WebSocket support requires the `smol-websocket` feature (`async-tungstenite`).
 
 use std::{
-    collections::{HashMap, VecDeque},
+    future::Future,
     io,
-    sync::{
-        Arc, Mutex, OnceLock,
-        atomic::{AtomicBool, Ordering},
-    },
-    time::{Duration, Instant},
+    pin::Pin,
+    sync::{Arc, OnceLock},
+    task::{Context, Poll},
+    time::Duration,
 };
 
 use bytes::{Bytes, BytesMut};
-use paho_mqtt_codec::{
-    ConnAck, Disconnect, MqttVersion, Packet, PubAck, QoS, RawPacket,
-    RetainHandling as CodecRetainHandling, Subscribe, Subscription, Unsubscribe,
-};
-use smol::io::split;
-use smol::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
+use futures::future::FusedFuture;
+use smol::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf, split};
 #[cfg(any(feature = "smol-tls", feature = "smol-websocket"))]
 use smol::net::TcpStream;
 
@@ -54,17 +49,21 @@ use super::smol_conn::{TlsConnection, make_tls_config};
 #[cfg(feature = "smol-websocket")]
 use super::smol_conn::{WsConnection, build_ws_request};
 use super::{
-    commands::{BufConfig, Command, ConnectParams, Event, ServerAddr, SessionLimits},
+    backend::{Backend, Sleep},
+    commands::{BufConfig, ConnectParams, ServerAddr},
     connection::Connection,
+    session::RuntimeHandle,
     smol_conn::TcpConnection,
 };
-
-use crate::{
-    Error, Message, Result,
-    persistence::ClientPersistence,
-    responses::{ConnectResponse, PublishResponse, SubscribeResponse, UnsubscribeResponse},
-    token::Completer,
-};
+#[cfg(any(
+    feature = "smol-tls",
+    feature = "smol-websocket",
+    feature = "tls",
+    feature = "openssl",
+    feature = "websocket"
+))]
+use crate::Error;
+use crate::Result;
 
 /////////////////////////////////////////////////////////////////////////////
 // Runtime management
@@ -102,1186 +101,212 @@ pub(crate) fn get_or_create_shared_executor() -> Arc<smol::Executor<'static>> {
         .clone()
 }
 
-/// Channels connecting the public API to the internal event loop.
-///
-/// Created by [`RuntimeHandle::spawn`].
-pub(crate) struct RuntimeHandle {
-    cmd_tx: async_channel::Sender<Command>,
-    event_rx: async_channel::Receiver<Event>,
-}
-
 impl RuntimeHandle {
-    /// Spawns the MQTT event loop as a task on `executor` and returns the
-    /// channel endpoints for communicating with it.
+    /// Spawns the MQTT event loop as a detached task on `executor` and
+    /// returns the channel endpoints for communicating with it.
     pub(crate) fn spawn(executor: &smol::Executor<'static>, buf_cfg: BufConfig) -> Self {
-        let (cmd_tx, cmd_rx) = async_channel::unbounded::<Command>();
-        let (event_tx, event_rx) = async_channel::unbounded::<Event>();
-        executor
-            .spawn(run_event_loop(cmd_rx, event_tx, buf_cfg))
-            .detach();
-        Self { cmd_tx, event_rx }
-    }
-
-    /// Consumes the handle, returning the underlying sender and receiver.
-    pub(crate) fn into_parts(
-        self,
-    ) -> (
-        async_channel::Sender<Command>,
-        async_channel::Receiver<Event>,
-    ) {
-        (self.cmd_tx, self.event_rx)
+        let (this, task) = Self::new::<SmolBackend>(buf_cfg);
+        executor.spawn(task).detach();
+        this
     }
 }
 
 /////////////////////////////////////////////////////////////////////////////
-// Internal event loop helpers
+// Backend
 
-/// Reads bytes until at least one complete MQTT packet is available, then
-/// returns the decoded CONNACK.  Returns an error if any other packet arrives
-/// first or if the connection closes.
-async fn recv_connack(
-    reader: &mut (impl AsyncRead + Unpin),
-    buf: &mut BytesMut,
-    ver: MqttVersion,
-    max_packet_size: u32,
-) -> Result<ConnAck> {
-    let mut tmp = [0u8; 512];
-    loop {
-        let n = reader.read(&mut tmp).await?;
-        if n == 0 {
-            return Err(Error::Disconnected);
+/// Resettable timer over [`smol::Timer`].
+pub(crate) struct SmolSleep {
+    timer: smol::Timer,
+    /// `false` for a timer created with [`Sleep::never`].
+    enabled: bool,
+}
+
+impl Future for SmolSleep {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        if self.enabled {
+            Pin::new(&mut self.timer).poll(cx).map(|_| ())
         }
-        buf.extend_from_slice(&tmp[..n]);
-        if let Some(raw) = RawPacket::decode_max(buf, max_packet_size)? {
-            match Packet::from_raw(raw, ver)? {
-                Packet::ConnAck(ack) => return Ok(ack),
-                _ => return Err(Error::General("expected CONNACK")),
-            }
+        else {
+            Poll::Pending
         }
     }
 }
 
-/////////////////////////////////////////////////////////////////////////////
-// Session
-
-/// PUBLISH payloads up to this size are copied into the header buffer and
-/// sent as one contiguous write; larger ones are written from their own
-/// buffer to avoid the copy.
-const INLINE_PAYLOAD_MAX: usize = 16 * 1024;
-
-/// Holds all mutable state for a connected MQTT session.
-struct Session {
-    /// Write half of the split transport.
-    writer: WriteHalf<Box<dyn Connection>>,
-    /// Negotiated MQTT version.
-    ver: MqttVersion,
-    /// Keep-alive interval.
-    keep_alive: Duration,
-    /// Reusable scratch buffer for packet encoding.
-    write_buf: BytesMut,
-    /// Monotonically increasing packet-ID counter (wraps; skips 0).
-    next_id: u16,
-    /// Pending QoS 1 outbound publishes awaiting PUBACK.
-    pending_pub1: HashMap<u16, Completer<PublishResponse>>,
-    /// Pending QoS 2 outbound publishes awaiting PUBCOMP.
-    pending_pub2: HashMap<u16, Completer<PublishResponse>>,
-    /// Pending inbound QoS 2 messages awaiting PUBREL (packet_id → message).
-    pending_pub2_in: HashMap<u16, Message>,
-    /// Pending SUBSCRIBE operations awaiting SUBACK.
-    pending_sub: HashMap<u16, Completer<SubscribeResponse>>,
-    /// Pending UNSUBSCRIBE operations awaiting UNSUBACK.
-    pending_unsub: HashMap<u16, Completer<UnsubscribeResponse>>,
-    /// Sender to deliver inbound events to the public layer.
-    event_tx: async_channel::Sender<Event>,
-    /// True when a PINGREQ has been sent and PINGRESP has not yet arrived.
-    ping_outstanding: bool,
-    /// Persistence store for in-flight QoS 1/2 messages (if any).
-    persist: Option<Arc<Mutex<Box<dyn ClientPersistence>>>>,
-    /// Limits fixed once the CONNACK arrived.
-    limits: SessionLimits,
-    /// QoS 1/2 publish commands deferred because the in-flight limit was reached.
-    inflight_deferred: VecDeque<Command>,
-    /// Set by `send()` to indicate a packet was written since the last
-    /// keep-alive timer reset.
-    sent_packet: bool,
+impl FusedFuture for SmolSleep {
+    fn is_terminated(&self) -> bool {
+        !self.enabled
+    }
 }
 
-impl Session {
-    fn new(
-        writer: WriteHalf<Box<dyn Connection>>,
-        ver: MqttVersion,
-        keep_alive: Duration,
-        event_tx: async_channel::Sender<Event>,
-        persist: Option<Arc<Mutex<Box<dyn ClientPersistence>>>>,
-        limits: SessionLimits,
-    ) -> Self {
+impl Sleep for SmolSleep {
+    fn new(dur: Duration) -> Self {
         Self {
-            writer,
-            ver,
-            keep_alive,
-            write_buf: BytesMut::with_capacity(256),
-            next_id: 0,
-            pending_pub1: HashMap::new(),
-            pending_pub2: HashMap::new(),
-            pending_pub2_in: HashMap::new(),
-            pending_sub: HashMap::new(),
-            pending_unsub: HashMap::new(),
-            event_tx,
-            ping_outstanding: false,
-            persist,
-            limits,
-            inflight_deferred: VecDeque::new(),
-            sent_packet: false,
+            timer: smol::Timer::after(dur),
+            enabled: true,
         }
     }
 
-    fn has_pending(&self) -> bool {
-        !self.pending_pub1.is_empty()
-            || !self.pending_pub2.is_empty()
-            || !self.pending_sub.is_empty()
-            || !self.pending_unsub.is_empty()
-            || !self.inflight_deferred.is_empty()
+    fn never() -> Self {
+        Self {
+            timer: smol::Timer::never(),
+            enabled: false,
+        }
     }
 
-    fn inflight_count(&self) -> usize {
-        self.pending_pub1.len() + self.pending_pub2.len()
+    fn reset(&mut self, dur: Duration) {
+        self.timer.set_after(dur);
     }
+}
 
-    async fn drain_deferred(&mut self) -> Result<()> {
-        loop {
-            if self.limits.max_inflight != 0
-                && self.inflight_count() >= self.limits.max_inflight
-            {
-                break;
+/// Bytes read from the transport per `read_buf` call.
+const READ_CHUNK: usize = 4096;
+
+/// The smol [`Backend`].
+pub(crate) struct SmolBackend;
+
+impl Backend for SmolBackend {
+    type Reader = ReadHalf<Box<dyn Connection>>;
+    type Writer = WriteHalf<Box<dyn Connection>>;
+    type Sleep = SmolSleep;
+
+    async fn open(
+        addr: &ServerAddr,
+        #[allow(unused_variables)] p: &ConnectParams, // only TLS/WS arms use it
+    ) -> Result<(Self::Reader, Self::Writer)> {
+        let conn: Box<dyn Connection> = match addr {
+            ServerAddr::Tcp { host, port } => {
+                Box::new(TcpConnection::connect(host, *port).await?)
             }
-            let Some(cmd) = self.inflight_deferred.pop_front()
-            else {
-                break;
-            };
-            self.handle_command(cmd).await?;
-        }
-        Ok(())
-    }
-
-    fn persist_put(&self, key: &str, data: Vec<&[u8]>) {
-        if let Some(p) = &self.persist {
-            let _ = p.lock().unwrap().put(key, data);
-        }
-    }
-
-    fn persist_remove(&self, key: &str) {
-        if let Some(p) = &self.persist {
-            let _ = p.lock().unwrap().remove(key);
-        }
-    }
-
-    fn alloc_id(&mut self) -> u16 {
-        self.next_id = self.next_id.wrapping_add(1);
-        if self.next_id == 0 {
-            self.next_id = 1;
-        }
-        self.next_id
-    }
-
-    async fn send(&mut self, packet: &Packet) -> Result<()> {
-        self.write_buf.clear();
-        let payload = packet.encode_split(&mut self.write_buf, self.ver)?;
-        self.check_outbound_size(payload.as_ref().map_or(0, Bytes::len))?;
-        self.write_frame(payload).await
-    }
-
-    /// Refuses a frame larger than the server's advertised maximum packet
-    /// size. The header is already in `write_buf`; `payload_len` is the
-    /// separately held payload, if any.
-    fn check_outbound_size(&self, payload_len: usize) -> Result<()> {
-        if let Some(max) = self.limits.server_max_packet_size
-            && self.write_buf.len() + payload_len > max as usize
-        {
-            return Err(paho_mqtt_codec::Error::PacketTooLarge.into());
-        }
-        Ok(())
-    }
-
-    /// Writes the packet header in `write_buf`, followed by `payload` if
-    /// present, as one flushed frame.
-    ///
-    /// Small payloads are appended to the header so the frame goes out in a
-    /// single write; larger ones are written from their own buffer to avoid
-    /// copying.
-    async fn write_frame(&mut self, payload: Option<Bytes>) -> Result<()> {
-        match payload {
-            Some(p) if p.len() > INLINE_PAYLOAD_MAX => {
-                self.writer.write_all(&self.write_buf).await?;
-                self.writer.write_all(&p).await?;
+            #[cfg(feature = "smol-tls")]
+            ServerAddr::Tls { host, port } => {
+                let tls = p.tls.as_ref().ok_or(Error::MissingTlsOptions)?;
+                let config = make_tls_config(tls)?;
+                let connector = futures_rustls::TlsConnector::from(config);
+                let server_name = rustls::pki_types::ServerName::try_from(host.as_str())
+                    .map_err(|_| {
+                        Error::GeneralString(format!("invalid TLS server name: {}", host))
+                    })?
+                    .to_owned();
+                let tcp = TcpStream::connect((host.as_str(), *port)).await?;
+                tcp.set_nodelay(true)?;
+                let tls_stream = connector
+                    .connect(server_name, tcp)
+                    .await
+                    .map_err(|e| Error::Tls(e.to_string()))?;
+                Box::new(TlsConnection::new(tls_stream))
             }
-            Some(p) => {
-                self.write_buf.extend_from_slice(&p);
-                self.writer.write_all(&self.write_buf).await?;
+            #[cfg(not(feature = "smol-tls"))]
+            #[cfg(any(feature = "tls", feature = "openssl"))]
+            ServerAddr::Tls { .. } => {
+                return Err(Error::General(
+                    "TLS is not yet supported with the smol runtime",
+                ));
             }
-            None => self.writer.write_all(&self.write_buf).await?,
-        }
-        self.writer.flush().await?;
-        self.sent_packet = true;
-        Ok(())
-    }
-
-    /// Restores in-flight QoS 1/2 messages from the persistence store after a
-    /// successful connect.
-    async fn restore(&mut self) -> Result<()> {
-        let keys = {
-            let Some(persist) = &self.persist
-            else {
-                return Ok(());
-            };
-            match persist.lock().unwrap().keys() {
-                Ok(k) => k,
-                Err(_) => return Ok(()),
+            #[cfg(unix)]
+            ServerAddr::Unix { path } => Box::new(UnixConnection::connect(path).await?),
+            #[cfg(feature = "smol-websocket")]
+            ServerAddr::Ws { host, port, path } => {
+                let url = format!("ws://{}:{}{}", host, port, path);
+                let request = build_ws_request(&url, &p.http_headers)?;
+                let tcp = TcpStream::connect((host.as_str(), *port)).await?;
+                tcp.set_nodelay(true)?;
+                let (ws, _) = async_tungstenite::client_async(request, tcp)
+                    .await
+                    .map_err(|e| Error::GeneralString(e.to_string()))?;
+                Box::new(WsConnection::new(ws))
+            }
+            #[cfg(not(feature = "smol-websocket"))]
+            #[cfg(feature = "websocket")]
+            ServerAddr::Ws { .. } => {
+                return Err(Error::General(
+                    "WebSocket is not yet supported with the smol runtime",
+                ));
+            }
+            #[cfg(all(feature = "smol-websocket", feature = "smol-tls"))]
+            ServerAddr::Wss { host, port, path } => {
+                let tls = p.tls.as_ref().ok_or(Error::MissingTlsOptions)?;
+                let config = make_tls_config(tls)?;
+                let connector = futures_rustls::TlsConnector::from(config);
+                let server_name = rustls::pki_types::ServerName::try_from(host.as_str())
+                    .map_err(|_| {
+                        Error::GeneralString(format!("invalid TLS server name: {}", host))
+                    })?
+                    .to_owned();
+                let tcp = TcpStream::connect((host.as_str(), *port)).await?;
+                tcp.set_nodelay(true)?;
+                let tls_stream = connector
+                    .connect(server_name, tcp)
+                    .await
+                    .map_err(|e| Error::Tls(e.to_string()))?;
+                let url = format!("wss://{}:{}{}", host, port, path);
+                let request = build_ws_request(&url, &p.http_headers)?;
+                let (ws, _) = async_tungstenite::client_async(request, tls_stream)
+                    .await
+                    .map_err(|e| Error::GeneralString(e.to_string()))?;
+                Box::new(WsConnection::new(ws))
+            }
+            #[cfg(all(
+                feature = "smol-websocket",
+                not(feature = "smol-tls"),
+                any(feature = "tls", feature = "openssl")
+            ))]
+            ServerAddr::Wss { .. } => {
+                return Err(Error::General(
+                    "WebSocket+TLS is not yet supported with the smol runtime",
+                ));
             }
         };
-
-        for key in &keys {
-            let data = {
-                let Some(persist) = &self.persist
-                else {
-                    return Ok(());
-                };
-                match persist.lock().unwrap().get(key) {
-                    Ok(d) => d,
-                    Err(_) => continue,
-                }
-            };
-
-            let mut buf = BytesMut::from(data.as_slice());
-            let raw = match RawPacket::decode(&mut buf) {
-                Ok(Some(r)) => r,
-                _ => continue,
-            };
-            let pkt = match Packet::from_raw(raw, self.ver) {
-                Ok(p) => p,
-                Err(_) => continue,
-            };
-
-            if key.starts_with('s') {
-                if let Packet::Publish(mut pub_pkt) = pkt {
-                    let Some(pid) = pub_pkt.packet_id
-                    else {
-                        continue;
-                    };
-                    let qos = pub_pkt.qos;
-                    pub_pkt.dup = true;
-                    self.send(&Packet::Publish(pub_pkt)).await?;
-                    if pid > self.next_id {
-                        self.next_id = pid;
-                    }
-                    let comp = Completer::orphan();
-                    match qos {
-                        QoS::QoS1 => {
-                            self.pending_pub1.insert(pid, comp);
-                        }
-                        QoS::QoS2 => {
-                            self.pending_pub2.insert(pid, comp);
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            else if key.starts_with('r')
-                && let Packet::Publish(pub_pkt) = pkt
-            {
-                let id = pub_pkt.packet_id.unwrap_or(0);
-                let msg = Message::from(pub_pkt);
-                self.pending_pub2_in.insert(id, msg);
-            }
-        }
-
-        Ok(())
+        Ok(split(conn))
     }
 
-    /// Main event loop: read from `reader`, dispatch commands from `cmd_rx`,
-    /// and service keep-alive until an error or clean disconnect.
-    async fn run(
-        &mut self,
-        reader: &mut (impl AsyncRead + Unpin),
-        cmd_rx: &async_channel::Receiver<Command>,
-    ) -> Result<()> {
-        let keep_alive = self.keep_alive;
-        let ka_enabled = !keep_alive.is_zero();
-
-        // Track the next expected keep-alive deadline; reset on outbound packets.
-        let mut ka_deadline = Instant::now() + keep_alive;
-
-        let mut read_buf = BytesMut::with_capacity(4096);
-        let mut tmp = [0u8; 4096];
-
-        loop {
-            // Three-way race: network read vs. command vs. keep-alive timer.
-            // Fresh futures are created each iteration; smol::future::race takes
-            // ownership of async blocks (reborrows of reader/tmp are released
-            // when race completes, allowing next-iteration reborrows).
-            enum LoopEv {
-                Net(io::Result<usize>),
-                Cmd(std::result::Result<Command, async_channel::RecvError>),
-                Ka,
-            }
-
-            let ka_dl = ka_deadline;
-            let ev = smol::future::race(
-                smol::future::race(
-                    async { LoopEv::Net(reader.read(&mut tmp).await) },
-                    async { LoopEv::Cmd(cmd_rx.recv().await) },
-                ),
-                async move {
-                    if ka_enabled {
-                        smol::Timer::at(ka_dl).await;
-                    }
-                    else {
-                        std::future::pending::<()>().await;
-                    }
-                    LoopEv::Ka
-                },
-            )
-            .await;
-
-            match ev {
-                LoopEv::Net(result) => {
-                    let n = result?;
-                    if n == 0 {
-                        return Err(Error::Disconnected);
-                    }
-                    read_buf.extend_from_slice(&tmp[..n]);
-                    while let Some(raw) =
-                        RawPacket::decode_max(&mut read_buf, self.limits.max_packet_size)?
-                    {
-                        let packet = Packet::from_raw(raw, self.ver)?;
-                        self.handle_packet(packet).await?;
-                    }
-                    if ka_enabled && self.sent_packet {
-                        self.sent_packet = false;
-                        ka_deadline = Instant::now() + keep_alive;
-                    }
-                }
-
-                LoopEv::Cmd(Err(_)) => return Ok(()),
-
-                LoopEv::Cmd(Ok(Command::Disconnect {
-                    timeout,
-                    reason_code,
-                    props,
-                    tx,
-                    connected_flag,
-                })) => {
-                    if !timeout.is_zero() && self.has_pending() {
-                        let drain_deadline = Instant::now() + timeout;
-                        'drain: loop {
-                            if !self.has_pending() {
-                                break;
-                            }
-                            enum DrainEv {
-                                Net(io::Result<usize>),
-                                Timeout,
-                            }
-                            let dl = drain_deadline;
-                            let dev = smol::future::race(
-                                async { DrainEv::Net(reader.read(&mut tmp).await) },
-                                async move {
-                                    smol::Timer::at(dl).await;
-                                    DrainEv::Timeout
-                                },
-                            )
-                            .await;
-                            match dev {
-                                DrainEv::Timeout => break 'drain,
-                                DrainEv::Net(Ok(0)) | DrainEv::Net(Err(_)) => break 'drain,
-                                DrainEv::Net(Ok(n)) => {
-                                    read_buf.extend_from_slice(&tmp[..n]);
-                                    while let Ok(Some(raw)) = RawPacket::decode_max(
-                                        &mut read_buf,
-                                        self.limits.max_packet_size,
-                                    ) {
-                                        match Packet::from_raw(raw, self.ver) {
-                                            Ok(pkt) => {
-                                                let _ = self.handle_packet(pkt).await;
-                                            }
-                                            Err(_) => break 'drain,
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    let disc = Disconnect {
-                        reason_code,
-                        properties: props,
-                    };
-                    let _ = self.send(&Packet::Disconnect(disc)).await;
-                    connected_flag.store(false, Ordering::SeqCst);
-                    tx.complete(Ok(()));
-                    return Ok(());
-                }
-
-                LoopEv::Cmd(Ok(cmd)) => {
-                    if self.handle_command(cmd).await? {
-                        return Ok(());
-                    }
-                    if ka_enabled && self.sent_packet {
-                        self.sent_packet = false;
-                        ka_deadline = Instant::now() + keep_alive;
-                    }
-                }
-
-                LoopEv::Ka => {
-                    if self.ping_outstanding {
-                        return Err(Error::Timeout);
-                    }
-                    self.send(&Packet::PingReq).await?;
-                    self.ping_outstanding = true;
-                    ka_deadline = Instant::now() + keep_alive;
-                }
-            }
-        }
+    /// `futures::io::AsyncRead` only reads into an initialised slice, so
+    /// read into a stack buffer and append; `buf` is untouched until the read
+    /// completes, which keeps this cancel-safe.
+    async fn read_buf(reader: &mut Self::Reader, buf: &mut BytesMut) -> io::Result<usize> {
+        let mut tmp = [0u8; READ_CHUNK];
+        let n = reader.read(&mut tmp).await?;
+        buf.extend_from_slice(&tmp[..n]);
+        Ok(n)
     }
 
-    async fn handle_packet(&mut self, packet: Packet) -> Result<()> {
-        match packet {
-            Packet::PubAck(ack) => {
-                if let Some(tx) = self.pending_pub1.remove(&ack.packet_id) {
-                    self.persist_remove(&format!("s{}", ack.packet_id));
-                    let rsp = PublishResponse::new(ack.reason_code, ack.properties);
-                    tx.complete(Ok(rsp));
-                }
-                self.drain_deferred().await?;
-            }
-
-            Packet::PubRec(rec) => {
-                if rec.reason_code as u8 >= 0x80 {
-                    if let Some(tx) = self.pending_pub2.remove(&rec.packet_id) {
-                        tx.complete(Err(Error::ReasonCode(
-                            rec.reason_code,
-                            rec.properties,
-                        )));
-                    }
-                    return Ok(());
-                }
-                let rel = PubAck::new(rec.packet_id);
-                self.send(&Packet::PubRel(rel)).await?;
-            }
-
-            Packet::PubComp(comp) => {
-                if let Some(tx) = self.pending_pub2.remove(&comp.packet_id) {
-                    self.persist_remove(&format!("s{}", comp.packet_id));
-                    let rsp = PublishResponse::new(comp.reason_code, comp.properties);
-                    tx.complete(Ok(rsp));
-                }
-                self.drain_deferred().await?;
-            }
-
-            Packet::SubAck(ack) => {
-                if let Some(tx) = self.pending_sub.remove(&ack.packet_id) {
-                    let rsp = SubscribeResponse::new(ack.reason_codes, ack.properties);
-                    tx.complete(Ok(rsp));
-                }
-            }
-
-            Packet::UnsubAck(ack) => {
-                if let Some(tx) = self.pending_unsub.remove(&ack.packet_id) {
-                    let rsp = UnsubscribeResponse::new(ack.reason_codes, ack.properties);
-                    tx.complete(Ok(rsp));
-                }
-            }
-
-            Packet::Publish(pub_pkt) => match pub_pkt.qos {
-                QoS::QoS0 => {
-                    let msg = Message::from(pub_pkt);
-                    let _ = self.event_tx.send(Event::MessageArrived(msg)).await;
-                }
-                QoS::QoS1 => {
-                    let id = pub_pkt.packet_id.unwrap_or(0);
-                    let msg = Message::from(pub_pkt);
-                    let _ = self.event_tx.send(Event::MessageArrived(msg)).await;
-                    let ack = PubAck::new(id);
-                    self.send(&Packet::PubAck(ack)).await?;
-                }
-                QoS::QoS2 => {
-                    let id = pub_pkt.packet_id.unwrap_or(0);
-                    let mut enc_buf = BytesMut::with_capacity(256);
-                    let packet = Packet::Publish(pub_pkt);
-                    if packet.encode(&mut enc_buf, self.ver).is_ok() {
-                        self.persist_put(&format!("r{id}"), vec![&enc_buf]);
-                    }
-                    let Packet::Publish(pub_pkt) = packet
-                    else {
-                        unreachable!()
-                    };
-                    let msg = Message::from(pub_pkt);
-                    self.pending_pub2_in.insert(id, msg);
-                    let rec = PubAck::new(id);
-                    self.send(&Packet::PubRec(rec)).await?;
-                }
-            },
-
-            Packet::PubRel(rel) => {
-                if let Some(msg) = self.pending_pub2_in.remove(&rel.packet_id) {
-                    self.persist_remove(&format!("r{}", rel.packet_id));
-                    let _ = self.event_tx.send(Event::MessageArrived(msg)).await;
-                }
-                let comp = PubAck::new(rel.packet_id);
-                self.send(&Packet::PubComp(comp)).await?;
-            }
-
-            Packet::PingResp => {
-                self.ping_outstanding = false;
-            }
-
-            // Broker-initiated disconnect: as in the C library, this also
-            // fires ConnectionLost and triggers auto-reconnect.
-            Packet::Disconnect(disc) => {
-                let _ = self
-                    .event_tx
-                    .send(Event::Disconnected {
-                        reason_code: disc.reason_code,
-                        props: disc.properties,
-                    })
-                    .await;
-                return Err(Error::Disconnected);
-            }
-
-            _ => {}
-        }
-        Ok(())
+    async fn write_all(writer: &mut Self::Writer, data: &[u8]) -> io::Result<()> {
+        writer.write_all(data).await
     }
 
-    async fn handle_command(&mut self, cmd: Command) -> Result<bool> {
-        match cmd {
-            Command::Connect { tx, .. } => {
-                tx.complete(Err(Error::General("already connected")));
-            }
+    /// No vectored `write_all` in `futures::io`; two writes, one flush.
+    async fn write_frame(
+        writer: &mut Self::Writer,
+        header: &[u8],
+        payload: Bytes,
+    ) -> io::Result<()> {
+        writer.write_all(header).await?;
+        writer.write_all(&payload).await
+    }
 
-            Command::Publish {
-                topic,
-                payload,
-                qos,
-                retain,
-                props,
-                tx,
-            } => {
-                if qos != QoS::QoS0
-                    && self.limits.max_inflight != 0
-                    && self.inflight_count() >= self.limits.max_inflight
-                {
-                    self.inflight_deferred.push_back(Command::Publish {
-                        topic,
-                        payload,
-                        qos,
-                        retain,
-                        props,
-                        tx,
-                    });
-                    return Ok(false);
-                }
-
-                let id = match qos {
-                    QoS::QoS0 => None,
-                    _ => Some(self.alloc_id()),
-                };
-
-                let pub_pkt = paho_mqtt_codec::Publish {
-                    dup: false,
-                    qos,
-                    retain,
-                    topic,
-                    packet_id: id,
-                    payload,
-                    properties: props,
-                };
-
-                let packet = Packet::Publish(pub_pkt);
-
-                // Encode once: the header lands in `write_buf` and the payload
-                // is shared by reference, so persisting and sending both use
-                // the same bytes without a second encode or a copy.
-                //
-                // A publish that cannot be encoded, or that exceeds the
-                // server's maximum packet size, is this publish's failure,
-                // not the connection's: fail its token and carry on.
-                self.write_buf.clear();
-                let payload = match packet.encode_split(&mut self.write_buf, self.ver) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        tx.complete(Err(e.into()));
-                        return Ok(false);
-                    }
-                };
-                if let Err(e) =
-                    self.check_outbound_size(payload.as_ref().map_or(0, Bytes::len))
-                {
-                    tx.complete(Err(e));
-                    return Ok(false);
-                }
-
-                if let Some(pid) = id {
-                    let mut parts = vec![&self.write_buf[..]];
-                    if let Some(p) = &payload {
-                        parts.push(&p[..]);
-                    }
-                    self.persist_put(&format!("s{pid}"), parts);
-                }
-
-                self.write_frame(payload).await?;
-
-                match qos {
-                    QoS::QoS0 => {
-                        tx.complete(Ok(PublishResponse::default()));
-                    }
-                    QoS::QoS1 => {
-                        if let Some(id) = id {
-                            self.pending_pub1.insert(id, tx);
-                        }
-                    }
-                    QoS::QoS2 => {
-                        if let Some(id) = id {
-                            self.pending_pub2.insert(id, tx);
-                        }
-                    }
-                }
-            }
-
-            Command::Subscribe { filters, props, tx } => {
-                let id = self.alloc_id();
-                let subscriptions = filters
-                    .into_iter()
-                    .map(|(f, q, opts)| {
-                        use crate::subscribe_options::RetainHandling as RH;
-                        Subscription {
-                            topic_filter: f,
-                            qos: q,
-                            no_local: opts.no_local,
-                            retain_as_published: opts.retain_as_published,
-                            retain_handling: match opts.retain_handling {
-                                RH::SendRetainedOnSubscribe => {
-                                    CodecRetainHandling::SendOnSubscribe
-                                }
-                                RH::SendRetainedOnNew => CodecRetainHandling::SendIfNew,
-                                RH::DontSendRetained => CodecRetainHandling::DoNotSend,
-                            },
-                        }
-                    })
-                    .collect();
-                let sub = Subscribe {
-                    packet_id: id,
-                    subscriptions,
-                    properties: props,
-                };
-                self.send(&Packet::Subscribe(sub)).await?;
-                self.pending_sub.insert(id, tx);
-            }
-
-            Command::Unsubscribe { filters, props, tx } => {
-                let id = self.alloc_id();
-                let unsub = Unsubscribe {
-                    packet_id: id,
-                    topic_filters: filters,
-                    properties: props,
-                };
-                self.send(&Packet::Unsubscribe(unsub)).await?;
-                self.pending_unsub.insert(id, tx);
-            }
-
-            Command::Disconnect { .. } => unreachable!(),
-        }
-        Ok(false)
+    async fn flush(writer: &mut Self::Writer) -> io::Result<()> {
+        writer.flush().await
     }
 }
 
 /////////////////////////////////////////////////////////////////////////////
-// Auto-reconnect helpers
-
-struct ConnectJob {
-    params: Box<ConnectParams>,
-    server_idx: usize,
-    connected_flag: Arc<AtomicBool>,
-    persist: Option<Arc<Mutex<Box<dyn ClientPersistence>>>>,
-}
-
-impl ConnectJob {
-    fn extract(
-        cmd: Command,
-    ) -> std::result::Result<(Self, Completer<ConnectResponse>), Command> {
-        match cmd {
-            Command::Connect {
-                params,
-                tx,
-                connected_flag,
-                persist,
-            } => Ok((
-                Self {
-                    params,
-                    server_idx: 0,
-                    connected_flag,
-                    persist,
-                },
-                tx,
-            )),
-            other => Err(other),
-        }
-    }
-}
-
-/// Opens the transport, opens persistence, sends CONNECT, waits for CONNACK.
-async fn do_connect(
-    job: &ConnectJob,
-) -> Result<(
-    ReadHalf<Box<dyn Connection>>,
-    WriteHalf<Box<dyn Connection>>,
-    ConnAck,
-)> {
-    let p = &job.params;
-    let (addr, server_uri) = &p.servers[job.server_idx];
-
-    if let Some(store) = &job.persist {
-        store.lock().unwrap().open(&p.client_id, server_uri)?;
-    }
-
-    let conn: Box<dyn Connection> = match addr {
-        ServerAddr::Tcp { host, port } => {
-            Box::new(TcpConnection::connect(host, *port).await?)
-        }
-        #[cfg(feature = "smol-tls")]
-        ServerAddr::Tls { host, port } => {
-            let tls = p.tls.as_ref().ok_or(Error::MissingTlsOptions)?;
-            let config = make_tls_config(tls)?;
-            let connector = futures_rustls::TlsConnector::from(config);
-            let server_name = rustls::pki_types::ServerName::try_from(host.as_str())
-                .map_err(|_| {
-                    Error::GeneralString(format!("invalid TLS server name: {}", host))
-                })?
-                .to_owned();
-            let tcp = TcpStream::connect((host.as_str(), *port)).await?;
-            tcp.set_nodelay(true)?;
-            let tls_stream = connector
-                .connect(server_name, tcp)
-                .await
-                .map_err(|e| Error::Tls(e.to_string()))?;
-            Box::new(TlsConnection::new(tls_stream))
-        }
-        #[cfg(not(feature = "smol-tls"))]
-        #[cfg(any(feature = "tls", feature = "openssl"))]
-        ServerAddr::Tls { .. } => {
-            return Err(Error::General(
-                "TLS is not yet supported with the smol runtime",
-            ));
-        }
-        #[cfg(unix)]
-        ServerAddr::Unix { path } => Box::new(UnixConnection::connect(path).await?),
-        #[cfg(feature = "smol-websocket")]
-        ServerAddr::Ws { host, port, path } => {
-            let url = format!("ws://{}:{}{}", host, port, path);
-            let request = build_ws_request(&url, &p.http_headers)?;
-            let tcp = TcpStream::connect((host.as_str(), *port)).await?;
-            tcp.set_nodelay(true)?;
-            let (ws, _) = async_tungstenite::client_async(request, tcp)
-                .await
-                .map_err(|e| Error::GeneralString(e.to_string()))?;
-            Box::new(WsConnection::new(ws))
-        }
-        #[cfg(not(feature = "smol-websocket"))]
-        #[cfg(feature = "websocket")]
-        ServerAddr::Ws { .. } => {
-            return Err(Error::General(
-                "WebSocket is not yet supported with the smol runtime",
-            ));
-        }
-        #[cfg(all(feature = "smol-websocket", feature = "smol-tls"))]
-        ServerAddr::Wss { host, port, path } => {
-            let tls = p.tls.as_ref().ok_or(Error::MissingTlsOptions)?;
-            let config = make_tls_config(tls)?;
-            let connector = futures_rustls::TlsConnector::from(config);
-            let server_name = rustls::pki_types::ServerName::try_from(host.as_str())
-                .map_err(|_| {
-                    Error::GeneralString(format!("invalid TLS server name: {}", host))
-                })?
-                .to_owned();
-            let tcp = TcpStream::connect((host.as_str(), *port)).await?;
-            tcp.set_nodelay(true)?;
-            let tls_stream = connector
-                .connect(server_name, tcp)
-                .await
-                .map_err(|e| Error::Tls(e.to_string()))?;
-            let url = format!("wss://{}:{}{}", host, port, path);
-            let request = build_ws_request(&url, &p.http_headers)?;
-            let (ws, _) = async_tungstenite::client_async(request, tls_stream)
-                .await
-                .map_err(|e| Error::GeneralString(e.to_string()))?;
-            Box::new(WsConnection::new(ws))
-        }
-        #[cfg(all(
-            feature = "smol-websocket",
-            not(feature = "smol-tls"),
-            any(feature = "tls", feature = "openssl")
-        ))]
-        ServerAddr::Wss { .. } => {
-            return Err(Error::General(
-                "WebSocket+TLS is not yet supported with the smol runtime",
-            ));
-        }
-    };
-
-    let (mut reader, mut writer) = split(conn);
-
-    let connect_pkt = paho_mqtt_codec::Connect {
-        version: p.ver,
-        clean_start: p.clean_start,
-        keep_alive: p.keep_alive_secs,
-        client_id: p.client_id.clone(),
-        username: p.user_name.clone(),
-        password: p.password.clone(),
-        will: p.will.clone(),
-        properties: p.props.clone(),
-    };
-
-    let mut buf = BytesMut::with_capacity(256);
-    Packet::Connect(Box::new(connect_pkt)).encode(&mut buf, p.ver)?;
-    writer.write_all(&buf).await?;
-    writer.flush().await?;
-
-    let mut read_buf = BytesMut::with_capacity(256);
-    let connack =
-        recv_connack(&mut reader, &mut read_buf, p.ver, p.max_packet_size()).await?;
-
-    Ok((reader, writer, connack))
-}
-
-fn buf_push(buf: &mut VecDeque<Command>, cmd: Command, cfg: &BufConfig) {
-    if buf.len() < cfg.max_buffered_msgs {
-        buf.push_back(cmd);
-    }
-    else if cfg.delete_oldest {
-        buf.pop_front();
-        buf.push_back(cmd);
-    }
-}
-
-enum WaitOutcome {
-    Retry,
-    Abort,
-    Replace(Box<ConnectJob>, Completer<ConnectResponse>),
-}
-
-/// Waits for `delay` while draining the command queue.
-async fn reconnect_wait(
-    delay: Duration,
-    cmd_rx: &async_channel::Receiver<Command>,
-    buf: &mut VecDeque<Command>,
-    buf_cfg: &BufConfig,
-) -> WaitOutcome {
-    let deadline = Instant::now() + delay;
-
-    loop {
-        enum WaitEv {
-            Timeout,
-            Cmd(std::result::Result<Command, async_channel::RecvError>),
-        }
-
-        let ev = smol::future::race(
-            async move {
-                smol::Timer::at(deadline).await;
-                WaitEv::Timeout
-            },
-            async { WaitEv::Cmd(cmd_rx.recv().await) },
-        )
-        .await;
-
-        match ev {
-            WaitEv::Timeout => return WaitOutcome::Retry,
-            WaitEv::Cmd(Err(_)) => return WaitOutcome::Abort,
-            WaitEv::Cmd(Ok(cmd)) => match cmd {
-                Command::Connect {
-                    params,
-                    tx,
-                    connected_flag,
-                    persist,
-                } => {
-                    return WaitOutcome::Replace(
-                        Box::new(ConnectJob {
-                            params,
-                            server_idx: 0,
-                            connected_flag,
-                            persist,
-                        }),
-                        tx,
-                    );
-                }
-                Command::Disconnect {
-                    tx, connected_flag, ..
-                } => {
-                    connected_flag.store(false, Ordering::SeqCst);
-                    tx.complete(Ok(()));
-                    return WaitOutcome::Abort;
-                }
-                Command::Publish {
-                    qos: QoS::QoS0, tx, ..
-                } if buf_cfg.send_while_disconnected && !buf_cfg.persist_qos0 => {
-                    tx.complete(Ok(PublishResponse::default()));
-                }
-                cmd @ Command::Publish { .. } if buf_cfg.send_while_disconnected => {
-                    buf_push(buf, cmd, buf_cfg);
-                }
-                Command::Publish { tx, .. } => {
-                    tx.complete(Err(Error::Disconnected));
-                }
-                Command::Subscribe { tx, .. } => {
-                    tx.complete(Err(Error::Disconnected));
-                }
-                Command::Unsubscribe { tx, .. } => {
-                    tx.complete(Err(Error::Disconnected));
-                }
-            },
-        }
-    }
-}
-
-fn build_connect_response(job: &ConnectJob, connack: ConnAck) -> ConnectResponse {
-    let server_uri = job.params.servers[job.server_idx].1.clone();
-    ConnectResponse {
-        server_uri,
-        mqtt_version: job.params.ver as u32,
-        session_present: connack.session_present,
-        reason_code: connack.reason_code,
-        properties: connack.properties,
-    }
-}
-
-/////////////////////////////////////////////////////////////////////////////
-// Top-level event loop
-
-/// Drives the MQTT event loop on behalf of a [`RuntimeHandle`].
-///
-/// Semantics are identical to the tokio backend; see `tokio_rt::run_event_loop`
-/// for full documentation.
-pub(crate) async fn run_event_loop(
-    cmd_rx: async_channel::Receiver<Command>,
-    event_tx: async_channel::Sender<Event>,
-    buf_cfg: BufConfig,
-) {
-    let mut buf: VecDeque<Command> = VecDeque::new();
-    let mut ever_connected = false;
-
-    'outer: loop {
-        let (mut job, initial_tx) = loop {
-            let cmd = match cmd_rx.recv().await {
-                Ok(cmd) => cmd,
-                Err(_) => return,
-            };
-            match ConnectJob::extract(cmd) {
-                Ok(pair) => break pair,
-                Err(cmd) => {
-                    let should_buf = buf_cfg.allow_send_any_time
-                        || (ever_connected && buf_cfg.send_while_disconnected);
-                    match cmd {
-                        Command::Publish {
-                            qos: QoS::QoS0, tx, ..
-                        } if should_buf && !buf_cfg.persist_qos0 => {
-                            tx.complete(Ok(PublishResponse::default()));
-                        }
-                        cmd @ Command::Publish { .. } if should_buf => {
-                            buf_push(&mut buf, cmd, &buf_cfg);
-                        }
-                        Command::Publish { tx, .. } => {
-                            tx.complete(Err(Error::Disconnected));
-                        }
-                        Command::Subscribe { tx, .. } => {
-                            tx.complete(Err(Error::Disconnected));
-                        }
-                        Command::Unsubscribe { tx, .. } => {
-                            tx.complete(Err(Error::Disconnected));
-                        }
-                        Command::Disconnect {
-                            tx, connected_flag, ..
-                        } => {
-                            connected_flag.store(false, Ordering::SeqCst);
-                            tx.complete(Ok(()));
-                        }
-                        Command::Connect { .. } => unreachable!(),
-                    }
-                }
-            }
-        };
-
-        let n = job.params.servers.len();
-        let mut last_err: Option<Error> = None;
-        let mut initial_result = None;
-
-        for idx in 0..n {
-            job.server_idx = idx;
-            match do_connect(&job).await {
-                Err(e) => last_err = Some(e),
-                Ok((reader, writer, connack)) => {
-                    if connack.reason_code as u8 >= 0x80 {
-                        last_err = Some(Error::ReasonCode(
-                            connack.reason_code,
-                            connack.properties,
-                        ));
-                    }
-                    else {
-                        initial_result = Some((reader, writer, connack));
-                        break;
-                    }
-                }
-            }
-        }
-
-        let (mut reader, writer, connack) = match initial_result {
-            Some(t) => t,
-            None => {
-                let err = last_err.unwrap_or(Error::General("no servers configured"));
-                if matches!(err, Error::Tls(_)) {
-                    let _ = event_tx.send(Event::TlsError(err.to_string())).await;
-                }
-                initial_tx.complete(Err(err));
-                continue 'outer;
-            }
-        };
-
-        let limits = SessionLimits::new(&job.params, &connack);
-        let response = build_connect_response(&job, connack);
-        job.connected_flag.store(true, Ordering::SeqCst);
-        ever_connected = true;
-        let _ = event_tx.send(Event::Connected(response.clone())).await;
-        initial_tx.complete(Ok(response));
-
-        let mut session = Session::new(
-            writer,
-            job.params.ver,
-            job.params.keep_alive_duration(),
-            event_tx.clone(),
-            job.persist.clone(),
-            limits,
-        );
-
-        if buf_cfg.restore_msgs && session.restore().await.is_err() {
-            continue 'outer;
-        }
-        while let Some(cmd) = buf.pop_front() {
-            if session.handle_command(cmd).await.is_err() {
-                buf.clear();
-                break;
-            }
-        }
-
-        let first_result = session.run(&mut reader, &cmd_rx).await;
-        if let Some(p) = &session.persist {
-            let _ = p.lock().unwrap().close();
-        }
-
-        match first_result {
-            Ok(()) => continue 'outer,
-            Err(e) => {
-                job.connected_flag.store(false, Ordering::SeqCst);
-                let _ = event_tx.send(Event::ConnectionLost(e)).await;
-
-                if !job.params.auto_reconnect {
-                    continue 'outer;
-                }
-            }
-        }
-
-        let mut retry_delay = job.params.min_retry_interval;
-
-        'retry: loop {
-            let tx_opt: Option<Completer<ConnectResponse>> =
-                match reconnect_wait(retry_delay, &cmd_rx, &mut buf, &buf_cfg).await {
-                    WaitOutcome::Abort => break 'retry,
-                    WaitOutcome::Retry => {
-                        let n = job.params.servers.len();
-                        job.server_idx = (job.server_idx + 1) % n;
-                        None
-                    }
-                    WaitOutcome::Replace(new_job, new_tx) => {
-                        job = *new_job;
-                        retry_delay = job.params.min_retry_interval;
-                        Some(new_tx)
-                    }
-                };
-
-            match do_connect(&job).await {
-                Err(e) => {
-                    if matches!(e, Error::Tls(_)) {
-                        let _ = event_tx.send(Event::TlsError(e.to_string())).await;
-                    }
-                    if let Some(tx) = tx_opt {
-                        tx.complete(Err(e));
-                    }
-                    retry_delay = (retry_delay * 2).min(job.params.max_retry_interval);
-                }
-                Ok((mut reader, writer, connack)) => {
-                    if connack.reason_code as u8 >= 0x80 {
-                        let e = Error::ReasonCode(connack.reason_code, connack.properties);
-                        if let Some(tx) = tx_opt {
-                            tx.complete(Err(e));
-                        }
-                        retry_delay = (retry_delay * 2).min(job.params.max_retry_interval);
-                        continue 'retry;
-                    }
-
-                    let limits = SessionLimits::new(&job.params, &connack);
-                    let response = build_connect_response(&job, connack);
-                    job.connected_flag.store(true, Ordering::SeqCst);
-                    let _ = event_tx.send(Event::Connected(response.clone())).await;
-                    if let Some(tx) = tx_opt {
-                        tx.complete(Ok(response));
-                    }
-
-                    let mut session = Session::new(
-                        writer,
-                        job.params.ver,
-                        job.params.keep_alive_duration(),
-                        event_tx.clone(),
-                        job.persist.clone(),
-                        limits,
-                    );
-
-                    if buf_cfg.restore_msgs && session.restore().await.is_err() {
-                        retry_delay = (retry_delay * 2).min(job.params.max_retry_interval);
-                        continue 'retry;
-                    }
-                    while let Some(cmd) = buf.pop_front() {
-                        if session.handle_command(cmd).await.is_err() {
-                            buf.clear();
-                            break;
-                        }
-                    }
-
-                    let result = session.run(&mut reader, &cmd_rx).await;
-                    if let Some(p) = &session.persist {
-                        let _ = p.lock().unwrap().close();
-                    }
-
-                    match result {
-                        Ok(()) => break 'retry,
-                        Err(e) => {
-                            job.connected_flag.store(false, Ordering::SeqCst);
-                            let _ = event_tx.send(Event::ConnectionLost(e)).await;
-                            retry_delay = job.params.min_retry_interval;
-                        }
-                    }
-                }
-            }
-        } // 'retry
-    } // 'outer
-}
-
+//                              Unit Tests
 /////////////////////////////////////////////////////////////////////////////
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::{Command, Event, session::run_event_loop};
 
     fn assert_send<F: Send + 'static>(_: F) {}
 
+    /// The event loop must be `Send` to run on the shared executor thread.
     #[test]
     fn test_run_event_loop_is_send() {
         let (_, cmd_rx) = async_channel::unbounded::<Command>();
         let (event_tx, _) = async_channel::unbounded::<Event>();
-        assert_send(run_event_loop(
+        assert_send(run_event_loop::<SmolBackend>(
             cmd_rx,
             event_tx,
             BufConfig {

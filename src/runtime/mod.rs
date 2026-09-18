@@ -20,19 +20,28 @@
 
 //! Internal async runtime and transport abstractions.
 //!
-//! This module contains the `Connection` trait that abstracts over the
-//! async transport layer, runtime-specific implementations, and the
-//! command/event types that bridge the public API and the event loop.
+//! The MQTT protocol logic lives once, in `session`, generic over the
+//! `Backend` trait defined in `backend`.  A backend module (`tokio_rt` or
+//! `smol_rt`) implements that trait for its runtime — opening transports,
+//! reading, writing, and timing — and supplies the transport types
+//! (`tokio_conn` / `smol_conn`) behind the `Connection` marker trait.  The
+//! `commands` module holds the command/event types that bridge the public
+//! API and the event loop.
 //!
-//! The `tokio` feature (default) enables the tokio-based runtime.
-//! The `smol` feature will enable an alternative smol-based runtime.
-//! The `commands` module is shared between both backends.
+//! The `tokio` feature (default) selects the tokio backend; the `smol`
+//! feature selects the smol backend.  When both are enabled, tokio wins.
 
 #[cfg(any(feature = "tokio", feature = "smol"))]
 pub(crate) mod commands;
 
 #[cfg(any(feature = "tokio", feature = "smol"))]
 pub(crate) mod connection;
+
+#[cfg(any(feature = "tokio", feature = "smol"))]
+pub(crate) mod backend;
+
+#[cfg(any(feature = "tokio", feature = "smol"))]
+pub(crate) mod session;
 
 #[cfg(feature = "tokio")]
 pub(crate) mod tokio_conn;
@@ -49,11 +58,14 @@ pub(crate) mod smol_rt;
 #[cfg(any(feature = "tokio", feature = "smol"))]
 pub(crate) use commands::{BufConfig, Command, ConnectParams, Event, ServerAddr};
 
+#[cfg(any(feature = "tokio", feature = "smol"))]
+pub(crate) use session::RuntimeHandle;
+
 #[cfg(feature = "tokio")]
-pub(crate) use tokio_rt::{RuntimeHandle, resolve_runtime};
+pub(crate) use tokio_rt::resolve_runtime;
 
 #[cfg(all(feature = "smol", not(feature = "tokio")))]
-pub(crate) use smol_rt::{RuntimeHandle, SmolOwnership, get_or_create_shared_executor};
+pub(crate) use smol_rt::{SmolOwnership, get_or_create_shared_executor};
 
 /// Unified runtime-ownership type for the active backend.
 #[cfg(feature = "tokio")]
