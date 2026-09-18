@@ -7,6 +7,41 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] - v2.0.0
+
+Version 2.0 is a rewrite of the library in pure Rust. The dependency on the Paho C library, and the `paho-mqtt-sys` FFI crate, are gone; the MQTT protocol is implemented by a new, separately published codec crate, `paho-mqtt-codec`, which has its own [CHANGELOG](paho-mqtt-codec/CHANGELOG.md). The public API is kept as close to v1.x as the rewrite allows; the items marked **[Breaking]** below are the places application code may need to change.
+
+### Architecture
+
+- Pure Rust; no C compiler, CMake, or OpenSSL build step. The `bundled`, `build_bindgen`, `ssl`, and `vendored-ssl` features no longer exist.
+- Selectable internal async runtime: `tokio` (default) or `smol`. The public API is unchanged by the choice and contains no `async fn`; `AsyncClient` still returns eagerly started `Token<T>` futures and `Client` still blocks on them.
+- Transports: TCP, Unix-domain sockets, TLS via rustls (`tls` / `smol-tls`) or OpenSSL (`openssl`, `openssl-vendored`; tokio only), WebSocket and WebSocket-over-TLS (`websocket` / `smol-websocket`).
+- **[Breaking]** MSRV is Rust 1.89; edition 2024.
+- **[Breaking]** Per-operation success/failure callbacks are removed. The connection-state callbacks (`connected`, `connection_lost`, `disconnected`) and the message callback remain, as do the sync and async event streams.
+
+### Protocol
+
+- MQTT v3.1 (`MQIsdp`, protocol level 3) is supported alongside v3.1.1 and v5: `MqttVersion::V3_1`, `MQTT_VERSION_3_1`, `ConnectOptions::with_mqtt_version(MQTT_VERSION_3_1)`.
+- The client advertises and enforces a maximum inbound packet size (v5 `MaximumPacketSize` in the connect properties), rejecting an oversized packet at the framing layer before its body is buffered.
+- The client honours the server's `MaximumPacketSize` from CONNACK: a publish that would exceed it fails its own token with `Error::Protocol(PacketTooLarge)` instead of being sent and causing the server to disconnect. A publish that cannot be encoded (for example, an invalid topic) likewise fails only its own token; previously either would have dropped the connection.
+- A broker-initiated DISCONNECT (v5) now fires the `disconnected` callback *and* `connection_lost`, and triggers auto-reconnect if enabled — matching the v1.x / Paho C behaviour. Previously it suppressed both.
+- Large publish payloads (over 16 KiB) are written to the transport from their own buffer, without being copied into the send buffer; QoS 1/2 messages are encoded once for both persistence and transmission.
+
+### API
+
+- **[Breaking]** `QOS_0`, `QOS_1`, `QOS_2` are `QoS` values and `MQTT_VERSION_*` are `MqttVersion` values, rather than `i32` / `u8`. Code that passes the named constants is unaffected (`Message::new(topic, payload, QOS_1)` still works). Code that passed integer literals or variables must convert: `QoS::try_from(n)?`, `MqttVersion::try_from(n)?`. The lossy `From<i32>` for `QoS` and `From<u8>` for `MqttVersion` — which mapped invalid values to a default — are removed.
+- **[Breaking]** `subscribe_many_same_qos` takes `impl Into<QoS>` instead of `i32`.
+- **[Breaking]** `Error::Publish` holds a `Box<Message>`.
+- **[Breaking]** `Properties`, `Property`, `PropertyId`, `PropertyValue`, `ReasonCode`, `QoS`, and `MqttVersion` are re-exported from `paho-mqtt-codec`; their APIs are described in that crate. `Properties` now validates values on `push` and rejects out-of-range values, repeated non-repeatable identifiers, and identifiers not permitted in the packet being encoded, at encode time.
+- `ConnectOptions::with_mqtt_version` now stores the requested version. In the initial v2 development builds it returned the default (v5) options for any v3 argument.
+- `ConnectResponse::mqtt_version` reports the negotiated protocol level (3, 4, or 5) rather than collapsing every v3 to 4.
+
+### Development
+
+- `paho-mqtt-codec` has Criterion benchmarks (`cargo bench -p paho-mqtt-codec`) and two `cargo-fuzz` targets; CI runs the benchmarks' compile and a short fuzz pass on every change, and builds the codec for a bare-metal `no_std` target.
+- `buildtst.sh` mirrors the CI matrix (feature sets × stable/MSRV, clippy, docs, no_std, benches) with `--integration`, `--fuzz`, and `--bench` options.
+- Integration tests (`tests/integration.rs`) run against a local Mosquitto on both runtimes, including WebSocket and v3.1.
+
 ## [v0.14.0](https://github.com/eclipse/paho.mqtt.rust/compare/v0.13.4..v0.14.0) - (2026-03-25)
 
 - Support for Paho C v1.3.16
