@@ -118,7 +118,8 @@ impl Unsubscribe {
 /// An UNSUBACK packet, unified across MQTT v3.1, v3.1.1, and v5.
 ///
 /// In v3, UNSUBACK carries only the packet identifier — `reason_codes`
-/// and `properties` are always empty and are not encoded on the wire.
+/// and `properties` must be empty; encoding a v3 UNSUBACK with either set
+/// is an error.
 /// In v5, one reason code is present per topic filter from the UNSUBSCRIBE.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
@@ -153,11 +154,12 @@ impl UnsubAck {
 
     /// Encodes the variable header and payload into `dst`.
     ///
-    /// Returns [`Error::ProtocolError`] if `packet_id` is 0, or if `ver` is
-    /// v5 and `reason_codes` is empty (§3.11.3). On v3 the codes are not on
-    /// the wire and may be empty.
+    /// Returns [`Error::ProtocolError`] if `packet_id` is 0, if `ver` is v5
+    /// and `reason_codes` is empty (§3.11.3), or if `ver` is v3 and
+    /// `reason_codes` is *not* empty — a v3 UNSUBACK cannot carry them, and
+    /// dropping them silently would hide a caller's mistake.
     pub fn encode<B: BufMut>(&self, dst: &mut B, ver: MqttVersion) -> Result<()> {
-        if ver == MqttVersion::V5 && self.reason_codes.is_empty() {
+        if (ver == MqttVersion::V5) == self.reason_codes.is_empty() {
             return Err(Error::ProtocolError);
         }
         dst.put_u16(check_packet_id(self.packet_id)?);
@@ -354,12 +356,13 @@ mod tests {
     }
 
     #[test]
-    fn test_unsuback_v311_ignores_reason_codes() {
-        // Reason codes are present in the struct but must not appear on the wire.
+    fn test_unsuback_v311_rejects_reason_codes() {
+        // A v3 UNSUBACK cannot carry reason codes; refusing to encode is
+        // better than dropping them silently.
         let ua = UnsubAck::new(1, vec![ReasonCode::Success, ReasonCode::NotAuthorized]);
         let mut dst = BytesMut::new();
-        ua.encode(&mut dst, v311()).unwrap();
-        assert_eq!(dst.len(), 2);
+        assert_eq!(ua.encode(&mut dst, v311()), Err(Error::ProtocolError));
+        assert!(dst.is_empty());
     }
 
     #[test]
@@ -442,11 +445,14 @@ mod tests {
     #[test]
     fn test_unsuback_encoded_size_matches_encode() {
         let ua = UnsubAck::new(3, vec![ReasonCode::Success, ReasonCode::NotAuthorized]);
-        for ver in [v311(), v5()] {
-            let mut dst = BytesMut::new();
-            ua.encode(&mut dst, ver).unwrap();
-            assert_eq!(dst.len(), ua.encoded_size(ver));
-        }
+        let mut dst = BytesMut::new();
+        ua.encode(&mut dst, v5()).unwrap();
+        assert_eq!(dst.len(), ua.encoded_size(v5()));
+
+        let ua = UnsubAck::new(3, vec![]);
+        let mut dst = BytesMut::new();
+        ua.encode(&mut dst, v311()).unwrap();
+        assert_eq!(dst.len(), ua.encoded_size(v311()));
     }
 
     #[test]

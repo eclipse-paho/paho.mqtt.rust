@@ -25,8 +25,9 @@
 //! collection encodes and decodes the length-prefixed property list that
 //! appears in the variable header of every v5 packet type that supports them.
 //!
-//! On v3 connections properties are always empty and are never written to
-//! or read from the wire.
+//! Properties exist only in v5. On a v3 connection nothing is read from the
+//! wire and an empty list writes nothing; encoding a non-empty list for v3
+//! is an error rather than a silent drop.
 
 use crate::{
     Error, MqttVersion, PacketType, Result, String, Vec, varlen,
@@ -607,8 +608,8 @@ impl SeenIds {
 /// `UserProperty`; allowed for `SubscriptionIdentifier`). Use [`Properties::get`]
 /// for the first occurrence and [`Properties::iter`] when you need all.
 ///
-/// On v3 connections, properties are always empty and are never written
-/// to the wire.
+/// On v3 connections nothing is read from the wire; encoding a non-empty
+/// list for v3 is an [`Error::ProtocolError`] (see [`encode`](Self::encode)).
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(
@@ -685,16 +686,24 @@ impl Properties {
 
     /// Encodes the properties to the wire: VBI(payload_len) followed by each property.
     ///
-    /// No bytes are written for v3 connections.
+    /// Properties do not exist before v5, so on a v3 connection an empty
+    /// list writes nothing and a non-empty one is [`Error::ProtocolError`]:
+    /// the caller built a packet the connection cannot carry, and dropping
+    /// the properties silently would hide that.
     pub fn encode<B: BufMut>(&self, dst: &mut B, ver: MqttVersion) -> Result<()> {
-        if ver >= MqttVersion::V5 {
-            if self.seen.is_invalid() {
-                return Err(Error::ProtocolError);
-            }
-            varlen::encode(self.payload_size() as u32, dst)?;
-            for prop in &self.props {
-                prop.encode(dst)?;
-            }
+        if ver < MqttVersion::V5 {
+            return if self.is_empty() {
+                Ok(())
+            } else {
+                Err(Error::ProtocolError)
+            };
+        }
+        if self.seen.is_invalid() {
+            return Err(Error::ProtocolError);
+        }
+        varlen::encode(self.payload_size() as u32, dst)?;
+        for prop in &self.props {
+            prop.encode(dst)?;
         }
         Ok(())
     }
@@ -1369,8 +1378,11 @@ mod tests {
         props.push(prop(PropertyId::ReceiveMaximum, PropertyValue::U16(2)));
         let mut dst = BytesMut::new();
         assert_eq!(props.encode(&mut dst, v5()), Err(Error::ProtocolError));
-        // Not written at all on v3.1.1, so nothing to reject.
-        assert!(props.encode(&mut dst, MqttVersion::V3_1_1).is_ok());
+        // Rejected on v3 too — non-empty properties cannot be carried there.
+        assert_eq!(
+            props.encode(&mut dst, MqttVersion::V3_1_1),
+            Err(Error::ProtocolError)
+        );
     }
 
     #[test]
@@ -1617,5 +1629,34 @@ mod tests {
         );
         // The context-free decoder stays permissive.
         assert!(Properties::decode(&mut wire.clone(), v5()).is_ok());
+    }
+
+    // ---- Non-empty properties cannot be encoded for v3 ----
+
+    #[test]
+    fn test_encode_non_empty_on_v3_is_protocol_error() {
+        let mut props = Properties::new();
+        props.push(prop(
+            PropertyId::UserProperty,
+            PropertyValue::StringPair("k".into(), "v".into()),
+        ));
+        for ver in [MqttVersion::V3_1, MqttVersion::V3_1_1] {
+            let mut dst = BytesMut::new();
+            assert_eq!(
+                props.encode(&mut dst, ver),
+                Err(Error::ProtocolError),
+                "{ver}"
+            );
+            assert!(dst.is_empty());
+            assert_eq!(props.encoded_size(ver), 0);
+        }
+        // Empty is still fine and writes nothing.
+        let mut dst = BytesMut::new();
+        assert!(
+            Properties::new()
+                .encode(&mut dst, MqttVersion::V3_1_1)
+                .is_ok()
+        );
+        assert!(dst.is_empty());
     }
 }

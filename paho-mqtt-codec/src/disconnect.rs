@@ -90,9 +90,14 @@ impl Disconnect {
     /// Uses the shortest v5 form permitted: nothing for a normal disconnect
     /// with no properties, just the reason code when there are no
     /// properties, otherwise the full form.
+    ///
+    /// On v3 nothing is written; a non-empty `properties` is
+    /// [`Error::ProtocolError`](crate::Error::ProtocolError). A v3 DISCONNECT
+    /// has no reason code, so `reason_code` is not checked for that version.
     pub fn encode<B: BufMut>(&self, dst: &mut B, ver: MqttVersion) -> Result<()> {
         if ver != MqttVersion::V5 {
-            return Ok(());
+            // A v3 DISCONNECT has no body; non-empty properties are an error.
+            return self.properties.encode(dst, ver);
         }
         match (self.reason_code, self.properties.is_empty()) {
             (ReasonCode::NormalDisconnection, true) => {}

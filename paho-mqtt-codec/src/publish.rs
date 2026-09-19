@@ -86,7 +86,7 @@ impl Publish {
     /// Encodes the PUBLISH variable header and payload into `dst`.
     ///
     /// Returns [`Error::ProtocolError`] if `qos > 0` but `packet_id` is `None`
-    /// or `Some(0)`.
+    /// or `Some(0)`, or if `qos == 0` and `packet_id` is set.
     pub fn encode<B: BufMut>(&self, dst: &mut B, ver: MqttVersion) -> Result<()> {
         self.encode_header(dst, ver)?;
         dst.put_slice(&self.payload);
@@ -98,7 +98,7 @@ impl Publish {
     /// separately by the caller.
     ///
     /// Returns [`Error::ProtocolError`] if `qos > 0` but `packet_id` is `None`
-    /// or `Some(0)`.
+    /// or `Some(0)`, or if `qos == 0` and `packet_id` is set.
     pub fn encode_header<B: BufMut>(&self, dst: &mut B, ver: MqttVersion) -> Result<()> {
         // Same rules as decode: no wildcards; empty only with a v5 alias.
         if topic::has_wildcards(&self.topic)
@@ -109,9 +109,13 @@ impl Publish {
             return Err(Error::TopicNameInvalid);
         }
         put_utf8(&self.topic, dst)?;
-        if self.qos != QoS::QoS0 {
-            let id = check_packet_id(self.packet_id.ok_or(Error::ProtocolError)?)?;
-            dst.put_u16(id);
+        match (self.qos, self.packet_id) {
+            // A QoS 0 PUBLISH has no packet identifier (MQTT-2.2.1-2); one
+            // that is set would be dropped silently, so treat it as a
+            // caller error.
+            (QoS::QoS0, Some(_)) => return Err(Error::ProtocolError),
+            (QoS::QoS0, None) => {}
+            (_, id) => dst.put_u16(check_packet_id(id.ok_or(Error::ProtocolError)?)?),
         }
         self.properties.check_context(PacketType::Publish)?;
         self.properties.encode(dst, ver)
@@ -235,11 +239,15 @@ impl PubAck {
 
     /// Encodes the variable header into `dst`.
     ///
-    /// Returns [`Error::ProtocolError`] if `packet_id` is 0.
+    /// Returns [`Error::ProtocolError`] if `packet_id` is 0, or if `ver` is
+    /// v3 and `properties` is not empty (v3 acknowledgements carry only the
+    /// packet identifier; a non-success `reason_code` cannot be expressed
+    /// either and is dropped — see [`PubAck`]).
     pub fn encode<B: BufMut>(&self, dst: &mut B, ver: MqttVersion) -> Result<()> {
         dst.put_u16(check_packet_id(self.packet_id)?);
         if ver != MqttVersion::V5 {
-            return Ok(());
+            // Nothing more on the wire; a non-empty list is an error.
+            return self.properties.encode(dst, ver);
         }
         match (self.reason_code, self.properties.is_empty()) {
             (ReasonCode::Success, true) => {}
@@ -804,5 +812,42 @@ mod tests {
             PubAck::decode(Bytes::from_static(&[0x00, 0x01, 0xFF, 0x00]), v5()),
             Err(Error::ProtocolError)
         );
+    }
+
+    // ---- v3 acknowledgements cannot carry properties ----
+
+    #[test]
+    fn test_puback_encode_props_on_v3_is_protocol_error() {
+        let mut ack = PubAck::new(1);
+        ack.properties.push(Property::new(
+            PropertyId::ReasonString,
+            PropertyValue::String("x".into()),
+        ));
+        let mut dst = BytesMut::new();
+        assert_eq!(ack.encode(&mut dst, v311()), Err(Error::ProtocolError));
+        // Same packet is fine on v5.
+        let mut dst = BytesMut::new();
+        assert!(ack.encode(&mut dst, v5()).is_ok());
+    }
+
+    // ---- A QoS 0 PUBLISH must not carry a packet identifier ----
+
+    #[test]
+    fn test_publish_qos0_with_packet_id_is_protocol_error_on_encode() {
+        let mut p = Publish::new("a", "x");
+        p.packet_id = Some(7);
+        for ver in [v311(), v5()] {
+            let mut dst = BytesMut::new();
+            assert_eq!(p.encode(&mut dst, ver), Err(Error::ProtocolError), "{ver}");
+            let mut dst = BytesMut::new();
+            assert_eq!(
+                p.encode_header(&mut dst, ver),
+                Err(Error::ProtocolError),
+                "{ver}"
+            );
+        }
+        p.packet_id = None;
+        let mut dst = BytesMut::new();
+        assert!(p.encode(&mut dst, v5()).is_ok());
     }
 }

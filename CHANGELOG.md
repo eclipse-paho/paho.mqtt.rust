@@ -33,6 +33,7 @@ Version 2.0 is a rewrite of the library in pure Rust. The dependency on the Paho
 - **[Breaking]** `subscribe_many_same_qos` takes `impl Into<QoS>` instead of `i32`.
 - **[Breaking]** `Error::Publish` holds a `Box<Message>`.
 - **[Breaking]** `Properties`, `Property`, `PropertyId`, `PropertyValue`, `ReasonCode`, `QoS`, and `MqttVersion` are re-exported from `paho-mqtt-codec`; their APIs are described in that crate. `Properties` now validates values on `push` and rejects out-of-range values, repeated non-repeatable identifiers, and identifiers not permitted in the packet being encoded, at encode time.
+- `AsyncClient::disconnect` / `Client::disconnect` return `Error::WrongMqttVersion` when `DisconnectOptions` carry v5 properties on a v3 connection, as `connect`, `publish`, and `subscribe` already did for theirs.
 - `ConnectOptions::with_mqtt_version` now stores the requested version. In the initial v2 development builds it returned the default (v5) options for any v3 argument.
 - `ConnectResponse::mqtt_version` reports the negotiated protocol level (3, 4, or 5) rather than collapsing every v3 to 4.
 

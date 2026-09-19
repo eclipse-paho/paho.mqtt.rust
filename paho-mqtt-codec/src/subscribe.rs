@@ -223,7 +223,8 @@ impl Subscribe {
 /// In v3 the per-subscription return codes (`0x00`=QoS0, `0x01`=QoS1,
 /// `0x02`=QoS2, `0x80`=Failure) share byte values with
 /// [`ReasonCode::GrantedQos0`] / `GrantedQos1` / `GrantedQos2` /
-/// [`ReasonCode::UnspecifiedError`], so no translation is needed.
+/// [`ReasonCode::UnspecifiedError`], so no translation is needed; any other
+/// code is rejected on a v3 connection in both directions.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct SubAck {
@@ -253,7 +254,9 @@ impl SubAck {
     /// Encodes the variable header and payload into `dst`.
     ///
     /// Returns [`Error::ProtocolError`] if `packet_id` is 0 or
-    /// `reason_codes` is empty (MQTT-3.9.3-1).
+    /// `reason_codes` is empty (MQTT-3.9.3-1), and
+    /// [`Error::MalformedPacket`] if `ver` is v3 and a code is not one of the
+    /// four v3 return codes (see [`is_v3_return_code`](Self::is_v3_return_code)).
     pub fn encode<B: BufMut>(&self, dst: &mut B, ver: MqttVersion) -> Result<()> {
         if self.reason_codes.is_empty() {
             return Err(Error::ProtocolError);
@@ -262,9 +265,25 @@ impl SubAck {
         self.properties.check_context(PacketType::SubAck)?;
         self.properties.encode(dst, ver)?;
         for &rc in &self.reason_codes {
+            if !ver.is_v5() && !Self::is_v3_return_code(rc) {
+                return Err(Error::MalformedPacket);
+            }
             dst.put_u8(rc as u8);
         }
         Ok(())
+    }
+
+    /// Returns `true` for the four return codes a v3 SUBACK may carry:
+    /// `GrantedQos0`/`1`/`2` (0x00–0x02) and `UnspecifiedError` (0x80, the
+    /// v3 "Failure"). Every other value is reserved in v3 (§3.9.3).
+    pub fn is_v3_return_code(rc: ReasonCode) -> bool {
+        matches!(
+            rc,
+            ReasonCode::GrantedQos0
+                | ReasonCode::GrantedQos1
+                | ReasonCode::GrantedQos2
+                | ReasonCode::UnspecifiedError
+        )
     }
 
     /// Decodes from the raw `payload` bytes for the given version, `ver`.
@@ -277,12 +296,18 @@ impl SubAck {
         let reason_codes = payload
             .iter()
             .copied()
-            .map(ReasonCode::try_from)
+            .map(|b| {
+                let rc = ReasonCode::try_from(b)?;
+                // v3 defines only 0x00–0x02 and 0x80; the rest are reserved.
+                if !ver.is_v5() && !Self::is_v3_return_code(rc) {
+                    return Err(Error::MalformedPacket);
+                }
+                Ok(rc)
+            })
             .collect::<Result<Vec<_>>>()?;
         if reason_codes.is_empty() {
             return Err(Error::ProtocolError); // one code per filter (MQTT-3.9.3-1)
         }
-
         Ok(SubAck {
             packet_id,
             reason_codes,
@@ -712,5 +737,43 @@ mod tests {
         // With a single identifier the same layout decodes.
         let bytes: &[u8] = &[0x00, 0x01, 0x02, 0x0B, 0x01, 0x00, 0x01, b'a', 0x00];
         assert!(Subscribe::decode(Bytes::from_static(bytes), v5()).is_ok());
+    }
+
+    // ---- v3 SUBACK carries only the four v3 return codes (§3.9.3) ----
+
+    #[test]
+    fn test_is_v3_return_code() {
+        assert!(SubAck::is_v3_return_code(ReasonCode::GrantedQos0));
+        assert!(SubAck::is_v3_return_code(ReasonCode::GrantedQos1));
+        assert!(SubAck::is_v3_return_code(ReasonCode::GrantedQos2));
+        assert!(SubAck::is_v3_return_code(ReasonCode::UnspecifiedError));
+        assert!(!SubAck::is_v3_return_code(ReasonCode::NotAuthorized));
+        assert!(!SubAck::is_v3_return_code(ReasonCode::TopicFilterInvalid));
+    }
+
+    #[test]
+    fn test_suback_v3_decode_rejects_v5_only_code() {
+        // id 1, code 0x87 (NotAuthorized): valid in a v5 SUBACK, reserved in v3.
+        let bytes: &[u8] = &[0x00, 0x01, 0x87];
+        assert_eq!(
+            SubAck::decode(Bytes::from_static(bytes), v311()),
+            Err(Error::MalformedPacket)
+        );
+        assert_eq!(
+            SubAck::decode(Bytes::from_static(bytes), MqttVersion::V3_1),
+            Err(Error::MalformedPacket)
+        );
+        // 0x80 (Failure) is the v3 error code and stays accepted.
+        let ok = SubAck::decode(Bytes::from_static(&[0x00, 0x01, 0x80]), v311()).unwrap();
+        assert_eq!(ok.reason_codes, vec![ReasonCode::UnspecifiedError]);
+    }
+
+    #[test]
+    fn test_suback_v3_encode_rejects_v5_only_code() {
+        let ack = SubAck::new(1, vec![ReasonCode::GrantedQos1, ReasonCode::NotAuthorized]);
+        let mut dst = BytesMut::new();
+        assert_eq!(ack.encode(&mut dst, v311()), Err(Error::MalformedPacket));
+        let mut dst = BytesMut::new();
+        assert!(ack.encode(&mut dst, v5()).is_ok());
     }
 }

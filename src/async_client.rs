@@ -331,6 +331,12 @@ impl AsyncClient {
         let opts = opts.into().unwrap_or_default();
         debug!("Disconnecting");
 
+        // v5 DISCONNECT properties cannot go on a v3 connection; the codec
+        // would refuse to encode them and the DISCONNECT would never be sent.
+        if let Err(e) = self.require_v5_for_props(&opts.props) {
+            return Token::<()>::from_err(e);
+        }
+
         let (tok, comp) = Token::<()>::new();
 
         let cmd = Command::Disconnect {
