@@ -33,18 +33,15 @@
 //! copy is excluded from the timing) because framing consumes its input.
 
 use bytes::{Bytes, BytesMut};
-use criterion::{
-    BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main,
-};
+use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use paho_mqtt_codec::{
-    Auth, ConnAck, Connect, Disconnect, MqttVersion, Packet, Properties, Property,
-    PropertyId, PropertyValue, PubAck, Publish, QoS, RawPacket, ReasonCode, RetainHandling,
-    SubAck, Subscribe, Subscription, UnsubAck, Unsubscribe, Will,
+    Auth, ConnAck, Connect, Disconnect, MqttVersion, Packet, Properties, Property, PropertyId,
+    PropertyValue, PubAck, Publish, QoS, RawPacket, ReasonCode, RetainHandling, SubAck, Subscribe,
+    Subscription, UnsubAck, Unsubscribe, Will,
 };
 use std::hint::black_box;
 
-const VERSIONS: [(MqttVersion, &str); 2] =
-    [(MqttVersion::V3_1_1, "v311"), (MqttVersion::V5, "v5")];
+const VERSIONS: [(MqttVersion, &str); 2] = [(MqttVersion::V3_1_1, "v311"), (MqttVersion::V5, "v5")];
 
 /// v3.1 differs from v3.1.1 only in CONNECT/CONNACK, so only those two are
 /// benchmarked for it.
@@ -56,8 +53,7 @@ fn packets_for(ver: MqttVersion) -> Vec<(&'static str, Packet)> {
     let pkts = packets(ver);
     if ver == MqttVersion::V3_1 {
         pkts.into_iter().take(2).collect()
-    }
-    else {
+    } else {
         pkts
     }
 }

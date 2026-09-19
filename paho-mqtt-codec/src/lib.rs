@@ -68,7 +68,7 @@ pub use publish::{PubAck, PubComp, PubRec, PubRel, Publish};
 pub use reason_code::ReasonCode;
 pub use subscribe::{RetainHandling, SubAck, Subscribe, Subscription};
 pub use types::{
-    MQTT_VERSION_3, MQTT_VERSION_3_1, MQTT_VERSION_3_1_1, MQTT_VERSION_5,
-    MQTT_VERSION_DEFAULT, MqttVersion, QOS_0, QOS_1, QOS_2, QoS,
+    MQTT_VERSION_3, MQTT_VERSION_3_1, MQTT_VERSION_3_1_1, MQTT_VERSION_5, MQTT_VERSION_DEFAULT,
+    MqttVersion, QOS_0, QOS_1, QOS_2, QoS,
 };
 pub use unsubscribe::{UnsubAck, Unsubscribe};

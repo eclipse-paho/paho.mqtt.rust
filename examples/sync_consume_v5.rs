@@ -59,8 +59,7 @@ fn command_handler(msg: mqtt::Message) -> bool {
     if cmd == "exit" {
         println!("Exit command received");
         false
-    }
-    else {
+    } else {
         println!("Received command: '{}'", cmd);
         true
     }
@@ -155,8 +154,7 @@ fn main() -> mqtt::Result<()> {
 
     if rsp.session_present {
         println!("  w/ client session already present on broker.");
-    }
-    else {
+    } else {
         // Register subscriptions on the server, using Subscription ID's.
         println!(r#"Subscribing to topics ["data/#", "command"]..."#);
         cli.subscribe_with_options("data/#", mqtt::QOS_0, None, sub_id(1))?;
@@ -190,8 +188,7 @@ fn main() -> mqtt::Result<()> {
             if !handler[sub_id - 1](msg) {
                 break;
             }
-        }
-        else if cli.is_connected() || !try_reconnect(&cli) {
+        } else if cli.is_connected() || !try_reconnect(&cli) {
             break;
         }
     }

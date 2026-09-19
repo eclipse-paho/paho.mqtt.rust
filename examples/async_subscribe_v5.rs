@@ -65,8 +65,7 @@ fn main() {
     let topics: Vec<String> = args.collect();
     let topics: Vec<&str> = if topics.is_empty() {
         vec![DEFAULT_TOPIC]
-    }
-    else {
+    } else {
         topics.iter().map(String::as_str).collect()
     };
     let qos = vec![QOS; topics.len()];
@@ -117,8 +116,7 @@ fn main() {
         cli.connect(conn_opts).await?;
 
         println!("Subscribing to topics: {:?}", topics);
-        let sub_opts =
-            vec![mqtt::SubscribeOptions::with_retain_as_published(); topics.len()];
+        let sub_opts = vec![mqtt::SubscribeOptions::with_retain_as_published(); topics.len()];
         cli.subscribe_many_with_options(&topics, &qos, &sub_opts, None)
             .await?;
 
@@ -136,8 +134,7 @@ fn main() {
                     print!("(R) ");
                 }
                 println!("{}", msg);
-            }
-            else {
+            } else {
                 // A "None" means we were disconnected. Try to reconnect...
                 println!("Lost connection. Attempting reconnect.");
                 while let Err(err) = cli.reconnect().await {

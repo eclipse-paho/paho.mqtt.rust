@@ -25,8 +25,7 @@
 //! a separate parameter extracted from [`crate::packet::RawPacket::header`].
 
 use crate::{
-    Error, MqttVersion, PacketType, Properties, PropertyId, QoS, ReasonCode, Result,
-    String, topic,
+    Error, MqttVersion, PacketType, Properties, PropertyId, QoS, ReasonCode, Result, String, topic,
     wire::{get_utf8, put_utf8, utf8_wire_size},
 };
 use bytes::{Buf, BufMut, Bytes};
@@ -144,8 +143,7 @@ impl Publish {
                 0 => return Err(Error::ProtocolError),
                 id => Some(id),
             }
-        }
-        else {
+        } else {
             None
         };
 
@@ -266,14 +264,12 @@ impl PubAck {
                 if payload.is_empty() {
                     // Shorthand: no reason code byte → implicit Success
                     (ReasonCode::Success, Properties::new())
-                }
-                else {
+                } else {
                     let rc = ReasonCode::try_from(payload.get_u8())?;
                     // Property length is omitted when the remaining length < 4.
                     let props = if payload.is_empty() {
                         Properties::new()
-                    }
-                    else {
+                    } else {
                         Properties::decode_in(&mut payload, ver, PacketType::PubAck)?
                     };
                     (rc, props)

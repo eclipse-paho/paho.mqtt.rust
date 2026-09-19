@@ -127,8 +127,7 @@ impl Future for SmolSleep {
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
         if self.enabled {
             Pin::new(&mut self.timer).poll(cx).map(|_| ())
-        }
-        else {
+        } else {
             Poll::Pending
         }
     }
@@ -176,9 +175,7 @@ impl Backend for SmolBackend {
         #[allow(unused_variables)] p: &ConnectParams, // only TLS/WS arms use it
     ) -> Result<(Self::Reader, Self::Writer)> {
         let conn: Box<dyn Connection> = match addr {
-            ServerAddr::Tcp { host, port } => {
-                Box::new(TcpConnection::connect(host, *port).await?)
-            }
+            ServerAddr::Tcp { host, port } => Box::new(TcpConnection::connect(host, *port).await?),
             #[cfg(feature = "smol-tls")]
             ServerAddr::Tls { host, port } => {
                 let tls = p.tls.as_ref().ok_or(Error::MissingTlsOptions)?;

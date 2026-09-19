@@ -139,8 +139,7 @@ impl UnsubAck {
     pub fn encoded_size(&self, ver: MqttVersion) -> usize {
         let rc_len = if ver == MqttVersion::V5 {
             self.reason_codes.len()
-        }
-        else {
+        } else {
             0
         };
         2 + self.properties.encoded_size(ver) + rc_len
@@ -176,8 +175,7 @@ impl UnsubAck {
                 return Err(Error::ProtocolError); // one code per filter (§3.11.3)
             }
             codes
-        }
-        else {
+        } else {
             Vec::new()
         };
 

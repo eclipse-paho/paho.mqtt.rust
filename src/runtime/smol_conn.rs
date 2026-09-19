@@ -86,17 +86,11 @@ macro_rules! impl_connection {
                 Pin::new(&mut self.stream).poll_write(cx, buf)
             }
 
-            fn poll_flush(
-                mut self: Pin<&mut Self>,
-                cx: &mut Context<'_>,
-            ) -> Poll<io::Result<()>> {
+            fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
                 Pin::new(&mut self.stream).poll_flush(cx)
             }
 
-            fn poll_close(
-                mut self: Pin<&mut Self>,
-                cx: &mut Context<'_>,
-            ) -> Poll<io::Result<()>> {
+            fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
                 Pin::new(&mut self.stream).poll_close(cx)
             }
         }
@@ -285,13 +279,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for WsConnection<S> {
                     return Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, e)));
                 }
                 Poll::Ready(Ok(())) => {
-                    if let Err(e) =
-                        Pin::new(&mut this.stream).start_send(WsMessage::Binary(data))
-                    {
-                        return Poll::Ready(Err(io::Error::new(
-                            io::ErrorKind::BrokenPipe,
-                            e,
-                        )));
+                    if let Err(e) = Pin::new(&mut this.stream).start_send(WsMessage::Binary(data)) {
+                        return Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, e)));
                     }
                 }
             }
@@ -444,9 +433,7 @@ fn filter_cipher_suites(spec: &str) -> Result<Vec<rustls::SupportedCipherSuite>>
 /// Identical logic to the tokio backend's `make_tls_config`; only the
 /// async wrapper crate differs (`futures-rustls` vs `tokio-rustls`).
 #[cfg(feature = "smol-tls")]
-pub(super) fn make_tls_config(
-    tls: &crate::TlsOptions,
-) -> Result<StdArc<rustls::ClientConfig>> {
+pub(super) fn make_tls_config(tls: &crate::TlsOptions) -> Result<StdArc<rustls::ClientConfig>> {
     use crate::TlsVersion;
     use rustls::RootCertStore;
     use std::io::BufReader;
@@ -519,8 +506,7 @@ pub(super) fn make_tls_config(
     // ---- Certificate verification ----
     let wants_client = if tls.enable_server_cert_auth {
         builder.with_root_certificates(root_store)
-    }
-    else {
+    } else {
         builder
             .dangerous()
             .with_custom_certificate_verifier(StdArc::new(NoCertVerifier))
@@ -536,8 +522,7 @@ pub(super) fn make_tls_config(
 
         let key_path = if !tls.private_key.as_os_str().is_empty() {
             &tls.private_key
-        }
-        else {
+        } else {
             &tls.key_store
         };
         let key_f = std::fs::File::open(key_path).map_err(Error::Io)?;
@@ -548,8 +533,7 @@ pub(super) fn make_tls_config(
         wants_client
             .with_client_auth_cert(certs, key)
             .map_err(|e| Error::GeneralString(e.to_string()))?
-    }
-    else {
+    } else {
         wants_client.with_no_client_auth()
     };
 

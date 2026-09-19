@@ -29,10 +29,9 @@
 //! The synchronous calls use a default timeout
 
 use crate::{
-    AsyncClient, AsyncReceiver, ConnectOptions, ConnectResponse, CreateOptions,
-    DeliveryToken, DisconnectOptions, Event, Message, MqttVersion, Properties,
-    PublishResponse, QoS, ReasonCode, Result, SubscribeOptions, SubscribeResponse,
-    SyncReceiver, UserData,
+    AsyncClient, AsyncReceiver, ConnectOptions, ConnectResponse, CreateOptions, DeliveryToken,
+    DisconnectOptions, Event, Message, MqttVersion, Properties, PublishResponse, QoS, ReasonCode,
+    Result, SubscribeOptions, SubscribeResponse, SyncReceiver, UserData,
 };
 use std::time::Duration;
 
@@ -201,11 +200,7 @@ impl Client {
     /// * `topics` The collection of topic names
     /// * `qos` The quality of service requested for all messages
     ///
-    pub fn subscribe_many_same_qos<T, Q>(
-        &self,
-        topics: &[T],
-        qos: Q,
-    ) -> Result<SubscribeResponse>
+    pub fn subscribe_many_same_qos<T, Q>(&self, topics: &[T], qos: Q) -> Result<SubscribeResponse>
     where
         T: AsRef<str>,
         Q: Into<QoS>,
@@ -294,11 +289,7 @@ impl Client {
     ///   previous subscribe.
     /// * `props` MQTT v5 properties for the unsubscribe.
     ///
-    pub fn unsubscribe_many_with_options<T>(
-        &self,
-        topics: &[T],
-        props: Properties,
-    ) -> Result<()>
+    pub fn unsubscribe_many_with_options<T>(&self, topics: &[T], props: Properties) -> Result<()>
     where
         T: AsRef<str>,
     {

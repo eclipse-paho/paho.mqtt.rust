@@ -218,13 +218,10 @@ impl<B: Backend> Session<B> {
     /// count is below `max_inflight`.  A transport error propagates immediately.
     async fn drain_deferred(&mut self) -> Result<()> {
         loop {
-            if self.limits.max_inflight != 0
-                && self.inflight_count() >= self.limits.max_inflight
-            {
+            if self.limits.max_inflight != 0 && self.inflight_count() >= self.limits.max_inflight {
                 break;
             }
-            let Some(cmd) = self.inflight_deferred.pop_front()
-            else {
+            let Some(cmd) = self.inflight_deferred.pop_front() else {
                 break;
             };
             self.handle_command(cmd).await?;
@@ -316,8 +313,7 @@ impl<B: Backend> Session<B> {
     /// error aborts the restore and bubbles up via `Err`.
     async fn restore(&mut self) -> Result<()> {
         let keys = {
-            let Some(persist) = &self.persist
-            else {
+            let Some(persist) = &self.persist else {
                 return Ok(());
             };
             match persist.lock().unwrap().keys() {
@@ -328,8 +324,7 @@ impl<B: Backend> Session<B> {
 
         for key in &keys {
             let data = {
-                let Some(persist) = &self.persist
-                else {
+                let Some(persist) = &self.persist else {
                     return Ok(());
                 };
                 match persist.lock().unwrap().get(key) {
@@ -351,8 +346,7 @@ impl<B: Backend> Session<B> {
             if key.starts_with('s') {
                 // Outbound QoS 1/2 PUBLISH — retransmit with DUP=true.
                 if let Packet::Publish(mut pub_pkt) = pkt {
-                    let Some(pid) = pub_pkt.packet_id
-                    else {
+                    let Some(pid) = pub_pkt.packet_id else {
                         continue;
                     };
                     let qos = pub_pkt.qos;
@@ -372,8 +366,7 @@ impl<B: Backend> Session<B> {
                         _ => {}
                     }
                 }
-            }
-            else if key.starts_with('r') {
+            } else if key.starts_with('r') {
                 // Inbound QoS 2 awaiting PUBREL — reload so PUBREL is handled.
                 if let Packet::Publish(pub_pkt) = pkt {
                     let id = pub_pkt.packet_id.unwrap_or(0);
@@ -402,8 +395,7 @@ impl<B: Backend> Session<B> {
         // that PINGREQs are only sent when the connection has been truly idle.
         let mut ka_sleep = if ka_enabled {
             B::Sleep::new(keep_alive)
-        }
-        else {
+        } else {
             B::Sleep::never()
         };
 
@@ -531,10 +523,7 @@ impl<B: Backend> Session<B> {
             Packet::PubRec(rec) => {
                 if rec.reason_code as u8 >= 0x80 {
                     if let Some(tx) = self.pending_pub2.remove(&rec.packet_id) {
-                        tx.complete(Err(Error::ReasonCode(
-                            rec.reason_code,
-                            rec.properties,
-                        )));
+                        tx.complete(Err(Error::ReasonCode(rec.reason_code, rec.properties)));
                     }
                     return Ok(());
                 }
@@ -590,8 +579,7 @@ impl<B: Backend> Session<B> {
                     if packet.encode(&mut enc_buf, self.ver).is_ok() {
                         self.persist_put(&format!("r{id}"), vec![&enc_buf]);
                     }
-                    let Packet::Publish(pub_pkt) = packet
-                    else {
+                    let Packet::Publish(pub_pkt) = packet else {
                         unreachable!()
                     };
                     let msg = Message::from(pub_pkt);
@@ -703,9 +691,7 @@ impl<B: Backend> Session<B> {
                         return Ok(false);
                     }
                 };
-                if let Err(e) =
-                    self.check_outbound_size(payload.as_ref().map_or(0, Bytes::len))
-                {
+                if let Err(e) = self.check_outbound_size(payload.as_ref().map_or(0, Bytes::len)) {
                     tx.complete(Err(e));
                     return Ok(false);
                 }
@@ -751,9 +737,7 @@ impl<B: Backend> Session<B> {
                             no_local: opts.no_local,
                             retain_as_published: opts.retain_as_published,
                             retain_handling: match opts.retain_handling {
-                                RH::SendRetainedOnSubscribe => {
-                                    CodecRetainHandling::SendOnSubscribe
-                                }
+                                RH::SendRetainedOnSubscribe => CodecRetainHandling::SendOnSubscribe,
                                 RH::SendRetainedOnNew => CodecRetainHandling::SendIfNew,
                                 RH::DontSendRetained => CodecRetainHandling::DoNotSend,
                             },
@@ -807,9 +791,7 @@ impl ConnectJob {
     ///
     /// Returns `Ok((job, tx))` on success or `Err(cmd)` if `cmd` is not a
     /// `Connect` variant, giving the caller back the original command.
-    fn extract(
-        cmd: Command,
-    ) -> std::result::Result<(Self, Completer<ConnectResponse>), Command> {
+    fn extract(cmd: Command) -> std::result::Result<(Self, Completer<ConnectResponse>), Command> {
         match cmd {
             Command::Connect {
                 params,
@@ -831,9 +813,7 @@ impl ConnectJob {
 }
 
 /// Opens persistence and the transport, sends CONNECT, waits for CONNACK.
-async fn do_connect<B: Backend>(
-    job: &ConnectJob,
-) -> Result<(B::Reader, B::Writer, ConnAck)> {
+async fn do_connect<B: Backend>(job: &ConnectJob) -> Result<(B::Reader, B::Writer, ConnAck)> {
     let p = &job.params;
     let (addr, server_uri) = &p.servers[job.server_idx];
 
@@ -864,8 +844,7 @@ async fn do_connect<B: Backend>(
 
     // ---- Wait for CONNACK ----
     let mut read_buf = BytesMut::with_capacity(256);
-    let connack =
-        recv_connack::<B>(&mut reader, &mut read_buf, p.ver, p.max_packet_size()).await?;
+    let connack = recv_connack::<B>(&mut reader, &mut read_buf, p.ver, p.max_packet_size()).await?;
 
     Ok((reader, writer, connack))
 }
@@ -879,8 +858,7 @@ async fn do_connect<B: Backend>(
 fn buf_push(buf: &mut VecDeque<Command>, cmd: Command, cfg: &BufConfig) {
     if buf.len() < cfg.max_buffered_msgs {
         buf.push_back(cmd);
-    }
-    else if cfg.delete_oldest {
+    } else if cfg.delete_oldest {
         buf.pop_front(); // oldest Completer drops → resolves with Disconnected
         buf.push_back(cmd);
     }
@@ -1066,12 +1044,8 @@ pub(crate) async fn run_event_loop<B: Backend>(
                 Err(e) => last_err = Some(e),
                 Ok((reader, writer, connack)) => {
                     if connack.reason_code as u8 >= 0x80 {
-                        last_err = Some(Error::ReasonCode(
-                            connack.reason_code,
-                            connack.properties,
-                        ));
-                    }
-                    else {
+                        last_err = Some(Error::ReasonCode(connack.reason_code, connack.properties));
+                    } else {
                         initial_result = Some((reader, writer, connack));
                         break;
                     }

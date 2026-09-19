@@ -156,11 +156,10 @@ async fn main() -> mqtt::Result<()> {
     loop {
         match strm.recv().await {
             Ok(mqtt::Event::Message(msg)) => {
-                let reply_corr_id =
-                    match msg.properties().get(mqtt::PropertyId::CorrelationData) {
-                        Some(mqtt::PropertyValue::Binary(b)) => b.clone(),
-                        _ => bytes::Bytes::new(),
-                    };
+                let reply_corr_id = match msg.properties().get(mqtt::PropertyId::CorrelationData) {
+                    Some(mqtt::PropertyValue::Binary(b)) => b.clone(),
+                    _ => bytes::Bytes::new(),
+                };
 
                 if reply_corr_id.as_ref() == corr_id.as_ref() {
                     let ms = 1000.0 * start_time.elapsed().as_secs_f64();
@@ -168,8 +167,7 @@ async fn main() -> mqtt::Result<()> {
 
                     let ret: f64 = serde_json::from_str(&msg.payload_str()).unwrap();
                     println!("{}", ret);
-                }
-                else {
+                } else {
                     eprintln!("Unknown response for {:?}", reply_corr_id);
                 }
                 break;

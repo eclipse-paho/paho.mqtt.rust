@@ -104,10 +104,7 @@ macro_rules! impl_connection {
                 self.stream.is_write_vectored()
             }
 
-            fn poll_flush(
-                mut self: Pin<&mut Self>,
-                cx: &mut Context<'_>,
-            ) -> Poll<io::Result<()>> {
+            fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
                 Pin::new(&mut self.stream).poll_flush(cx)
             }
 
@@ -295,9 +292,7 @@ fn filter_cipher_suites(spec: &str) -> Result<Vec<rustls::SupportedCipherSuite>>
 ///   empty string keeps all defaults.
 /// * `protos` — ALPN protocol list.
 #[cfg(feature = "tls")]
-pub(super) fn make_tls_config(
-    tls: &crate::TlsOptions,
-) -> Result<StdArc<rustls::ClientConfig>> {
+pub(super) fn make_tls_config(tls: &crate::TlsOptions) -> Result<StdArc<rustls::ClientConfig>> {
     use crate::TlsVersion;
     use rustls::RootCertStore;
     use std::io::BufReader;
@@ -374,8 +369,7 @@ pub(super) fn make_tls_config(
     // ---- Certificate verification ----
     let wants_client = if tls.enable_server_cert_auth {
         builder.with_root_certificates(root_store)
-    }
-    else {
+    } else {
         builder
             .dangerous()
             .with_custom_certificate_verifier(StdArc::new(NoCertVerifier))
@@ -391,8 +385,7 @@ pub(super) fn make_tls_config(
 
         let key_path = if !tls.private_key.as_os_str().is_empty() {
             &tls.private_key
-        }
-        else {
+        } else {
             &tls.key_store
         };
         let key_f = std::fs::File::open(key_path).map_err(Error::Io)?;
@@ -403,8 +396,7 @@ pub(super) fn make_tls_config(
         wants_client
             .with_client_auth_cert(certs, key)
             .map_err(|e| Error::GeneralString(e.to_string()))?
-    }
-    else {
+    } else {
         wants_client.with_no_client_auth()
     };
 
@@ -430,17 +422,14 @@ pub(super) fn make_tls_config(
 /// * `protos` — ALPN protocol list.
 /// * `disable_default_trust_store` — when `true`, skips loading system CA.
 #[cfg(all(feature = "openssl", not(feature = "tls")))]
-pub(super) fn make_openssl_config(
-    tls: &crate::TlsOptions,
-) -> Result<openssl::ssl::SslConnector> {
+pub(super) fn make_openssl_config(tls: &crate::TlsOptions) -> Result<openssl::ssl::SslConnector> {
     let mut builder = SslConnector::builder(SslMethod::tls_client())
         .map_err(|e| Error::GeneralString(e.to_string()))?;
 
     // Server certificate verification
     builder.set_verify(if tls.enable_server_cert_auth {
         SslVerifyMode::PEER
-    }
-    else {
+    } else {
         SslVerifyMode::NONE
     });
 
@@ -480,9 +469,7 @@ pub(super) fn make_openssl_config(
 
     // Minimum TLS protocol version
     let min_ver = match tls.version {
-        crate::TlsVersion::Default | crate::TlsVersion::Tls1_2 => {
-            Some(OpenSslProtoVersion::TLS1_2)
-        }
+        crate::TlsVersion::Default | crate::TlsVersion::Tls1_2 => Some(OpenSslProtoVersion::TLS1_2),
         crate::TlsVersion::Tls1_0 => Some(OpenSslProtoVersion::TLS1),
         crate::TlsVersion::Tls1_1 => Some(OpenSslProtoVersion::TLS1_1),
     };
@@ -497,8 +484,7 @@ pub(super) fn make_openssl_config(
             .map_err(|e| Error::GeneralString(e.to_string()))?;
         let key_path = if !tls.private_key.as_os_str().is_empty() {
             &tls.private_key
-        }
-        else {
+        } else {
             &tls.key_store
         };
         if !tls.private_key_password.is_empty() {
@@ -512,8 +498,7 @@ pub(super) fn make_openssl_config(
             builder
                 .set_private_key(&key)
                 .map_err(|e| Error::GeneralString(e.to_string()))?;
-        }
-        else {
+        } else {
             builder
                 .set_private_key_file(key_path, SslFiletype::PEM)
                 .map_err(|e| Error::GeneralString(e.to_string()))?;
@@ -667,13 +652,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for WsConnection<S> {
                     return Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, e)));
                 }
                 Poll::Ready(Ok(())) => {
-                    if let Err(e) =
-                        Pin::new(&mut this.stream).start_send(WsMessage::Binary(data))
-                    {
-                        return Poll::Ready(Err(io::Error::new(
-                            io::ErrorKind::BrokenPipe,
-                            e,
-                        )));
+                    if let Err(e) = Pin::new(&mut this.stream).start_send(WsMessage::Binary(data)) {
+                        return Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, e)));
                     }
                 }
             }

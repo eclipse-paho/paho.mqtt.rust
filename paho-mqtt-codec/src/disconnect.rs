@@ -117,8 +117,7 @@ impl Disconnect {
         // Property length is omitted when the remaining length < 2.
         let properties = if payload.is_empty() {
             Properties::new()
-        }
-        else {
+        } else {
             Properties::decode_in(&mut payload, ver, PacketType::Disconnect)?
         };
 

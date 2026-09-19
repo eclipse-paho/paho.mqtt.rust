@@ -170,8 +170,7 @@ fn handle_request(cli: &mqtt::AsyncClient, msg: mqtt::Message) -> mqtt::Result<(
             .finalize();
 
         let _ = cli.publish(msg).wait();
-    }
-    else {
+    } else {
         eprintln!("Unknown command: {}", fname);
     }
     Ok(())
@@ -241,8 +240,7 @@ fn main() -> mqtt::Result<()> {
             if let Err(err) = handle_request(&cli, msg) {
                 eprintln!("Error: {}", err);
             }
-        }
-        else if cli.is_connected() || !try_reconnect(&cli, conn_opts.clone()) {
+        } else if cli.is_connected() || !try_reconnect(&cli, conn_opts.clone()) {
             break;
         }
     }

@@ -21,8 +21,8 @@
 //! MQTT CONNECT and CONNACK packets.
 
 use crate::{
-    DecodeOptions, Error, MqttVersion, PacketType, Properties, PropertyContext, QoS,
-    ReasonCode, Result, String,
+    DecodeOptions, Error, MqttVersion, PacketType, Properties, PropertyContext, QoS, ReasonCode,
+    Result, String,
     wire::{binary_wire_size, get_binary, get_utf8, put_binary, put_utf8, utf8_wire_size},
 };
 use bytes::{Buf, BufMut, Bytes};
@@ -243,8 +243,7 @@ impl Connect {
         let client_id = get_utf8(&mut payload)?;
         // Will
         let will = if will_flag {
-            let will_props =
-                Properties::decode_in(&mut payload, ver, PropertyContext::Will)?;
+            let will_props = Properties::decode_in(&mut payload, ver, PropertyContext::Will)?;
             let topic = get_utf8(&mut payload)?;
             let will_payload = get_binary(&mut payload)?;
             Some(Will {
@@ -254,21 +253,18 @@ impl Connect {
                 retain: will_retain,
                 properties: will_props,
             })
-        }
-        else {
+        } else {
             None
         };
         // Username / password
         let username = if username_flag {
             Some(get_utf8(&mut payload)?)
-        }
-        else {
+        } else {
             None
         };
         let password = if password_flag {
             Some(get_binary(&mut payload)?)
-        }
-        else {
+        } else {
             None
         };
         Ok(Self {
@@ -359,8 +355,7 @@ impl ConnAck {
         // v3.1 has no such flag; the byte is reserved and sent as zero.
         let flags = if self.session_present && ver != MqttVersion::V3_1 {
             0x01
-        }
-        else {
+        } else {
             0x00
         };
         dst.put_u8(flags);
@@ -385,11 +380,7 @@ impl ConnAck {
     /// deciding whether a refused connection that sets Session Present is a
     /// [`ProtocolError`](Error::ProtocolError) (strict) or has the flag
     /// cleared (default).
-    pub fn decode_with(
-        mut payload: Bytes,
-        ver: MqttVersion,
-        opts: DecodeOptions,
-    ) -> Result<Self> {
+    pub fn decode_with(mut payload: Bytes, ver: MqttVersion, opts: DecodeOptions) -> Result<Self> {
         if payload.remaining() < 2 {
             return Err(Error::PacketTooShort);
         }
@@ -1013,8 +1004,7 @@ mod tests {
         ack.encode(&mut dst, MqttVersion::V3_1).unwrap();
         assert_eq!(&dst[..], &[0x00, 0x00]);
         // ... and decoding ignores the reserved byte entirely.
-        let ack =
-            ConnAck::decode(Bytes::from_static(&[0xFF, 0x00]), MqttVersion::V3_1).unwrap();
+        let ack = ConnAck::decode(Bytes::from_static(&[0xFF, 0x00]), MqttVersion::V3_1).unwrap();
         assert!(!ack.session_present);
         assert_eq!(ack.reason_code, ReasonCode::Success);
         // The same bytes are malformed on v3.1.1.

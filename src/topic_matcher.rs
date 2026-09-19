@@ -415,20 +415,21 @@ impl<'a, 'b, T> Iterator for MatchIter<'a, 'b, T> {
         // If no more nodes to search, we're done
         let (node, mut fields, first) = self.remaining.pop()?;
 
-        let field =
-            match fields.next() {
-                Some(field) => field,
-                None => {
-                    return node.value.as_ref().map(|(k, v)| (k.as_str(), v)).or_else(
-                        || {
-                            node.children
-                                .get("#")
-                                .and_then(|child| child.value_ref())
-                                .or_else(|| self.next())
-                        },
-                    );
-                }
-            };
+        let field = match fields.next() {
+            Some(field) => field,
+            None => {
+                return node
+                    .value
+                    .as_ref()
+                    .map(|(k, v)| (k.as_str(), v))
+                    .or_else(|| {
+                        node.children
+                            .get("#")
+                            .and_then(|child| child.value_ref())
+                            .or_else(|| self.next())
+                    });
+            }
+        };
 
         if let Some(child) = node.children.get(field) {
             self.remaining.push((child, fields.clone(), false));

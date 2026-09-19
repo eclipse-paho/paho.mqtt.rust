@@ -291,8 +291,7 @@ const ALLOWED: [CodeSet; 16] = {
         SubscriptionIdentifiersNotSupported,
         WildcardSubscriptionsNotSupported,
     ]);
-    t[PacketType::Auth as usize] =
-        code_set(&[Success, ContinueAuthentication, ReAuthenticate]);
+    t[PacketType::Auth as usize] = code_set(&[Success, ContinueAuthentication, ReAuthenticate]);
     t
 };
 

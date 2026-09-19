@@ -110,8 +110,7 @@ fn main() {
                 // Since our persistent session is already on the broker
                 // we don't need to subscribe to the topics.
                 println!("  w/ client session already present on broker.");
-            }
-            else {
+            } else {
                 // The server doesn't have a persistent session already
                 // stored for us (1st connection?), so we need to subscribe
                 // to the topics we want to receive.
@@ -151,8 +150,7 @@ fn main() {
     for msg in rx.iter() {
         if let Some(msg) = msg {
             println!("{}", msg);
-        }
-        else if cli.is_connected() || !try_reconnect(&cli) {
+        } else if cli.is_connected() || !try_reconnect(&cli) {
             break;
         }
     }

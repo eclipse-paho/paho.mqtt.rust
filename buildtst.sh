@@ -58,12 +58,8 @@ have_toolchain() { rustup run "$1" rustc --version >/dev/null 2>&1; }
 
 # ---------------------------------------------------------------------------
 
-step "Format check (nightly rustfmt)"
-if have_toolchain nightly; then
-    run cargo +nightly fmt --all --check
-else
-    skip "nightly toolchain not installed"
-fi
+step "Format check (rustfmt)"
+run cargo fmt --all --check
 
 get_crate_msrv
 TOOLCHAINS=(stable)

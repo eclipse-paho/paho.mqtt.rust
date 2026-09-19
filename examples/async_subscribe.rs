@@ -63,8 +63,7 @@ fn main() {
     let topics: Vec<String> = args.collect();
     let topics: Vec<&str> = if topics.is_empty() {
         vec![DEFAULT_TOPIC]
-    }
-    else {
+    } else {
         topics.iter().map(String::as_str).collect()
     };
     let qos = vec![QOS; topics.len()];
@@ -118,8 +117,7 @@ fn main() {
         while let Ok(msg_opt) = strm.recv().await {
             if let Some(msg) = msg_opt {
                 println!("{}", msg);
-            }
-            else {
+            } else {
                 // A "None" means we were disconnected. Try to reconnect...
                 println!("Lost connection. Attempting reconnect...");
                 while let Err(err) = cli.reconnect().await {

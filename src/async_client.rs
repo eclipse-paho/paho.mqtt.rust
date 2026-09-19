@@ -45,10 +45,10 @@
 //! ```
 
 use crate::{
-    AsyncReceiver, ConnectOptions, ConnectResponse, ConnectToken, CreateOptions,
-    DeliveryToken, DisconnectOptions, Event, FilePersistence, Message, PersistenceType,
-    Properties, ReasonCode, SubscribeManyToken, SubscribeOptions, SubscribeToken,
-    SyncReceiver, UnsubscribeManyToken, UnsubscribeToken, UserData,
+    AsyncReceiver, ConnectOptions, ConnectResponse, ConnectToken, CreateOptions, DeliveryToken,
+    DisconnectOptions, Event, FilePersistence, Message, PersistenceType, Properties, ReasonCode,
+    SubscribeManyToken, SubscribeOptions, SubscribeToken, SyncReceiver, UnsubscribeManyToken,
+    UnsubscribeToken, UserData,
     error::{Error, Result},
     persistence::ClientPersistence,
     runtime::{BufConfig, Command, ConnectParams, RtOwnership, ServerAddr},
@@ -71,9 +71,7 @@ use std::{
 /// Constructs a boxed, mutex-wrapped persistence store from a `PersistenceType`.
 ///
 /// Returns `None` when `typ` is `PersistenceType::None`.
-fn make_persistence(
-    typ: PersistenceType,
-) -> Option<Arc<Mutex<Box<dyn ClientPersistence>>>> {
+fn make_persistence(typ: PersistenceType) -> Option<Arc<Mutex<Box<dyn ClientPersistence>>>> {
     let store: Box<dyn ClientPersistence> = match typ {
         PersistenceType::None => return None,
         PersistenceType::File => Box::new(FilePersistence::new(".")),
@@ -127,8 +125,7 @@ pub type ConnectedCallback = dyn FnMut(&AsyncClient, &ConnectResponse) + Send + 
 pub type ConnectionLostCallback = dyn FnMut(&AsyncClient) + Send + 'static;
 
 /// User callback type for when the client receives a disconnect packet.
-pub type DisconnectedCallback =
-    dyn FnMut(&AsyncClient, Properties, ReasonCode) + Send + 'static;
+pub type DisconnectedCallback = dyn FnMut(&AsyncClient, Properties, ReasonCode) + Send + 'static;
 
 /// User callback signature for when subscribed messages are received.
 pub type MessageArrivedCallback = dyn FnMut(&AsyncClient, Option<Message>) + Send + 'static;
@@ -178,9 +175,7 @@ impl AsyncClient {
 
         #[cfg(all(feature = "smol", not(feature = "tokio")))]
         let (rt, rt_ownership) = {
-            use crate::runtime::{
-                RuntimeHandle, SmolOwnership, get_or_create_shared_executor,
-            };
+            use crate::runtime::{RuntimeHandle, SmolOwnership, get_or_create_shared_executor};
             let executor = get_or_create_shared_executor();
             let rt = RuntimeHandle::spawn(&executor, buf_cfg);
             (rt, SmolOwnership::Shared(executor))
@@ -216,8 +211,7 @@ impl AsyncClient {
             .name("mqtt-events".into())
             .spawn(move || {
                 while let Ok(ev) = event_rx.recv_blocking() {
-                    let Some(inner) = weak.upgrade()
-                    else {
+                    let Some(inner) = weak.upgrade() else {
                         break;
                     };
                     let cli = AsyncClient { inner };
@@ -269,8 +263,7 @@ impl AsyncClient {
         // fall back to the URI given at client creation time.
         let uris: Vec<String> = if opts.server_uris.is_empty() {
             vec![self.inner.opts.server_uri.clone()]
-        }
-        else {
+        } else {
             opts.server_uris.clone()
         };
         let mut servers: Vec<(ServerAddr, String)> = Vec::with_capacity(uris.len());
@@ -281,16 +274,10 @@ impl AsyncClient {
             }
         }
 
-        let keep_alive_secs =
-            opts.keep_alive_interval.as_secs().min(u16::MAX as u64) as u16;
+        let keep_alive_secs = opts.keep_alive_interval.as_secs().min(u16::MAX as u64) as u16;
 
         let will = opts.will.as_ref().map(|msg| {
-            paho_mqtt_codec::Will::new(
-                msg.topic.clone(),
-                msg.payload.clone(),
-                msg.qos,
-                msg.retain,
-            )
+            paho_mqtt_codec::Will::new(msg.topic.clone(), msg.payload.clone(), msg.qos, msg.retain)
         });
 
         let (tok, comp) = ConnectToken::new();
@@ -499,9 +486,7 @@ impl AsyncClient {
     {
         let n = topics.len();
         if n != qos.len() {
-            return SubscribeManyToken::from_err(Error::General(
-                "topics/qos length mismatch",
-            ));
+            return SubscribeManyToken::from_err(Error::General("topics/qos length mismatch"));
         }
 
         let (tok, comp) = SubscribeManyToken::new();
@@ -568,14 +553,10 @@ impl AsyncClient {
     {
         let n = topics.len();
         if n != qos.len() {
-            return SubscribeManyToken::from_err(Error::General(
-                "topics/qos length mismatch",
-            ));
+            return SubscribeManyToken::from_err(Error::General("topics/qos length mismatch"));
         }
         if !opts.is_empty() && opts.len() != n {
-            return SubscribeManyToken::from_err(Error::General(
-                "topics/opts length mismatch",
-            ));
+            return SubscribeManyToken::from_err(Error::General("topics/opts length mismatch"));
         }
 
         let props = props.into().unwrap_or_default();
@@ -641,11 +622,7 @@ impl AsyncClient {
     /// * `topic` The topic to unsubscribe.
     /// * `props` MQTT v5 properties for the unsubscribe.
     ///
-    pub fn unsubscribe_with_options<S>(
-        &self,
-        topic: S,
-        props: Properties,
-    ) -> UnsubscribeToken
+    pub fn unsubscribe_with_options<S>(&self, topic: S, props: Properties) -> UnsubscribeToken
     where
         S: Into<String>,
     {
@@ -729,8 +706,7 @@ impl AsyncClient {
     fn require_v5_for_props(&self, props: &Properties) -> Result<()> {
         if !props.is_empty() && self.mqtt_version() < MqttVersion::V5 {
             Err(Error::WrongMqttVersion)
-        }
-        else {
+        } else {
             Ok(())
         }
     }
@@ -741,12 +717,10 @@ impl AsyncClient {
         if self.mqtt_version() < MqttVersion::V5
             && (opts.no_local
                 || opts.retain_as_published
-                || opts.retain_handling
-                    != crate::subscribe_options::RetainHandling::default())
+                || opts.retain_handling != crate::subscribe_options::RetainHandling::default())
         {
             Err(Error::WrongMqttVersion)
-        }
-        else {
+        } else {
             Ok(())
         }
     }
@@ -1168,8 +1142,7 @@ unsafe impl Sync for AsyncClient {}
 fn log_send_err(is_full: bool) {
     if is_full {
         warn!("Event stream full. Losing messages");
-    }
-    else {
+    } else {
         warn!("Event stream closed");
     }
 }
@@ -1195,8 +1168,7 @@ fn parse_host_port_path(rest: &str, default_port: u16) -> Result<(String, u16, S
     let authority = rest.split('/').next().unwrap_or(rest);
     let path = if authority.len() < rest.len() {
         rest[authority.len()..].to_string()
-    }
-    else {
+    } else {
         "/".to_string()
     };
 
@@ -1206,8 +1178,7 @@ fn parse_host_port_path(rest: &str, default_port: u16) -> Result<(String, u16, S
             .parse::<u16>()
             .map_err(|_| Error::General("invalid port in server URI"))?;
         (host, port)
-    }
-    else {
+    } else {
         (authority.to_string(), default_port)
     };
 
@@ -1272,15 +1243,13 @@ fn parse_server_uri(uri: &str) -> Result<ServerAddr> {
         .or_else(|| uri.strip_prefix("wss://"))
     {
         (8883u16, true, s)
-    }
-    else if let Some(s) = uri
+    } else if let Some(s) = uri
         .strip_prefix("mqtt://")
         .or_else(|| uri.strip_prefix("tcp://"))
         .or_else(|| uri.strip_prefix("ws://"))
     {
         (1883u16, false, s)
-    }
-    else {
+    } else {
         (1883u16, false, uri)
     };
 

@@ -23,8 +23,8 @@
 //!
 
 use crate::{
-    AsyncClient, Client, DeliveryToken, Error, Message, MessageBuilder, Properties,
-    Property, PropertyId, PropertyValue, QoS, Result, SubscribeOptions, SubscribeResponse,
+    AsyncClient, Client, DeliveryToken, Error, Message, MessageBuilder, Properties, Property,
+    PropertyId, PropertyValue, QoS, Result, SubscribeOptions, SubscribeResponse,
     token::SubscribeToken,
 };
 use std::fmt;
@@ -235,11 +235,7 @@ impl<'a> Topic<'a> {
     /// See [`publish_with_alias()`](Self::publish_with_alias) for more information.
     ///
     /// Returns a Publish Error containing the complete message on failure.
-    pub fn try_publish_with_alias<V>(
-        &mut self,
-        alias: u16,
-        payload: V,
-    ) -> Result<DeliveryToken>
+    pub fn try_publish_with_alias<V>(&mut self, alias: u16, payload: V) -> Result<DeliveryToken>
     where
         V: Into<bytes::Bytes>,
     {
@@ -334,11 +330,7 @@ impl<'a> SyncTopic<'a> {
     }
 
     /// Subscribe to the topic with subscription options.
-    pub fn subscribe_with_options<T, P>(
-        &self,
-        opts: T,
-        props: P,
-    ) -> Result<SubscribeResponse>
+    pub fn subscribe_with_options<T, P>(&self, opts: T, props: P) -> Result<SubscribeResponse>
     where
         T: Into<SubscribeOptions>,
         P: Into<Option<Properties>>,
@@ -490,8 +482,7 @@ impl TopicFilter {
         let v = if wild {
             let fields = filter.split('/').map(String::from).collect();
             Self::Fields(fields)
-        }
-        else {
+        } else {
             Self::Topic(filter)
         };
 
@@ -504,8 +495,7 @@ impl TopicFilter {
 
         if filter.ends_with('#') || filter.contains('+') {
             Self::Fields(filter.split('/').map(String::from).collect())
-        }
-        else {
+        } else {
             Self::Topic(filter)
         }
     }

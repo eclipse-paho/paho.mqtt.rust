@@ -31,8 +31,8 @@
 //!    payload given the negotiated [`MqttVersion`].
 
 use crate::{
-    Auth, ConnAck, Connect, Disconnect, Error, MqttVersion, PubAck, Publish, Result,
-    SubAck, Subscribe, UnsubAck, Unsubscribe, varlen,
+    Auth, ConnAck, Connect, Disconnect, Error, MqttVersion, PubAck, Publish, Result, SubAck,
+    Subscribe, UnsubAck, Unsubscribe, varlen,
 };
 use alloc::boxed::Box;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
@@ -344,11 +344,7 @@ impl Packet {
 
     /// Parses a [`RawPacket`] into a typed [`Packet`] given `ver` and
     /// `opts`; see [`DecodeOptions`] for what the options affect.
-    pub fn from_raw_with(
-        raw: RawPacket,
-        ver: MqttVersion,
-        opts: DecodeOptions,
-    ) -> Result<Self> {
+    pub fn from_raw_with(raw: RawPacket, ver: MqttVersion, opts: DecodeOptions) -> Result<Self> {
         use PacketType as T;
 
         let ty = raw.packet_type()?;
@@ -401,20 +397,16 @@ impl Packet {
         use Packet::*;
         let ok = match self {
             ConnAck(a) => a.reason_code.is_allowed_in(ty),
-            PubAck(a) | PubRec(a) | PubRel(a) | PubComp(a) => {
-                a.reason_code.is_allowed_in(ty)
-            }
+            PubAck(a) | PubRec(a) | PubRel(a) | PubComp(a) => a.reason_code.is_allowed_in(ty),
             SubAck(a) => a.reason_codes.iter().all(|rc| rc.is_allowed_in(ty)),
             UnsubAck(a) => a.reason_codes.iter().all(|rc| rc.is_allowed_in(ty)),
             Disconnect(d) => d.reason_code.is_allowed_in(ty),
             Auth(a) => a.reason_code.is_allowed_in(ty),
-            Connect(_) | Publish(_) | Subscribe(_) | Unsubscribe(_) | PingReq
-            | PingResp => true,
+            Connect(_) | Publish(_) | Subscribe(_) | Unsubscribe(_) | PingReq | PingResp => true,
         };
         if ok {
             Ok(())
-        }
-        else {
+        } else {
             Err(Error::ProtocolError)
         }
     }
@@ -437,9 +429,7 @@ impl Packet {
                 }
                 (hdr, pub_.encoded_size(ver))
             }
-            PubAck(ack) | PubRec(ack) | PubRel(ack) | PubComp(ack) => {
-                (hdr, ack.encoded_size(ver))
-            }
+            PubAck(ack) | PubRec(ack) | PubRel(ack) | PubComp(ack) => (hdr, ack.encoded_size(ver)),
             Subscribe(s) => (hdr, s.encoded_size(ver)),
             SubAck(sa) => (hdr, sa.encoded_size(ver)),
             Unsubscribe(u) => (hdr, u.encoded_size(ver)),
@@ -513,11 +503,7 @@ impl Packet {
     /// empty.
     ///
     /// On error nothing is appended to `dst`.
-    pub fn encode_split(
-        &self,
-        dst: &mut BytesMut,
-        ver: MqttVersion,
-    ) -> Result<Option<Bytes>> {
+    pub fn encode_split(&self, dst: &mut BytesMut, ver: MqttVersion) -> Result<Option<Bytes>> {
         let start = dst.len();
         let res = self.encode_inner(dst, ver, false);
         if res.is_err() {
@@ -558,17 +544,14 @@ impl Packet {
             Publish(pub_) => {
                 if inline_payload {
                     pub_.encode(dst, ver)?;
-                }
-                else {
+                } else {
                     pub_.encode_header(dst, ver)?;
                     if !pub_.payload.is_empty() {
                         return Ok(Some(pub_.payload.clone()));
                     }
                 }
             }
-            PubAck(ack) | PubRec(ack) | PubRel(ack) | PubComp(ack) => {
-                ack.encode(dst, ver)?
-            }
+            PubAck(ack) | PubRec(ack) | PubRel(ack) | PubComp(ack) => ack.encode(dst, ver)?,
             Subscribe(s) => s.encode(dst, ver)?,
             SubAck(sa) => sa.encode(dst, ver)?,
             Unsubscribe(u) => u.encode(dst, ver)?,

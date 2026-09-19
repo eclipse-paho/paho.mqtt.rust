@@ -71,9 +71,9 @@ Generates reference documentation.
 
 Runs the linter with warnings treated as errors, as the CI does.
 
-Formatting uses nightly-only options, so format with:
+Format with the standard stable formatter:
 
-    $ cargo +nightly fmt
+    $ cargo fmt
 
 ### Benchmarks
 

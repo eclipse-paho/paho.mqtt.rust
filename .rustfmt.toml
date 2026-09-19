@@ -1,11 +1,2 @@
-# .rustfmt.toml
-#
-# Code format definitions for Eclipse Paho MQTT Rust library.
-#
-
-edition = "2021"
-max_width = 92
-
-# As of 2024-07-21, this is still unstable, requiring +nightly
-control_brace_style = "ClosingNextLine"
-
+# A blank format spec ensures default formatting isn't accidentally overriden
+# by a contributor with a different default format file in their dev tree.

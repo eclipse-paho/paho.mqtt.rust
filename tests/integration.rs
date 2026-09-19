@@ -666,8 +666,7 @@ fn test_v5_user_properties() {
     if let Some(PropertyValue::StringPair(k, v)) = user_prop.map(|p| &p.value) {
         assert_eq!(k, "env");
         assert_eq!(v, "test");
-    }
-    else {
+    } else {
         panic!("user property has wrong type");
     }
 
@@ -795,8 +794,7 @@ fn test_v5_retain_handling_do_not_send() {
         .expect("connect failed");
     let rx = sub.start_consuming();
 
-    let opts =
-        mqtt::SubscribeOptions::with_retain_handling(RetainHandling::DontSendRetained);
+    let opts = mqtt::SubscribeOptions::with_retain_handling(RetainHandling::DontSendRetained);
     sub.subscribe_with_options(topic, mqtt::QOS_1, opts, None)
         .wait()
         .expect("subscribe failed");
@@ -1171,8 +1169,7 @@ fn test_max_inflight() {
     // Fire all publishes at once; some will be deferred internally
     let tokens: Vec<_> = (0..N_MSGS)
         .map(|i| {
-            let msg =
-                mqtt::Message::new(INFLIGHT_TOPIC, format!("msg-{i:02}"), mqtt::QOS_1);
+            let msg = mqtt::Message::new(INFLIGHT_TOPIC, format!("msg-{i:02}"), mqtt::QOS_1);
             pub_cli.publish(msg)
         })
         .collect();

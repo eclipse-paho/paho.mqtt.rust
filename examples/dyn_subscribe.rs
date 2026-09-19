@@ -119,12 +119,10 @@ fn main() {
                     println!("Adding topic: {}", new_topic);
                     cli.subscribe(&new_topic, QOS);
                     topics.push(new_topic);
-                }
-                else {
+                } else {
                     println!("Failed to add topic: {}", payload_str);
                 }
-            }
-            else {
+            } else {
                 println!("{} - {}", topic, payload_str);
             }
         }

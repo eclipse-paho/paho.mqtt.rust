@@ -167,12 +167,10 @@ fn main() -> mqtt::Result<()> {
 
             let ret: f64 = serde_json::from_str(&msg.payload_str()).unwrap();
             println!("{}", ret);
-        }
-        else {
+        } else {
             eprintln!("Unknown response for {:?}", reply_corr_id);
         }
-    }
-    else {
+    } else {
         eprintln!("Error receiving reply.");
     }
 

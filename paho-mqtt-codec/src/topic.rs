@@ -71,8 +71,7 @@ pub fn validate_filter(filter: &str) -> Result<()> {
             return Err(Error::TopicFilterInvalid);
         }
         rest
-    }
-    else {
+    } else {
         filter
     };
     if filter.is_empty() {
@@ -89,8 +88,7 @@ pub fn validate_filter(filter: &str) -> Result<()> {
         let level_start = i == 0 || bytes[i - 1] == b'/';
         let ok = if b == b'#' {
             level_start && i + 1 == n
-        }
-        else {
+        } else {
             level_start && (i + 1 == n || bytes[i + 1] == b'/')
         };
         if !ok {

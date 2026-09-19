@@ -249,9 +249,7 @@ impl PropertyContext {
             Self::Packet(T::PubAck | T::PubRec | T::PubRel | T::PubComp) => {
                 const { ids(&[ReasonString, UserProperty]) }
             }
-            Self::Packet(T::Subscribe) => {
-                const { ids(&[SubscriptionIdentifier, UserProperty]) }
-            }
+            Self::Packet(T::Subscribe) => const { ids(&[SubscriptionIdentifier, UserProperty]) },
             Self::Packet(T::SubAck) => const { ids(&[ReasonString, UserProperty]) },
             Self::Packet(T::Unsubscribe) => const { ids(&[UserProperty]) },
             Self::Packet(T::UnsubAck) => const { ids(&[ReasonString, UserProperty]) },
@@ -491,8 +489,7 @@ impl Property {
         };
         if ok {
             Ok(())
-        }
-        else {
+        } else {
             Err(Error::ProtocolError)
         }
     }
@@ -528,8 +525,8 @@ impl Property {
 struct SeenIds(u64);
 
 impl SeenIds {
-    const REPEATABLE: u64 = (1 << PropertyId::UserProperty as u8)
-        | (1 << PropertyId::SubscriptionIdentifier as u8);
+    const REPEATABLE: u64 =
+        (1 << PropertyId::UserProperty as u8) | (1 << PropertyId::SubscriptionIdentifier as u8);
     const INVALID: u64 = 1 << 63;
 
     /// Records `id`; returns [`Error::ProtocolError`] if a non-repeatable
@@ -629,8 +626,7 @@ impl Properties {
     pub fn encoded_size(&self, ver: MqttVersion) -> usize {
         if ver < MqttVersion::V5 {
             0
-        }
-        else {
+        } else {
             let data_len = self.payload_size();
             varlen::encoded_size(data_len as u32) + data_len
         }
@@ -666,8 +662,7 @@ impl Properties {
             .all(|p| allowed & (1 << (p.id as u8)) != 0)
         {
             Ok(())
-        }
-        else {
+        } else {
             Err(Error::ProtocolError)
         }
     }
@@ -1130,8 +1125,7 @@ mod tests {
             Err(Error::ProtocolError)
         );
         assert_eq!(
-            Property::new(PropertyId::SubscriptionIdentifier, PropertyValue::VarInt(0))
-                .validate(),
+            Property::new(PropertyId::SubscriptionIdentifier, PropertyValue::VarInt(0)).validate(),
             Err(Error::ProtocolError)
         );
         // Wire forms: ReceiveMaximum = 0, MaximumPacketSize = 0, TopicAlias = 0, SubId = 0
@@ -1247,9 +1241,7 @@ mod tests {
             Properties::decode_in(&mut bytes.clone(), v5(), PacketType::Connect),
             Err(Error::ProtocolError)
         );
-        assert!(
-            Properties::decode_in(&mut bytes.clone(), v5(), PacketType::ConnAck).is_ok()
-        );
+        assert!(Properties::decode_in(&mut bytes.clone(), v5(), PacketType::ConnAck).is_ok());
         // The context-free decoder still accepts it.
         assert!(Properties::decode(&mut bytes.clone(), v5()).is_ok());
     }
@@ -1289,8 +1281,7 @@ mod tests {
     fn test_decode_allows_repeatable_properties() {
         // Two user properties and two subscription identifiers.
         let props = decode_raw(&[
-            0x26, 0, 1, b'k', 0, 1, b'v', 0x26, 0, 1, b'k', 0, 1, b'w', 0x0B, 0x01, 0x0B,
-            0x02,
+            0x26, 0, 1, b'k', 0, 1, b'v', 0x26, 0, 1, b'k', 0, 1, b'w', 0x0B, 0x01, 0x0B, 0x02,
         ])
         .unwrap();
         assert_eq!(props.len(), 4);

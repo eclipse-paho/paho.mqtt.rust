@@ -170,8 +170,7 @@ async fn handle_request(cli: &mqtt::AsyncClient, msg: mqtt::Message) -> mqtt::Re
             .finalize();
 
         let _ = cli.publish(msg).await;
-    }
-    else {
+    } else {
         eprintln!("Unknown command: {}", fname);
     }
     Ok(())

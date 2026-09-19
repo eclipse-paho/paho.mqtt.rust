@@ -100,10 +100,8 @@ impl Error {
     pub fn reason_code(&self) -> ReasonCode {
         use Error::*;
         match self {
-            BadQoS | VarLenOverflow | MalformedVarLen | UnknownPacketType(_)
-            | PacketTooShort | MalformedPacket | StringTooLong | BinaryTooLong => {
-                ReasonCode::MalformedPacket
-            }
+            BadQoS | VarLenOverflow | MalformedVarLen | UnknownPacketType(_) | PacketTooShort
+            | MalformedPacket | StringTooLong | BinaryTooLong => ReasonCode::MalformedPacket,
             ProtocolError => ReasonCode::ProtocolError,
             TopicNameInvalid => ReasonCode::TopicNameInvalid,
             TopicFilterInvalid => ReasonCode::TopicFilterInvalid,

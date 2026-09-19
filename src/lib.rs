@@ -89,8 +89,8 @@ pub use crate::subscribe_options::{
 };
 pub use crate::tls_options::{TlsOptions, TlsOptionsBuilder, TlsVersion};
 pub use crate::token::{
-    ConnectToken, DeliveryToken, SubscribeManyToken, SubscribeToken, Token,
-    UnsubscribeManyToken, UnsubscribeToken,
+    ConnectToken, DeliveryToken, SubscribeManyToken, SubscribeToken, Token, UnsubscribeManyToken,
+    UnsubscribeToken,
 };
 pub use crate::topic::{SyncTopic, Topic, TopicFilter, is_topic_filter_valid};
 pub use crate::topic_matcher::TopicMatcher;

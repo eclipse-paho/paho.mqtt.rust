@@ -101,8 +101,7 @@ fn main() {
         cli.connect(conn_opts).await?;
 
         println!("Subscribing to topics: {:?}", TOPICS);
-        let sub_opts =
-            vec![mqtt::SubscribeOptions::with_retain_as_published(); TOPICS.len()];
+        let sub_opts = vec![mqtt::SubscribeOptions::with_retain_as_published(); TOPICS.len()];
         cli.subscribe_many_with_options(TOPICS, QOS, &sub_opts, None)
             .await?;
 
