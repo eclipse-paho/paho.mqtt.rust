@@ -26,7 +26,7 @@
 
 use crate::{
     Error, MqttVersion, PacketType, Properties, PropertyId, QoS, ReasonCode, Result, String, topic,
-    wire::{get_utf8, put_utf8, utf8_wire_size},
+    wire::{check_packet_id, expect_end, get_utf8, put_utf8, utf8_wire_size},
 };
 use bytes::{Buf, BufMut, Bytes};
 
@@ -35,9 +35,9 @@ use serde::{Deserialize, Serialize};
 
 /////////////////////////////////////////////////////////////////////////////
 
-/// A PUBLISH packet, unified across MQTT v3.1.1 and v5.
+/// A PUBLISH packet, unified across MQTT v3.1, v3.1.1, and v5.
 ///
-/// The `properties` field is always empty on v3.1.1 connections and is not
+/// The `properties` field is always empty on v3 connections and is not
 /// encoded on the wire for that version.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
@@ -54,7 +54,7 @@ pub struct Publish {
     pub packet_id: Option<u16>,
     /// Application message payload.
     pub payload: Bytes,
-    /// MQTT v5 properties; empty on v3.1.1 connections.
+    /// MQTT v5 properties; empty on v3 connections.
     pub properties: Properties,
 }
 
@@ -85,7 +85,8 @@ impl Publish {
 
     /// Encodes the PUBLISH variable header and payload into `dst`.
     ///
-    /// Returns [`Error::ProtocolError`] if `qos > 0` but `packet_id` is `None`.
+    /// Returns [`Error::ProtocolError`] if `qos > 0` but `packet_id` is `None`
+    /// or `Some(0)`.
     pub fn encode<B: BufMut>(&self, dst: &mut B, ver: MqttVersion) -> Result<()> {
         self.encode_header(dst, ver)?;
         dst.put_slice(&self.payload);
@@ -96,7 +97,8 @@ impl Publish {
     /// properties) into `dst`, leaving the application payload to be written
     /// separately by the caller.
     ///
-    /// Returns [`Error::ProtocolError`] if `qos > 0` but `packet_id` is `None`.
+    /// Returns [`Error::ProtocolError`] if `qos > 0` but `packet_id` is `None`
+    /// or `Some(0)`.
     pub fn encode_header<B: BufMut>(&self, dst: &mut B, ver: MqttVersion) -> Result<()> {
         // Same rules as decode: no wildcards; empty only with a v5 alias.
         if topic::has_wildcards(&self.topic)
@@ -108,7 +110,7 @@ impl Publish {
         }
         put_utf8(&self.topic, dst)?;
         if self.qos != QoS::QoS0 {
-            let id = self.packet_id.ok_or(Error::ProtocolError)?;
+            let id = check_packet_id(self.packet_id.ok_or(Error::ProtocolError)?)?;
             dst.put_u16(id);
         }
         self.properties.check_context(PacketType::Publish)?;
@@ -139,10 +141,7 @@ impl Publish {
             if payload.remaining() < 2 {
                 return Err(Error::PacketTooShort);
             }
-            match payload.get_u16() {
-                0 => return Err(Error::ProtocolError),
-                id => Some(id),
-            }
+            Some(check_packet_id(payload.get_u16())?)
         } else {
             None
         };
@@ -197,7 +196,7 @@ pub struct PubAck {
     pub packet_id: u16,
     /// Outcome of the operation; defaults to [`ReasonCode::Success`].
     pub reason_code: ReasonCode,
-    /// MQTT v5 properties; empty on v3.1.1 connections.
+    /// MQTT v5 properties; empty on v3 connections.
     pub properties: Properties,
 }
 
@@ -235,8 +234,10 @@ impl PubAck {
     }
 
     /// Encodes the variable header into `dst`.
+    ///
+    /// Returns [`Error::ProtocolError`] if `packet_id` is 0.
     pub fn encode<B: BufMut>(&self, dst: &mut B, ver: MqttVersion) -> Result<()> {
-        dst.put_u16(self.packet_id);
+        dst.put_u16(check_packet_id(self.packet_id)?);
         if ver != MqttVersion::V5 {
             return Ok(());
         }
@@ -257,7 +258,7 @@ impl PubAck {
         if payload.remaining() < 2 {
             return Err(Error::PacketTooShort);
         }
-        let packet_id = payload.get_u16();
+        let packet_id = check_packet_id(payload.get_u16())?;
 
         let (reason_code, properties) = match ver {
             MqttVersion::V5 => {
@@ -277,6 +278,7 @@ impl PubAck {
             }
             _ => (ReasonCode::Success, Properties::new()),
         };
+        expect_end(&payload)?;
 
         Ok(PubAck {
             packet_id,

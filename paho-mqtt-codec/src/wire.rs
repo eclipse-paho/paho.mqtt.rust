@@ -84,6 +84,31 @@ pub(crate) fn get_binary<B: Buf>(src: &mut B) -> Result<Bytes> {
     Ok(src.copy_to_bytes(len))
 }
 
+/// Checks that a decoder consumed its whole input.
+///
+/// The remaining length names the packet's exact extent (§2.1.4), so bytes
+/// left over once every field has been read mean the packet does not have the
+/// structure its type requires — a PINGREQ with a body, a v3 CONNACK longer
+/// than two bytes, a CONNECT with data after the password. Returns
+/// [`Error::MalformedPacket`] if anything remains.
+pub(crate) fn expect_end<B: Buf>(src: &B) -> Result<()> {
+    if src.has_remaining() {
+        return Err(Error::MalformedPacket);
+    }
+    Ok(())
+}
+
+/// Checks a packet identifier read from, or about to be written to, the wire.
+///
+/// Zero is never a valid identifier (MQTT-2.2.1-3). Returns
+/// [`Error::ProtocolError`] for it.
+pub(crate) fn check_packet_id(id: u16) -> Result<u16> {
+    if id == 0 {
+        return Err(Error::ProtocolError);
+    }
+    Ok(id)
+}
+
 /// Wire size of a length-prefixed UTF-8 string: 2-byte prefix + content bytes.
 pub(crate) fn utf8_wire_size(s: &str) -> usize {
     2 + s.len()

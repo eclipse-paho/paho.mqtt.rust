@@ -249,7 +249,7 @@ fn properties(
     let mut used = [false; 64];
     for _ in 0..n {
         let id = *u.choose(&allowed)?;
-        if !id.is_repeatable() {
+        if !id.is_repeatable_in(ctx) {
             if used[id as usize] {
                 continue;
             }

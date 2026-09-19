@@ -23,13 +23,13 @@
 //! DISCONNECT is sent by either the client or the broker to signal a clean
 //! session end.
 //!
-//! Wire format has an important shorthand shared by both versions: when the
+//! Wire format has an important shorthand shared by all versions: when the
 //! reason code is `NormalDisconnection` (0x00) and there are no properties,
 //! the remaining_length is 0 (the payload is omitted entirely). This means a
-//! v3.1.1 DISCONNECT and a v5 normal-disconnect are byte-identical on the
+//! v3 DISCONNECT and a v5 normal-disconnect are byte-identical on the
 //! wire.
 
-use crate::{MqttVersion, PacketType, Properties, ReasonCode, Result};
+use crate::{MqttVersion, PacketType, Properties, ReasonCode, Result, wire::expect_end};
 use bytes::{Buf, BufMut, Bytes};
 
 #[cfg(feature = "serde")]
@@ -37,18 +37,18 @@ use serde::{Deserialize, Serialize};
 
 /////////////////////////////////////////////////////////////////////////////
 
-/// A DISCONNECT packet, unified across MQTT v3.1.1 and v5.
+/// A DISCONNECT packet, unified across MQTT v3.1, v3.1.1, and v5.
 ///
-/// In v3.1.1, DISCONNECT carries no payload at all — `reason_code` is always
+/// In v3, DISCONNECT carries no payload at all — `reason_code` is always
 /// `NormalDisconnection` and `properties` is always empty on the wire.
 /// In v5, a reason code and optional properties may be present, but if both
-/// are absent the wire form is identical to v3.1.1.
+/// are absent the wire form is identical to v3.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct Disconnect {
-    /// Disconnect reason code (v5 only; always `NormalDisconnection` for v3.1.1).
+    /// Disconnect reason code (v5 only; always `NormalDisconnection` for v3).
     pub reason_code: ReasonCode,
-    /// MQTT v5 properties; empty on v3.1.1 connections.
+    /// MQTT v5 properties; empty on v3 connections.
     pub properties: Properties,
 }
 
@@ -107,9 +107,16 @@ impl Disconnect {
     }
 
     /// Decodes from the raw `payload` bytes for the given version, `ver`.
+    ///
+    /// A v3 DISCONNECT has no body; any payload at all is
+    /// [`MalformedPacket`](crate::Error::MalformedPacket).
     pub fn decode(mut payload: Bytes, ver: MqttVersion) -> Result<Self> {
-        // Empty payload (shorthand or v3.1.1) → NormalDisconnection, no props.
-        if payload.is_empty() || ver != MqttVersion::V5 {
+        if ver != MqttVersion::V5 {
+            expect_end(&payload)?;
+            return Ok(Disconnect::default());
+        }
+        // Empty payload (shorthand or v3) → NormalDisconnection, no props.
+        if payload.is_empty() {
             return Ok(Disconnect::default());
         }
 
@@ -120,6 +127,7 @@ impl Disconnect {
         } else {
             Properties::decode_in(&mut payload, ver, PacketType::Disconnect)?
         };
+        expect_end(&payload)?;
 
         Ok(Disconnect {
             reason_code,

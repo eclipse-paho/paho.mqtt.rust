@@ -30,7 +30,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// These are used in MQTT v5 packets to indicate the result of an operation.
 /// Codes below 0x80 indicate success; 0x80 and above indicate an error.
-/// In MQTT v3.1.1, the connect return code is mapped to the nearest equivalent
+/// In MQTT v3, the connect return code is mapped to the nearest equivalent
 /// reason code.
 #[repr(u8)]
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]

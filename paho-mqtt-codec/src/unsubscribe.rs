@@ -22,14 +22,14 @@
 //!
 //! UNSUBSCRIBE is a list of topic filters with no per-filter options.
 //!
-//! UNSUBACK has an asymmetry between versions: v3.1.1 carries only the
+//! UNSUBACK has an asymmetry between versions: v3 carries only the
 //! packet identifier (no reason codes), while v5 adds properties and one
 //! reason code per topic filter. The unified [`UnsubAck`] struct represents
-//! both — `reason_codes` is an empty `Vec` on v3.1.1 connections.
+//! both — `reason_codes` is an empty `Vec` on v3 connections.
 
 use crate::{
     Error, MqttVersion, PacketType, Properties, ReasonCode, Result, String, Vec, topic,
-    wire::{get_utf8, put_utf8, utf8_wire_size},
+    wire::{check_packet_id, expect_end, get_utf8, put_utf8, utf8_wire_size},
 };
 use bytes::{Buf, BufMut, Bytes};
 
@@ -38,7 +38,7 @@ use serde::{Deserialize, Serialize};
 
 /////////////////////////////////////////////////////////////////////////////
 
-/// An UNSUBSCRIBE packet, unified across MQTT v3.1.1 and v5.
+/// An UNSUBSCRIBE packet, unified across MQTT v3.1, v3.1.1, and v5.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct Unsubscribe {
@@ -46,7 +46,7 @@ pub struct Unsubscribe {
     pub packet_id: u16,
     /// Topic filters to remove. Must not be empty.
     pub topic_filters: Vec<String>,
-    /// MQTT v5 properties; empty on v3.1.1 connections.
+    /// MQTT v5 properties; empty on v3 connections.
     pub properties: Properties,
 }
 
@@ -70,8 +70,14 @@ impl Unsubscribe {
     }
 
     /// Encodes the variable header and payload into `dst`.
+    ///
+    /// Returns [`Error::ProtocolError`] if `packet_id` is 0 or
+    /// `topic_filters` is empty (MQTT-3.10.3-2).
     pub fn encode<B: BufMut>(&self, dst: &mut B, ver: MqttVersion) -> Result<()> {
-        dst.put_u16(self.packet_id);
+        if self.topic_filters.is_empty() {
+            return Err(Error::ProtocolError);
+        }
+        dst.put_u16(check_packet_id(self.packet_id)?);
         self.properties.check_context(PacketType::Unsubscribe)?;
         self.properties.encode(dst, ver)?;
         for filter in &self.topic_filters {
@@ -86,7 +92,7 @@ impl Unsubscribe {
         if payload.remaining() < 2 {
             return Err(Error::PacketTooShort);
         }
-        let packet_id = payload.get_u16();
+        let packet_id = check_packet_id(payload.get_u16())?;
         let properties = Properties::decode_in(&mut payload, ver, PacketType::Unsubscribe)?;
         let mut topic_filters = Vec::new();
         while payload.has_remaining() {
@@ -109,9 +115,9 @@ impl Unsubscribe {
 
 /////////////////////////////////////////////////////////////////////////////
 
-/// An UNSUBACK packet, unified across MQTT v3.1.1 and v5.
+/// An UNSUBACK packet, unified across MQTT v3.1, v3.1.1, and v5.
 ///
-/// In v3.1.1, UNSUBACK carries only the packet identifier — `reason_codes`
+/// In v3, UNSUBACK carries only the packet identifier — `reason_codes`
 /// and `properties` are always empty and are not encoded on the wire.
 /// In v5, one reason code is present per topic filter from the UNSUBSCRIBE.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -119,9 +125,9 @@ impl Unsubscribe {
 pub struct UnsubAck {
     /// Packet identifier matching the original UNSUBSCRIBE.
     pub packet_id: u16,
-    /// One reason code per unsubscribed topic filter (v5 only; empty on v3.1.1).
+    /// One reason code per unsubscribed topic filter (v5 only; empty on v3).
     pub reason_codes: Vec<ReasonCode>,
-    /// MQTT v5 properties; empty on v3.1.1 connections.
+    /// MQTT v5 properties; empty on v3 connections.
     pub properties: Properties,
 }
 
@@ -146,8 +152,15 @@ impl UnsubAck {
     }
 
     /// Encodes the variable header and payload into `dst`.
+    ///
+    /// Returns [`Error::ProtocolError`] if `packet_id` is 0, or if `ver` is
+    /// v5 and `reason_codes` is empty (§3.11.3). On v3 the codes are not on
+    /// the wire and may be empty.
     pub fn encode<B: BufMut>(&self, dst: &mut B, ver: MqttVersion) -> Result<()> {
-        dst.put_u16(self.packet_id);
+        if ver == MqttVersion::V5 && self.reason_codes.is_empty() {
+            return Err(Error::ProtocolError);
+        }
+        dst.put_u16(check_packet_id(self.packet_id)?);
         self.properties.check_context(PacketType::UnsubAck)?;
         self.properties.encode(dst, ver)?;
         if ver == MqttVersion::V5 {
@@ -163,7 +176,7 @@ impl UnsubAck {
         if payload.remaining() < 2 {
             return Err(Error::PacketTooShort);
         }
-        let packet_id = payload.get_u16();
+        let packet_id = check_packet_id(payload.get_u16())?;
         let properties = Properties::decode_in(&mut payload, ver, PacketType::UnsubAck)?;
         let reason_codes = if ver == MqttVersion::V5 {
             let codes = payload
@@ -176,6 +189,8 @@ impl UnsubAck {
             }
             codes
         } else {
+            // v3 UNSUBACK is exactly the packet identifier.
+            expect_end(&payload)?;
             Vec::new()
         };
 
@@ -355,15 +370,16 @@ mod tests {
     }
 
     #[test]
-    fn test_unsuback_decode_v311_ignores_extra_bytes() {
-        // v3.1.1 decode reads only 2 bytes; reason_codes stays empty.
+    fn test_unsuback_decode_v311_rejects_extra_bytes() {
+        // A v3 UNSUBACK is exactly the packet identifier; a v5 encoding of
+        // the same packet carries more and must not decode as v3.
         let mut dst = BytesMut::new();
         let ua_v5 = UnsubAck::new(3, vec![ReasonCode::Success]);
         ua_v5.encode(&mut dst, v5()).unwrap();
-        // Decode the same bytes as v3.1.1 — reason codes are ignored.
-        let decoded = UnsubAck::decode(dst.freeze(), v311()).unwrap();
-        assert_eq!(decoded.packet_id, 3);
-        assert!(decoded.reason_codes.is_empty());
+        assert_eq!(
+            UnsubAck::decode(dst.freeze(), v311()),
+            Err(Error::MalformedPacket)
+        );
     }
 
     // ---- v5: properties + reason codes ----
@@ -447,5 +463,29 @@ mod tests {
             UnsubAck::decode(Bytes::from_static(&[0x00, 0x01, 0x00, 0x00, 0x12]), v5()),
             Err(Error::ProtocolError)
         );
+    }
+
+    // ---- Empty lists are rejected on encode as they are on decode ----
+
+    #[test]
+    fn test_unsubscribe_encode_empty_list_is_protocol_error() {
+        let unsub = Unsubscribe::new(1, vec![]);
+        for ver in [v311(), v5()] {
+            let mut dst = BytesMut::new();
+            assert_eq!(unsub.encode(&mut dst, ver), Err(Error::ProtocolError));
+            assert!(dst.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_unsuback_encode_empty_codes_is_protocol_error_on_v5_only() {
+        let ack = UnsubAck::new(1, vec![]);
+        let mut dst = BytesMut::new();
+        assert_eq!(ack.encode(&mut dst, v5()), Err(Error::ProtocolError));
+        assert!(dst.is_empty());
+        // v3 has no codes on the wire, so an empty list is the normal case.
+        let mut dst = BytesMut::new();
+        assert!(ack.encode(&mut dst, v311()).is_ok());
+        assert_eq!(&dst[..], &[0x00, 0x01]);
     }
 }

@@ -23,7 +23,9 @@
 use crate::{
     DecodeOptions, Error, MqttVersion, PacketType, Properties, PropertyContext, QoS, ReasonCode,
     Result, String,
-    wire::{binary_wire_size, get_binary, get_utf8, put_binary, put_utf8, utf8_wire_size},
+    wire::{
+        binary_wire_size, expect_end, get_binary, get_utf8, put_binary, put_utf8, utf8_wire_size,
+    },
 };
 use bytes::{Buf, BufMut, Bytes};
 
@@ -34,7 +36,7 @@ use serde::{Deserialize, Serialize};
 
 /// The Will message carried in a CONNECT packet.
 ///
-/// On v3.1.1 connections `properties` is always empty.
+/// On v3 connections `properties` is always empty.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct Will {
@@ -46,7 +48,7 @@ pub struct Will {
     pub qos: QoS,
     /// Whether the Will message should be retained by the broker.
     pub retain: bool,
-    /// MQTT v5 Will Properties; empty on v3.1.1 connections.
+    /// MQTT v5 Will Properties; empty on v3 connections.
     pub properties: Properties,
 }
 
@@ -70,14 +72,14 @@ impl Will {
 
 /////////////////////////////////////////////////////////////////////////////
 
-/// A CONNECT packet, unified across MQTT v3.1.1 and v5.
+/// A CONNECT packet, unified across MQTT v3.1, v3.1.1, and v5.
 ///
 /// Unlike every other packet, CONNECT declares its own protocol version on
 /// the wire (the protocol-level byte), so it carries a [`version`](Self::version)
 /// field rather than taking one as a parameter. Encoding uses that field;
 /// decoding sets it from the wire.
 ///
-/// The `properties` field and `will.properties` are always empty on v3.1.1
+/// The `properties` field and `will.properties` are always empty on v3
 /// connections and are not encoded on the wire for that version.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
@@ -96,7 +98,7 @@ pub struct Connect {
     pub password: Option<Bytes>,
     /// Optional Will message to publish if the connection is lost unexpectedly.
     pub will: Option<Will>,
-    /// MQTT v5 connect properties; empty on v3.1.1 connections.
+    /// MQTT v5 connect properties; empty on v3 connections.
     pub properties: Properties,
 }
 
@@ -267,6 +269,7 @@ impl Connect {
         } else {
             None
         };
+        expect_end(&payload)?;
         Ok(Self {
             version: ver,
             clean_start,
@@ -282,7 +285,7 @@ impl Connect {
 
 // --------------------------------------------------------------------------
 
-// MQTT v3.1.1 §3.2.2.3: six defined return codes (0–5). On decode we map
+// MQTT v3.1 / v3.1.1 §3.2.2.3: six defined return codes (0–5). On decode we map
 // them to the nearest v5 ReasonCode; on encode we reverse the mapping.
 // Unknown return codes are treated as malformed.
 
@@ -314,10 +317,10 @@ fn reason_to_v311_code(rc: ReasonCode) -> Result<u8> {
 
 /////////////////////////////////////////////////////////////////////////////
 
-/// A CONNACK packet, unified across MQTT v3.1.1 and v5.
+/// A CONNACK packet, unified across MQTT v3.1, v3.1.1, and v5.
 ///
-/// On v3.1.1 connections the `properties` field is always empty; on v5 it
-/// carries the server's capabilities and assigned values. The v3.1.1
+/// On v3 connections the `properties` field is always empty; on v5 it
+/// carries the server's capabilities and assigned values. The v3
 /// connect return code is translated to the nearest [`ReasonCode`] on
 /// decode, and the reverse mapping is applied on encode.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -327,12 +330,12 @@ pub struct ConnAck {
     pub session_present: bool,
     /// Outcome of the connection attempt.
     pub reason_code: ReasonCode,
-    /// MQTT v5 properties; empty on v3.1.1 connections.
+    /// MQTT v5 properties; empty on v3 connections.
     pub properties: Properties,
 }
 
 impl ConnAck {
-    /// Creates a `ConnAck` with no properties (suitable for either version).
+    /// Creates a `ConnAck` with no properties (suitable for any version).
     pub fn new(session_present: bool, reason_code: ReasonCode) -> Self {
         Self {
             session_present,
@@ -404,6 +407,7 @@ impl ConnAck {
             _ => v311_code_to_reason(code_byte)?,
         };
         let properties = Properties::decode_in(&mut payload, ver, PacketType::ConnAck)?;
+        expect_end(&payload)?;
 
         // A server must clear Session Present on a refused connection
         // (MQTT-3.2.2-4). If one doesn't, the flag is meaningless anyway;

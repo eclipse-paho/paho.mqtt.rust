@@ -25,7 +25,7 @@
 //! collection encodes and decodes the length-prefixed property list that
 //! appears in the variable header of every v5 packet type that supports them.
 //!
-//! On v3.1.1 connections properties are always empty and are never written to
+//! On v3 connections properties are always empty and are never written to
 //! or read from the wire.
 
 use crate::{
@@ -68,34 +68,67 @@ pub enum PropertyType {
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-#[allow(missing_docs)]
 pub enum PropertyId {
+    /// Payload is unspecified bytes (0) or UTF-8 text (1). PUBLISH, Will.
     PayloadFormatIndicator = 0x01,
+    /// Message lifetime in seconds. PUBLISH, Will.
     MessageExpiryInterval = 0x02,
+    /// Description of the payload content, e.g. a MIME type. PUBLISH, Will.
     ContentType = 0x03,
+    /// Topic for a response in a request/response exchange. PUBLISH, Will.
     ResponseTopic = 0x08,
+    /// Opaque data correlating a response with its request. PUBLISH, Will.
     CorrelationData = 0x09,
+    /// Identifier tying a delivered PUBLISH to the subscription that matched
+    /// it. SUBSCRIBE (once), PUBLISH (may repeat).
     SubscriptionIdentifier = 0x0B,
+    /// How long the session survives after disconnect, in seconds.
+    /// CONNECT, CONNACK, DISCONNECT.
     SessionExpiryInterval = 0x11,
+    /// Client identifier the server assigned when the client sent none.
+    /// CONNACK.
     AssignedClientIdentifier = 0x12,
+    /// Keep-alive the server requires, overriding the client's. CONNACK.
     ServerKeepAlive = 0x13,
+    /// Name of the extended authentication method. CONNECT, CONNACK, AUTH.
     AuthenticationMethod = 0x15,
+    /// Method-specific authentication data. CONNECT, CONNACK, AUTH.
     AuthenticationData = 0x16,
+    /// Whether the server may send Reason Strings and User Properties on
+    /// failures other than PUBLISH, CONNACK, and DISCONNECT. CONNECT.
     RequestProblemInformation = 0x17,
+    /// Delay before the server publishes the Will, in seconds. Will.
     WillDelayInterval = 0x18,
+    /// Whether the client wants Response Information in CONNACK. CONNECT.
     RequestResponseInformation = 0x19,
+    /// Basis for building response topics. CONNACK.
     ResponseInformation = 0x1A,
+    /// Another server the client should use. CONNACK, DISCONNECT.
     ServerReference = 0x1C,
+    /// Human-readable explanation of a reason code. Any acknowledgement,
+    /// DISCONNECT, AUTH.
     ReasonString = 0x1F,
+    /// Most QoS 1 and 2 PUBLISH packets the sender will accept in flight.
+    /// CONNECT, CONNACK.
     ReceiveMaximum = 0x21,
+    /// Highest topic alias the sender will accept. CONNECT, CONNACK.
     TopicAliasMaximum = 0x22,
+    /// Integer standing in for the topic name. PUBLISH.
     TopicAlias = 0x23,
+    /// Highest QoS the server supports (0 or 1). CONNACK.
     MaximumQoS = 0x24,
+    /// Whether the server supports retained messages. CONNACK.
     RetainAvailable = 0x25,
+    /// Application-defined name/value pair. Every packet except PINGREQ
+    /// and PINGRESP; may repeat.
     UserProperty = 0x26,
+    /// Largest packet the sender will accept. CONNECT, CONNACK.
     MaximumPacketSize = 0x27,
+    /// Whether the server supports wildcard subscriptions. CONNACK.
     WildcardSubscriptionAvailable = 0x28,
+    /// Whether the server supports subscription identifiers. CONNACK.
     SubscriptionIdentifierAvailable = 0x29,
+    /// Whether the server supports shared subscriptions. CONNACK.
     SharedSubscriptionAvailable = 0x2A,
 }
 
@@ -137,13 +170,31 @@ impl PropertyId {
         }
     }
 
-    /// Returns `true` if this property may appear more than once in a packet.
+    /// Returns `true` if this property may appear more than once in some
+    /// packet.
     ///
-    /// Only `UserProperty` and `SubscriptionIdentifier` may repeat; the
+    /// Only `UserProperty` and `SubscriptionIdentifier` ever repeat; the
     /// specification makes a second occurrence of any other property a
-    /// Protocol Error.
+    /// Protocol Error. `SubscriptionIdentifier` repeats only in PUBLISH —
+    /// see [`is_repeatable_in`](Self::is_repeatable_in) for the
+    /// context-aware form.
     pub fn is_repeatable(self) -> bool {
         matches!(self, Self::UserProperty | Self::SubscriptionIdentifier)
+    }
+
+    /// Returns `true` if this property may appear more than once in `ctx`.
+    ///
+    /// `UserProperty` may repeat anywhere it is allowed. A PUBLISH may carry
+    /// several `SubscriptionIdentifier`s (one per matching subscription,
+    /// §3.3.2.3.8) but a SUBSCRIBE may carry only one (§3.8.2.1.2).
+    pub fn is_repeatable_in(self, ctx: impl Into<PropertyContext>) -> bool {
+        match self {
+            Self::UserProperty => true,
+            Self::SubscriptionIdentifier => {
+                ctx.into() == PropertyContext::Packet(PacketType::Publish)
+            }
+            _ => false,
+        }
     }
 }
 
@@ -556,7 +607,7 @@ impl SeenIds {
 /// `UserProperty`; allowed for `SubscriptionIdentifier`). Use [`Properties::get`]
 /// for the first occurrence and [`Properties::iter`] when you need all.
 ///
-/// On v3.1.1 connections, properties are always empty and are never written
+/// On v3 connections, properties are always empty and are never written
 /// to the wire.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
@@ -622,7 +673,7 @@ impl Properties {
 
     /// Number of bytes this encodes to on the wire, including the VBI length prefix.
     ///
-    /// Returns 0 for v3.1.1 connections — properties are not present on the wire.
+    /// Returns 0 for v3 connections — properties are not present on the wire.
     pub fn encoded_size(&self, ver: MqttVersion) -> usize {
         if ver < MqttVersion::V5 {
             0
@@ -634,7 +685,7 @@ impl Properties {
 
     /// Encodes the properties to the wire: VBI(payload_len) followed by each property.
     ///
-    /// No bytes are written for v3.1.1 connections.
+    /// No bytes are written for v3 connections.
     pub fn encode<B: BufMut>(&self, dst: &mut B, ver: MqttVersion) -> Result<()> {
         if ver >= MqttVersion::V5 {
             if self.seen.is_invalid() {
@@ -648,23 +699,30 @@ impl Properties {
         Ok(())
     }
 
-    /// Checks that every property is allowed in `ctx` (MQTT v5 §2.2.2.2).
-    /// Returns [`Error::ProtocolError`] otherwise.
+    /// Checks that every property is allowed in `ctx` (MQTT v5 §2.2.2.2)
+    /// and that none repeats where `ctx` forbids it — in practice, that a
+    /// `SubscriptionIdentifier` appears at most once outside a PUBLISH
+    /// (§3.8.2.1.2). Returns [`Error::ProtocolError`] otherwise.
     ///
     /// Packet encoders call this; use it directly when assembling properties
     /// for a packet to catch a misplaced one early.
     #[inline]
     pub fn check_context(&self, ctx: impl Into<PropertyContext>) -> Result<()> {
-        let allowed = ctx.into().allowed_ids();
-        if self
-            .props
-            .iter()
-            .all(|p| allowed & (1 << (p.id as u8)) != 0)
-        {
-            Ok(())
-        } else {
-            Err(Error::ProtocolError)
+        let ctx = ctx.into();
+        let allowed = ctx.allowed_ids();
+        let mut sub_ids = 0usize;
+        for p in &self.props {
+            if allowed & (1 << (p.id as u8)) == 0 {
+                return Err(Error::ProtocolError);
+            }
+            if p.id == PropertyId::SubscriptionIdentifier {
+                sub_ids += 1;
+            }
         }
+        if sub_ids > 1 && !PropertyId::SubscriptionIdentifier.is_repeatable_in(ctx) {
+            return Err(Error::ProtocolError);
+        }
+        Ok(())
     }
 
     /// Decodes the properties from the wire: reads the VBI length prefix, then
@@ -672,24 +730,34 @@ impl Properties {
     ///
     /// Accepts any property identifier in any position; see
     /// [`decode_in`](Self::decode_in) to also enforce which properties may
-    /// appear in a given packet. Returns an empty collection for v3.1.1
+    /// appear in a given packet. Returns an empty collection for v3
     /// connections without consuming any bytes.
     pub fn decode<B: Buf>(src: &mut B, ver: MqttVersion) -> Result<Self> {
-        Self::decode_allowed(src, ver, u64::MAX)
+        Self::decode_allowed(src, ver, u64::MAX, true)
     }
 
     /// Decodes the properties from the wire as [`decode`](Self::decode) does,
     /// and additionally rejects with [`Error::ProtocolError`] any property the
-    /// specification does not allow in `ctx` (MQTT v5 §2.2.2.2).
+    /// specification does not allow in `ctx` (MQTT v5 §2.2.2.2), or a
+    /// `SubscriptionIdentifier` repeated anywhere but a PUBLISH (§3.8.2.1.2).
     pub fn decode_in<B: Buf>(
         src: &mut B,
         ver: MqttVersion,
         ctx: impl Into<PropertyContext>,
     ) -> Result<Self> {
-        Self::decode_allowed(src, ver, ctx.into().allowed_ids())
+        let ctx = ctx.into();
+        let sub_id_repeats = PropertyId::SubscriptionIdentifier.is_repeatable_in(ctx);
+        Self::decode_allowed(src, ver, ctx.allowed_ids(), sub_id_repeats)
     }
 
-    fn decode_allowed<B: Buf>(src: &mut B, ver: MqttVersion, allowed: u64) -> Result<Self> {
+    /// `allowed` is the identifier bitmask for the context; `sub_id_repeats`
+    /// says whether a second `SubscriptionIdentifier` is permitted there.
+    fn decode_allowed<B: Buf>(
+        src: &mut B,
+        ver: MqttVersion,
+        allowed: u64,
+        sub_id_repeats: bool,
+    ) -> Result<Self> {
         if ver < MqttVersion::V5 {
             return Ok(Self::new());
         }
@@ -702,12 +770,19 @@ impl Properties {
         let mut props = Vec::new();
         let mut seen = SeenIds::default();
         let mut payload_size = 0;
+        let mut saw_sub_id = false;
         while payload.has_remaining() {
             let prop = Property::decode(&mut payload)?; // validated
             if allowed & (1 << (prop.id as u8)) == 0 {
                 return Err(Error::ProtocolError);
             }
             seen.note(prop.id)?;
+            if prop.id == PropertyId::SubscriptionIdentifier {
+                if saw_sub_id && !sub_id_repeats {
+                    return Err(Error::ProtocolError);
+                }
+                saw_sub_id = true;
+            }
             // Size from the decoded value, not the wire length, so the cache
             // is right by construction even for a non-canonical encoding.
             payload_size += prop.encoded_size();
@@ -1486,5 +1561,61 @@ mod tests {
         ));
         let mut dst = BytesMut::new();
         assert_eq!(props.encode(&mut dst, v5()), Err(Error::StringTooLong));
+    }
+
+    // ---- SubscriptionIdentifier repeats only in PUBLISH (§3.3.2.3.8, §3.8.2.1.2) ----
+
+    fn two_sub_ids() -> Properties {
+        let mut props = Properties::new();
+        props.push(Property::new(
+            PropertyId::SubscriptionIdentifier,
+            PropertyValue::VarInt(1),
+        ));
+        props.push(Property::new(
+            PropertyId::SubscriptionIdentifier,
+            PropertyValue::VarInt(2),
+        ));
+        props
+    }
+
+    #[test]
+    fn test_is_repeatable_in() {
+        use PropertyId::*;
+        assert!(SubscriptionIdentifier.is_repeatable_in(PacketType::Publish));
+        assert!(!SubscriptionIdentifier.is_repeatable_in(PacketType::Subscribe));
+        assert!(UserProperty.is_repeatable_in(PacketType::Subscribe));
+        assert!(UserProperty.is_repeatable_in(PropertyContext::Will));
+        assert!(!ReasonString.is_repeatable_in(PacketType::PubAck));
+    }
+
+    #[test]
+    fn test_check_context_subscription_identifier_repeat() {
+        let props = two_sub_ids();
+        assert!(props.check_context(PacketType::Publish).is_ok());
+        assert_eq!(
+            props.check_context(PacketType::Subscribe),
+            Err(Error::ProtocolError)
+        );
+        // The list itself is still valid: `encode` without a context accepts it.
+        let mut dst = BytesMut::new();
+        assert!(props.encode(&mut dst, v5()).is_ok());
+    }
+
+    #[test]
+    fn test_decode_in_subscription_identifier_repeat() {
+        let mut wire = BytesMut::new();
+        two_sub_ids().encode(&mut wire, v5()).unwrap();
+        let wire = wire.freeze();
+
+        let decoded = Properties::decode_in(&mut wire.clone(), v5(), PacketType::Publish)
+            .expect("PUBLISH may carry several");
+        assert_eq!(decoded.len(), 2);
+
+        assert_eq!(
+            Properties::decode_in(&mut wire.clone(), v5(), PacketType::Subscribe),
+            Err(Error::ProtocolError)
+        );
+        // The context-free decoder stays permissive.
+        assert!(Properties::decode(&mut wire.clone(), v5()).is_ok());
     }
 }

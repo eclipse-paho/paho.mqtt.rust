@@ -20,15 +20,15 @@
 
 //! MQTT SUBSCRIBE and SUBACK packets.
 //!
-//! SUBSCRIBE carries per-subscription options in a single byte. In v3.1.1
+//! SUBSCRIBE carries per-subscription options in a single byte. In v3
 //! that byte is just the requested QoS; in v5 it also carries `no_local`,
 //! `retain_as_published`, and `retain_handling` flags. The unified
-//! [`Subscription`] struct carries all fields; v3.1.1 encode writes only
-//! the QoS bits and v3.1.1 decode leaves the v5 fields at their defaults.
+//! [`Subscription`] struct carries all fields; v3 encode writes only
+//! the QoS bits and v3 decode leaves the v5 fields at their defaults.
 
 use crate::{
     Error, MqttVersion, PacketType, Properties, QoS, ReasonCode, Result, String, Vec, topic,
-    wire::{get_utf8, put_utf8, utf8_wire_size},
+    wire::{check_packet_id, get_utf8, put_utf8, utf8_wire_size},
 };
 use bytes::{Buf, BufMut, Bytes};
 
@@ -44,7 +44,7 @@ use serde::{Deserialize, Serialize};
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[repr(u8)]
 pub enum RetainHandling {
-    /// Send retained messages at subscribe time (v3.1.1 behaviour).
+    /// Send retained messages at subscribe time (v3 behaviour).
     #[default]
     SendOnSubscribe = 0,
     /// Send retained messages only if the subscription does not already exist.
@@ -57,7 +57,7 @@ pub enum RetainHandling {
 
 /// A single topic-filter entry inside a SUBSCRIBE packet.
 ///
-/// On v3.1.1 connections the v5-only fields (`no_local`,
+/// On v3 connections the v5-only fields (`no_local`,
 /// `retain_as_published`, `retain_handling`) are ignored during encode and
 /// left at their defaults during decode.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -105,7 +105,7 @@ impl Subscription {
 
 /////////////////////////////////////////////////////////////////////////////
 
-/// A SUBSCRIBE packet, unified across MQTT v3.1.1 and v5.
+/// A SUBSCRIBE packet, unified across MQTT v3.1, v3.1.1, and v5.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct Subscribe {
@@ -113,7 +113,7 @@ pub struct Subscribe {
     pub packet_id: u16,
     /// One or more topic-filter / options pairs. Must not be empty.
     pub subscriptions: Vec<Subscription>,
-    /// MQTT v5 properties; empty on v3.1.1 connections.
+    /// MQTT v5 properties; empty on v3 connections.
     pub properties: Properties,
 }
 
@@ -138,8 +138,15 @@ impl Subscribe {
     }
 
     /// Encodes the variable header and payload into `dst`.
+    ///
+    /// Returns [`Error::ProtocolError`] if `packet_id` is 0 or
+    /// `subscriptions` is empty (MQTT-3.8.3-2) — the same rules decode
+    /// applies.
     pub fn encode<B: BufMut>(&self, dst: &mut B, ver: MqttVersion) -> Result<()> {
-        dst.put_u16(self.packet_id);
+        if self.subscriptions.is_empty() {
+            return Err(Error::ProtocolError);
+        }
+        dst.put_u16(check_packet_id(self.packet_id)?);
         self.properties.check_context(PacketType::Subscribe)?;
         self.properties.encode(dst, ver)?;
         for sub in &self.subscriptions {
@@ -155,7 +162,7 @@ impl Subscribe {
         if payload.remaining() < 2 {
             return Err(Error::PacketTooShort);
         }
-        let packet_id = payload.get_u16();
+        let packet_id = check_packet_id(payload.get_u16())?;
         let properties = Properties::decode_in(&mut payload, ver, PacketType::Subscribe)?;
         let mut subscriptions = Vec::new();
         while payload.has_remaining() {
@@ -182,7 +189,7 @@ impl Subscribe {
                 }
                 _ => {
                     if options & 0xFC != 0 {
-                        return Err(Error::MalformedPacket); // bits 7-2 reserved in v3.1.1
+                        return Err(Error::MalformedPacket); // bits 7-2 reserved in v3
                     }
                     (false, false, RetainHandling::SendOnSubscribe)
                 }
@@ -211,9 +218,9 @@ impl Subscribe {
 
 /////////////////////////////////////////////////////////////////////////////
 
-/// A SUBACK packet, unified across MQTT v3.1.1 and v5.
+/// A SUBACK packet, unified across MQTT v3.1, v3.1.1, and v5.
 ///
-/// In v3.1.1 the per-subscription return codes (`0x00`=QoS0, `0x01`=QoS1,
+/// In v3 the per-subscription return codes (`0x00`=QoS0, `0x01`=QoS1,
 /// `0x02`=QoS2, `0x80`=Failure) share byte values with
 /// [`ReasonCode::GrantedQos0`] / `GrantedQos1` / `GrantedQos2` /
 /// [`ReasonCode::UnspecifiedError`], so no translation is needed.
@@ -224,7 +231,7 @@ pub struct SubAck {
     pub packet_id: u16,
     /// One reason code per topic filter in the SUBSCRIBE, in order.
     pub reason_codes: Vec<ReasonCode>,
-    /// MQTT v5 properties; empty on v3.1.1 connections.
+    /// MQTT v5 properties; empty on v3 connections.
     pub properties: Properties,
 }
 
@@ -244,8 +251,14 @@ impl SubAck {
     }
 
     /// Encodes the variable header and payload into `dst`.
+    ///
+    /// Returns [`Error::ProtocolError`] if `packet_id` is 0 or
+    /// `reason_codes` is empty (MQTT-3.9.3-1).
     pub fn encode<B: BufMut>(&self, dst: &mut B, ver: MqttVersion) -> Result<()> {
-        dst.put_u16(self.packet_id);
+        if self.reason_codes.is_empty() {
+            return Err(Error::ProtocolError);
+        }
+        dst.put_u16(check_packet_id(self.packet_id)?);
         self.properties.check_context(PacketType::SubAck)?;
         self.properties.encode(dst, ver)?;
         for &rc in &self.reason_codes {
@@ -259,7 +272,7 @@ impl SubAck {
         if payload.remaining() < 2 {
             return Err(Error::PacketTooShort);
         }
-        let packet_id = payload.get_u16();
+        let packet_id = check_packet_id(payload.get_u16())?;
         let properties = Properties::decode_in(&mut payload, ver, PacketType::SubAck)?;
         let reason_codes = payload
             .iter()
@@ -285,7 +298,10 @@ impl SubAck {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{MQTT_VERSION_3_1_1, MQTT_VERSION_5};
+    use crate::{
+        Property, PropertyId, PropertyValue,
+        types::{MQTT_VERSION_3_1_1, MQTT_VERSION_5},
+    };
     use alloc::vec;
     use bytes::BytesMut;
 
@@ -641,5 +657,60 @@ mod tests {
         let mut dst = BytesMut::new();
         sa.encode(&mut dst, v311()).unwrap();
         assert_eq!(&dst[2..], &[0x00, 0x01, 0x02, 0x80]);
+    }
+
+    // ---- Empty lists are rejected on encode as they are on decode ----
+
+    #[test]
+    fn test_subscribe_encode_empty_list_is_protocol_error() {
+        let sub = Subscribe::new(1, vec![]);
+        for ver in [v311(), v5()] {
+            let mut dst = BytesMut::new();
+            assert_eq!(sub.encode(&mut dst, ver), Err(Error::ProtocolError));
+            assert!(dst.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_suback_encode_empty_codes_is_protocol_error() {
+        let ack = SubAck::new(1, vec![]);
+        for ver in [v311(), v5()] {
+            let mut dst = BytesMut::new();
+            assert_eq!(ack.encode(&mut dst, ver), Err(Error::ProtocolError));
+            assert!(dst.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_subscribe_encode_rejects_second_subscription_identifier() {
+        // A PUBLISH may carry several; a SUBSCRIBE only one (§3.8.2.1.2).
+        let mut sub = Subscribe::new(1, vec![Subscription::new("a", QoS::QoS0)]);
+        sub.properties.push(Property::new(
+            PropertyId::SubscriptionIdentifier,
+            PropertyValue::VarInt(1),
+        ));
+        let mut dst = BytesMut::new();
+        assert!(sub.encode(&mut dst, v5()).is_ok(), "one is fine");
+        sub.properties.push(Property::new(
+            PropertyId::SubscriptionIdentifier,
+            PropertyValue::VarInt(2),
+        ));
+        let mut dst = BytesMut::new();
+        assert_eq!(sub.encode(&mut dst, v5()), Err(Error::ProtocolError));
+    }
+
+    #[test]
+    fn test_subscribe_decode_rejects_second_subscription_identifier() {
+        // packet id 1; props len 4: (0x0B, 1), (0x0B, 2); filter "a" qos 0
+        let bytes: &[u8] = &[
+            0x00, 0x01, 0x04, 0x0B, 0x01, 0x0B, 0x02, 0x00, 0x01, b'a', 0x00,
+        ];
+        assert_eq!(
+            Subscribe::decode(Bytes::from_static(bytes), v5()),
+            Err(Error::ProtocolError)
+        );
+        // With a single identifier the same layout decodes.
+        let bytes: &[u8] = &[0x00, 0x01, 0x02, 0x0B, 0x01, 0x00, 0x01, b'a', 0x00];
+        assert!(Subscribe::decode(Bytes::from_static(bytes), v5()).is_ok());
     }
 }

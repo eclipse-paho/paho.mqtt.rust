@@ -80,8 +80,13 @@ pub enum Error {
     /// An incoming packet's declared size exceeded the configured maximum.
     #[error("packet exceeds maximum packet size")]
     PacketTooLarge,
-    /// A CONNECT packet named a protocol or protocol level this codec does
-    /// not support (e.g. MQTT v3.1's `MQIsdp`).
+    /// A CONNECT packet named a protocol level this codec does not support,
+    /// or a protocol name and level that do not belong together (the crate
+    /// speaks `MQIsdp`/3 for v3.1, `MQTT`/4 for v3.1.1, and `MQTT`/5 for v5).
+    /// Also returned by the `TryFrom` conversions on [`MqttVersion`] for an
+    /// unknown level byte.
+    ///
+    /// [`MqttVersion`]: crate::MqttVersion
     #[error("unsupported protocol version")]
     UnsupportedProtocolVersion,
 }

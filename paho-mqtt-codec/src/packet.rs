@@ -32,7 +32,7 @@
 
 use crate::{
     Auth, ConnAck, Connect, Disconnect, Error, MqttVersion, PubAck, Publish, Result, SubAck,
-    Subscribe, UnsubAck, Unsubscribe, varlen,
+    Subscribe, UnsubAck, Unsubscribe, varlen, wire::expect_end,
 };
 use alloc::boxed::Box;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
@@ -266,8 +266,8 @@ impl RawPacket {
 
 /// A typed MQTT packet.
 ///
-/// This enum covers all packet types for MQTT v3.1, v3.1.1, and v5. v5-only
-/// packets (e.g. `Auth`) are present but will not appear on v3 connections.
+/// This enum covers all packet types for MQTT v3.1, v3.1.1, and v5. The one
+/// v5-only packet, `Auth`, is present but will not appear on v3 connections.
 /// v5 fields (reason codes, properties) are present on all applicable structs
 /// and default to empty/success on v3 connections.
 ///
@@ -359,7 +359,7 @@ impl Packet {
             return Err(Error::MalformedPacket);
         }
 
-        // Type 15 is reserved in v3.1.1; AUTH exists only in v5.
+        // Type 15 is reserved in v3.1 and v3.1.1; AUTH exists only in v5.
         if ty == T::Auth && ver != MqttVersion::V5 {
             return Err(Error::UnknownPacketType(ty as u8));
         }
@@ -376,8 +376,14 @@ impl Packet {
             T::SubAck => Packet::SubAck(SubAck::decode(raw.payload, ver)?),
             T::Unsubscribe => Packet::Unsubscribe(Unsubscribe::decode(raw.payload, ver)?),
             T::UnsubAck => Packet::UnsubAck(UnsubAck::decode(raw.payload, ver)?),
-            T::PingReq => Packet::PingReq,
-            T::PingResp => Packet::PingResp,
+            T::PingReq => {
+                expect_end(&raw.payload)?;
+                Packet::PingReq
+            }
+            T::PingResp => {
+                expect_end(&raw.payload)?;
+                Packet::PingResp
+            }
             T::Disconnect => Packet::Disconnect(Disconnect::decode(raw.payload, ver)?),
             T::Auth => Packet::Auth(Auth::decode(raw.payload)?),
         };
@@ -389,7 +395,7 @@ impl Packet {
     /// lists for this packet type (MQTT v5 §2.4); each acknowledgement has
     /// its own allowed set. Returns [`Error::ProtocolError`] otherwise.
     ///
-    /// Not version-gated: on v3.1.1 the only codes that can be present are
+    /// Not version-gated: on v3 the only codes that can be present are
     /// the CONNACK return codes and SUBACK granted-QoS values, which are in
     /// their respective sets.
     #[inline]
@@ -575,6 +581,7 @@ mod tests {
         QoS, ReasonCode, String, Subscription,
         types::{MQTT_VERSION_3_1_1, MQTT_VERSION_5},
     };
+    use alloc::vec;
 
     fn v311() -> MqttVersion {
         MQTT_VERSION_3_1_1
@@ -1076,5 +1083,154 @@ mod tests {
         let mut dst = BytesMut::from(&b"existing"[..]);
         assert_eq!(pkt.encode(&mut dst, v5()), Err(Error::ProtocolError));
         assert_eq!(&dst[..], b"existing");
+    }
+
+    // ---- Packet identifier 0 is rejected everywhere (MQTT-2.2.1-3) ----
+
+    /// Frames `body` under `header` and parses it.
+    fn parse(header: u8, body: &[u8], ver: MqttVersion) -> Result<Packet> {
+        let mut src = BytesMut::new();
+        src.put_u8(header);
+        varlen::encode(body.len() as u32, &mut src).unwrap();
+        src.put_slice(body);
+        Packet::from_raw(RawPacket::decode(&mut src).unwrap().unwrap(), ver)
+    }
+
+    #[test]
+    fn test_decode_packet_id_zero_is_protocol_error_in_every_packet() {
+        use PacketType as T;
+        let cases: [(PacketType, &[u8]); 8] = [
+            (T::PubAck, &[0x00, 0x00]),
+            (T::PubRec, &[0x00, 0x00]),
+            (T::PubRel, &[0x00, 0x00]),
+            (T::PubComp, &[0x00, 0x00]),
+            (T::Subscribe, &[0x00, 0x00, 0x00, 0x01, b'a', 0x00]),
+            (T::SubAck, &[0x00, 0x00, 0x00]),
+            (T::Unsubscribe, &[0x00, 0x00, 0x00, 0x01, b'a']),
+            (T::UnsubAck, &[0x00, 0x00]),
+        ];
+        for (ty, body) in cases {
+            assert_eq!(
+                parse(ty.header_byte(), body, v311()),
+                Err(Error::ProtocolError),
+                "{ty:?} v3"
+            );
+        }
+        // Same bodies are valid once the identifier is non-zero.
+        for (ty, body) in cases {
+            let mut fixed = body.to_vec();
+            fixed[1] = 0x07;
+            assert!(parse(ty.header_byte(), &fixed, v311()).is_ok(), "{ty:?}");
+        }
+        // PUBLISH QoS 1 with ID 0 was already rejected; keep it pinned.
+        assert_eq!(
+            parse(0x32, &[0x00, 0x01, b'a', 0x00, 0x00], v311()),
+            Err(Error::ProtocolError)
+        );
+    }
+
+    #[test]
+    fn test_encode_packet_id_zero_is_protocol_error_in_every_packet() {
+        let mut publish = Publish::new("a", "x");
+        publish.qos = QoS::QoS1;
+        publish.packet_id = Some(0);
+        let pkts = [
+            Packet::Publish(publish),
+            Packet::PubAck(PubAck::new(0)),
+            Packet::PubRec(PubAck::new(0)),
+            Packet::PubRel(PubAck::new(0)),
+            Packet::PubComp(PubAck::new(0)),
+            Packet::Subscribe(Subscribe::new(0, vec![Subscription::new("a", QoS::QoS0)])),
+            Packet::SubAck(SubAck::new(0, vec![ReasonCode::Success])),
+            Packet::Unsubscribe(Unsubscribe::new(0, vec![String::from("a")])),
+            Packet::UnsubAck(UnsubAck::new(0, vec![ReasonCode::Success])),
+        ];
+        for pkt in pkts {
+            for ver in [v311(), v5()] {
+                let mut dst = BytesMut::new();
+                assert_eq!(
+                    pkt.encode(&mut dst, ver),
+                    Err(Error::ProtocolError),
+                    "{:?} {ver}",
+                    pkt.packet_type()
+                );
+                assert!(dst.is_empty(), "nothing written on failure");
+            }
+        }
+    }
+
+    // ---- Trailing bytes are malformed (§2.1.4) ----
+
+    #[test]
+    fn test_pingreq_pingresp_with_body_are_malformed() {
+        assert_eq!(
+            parse(PacketType::PingReq.header_byte(), &[0x00], v5()),
+            Err(Error::MalformedPacket)
+        );
+        assert_eq!(
+            parse(PacketType::PingResp.header_byte(), &[0x00, 0x00], v311()),
+            Err(Error::MalformedPacket)
+        );
+        // Zero remaining length is still fine.
+        assert_eq!(
+            parse(PacketType::PingReq.header_byte(), &[], v5()),
+            Ok(Packet::PingReq)
+        );
+    }
+
+    #[test]
+    fn test_trailing_bytes_after_fixed_size_bodies_are_malformed() {
+        use PacketType as T;
+        // (type, minimal valid body, version)
+        let cases: [(PacketType, &[u8], MqttVersion); 9] = [
+            (T::ConnAck, &[0x00, 0x00], v311()),
+            (T::ConnAck, &[0x00, 0x00, 0x00], v5()), // with empty properties
+            (T::PubAck, &[0x00, 0x01], v311()),
+            (T::PubAck, &[0x00, 0x01, 0x00, 0x00], v5()), // rc + empty props
+            (T::PubRel, &[0x00, 0x01], v311()),
+            (T::UnsubAck, &[0x00, 0x01], v311()),
+            (T::Disconnect, &[], v311()),
+            (T::Disconnect, &[0x00, 0x00], v5()), // rc + empty props
+            (T::Auth, &[0x00, 0x00], v5()),
+        ];
+        for (ty, body, ver) in cases {
+            assert!(
+                parse(ty.header_byte(), body, ver).is_ok(),
+                "{ty:?} {ver} baseline"
+            );
+            let mut extra = body.to_vec();
+            extra.push(0xFF);
+            assert_eq!(
+                parse(ty.header_byte(), &extra, ver),
+                Err(Error::MalformedPacket),
+                "{ty:?} {ver} with a trailing byte"
+            );
+        }
+    }
+
+    #[test]
+    fn test_connect_with_trailing_bytes_is_malformed() {
+        let mut conn = Connect::new(v5(), true, "c");
+        conn.username = Some(String::from("u"));
+        conn.password = Some(Bytes::from_static(b"p"));
+        let mut dst = BytesMut::new();
+        Packet::Connect(Box::new(conn))
+            .encode(&mut dst, v5())
+            .unwrap();
+        // Append one byte and patch the remaining length (single-byte VBI here).
+        dst.put_u8(0xFF);
+        dst[1] += 1;
+        let raw = RawPacket::decode(&mut dst).unwrap().unwrap();
+        assert_eq!(Packet::from_raw(raw, v5()), Err(Error::MalformedPacket));
+    }
+
+    #[test]
+    fn test_v3_disconnect_with_body_is_malformed() {
+        assert_eq!(
+            parse(PacketType::Disconnect.header_byte(), &[0x00], v311()),
+            Err(Error::MalformedPacket)
+        );
+        // The same bytes are a valid v5 DISCONNECT (reason code, no props).
+        assert!(parse(PacketType::Disconnect.header_byte(), &[0x00], v5()).is_ok());
     }
 }
