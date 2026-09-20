@@ -115,8 +115,6 @@ pub(crate) struct InnerAsyncClient {
 }
 
 // The client is safe to send or share between threads.
-unsafe impl Send for InnerAsyncClient {}
-unsafe impl Sync for InnerAsyncClient {}
 
 /// User callback type for when the client is connected.
 pub type ConnectedCallback = dyn FnMut(&AsyncClient, &ConnectResponse) + Send + 'static;
@@ -276,8 +274,20 @@ impl AsyncClient {
 
         let keep_alive_secs = opts.keep_alive_interval.as_secs().min(u16::MAX as u64) as u16;
 
-        let will = opts.will.as_ref().map(|msg| {
-            paho_mqtt_codec::Will::new(msg.topic.clone(), msg.payload.clone(), msg.qos, msg.retain)
+        // The Will's v5 properties (delay interval, expiry, content type, …)
+        // travel with it; like connect properties they need a v5 connection.
+        if let Some(msg) = &opts.will
+            && !msg.props.is_empty()
+            && ver < MqttVersion::V5
+        {
+            return ConnectToken::from(Error::WrongMqttVersion);
+        }
+        let will = opts.will.as_ref().map(|msg| paho_mqtt_codec::Will {
+            topic: msg.topic.clone(),
+            payload: msg.payload.clone(),
+            qos: msg.qos,
+            retain: msg.retain,
+            properties: msg.props.clone(),
         });
 
         let (tok, comp) = ConnectToken::new();
@@ -301,6 +311,7 @@ impl AsyncClient {
             min_retry_interval: opts.min_retry_interval,
             max_retry_interval: opts.max_retry_interval,
             max_inflight: opts.max_inflight as usize,
+            connect_timeout: opts.timeout,
         };
 
         let cmd = Command::Connect {
@@ -426,6 +437,7 @@ impl AsyncClient {
     {
         let (tok, comp) = SubscribeToken::new();
         let cmd = Command::Subscribe {
+            single: true,
             filters: vec![(topic.into(), qos.into(), SubscribeOptions::default())],
             props: Default::default(),
             tx: comp,
@@ -468,6 +480,7 @@ impl AsyncClient {
         }
         let (tok, comp) = SubscribeToken::new();
         let cmd = Command::Subscribe {
+            single: true,
             filters: vec![(topic.into(), qos.into(), opts)],
             props,
             tx: comp,
@@ -509,6 +522,7 @@ impl AsyncClient {
             .collect();
 
         let cmd = Command::Subscribe {
+            single: false,
             filters,
             props: Default::default(),
             tx: comp,
@@ -588,6 +602,7 @@ impl AsyncClient {
 
         let (tok, comp) = SubscribeManyToken::new();
         let cmd = Command::Subscribe {
+            single: false,
             filters,
             props,
             tx: comp,
@@ -611,6 +626,7 @@ impl AsyncClient {
     {
         let (tok, comp) = UnsubscribeToken::new();
         let cmd = Command::Unsubscribe {
+            single: true,
             filters: vec![topic.into()],
             props: Default::default(),
             tx: comp,
@@ -637,6 +653,7 @@ impl AsyncClient {
         }
         let (tok, comp) = UnsubscribeToken::new();
         let cmd = Command::Unsubscribe {
+            single: true,
             filters: vec![topic.into()],
             props,
             tx: comp,
@@ -661,6 +678,7 @@ impl AsyncClient {
         let (tok, comp) = UnsubscribeManyToken::new();
         let filters = topics.iter().map(|t| t.as_ref().to_string()).collect();
         let cmd = Command::Unsubscribe {
+            single: false,
             filters,
             props: Default::default(),
             tx: comp,
@@ -692,6 +710,7 @@ impl AsyncClient {
         let (tok, comp) = UnsubscribeManyToken::new();
         let filters = topics.iter().map(|t| t.as_ref().to_string()).collect();
         let cmd = Command::Unsubscribe {
+            single: false,
             filters,
             props,
             tx: comp,
@@ -1142,8 +1161,6 @@ impl AsyncClient {
 }
 
 // The client is safe to send or share between threads.
-unsafe impl Send for AsyncClient {}
-unsafe impl Sync for AsyncClient {}
 
 fn log_send_err(is_full: bool) {
     if is_full {
@@ -1240,19 +1257,24 @@ fn parse_server_uri(uri: &str) -> Result<ServerAddr> {
         return Err(Error::TlsNotSupported);
     }
 
+    // Without a WebSocket feature these schemes must not fall through to the
+    // raw TCP/TLS parsing below, which would speak plain MQTT to an HTTP
+    // listener.
+    #[cfg(not(any(feature = "websocket", feature = "smol-websocket")))]
+    if uri.starts_with("ws://") || uri.starts_with("wss://") {
+        return Err(Error::WebSocketNotSupported);
+    }
     // Plain TCP / TLS transports (wss:// falls through to TLS when websocket
     // feature is absent).
     let (default_port, is_tls, rest) = if let Some(s) = uri
         .strip_prefix("mqtts://")
         .or_else(|| uri.strip_prefix("ssl://"))
         .or_else(|| uri.strip_prefix("tls://"))
-        .or_else(|| uri.strip_prefix("wss://"))
     {
         (8883u16, true, s)
     } else if let Some(s) = uri
         .strip_prefix("mqtt://")
         .or_else(|| uri.strip_prefix("tcp://"))
-        .or_else(|| uri.strip_prefix("ws://"))
     {
         (1883u16, false, s)
     } else {
@@ -1486,12 +1508,19 @@ mod tests {
             parse_server_uri("mqtts://secure.broker.io"),
             Err(Error::TlsNotSupported)
         ));
-        // Without the websocket feature ws:// maps to plain TCP.
+        // Without the websocket feature ws:// and wss:// are refused rather
+        // than silently downgraded to raw TCP / TLS.
         #[cfg(not(any(feature = "websocket", feature = "smol-websocket")))]
-        assert!(matches!(
-            parse_server_uri("ws://localhost:8080/mqtt").unwrap(),
-            ServerAddr::Tcp { host, port } if host == "localhost" && port == 8080
-        ));
+        {
+            assert!(matches!(
+                parse_server_uri("ws://localhost:8080/mqtt"),
+                Err(Error::WebSocketNotSupported)
+            ));
+            assert!(matches!(
+                parse_server_uri("wss://localhost:8081/mqtt"),
+                Err(Error::WebSocketNotSupported)
+            ));
+        }
         // With the websocket feature ws:// maps to a WebSocket address.
         #[cfg(any(feature = "websocket", feature = "smol-websocket"))]
         assert!(matches!(

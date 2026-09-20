@@ -160,6 +160,9 @@ pub(crate) struct ConnectParams {
     pub max_retry_interval: Duration,
     /// Maximum concurrent outbound QoS 1/2 publishes; 0 means unlimited.
     pub max_inflight: usize,
+    /// Deadline for one connection attempt — transport connect, TLS/WebSocket
+    /// handshake, CONNECT and CONNACK together. Zero disables the deadline.
+    pub connect_timeout: Duration,
 }
 
 impl ConnectParams {
@@ -255,6 +258,10 @@ pub(crate) enum Command {
 
     /// Subscribe to one or more topic filters.
     Subscribe {
+        /// `true` for `subscribe()` (one filter, whose failure fails the
+        /// token); `false` for `subscribe_many()` (per-filter codes are
+        /// returned in the response even when some fail).
+        single: bool,
         /// `(topic_filter, max_qos, subscribe_options)` triples.
         filters: Vec<(String, QoS, SubscribeOptions)>,
         /// MQTT v5 properties; empty for v3.1.1.
@@ -265,6 +272,8 @@ pub(crate) enum Command {
 
     /// Unsubscribe from one or more topic filters.
     Unsubscribe {
+        /// As for [`Command::Subscribe`].
+        single: bool,
         /// Topic filters to remove.
         filters: Vec<String>,
         /// MQTT v5 properties; empty for v3.1.1.
@@ -339,6 +348,7 @@ mod tests {
             min_retry_interval: Duration::ZERO,
             max_retry_interval: Duration::ZERO,
             max_inflight: 0,
+            connect_timeout: Duration::ZERO,
         }
     }
 

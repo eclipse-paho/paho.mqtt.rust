@@ -44,6 +44,13 @@ pub struct ConnectResponse {
 ///
 /// For QoS 0 the token resolves immediately with defaults. For QoS 1 the data
 /// comes from the PUBACK packet; for QoS 2 from the PUBCOMP.
+///
+/// A response is only produced for a *successful* acknowledgement. When the
+/// broker answers with an error reason code (0x80 and above — `NotAuthorized`,
+/// `QuotaExceeded`, `TopicNameInvalid`, …) the token resolves to
+/// [`Error::ReasonCode`](crate::Error::ReasonCode) carrying that code and the
+/// acknowledgement's properties, so `reason_code` here is always a success
+/// code (`Success` or `NoMatchingSubscribers`).
 #[derive(Clone, Default, Debug)]
 pub struct PublishResponse {
     /// Reason code from PUBACK or PUBCOMP (MQTT v5 only). `Success` on v3.
@@ -63,6 +70,15 @@ impl PublishResponse {
 }
 
 /// Response data from a SUBSCRIBE → SUBACK exchange.
+///
+/// How an error reason code is reported depends on the call that produced
+/// the token. [`subscribe`](crate::AsyncClient::subscribe) has exactly one
+/// filter, so an error code fails the token with
+/// [`Error::ReasonCode`](crate::Error::ReasonCode) and this response is only
+/// seen on success. [`subscribe_many`](crate::AsyncClient::subscribe_many)
+/// may succeed for some filters and fail for others, so it always resolves
+/// `Ok` and `reason_codes` must be inspected per filter — check each code
+/// with `ReasonCode::is_err()`.
 #[derive(Clone, Default, Debug)]
 pub struct SubscribeResponse {
     /// Per-topic reason codes from the SUBACK.
@@ -85,6 +101,12 @@ impl SubscribeResponse {
 }
 
 /// Response data from an UNSUBSCRIBE → UNSUBACK exchange.
+///
+/// Reported like [`SubscribeResponse`]: an error code fails an
+/// [`unsubscribe`](crate::AsyncClient::unsubscribe) token, while
+/// [`unsubscribe_many`](crate::AsyncClient::unsubscribe_many) always
+/// resolves `Ok` with the per-filter codes. On v3 there are no codes, so an
+/// unsubscribe never fails once acknowledged.
 #[derive(Clone, Default, Debug)]
 pub struct UnsubscribeResponse {
     /// Per-topic reason codes from the UNSUBACK (MQTT v5 only). Empty on v3.

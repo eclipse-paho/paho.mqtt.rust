@@ -29,6 +29,7 @@
 use std::{
     collections::{HashMap, VecDeque},
     io,
+    pin::pin,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -39,7 +40,7 @@ use std::{
 use bytes::{Bytes, BytesMut};
 use futures::{FutureExt, select};
 use paho_mqtt_codec::{
-    ConnAck, Disconnect, MqttVersion, Packet, PubAck, QoS, RawPacket,
+    ConnAck, Disconnect, MqttVersion, Packet, Properties, PubAck, QoS, RawPacket, ReasonCode,
     RetainHandling as CodecRetainHandling, Subscribe, Subscription, Unsubscribe,
 };
 
@@ -127,6 +128,42 @@ enum LoopEvent {
 
 // Session
 
+/// A QoS 1/2 publish waiting for an in-flight slot.
+enum Deferred {
+    /// A `Command::Publish` from the API, not yet assigned a packet ID.
+    Command(Command),
+    /// A persisted PUBLISH awaiting re-transmission under its original ID.
+    Restored(paho_mqtt_codec::Publish),
+}
+
+/// Resolves a publish token from its PUBACK/PUBCOMP: `Ok` for a success
+/// code, `Err(ReasonCode)` for an error code.
+fn publish_outcome(rc: ReasonCode, props: Properties) -> Result<PublishResponse> {
+    if rc.is_err() {
+        Err(Error::ReasonCode(rc, props))
+    } else {
+        Ok(PublishResponse::new(rc, props))
+    }
+}
+
+/// Resolves a (un)subscribe token from its acknowledgement. For a `single`
+/// operation an error code fails the token; a many-topic operation always
+/// resolves `Ok` so partial success is visible per filter.
+fn single_outcome<R>(
+    single: bool,
+    rsp: R,
+    codes: impl Fn(&R) -> &Vec<ReasonCode>,
+    props: impl FnOnce(R) -> Properties,
+) -> Result<R> {
+    if single
+        && let Some(rc) = codes(&rsp).first().copied()
+        && rc.is_err()
+    {
+        return Err(Error::ReasonCode(rc, props(rsp)));
+    }
+    Ok(rsp)
+}
+
 /// PUBLISH payloads up to this size are copied into the header buffer and
 /// sent as one contiguous write; larger ones are written from their own
 /// buffer to avoid the copy.
@@ -150,10 +187,11 @@ struct Session<B: Backend> {
     pending_pub2: HashMap<u16, Completer<PublishResponse>>,
     /// Pending inbound QoS 2 messages awaiting PUBREL (packet_id → message).
     pending_pub2_in: HashMap<u16, Message>,
-    /// Pending SUBSCRIBE operations awaiting SUBACK.
-    pending_sub: HashMap<u16, Completer<SubscribeResponse>>,
-    /// Pending UNSUBSCRIBE operations awaiting UNSUBACK.
-    pending_unsub: HashMap<u16, Completer<UnsubscribeResponse>>,
+    /// Pending SUBSCRIBE operations awaiting SUBACK, with the `single` flag
+    /// that decides how an error code in the SUBACK is reported.
+    pending_sub: HashMap<u16, (Completer<SubscribeResponse>, bool)>,
+    /// Pending UNSUBSCRIBE operations awaiting UNSUBACK, likewise.
+    pending_unsub: HashMap<u16, (Completer<UnsubscribeResponse>, bool)>,
     /// Sender to deliver inbound events to the public layer.
     event_tx: async_channel::Sender<Event>,
     /// True when a PINGREQ has been sent and PINGRESP has not yet arrived.
@@ -162,9 +200,10 @@ struct Session<B: Backend> {
     persist: Option<Arc<Mutex<Box<dyn ClientPersistence>>>>,
     /// Limits fixed once the CONNACK arrived.
     limits: SessionLimits,
-    /// QoS 1/2 publish commands deferred because the in-flight limit was
-    /// reached.  Drained one-for-one as PUBACK/PUBCOMP ACKs arrive.
-    inflight_deferred: VecDeque<Command>,
+    /// QoS 1/2 publishes deferred because the in-flight limit was reached —
+    /// new commands and persisted messages awaiting re-transmission alike.
+    /// Drained one-for-one as PUBACK/PUBCOMP ACKs arrive.
+    inflight_deferred: VecDeque<Deferred>,
     /// Set by `send()` to indicate a packet was written since the last
     /// keep-alive timer reset. Checked in `run()` to reset the deadline.
     sent_packet: bool,
@@ -214,19 +253,55 @@ impl<B: Backend> Session<B> {
         self.pending_pub1.len() + self.pending_pub2.len()
     }
 
-    /// Drains deferred publish commands into the session while the in-flight
-    /// count is below `max_inflight`.  A transport error propagates immediately.
+    /// `true` when another QoS 1/2 publish may go out now.
+    fn inflight_slot_free(&self) -> bool {
+        self.limits.max_inflight == 0 || self.inflight_count() < self.limits.max_inflight
+    }
+
+    /// Drains deferred publishes into the session while the in-flight count
+    /// is below `max_inflight`.  A transport error propagates immediately.
     async fn drain_deferred(&mut self) -> Result<()> {
-        loop {
-            if self.limits.max_inflight != 0 && self.inflight_count() >= self.limits.max_inflight {
-                break;
+        while self.inflight_slot_free() {
+            match self.inflight_deferred.pop_front() {
+                Some(Deferred::Command(cmd)) => {
+                    self.handle_command(cmd).await?;
+                }
+                Some(Deferred::Restored(pkt)) => self.send_restored(pkt).await?,
+                None => break,
             }
-            let Some(cmd) = self.inflight_deferred.pop_front() else {
-                break;
-            };
-            self.handle_command(cmd).await?;
         }
         Ok(())
+    }
+
+    /// Re-transmits a persisted QoS 1/2 PUBLISH under its original packet
+    /// identifier with DUP set, registering an orphan completer so the ACK
+    /// cleans up the persistence entry without resolving any user token.
+    async fn send_restored(&mut self, mut pub_pkt: paho_mqtt_codec::Publish) -> Result<()> {
+        let Some(pid) = pub_pkt.packet_id else {
+            return Ok(());
+        };
+        let qos = pub_pkt.qos;
+        pub_pkt.dup = true;
+        self.send(&Packet::Publish(pub_pkt)).await?;
+        let comp = Completer::orphan();
+        match qos {
+            QoS::QoS1 => {
+                self.pending_pub1.insert(pid, comp);
+            }
+            QoS::QoS2 => {
+                self.pending_pub2.insert(pid, comp);
+            }
+            QoS::QoS0 => {}
+        }
+        Ok(())
+    }
+
+    /// `true` if `id` is currently in use by any outstanding operation.
+    fn id_in_use(&self, id: u16) -> bool {
+        self.pending_pub1.contains_key(&id)
+            || self.pending_pub2.contains_key(&id)
+            || self.pending_sub.contains_key(&id)
+            || self.pending_unsub.contains_key(&id)
     }
 
     /// Persists `data` under `key`, silently ignoring errors.
@@ -243,13 +318,22 @@ impl<B: Backend> Session<B> {
         }
     }
 
-    /// Allocates the next available packet identifier (1 – 65535, wrapping).
+    /// Allocates the next free packet identifier (1 – 65535, wrapping).
+    ///
+    /// Identifiers still awaiting an acknowledgement are skipped: after a
+    /// session restore `next_id` sits past the highest persisted identifier,
+    /// so a wrap-around could otherwise land on one that is still in flight
+    /// and silently replace its completer.
     fn alloc_id(&mut self) -> u16 {
-        self.next_id = self.next_id.wrapping_add(1);
-        if self.next_id == 0 {
-            self.next_id = 1;
+        loop {
+            self.next_id = self.next_id.wrapping_add(1);
+            if self.next_id == 0 {
+                self.next_id = 1;
+            }
+            if !self.id_in_use(self.next_id) {
+                return self.next_id;
+            }
         }
-        self.next_id
     }
 
     /// Encodes and sends a packet on the wire.
@@ -344,26 +428,20 @@ impl<B: Backend> Session<B> {
             };
 
             if key.starts_with('s') {
-                // Outbound QoS 1/2 PUBLISH — retransmit with DUP=true.
-                if let Packet::Publish(mut pub_pkt) = pkt {
+                // Outbound QoS 1/2 PUBLISH — retransmit with DUP=true, subject
+                // to the same in-flight limit as new publishes.
+                if let Packet::Publish(pub_pkt) = pkt {
                     let Some(pid) = pub_pkt.packet_id else {
                         continue;
                     };
-                    let qos = pub_pkt.qos;
-                    pub_pkt.dup = true;
-                    self.send(&Packet::Publish(pub_pkt)).await?;
                     if pid > self.next_id {
                         self.next_id = pid;
                     }
-                    let comp = Completer::orphan();
-                    match qos {
-                        QoS::QoS1 => {
-                            self.pending_pub1.insert(pid, comp);
-                        }
-                        QoS::QoS2 => {
-                            self.pending_pub2.insert(pid, comp);
-                        }
-                        _ => {}
+                    if self.inflight_slot_free() {
+                        self.send_restored(pub_pkt).await?;
+                    } else {
+                        self.inflight_deferred
+                            .push_back(Deferred::Restored(pub_pkt));
                     }
                 }
             } else if key.starts_with('r') {
@@ -377,6 +455,30 @@ impl<B: Backend> Session<B> {
         }
 
         Ok(())
+    }
+
+    /// Brings a freshly connected session up and runs it to completion:
+    /// restores persisted in-flight messages (if `restore`), flushes the
+    /// commands buffered while disconnected, then services the connection
+    /// until it ends.
+    ///
+    /// Any failure — restore, flush, or run — surfaces as one `Err`, so the
+    /// caller tears the session down the same way in every case. Commands
+    /// still in `buf` when a flush fails stay there for the next connection.
+    async fn serve(
+        &mut self,
+        reader: &mut B::Reader,
+        cmd_rx: &async_channel::Receiver<Command>,
+        buf: &mut VecDeque<Command>,
+        restore: bool,
+    ) -> Result<()> {
+        if restore {
+            self.restore().await?;
+        }
+        while let Some(cmd) = buf.pop_front() {
+            self.handle_command(cmd).await?;
+        }
+        self.run(reader, cmd_rx).await
     }
 
     /// Main event loop: read from `reader`, dispatch commands from `cmd_rx`,
@@ -510,21 +612,26 @@ impl<B: Backend> Session<B> {
     async fn handle_packet(&mut self, packet: Packet) -> Result<()> {
         match packet {
             // ---- Publish acknowledgements ----
+            // A publish is one operation with one outcome: an error reason
+            // code fails its token, mirroring how a refused CONNACK fails
+            // `connect()`. The persisted copy is removed either way — the
+            // broker has answered, so there is nothing left to retry.
             Packet::PubAck(ack) => {
                 if let Some(tx) = self.pending_pub1.remove(&ack.packet_id) {
                     self.persist_remove(&format!("s{}", ack.packet_id));
-                    let rsp = PublishResponse::new(ack.reason_code, ack.properties);
-                    tx.complete(Ok(rsp));
+                    tx.complete(publish_outcome(ack.reason_code, ack.properties));
                 }
                 self.drain_deferred().await?;
             }
 
             // ---- QoS 2 outbound: PUBREC → send PUBREL ----
             Packet::PubRec(rec) => {
-                if rec.reason_code as u8 >= 0x80 {
+                if rec.reason_code.is_err() {
                     if let Some(tx) = self.pending_pub2.remove(&rec.packet_id) {
+                        self.persist_remove(&format!("s{}", rec.packet_id));
                         tx.complete(Err(Error::ReasonCode(rec.reason_code, rec.properties)));
                     }
+                    self.drain_deferred().await?;
                     return Ok(());
                 }
                 let rel = PubAck::new(rec.packet_id);
@@ -535,25 +642,37 @@ impl<B: Backend> Session<B> {
             Packet::PubComp(comp) => {
                 if let Some(tx) = self.pending_pub2.remove(&comp.packet_id) {
                     self.persist_remove(&format!("s{}", comp.packet_id));
-                    let rsp = PublishResponse::new(comp.reason_code, comp.properties);
-                    tx.complete(Ok(rsp));
+                    tx.complete(publish_outcome(comp.reason_code, comp.properties));
                 }
                 self.drain_deferred().await?;
             }
 
             // ---- Subscription acknowledgement ----
+            // `subscribe()` has one filter, so its one code decides the
+            // outcome. `subscribe_many()` may succeed partially, so it always
+            // resolves `Ok` and the caller inspects the per-filter codes.
             Packet::SubAck(ack) => {
-                if let Some(tx) = self.pending_sub.remove(&ack.packet_id) {
+                if let Some((tx, single)) = self.pending_sub.remove(&ack.packet_id) {
                     let rsp = SubscribeResponse::new(ack.reason_codes, ack.properties);
-                    tx.complete(Ok(rsp));
+                    tx.complete(single_outcome(
+                        single,
+                        rsp,
+                        |r| &r.reason_codes,
+                        |r| r.properties,
+                    ));
                 }
             }
 
             // ---- Unsubscription acknowledgement ----
             Packet::UnsubAck(ack) => {
-                if let Some(tx) = self.pending_unsub.remove(&ack.packet_id) {
+                if let Some((tx, single)) = self.pending_unsub.remove(&ack.packet_id) {
                     let rsp = UnsubscribeResponse::new(ack.reason_codes, ack.properties);
-                    tx.complete(Ok(rsp));
+                    tx.complete(single_outcome(
+                        single,
+                        rsp,
+                        |r| &r.reason_codes,
+                        |r| r.properties,
+                    ));
                 }
             }
 
@@ -644,18 +763,16 @@ impl<B: Backend> Session<B> {
             } => {
                 // QoS 1/2 publishes are deferred when the in-flight limit is
                 // reached.  QoS 0 is never gated (no ACK, no packet ID).
-                if qos != QoS::QoS0
-                    && self.limits.max_inflight != 0
-                    && self.inflight_count() >= self.limits.max_inflight
-                {
-                    self.inflight_deferred.push_back(Command::Publish {
-                        topic,
-                        payload,
-                        qos,
-                        retain,
-                        props,
-                        tx,
-                    });
+                if qos != QoS::QoS0 && !self.inflight_slot_free() {
+                    self.inflight_deferred
+                        .push_back(Deferred::Command(Command::Publish {
+                            topic,
+                            payload,
+                            qos,
+                            retain,
+                            props,
+                            tx,
+                        }));
                     return Ok(false);
                 }
 
@@ -725,7 +842,12 @@ impl<B: Backend> Session<B> {
                 }
             }
 
-            Command::Subscribe { filters, props, tx } => {
+            Command::Subscribe {
+                single,
+                filters,
+                props,
+                tx,
+            } => {
                 let id = self.alloc_id();
                 let subscriptions = filters
                     .into_iter()
@@ -750,10 +872,15 @@ impl<B: Backend> Session<B> {
                     properties: props,
                 };
                 self.send(&Packet::Subscribe(sub)).await?;
-                self.pending_sub.insert(id, tx);
+                self.pending_sub.insert(id, (tx, single));
             }
 
-            Command::Unsubscribe { filters, props, tx } => {
+            Command::Unsubscribe {
+                single,
+                filters,
+                props,
+                tx,
+            } => {
                 let id = self.alloc_id();
                 let unsub = Unsubscribe {
                     packet_id: id,
@@ -761,7 +888,7 @@ impl<B: Backend> Session<B> {
                     properties: props,
                 };
                 self.send(&Packet::Unsubscribe(unsub)).await?;
-                self.pending_unsub.insert(id, tx);
+                self.pending_unsub.insert(id, (tx, single));
             }
 
             // Intercepted in run() before this method is called.
@@ -776,40 +903,14 @@ impl<B: Backend> Session<B> {
 
 /// All parameters needed to establish one MQTT session.
 ///
-/// Extracted from [`Command::Connect`] so they can be retained across
-/// reconnect attempts without re-receiving the command.
+/// Built from a [`Command::Connect`] by [`handle_offline_command`] and
+/// retained across reconnect attempts.
 struct ConnectJob {
     params: Box<ConnectParams>,
     /// Index into `params.servers` for the current connection attempt.
     server_idx: usize,
     connected_flag: Arc<AtomicBool>,
     persist: Option<Arc<Mutex<Box<dyn ClientPersistence>>>>,
-}
-
-impl ConnectJob {
-    /// Extracts a `ConnectJob` from a `Command::Connect`.
-    ///
-    /// Returns `Ok((job, tx))` on success or `Err(cmd)` if `cmd` is not a
-    /// `Connect` variant, giving the caller back the original command.
-    fn extract(cmd: Command) -> std::result::Result<(Self, Completer<ConnectResponse>), Command> {
-        match cmd {
-            Command::Connect {
-                params,
-                tx,
-                connected_flag,
-                persist,
-            } => Ok((
-                Self {
-                    params,
-                    server_idx: 0,
-                    connected_flag,
-                    persist,
-                },
-                tx,
-            )),
-            other => Err(other),
-        }
-    }
 }
 
 /// Opens persistence and the transport, sends CONNECT, waits for CONNACK.
@@ -865,27 +966,150 @@ fn buf_push(buf: &mut VecDeque<Command>, cmd: Command, cfg: &BufConfig) {
     // else: buffer full, new cmd is dropped → its Completer resolves with Disconnected
 }
 
+/// What became of a command that arrived while there was no session.
+enum Offline {
+    /// Buffered, or its token was resolved; nothing else to do.
+    Handled,
+    /// `disconnect()` was called. Its token is resolved and the connected
+    /// flag cleared; whatever the caller was doing (waiting, connecting,
+    /// backing off) should stop.
+    Disconnect,
+    /// `connect()` was called: new parameters and the token to resolve.
+    Connect(Box<ConnectJob>, Completer<ConnectResponse>),
+}
+
+/// Disposes of a command received while disconnected.
+///
+/// `Publish` is buffered when `should_buf` allows it (QoS 0 is dropped as
+/// `Ok` when `persist_qos0` is off); otherwise it, `Subscribe`, and
+/// `Unsubscribe` fail with [`Error::Disconnected`]. `Disconnect` is satisfied
+/// on the spot. `Connect` is handed back to the caller.
+fn handle_offline_command(
+    cmd: Command,
+    buf: &mut VecDeque<Command>,
+    cfg: &BufConfig,
+    should_buf: bool,
+) -> Offline {
+    match cmd {
+        Command::Connect {
+            params,
+            tx,
+            connected_flag,
+            persist,
+        } => Offline::Connect(
+            Box::new(ConnectJob {
+                params,
+                server_idx: 0,
+                connected_flag,
+                persist,
+            }),
+            tx,
+        ),
+        Command::Disconnect {
+            tx, connected_flag, ..
+        } => {
+            connected_flag.store(false, Ordering::SeqCst);
+            tx.complete(Ok(()));
+            Offline::Disconnect
+        }
+        Command::Publish {
+            qos: QoS::QoS0, tx, ..
+        } if should_buf && !cfg.persist_qos0 => {
+            tx.complete(Ok(PublishResponse::default()));
+            Offline::Handled
+        }
+        cmd @ Command::Publish { .. } if should_buf => {
+            buf_push(buf, cmd, cfg);
+            Offline::Handled
+        }
+        Command::Publish { tx, .. } => {
+            tx.complete(Err(Error::Disconnected));
+            Offline::Handled
+        }
+        Command::Subscribe { tx, .. } => {
+            tx.complete(Err(Error::Disconnected));
+            Offline::Handled
+        }
+        Command::Unsubscribe { tx, .. } => {
+            tx.complete(Err(Error::Disconnected));
+            Offline::Handled
+        }
+    }
+}
+
+/// Outcome of one connection attempt against one server.
+enum Attempt<B: Backend> {
+    /// Transport up and CONNACK received (its reason code not yet examined).
+    Connected(B::Reader, B::Writer, ConnAck),
+    /// The attempt failed or timed out.
+    Failed(Error),
+    /// `disconnect()` was called mid-attempt (or the API was dropped); the
+    /// half-open connection was discarded.
+    Aborted,
+}
+
+/// Runs [`do_connect`] for `job.server_idx` under the job's connect timeout
+/// while continuing to service the command channel.
+///
+/// A `Disconnect` aborts the attempt. A `Connect` during an attempt fails its
+/// own token — one connect at a time. Everything else is handled as it is
+/// while disconnected.
+async fn attempt_connect<B: Backend>(
+    job: &ConnectJob,
+    cmd_rx: &async_channel::Receiver<Command>,
+    buf: &mut VecDeque<Command>,
+    buf_cfg: &BufConfig,
+    should_buf: bool,
+) -> Attempt<B> {
+    let timeout = job.params.connect_timeout;
+    let mut deadline = if timeout.is_zero() {
+        B::Sleep::never()
+    } else {
+        B::Sleep::new(timeout)
+    };
+    let mut conn = pin!(do_connect::<B>(job).fuse());
+
+    loop {
+        let cmd = select! {
+            res = conn => {
+                return match res {
+                    Ok((r, w, ack)) => Attempt::Connected(r, w, ack),
+                    Err(e) => Attempt::Failed(e),
+                };
+            }
+            _ = deadline => return Attempt::Failed(Error::Timeout),
+            cmd = cmd_rx.recv().fuse() => cmd,
+        };
+        match cmd {
+            // API dropped: nothing will ever use the connection.
+            Err(_) => return Attempt::Aborted,
+            Ok(Command::Connect { tx, .. }) => {
+                tx.complete(Err(Error::General("connect already in progress")));
+            }
+            Ok(cmd) => match handle_offline_command(cmd, buf, buf_cfg, should_buf) {
+                Offline::Handled => {}
+                Offline::Disconnect => return Attempt::Aborted,
+                Offline::Connect(..) => unreachable!("Connect is matched above"),
+            },
+        }
+    }
+}
+
 /// Result of waiting for the reconnect timer to fire.
 enum WaitOutcome {
     /// Timer expired — proceed with the current [`ConnectJob`].
     Retry,
-    /// A `Disconnect` command arrived; the token has been resolved and the
-    /// reconnect loop should be abandoned.
+    /// A `Disconnect` command arrived (or the API was dropped); abandon the
+    /// reconnect loop.
     Abort,
     /// A new `Connect` command arrived with updated parameters; use these
     /// for the next attempt and resolve the supplied token with the result.
     Replace(Box<ConnectJob>, Completer<ConnectResponse>),
 }
 
-/// Waits for `delay` to elapse while draining the command queue.
-///
-/// * `Disconnect` → completes the token (already disconnected) and returns
-///   [`WaitOutcome::Abort`].
-/// * `Connect` → captures the new parameters and returns
-///   [`WaitOutcome::Replace`] immediately (skips remaining delay).
-/// * `Publish` with `send_while_disconnected` set → pushed into `buf`.
-/// * Any other command → completes the completer with
-///   [`Error::Disconnected`] and keeps waiting.
+/// Waits for `delay` to elapse while draining the command queue; see
+/// [`handle_offline_command`] for how each command is treated. A `Connect`
+/// ends the wait early.
 async fn reconnect_wait<B: Backend>(
     delay: Duration,
     cmd_rx: &async_channel::Receiver<Command>,
@@ -901,49 +1125,13 @@ async fn reconnect_wait<B: Backend>(
         };
         match result {
             Err(_) => return WaitOutcome::Abort,
-            Ok(cmd) => match cmd {
-                Command::Connect {
-                    params,
-                    tx,
-                    connected_flag,
-                    persist,
-                } => {
-                    return WaitOutcome::Replace(
-                        Box::new(ConnectJob {
-                            params,
-                            server_idx: 0,
-                            connected_flag,
-                            persist,
-                        }),
-                        tx,
-                    );
+            Ok(cmd) => {
+                match handle_offline_command(cmd, buf, buf_cfg, buf_cfg.send_while_disconnected) {
+                    Offline::Handled => {}
+                    Offline::Disconnect => return WaitOutcome::Abort,
+                    Offline::Connect(job, tx) => return WaitOutcome::Replace(job, tx),
                 }
-                Command::Disconnect {
-                    tx, connected_flag, ..
-                } => {
-                    // We are already disconnected; satisfy the caller.
-                    connected_flag.store(false, Ordering::SeqCst);
-                    tx.complete(Ok(()));
-                    return WaitOutcome::Abort;
-                }
-                Command::Publish {
-                    qos: QoS::QoS0, tx, ..
-                } if buf_cfg.send_while_disconnected && !buf_cfg.persist_qos0 => {
-                    tx.complete(Ok(PublishResponse::default()));
-                }
-                cmd @ Command::Publish { .. } if buf_cfg.send_while_disconnected => {
-                    buf_push(buf, cmd, buf_cfg);
-                }
-                Command::Publish { tx, .. } => {
-                    tx.complete(Err(Error::Disconnected));
-                }
-                Command::Subscribe { tx, .. } => {
-                    tx.complete(Err(Error::Disconnected));
-                }
-                Command::Unsubscribe { tx, .. } => {
-                    tx.complete(Err(Error::Disconnected));
-                }
-            },
+            }
         }
     }
 }
@@ -966,15 +1154,17 @@ fn build_connect_response(job: &ConnectJob, connack: ConnAck) -> ConnectResponse
 /// Drives the MQTT event loop on behalf of a [`RuntimeHandle`].
 ///
 /// Runs indefinitely as a task on the backend's executor.  Waits for a
-/// [`Command::Connect`], calls [`do_connect`] to perform the TCP + MQTT
-/// handshake, then delegates to [`Session::run`] for the lifetime of the
-/// connection.
+/// [`Command::Connect`], tries each configured server in turn under the
+/// connect timeout, then delegates to [`Session::serve`] for the lifetime of
+/// the connection.
 ///
-/// If `auto_reconnect` is set in the connect options and the session ends
-/// unexpectedly, the loop retries with exponential backoff (capped at
-/// `max_retry_interval`) without re-waiting for a new `Command::Connect`.
-/// An explicit `Command::Disconnect` during the backoff wait aborts the
-/// reconnect loop.
+/// If `auto_reconnect` is set in the connect options and an established
+/// session ends unexpectedly, the loop retries with exponential backoff
+/// (capped at `max_retry_interval`), rotating through the server list,
+/// without re-waiting for a new `Command::Connect`. A failed *initial*
+/// connect is reported to the caller and not retried. An explicit
+/// `Command::Disconnect` at any point — waiting, connecting, backing off —
+/// stops the loop and returns it to waiting for a `Connect`.
 ///
 /// `buf_cfg` controls the send-while-disconnected buffer.  When enabled,
 /// `Publish` commands received while the client is disconnected are queued
@@ -991,215 +1181,136 @@ pub(crate) async fn run_event_loop<B: Backend>(
 
     'outer: loop {
         // ---- Wait for a Connect command ----
-        // While waiting, optionally buffer Publish commands.
-        let (mut job, initial_tx) = loop {
+        let (mut job, mut tx_opt) = loop {
             let cmd = match cmd_rx.recv().await {
                 Ok(cmd) => cmd,
                 Err(_) => return,
             };
-            match ConnectJob::extract(cmd) {
-                Ok(pair) => break pair,
-                Err(cmd) => {
-                    // Non-Connect command while not connected.
-                    let should_buf = buf_cfg.allow_send_any_time
-                        || (ever_connected && buf_cfg.send_while_disconnected);
-                    match cmd {
-                        Command::Publish {
-                            qos: QoS::QoS0, tx, ..
-                        } if should_buf && !buf_cfg.persist_qos0 => {
-                            tx.complete(Ok(PublishResponse::default()));
-                        }
-                        cmd @ Command::Publish { .. } if should_buf => {
-                            buf_push(&mut buf, cmd, &buf_cfg);
-                        }
-                        Command::Publish { tx, .. } => {
-                            tx.complete(Err(Error::Disconnected));
-                        }
-                        Command::Subscribe { tx, .. } => {
-                            tx.complete(Err(Error::Disconnected));
-                        }
-                        Command::Unsubscribe { tx, .. } => {
-                            tx.complete(Err(Error::Disconnected));
-                        }
-                        Command::Disconnect {
-                            tx, connected_flag, ..
-                        } => {
-                            connected_flag.store(false, Ordering::SeqCst);
-                            tx.complete(Ok(()));
-                        }
-                        Command::Connect { .. } => unreachable!(),
-                    }
-                }
+            let should_buf =
+                buf_cfg.allow_send_any_time || (ever_connected && buf_cfg.send_while_disconnected);
+            match handle_offline_command(cmd, &mut buf, &buf_cfg, should_buf) {
+                Offline::Handled | Offline::Disconnect => {}
+                Offline::Connect(job, tx) => break (job, Some(tx)),
             }
         };
 
-        // ---- First connection attempt: try each server in order ----
-        let n = job.params.servers.len();
-        let mut last_err: Option<Error> = None;
-        let mut initial_result = None;
-
-        for idx in 0..n {
-            job.server_idx = idx;
-            match do_connect::<B>(&job).await {
-                Err(e) => last_err = Some(e),
-                Ok((reader, writer, connack)) => {
-                    if connack.reason_code as u8 >= 0x80 {
-                        last_err = Some(Error::ReasonCode(connack.reason_code, connack.properties));
-                    } else {
-                        initial_result = Some((reader, writer, connack));
-                        break;
-                    }
-                }
-            }
-        }
-
-        let (mut reader, writer, connack) = match initial_result {
-            Some(t) => t,
-            None => {
-                let err = last_err.unwrap_or(Error::General("no servers configured"));
-                if matches!(err, Error::Tls(_)) {
-                    let _ = event_tx.send(Event::TlsError(err.to_string())).await;
-                }
-                initial_tx.complete(Err(err));
-                continue 'outer;
-            }
-        };
-
-        let limits = SessionLimits::new(&job.params, &connack);
-        let response = build_connect_response(&job, connack);
-        // Set the flag before resolving the token so `is_connected()` is true
-        // as soon as `wait()` / `.await` returns in the caller.
-        job.connected_flag.store(true, Ordering::SeqCst);
-        ever_connected = true;
-        let _ = event_tx.send(Event::Connected(response.clone())).await;
-        initial_tx.complete(Ok(response));
-
-        // ---- Run the session ----
-        let mut session = Session::<B>::new(
-            writer,
-            job.params.ver,
-            job.params.keep_alive_duration(),
-            event_tx.clone(),
-            job.persist.clone(),
-            limits,
-        );
-
-        // Restore persisted in-flight messages, then flush the disconnected
-        // buffer into the newly connected session.
-        if buf_cfg.restore_msgs && session.restore().await.is_err() {
-            continue 'outer;
-        }
-        while let Some(cmd) = buf.pop_front() {
-            if session.handle_command(cmd).await.is_err() {
-                buf.clear();
-                break;
-            }
-        }
-
-        let first_result = session.run(&mut reader, &cmd_rx).await;
-        if let Some(p) = &session.persist {
-            let _ = p.lock().unwrap().close();
-        }
-
-        match first_result {
-            Ok(()) => continue 'outer, // clean disconnect
-            Err(e) => {
-                job.connected_flag.store(false, Ordering::SeqCst);
-                let _ = event_tx.send(Event::ConnectionLost(e)).await;
-
-                if !job.params.auto_reconnect {
-                    continue 'outer;
-                }
-            }
-        }
-
-        // ---- Auto-reconnect loop ----
+        // `false` for the initial connect (each server tried once, then the
+        // caller is told); `true` once a session has been lost and
+        // `auto_reconnect` is retrying with backoff.
+        let mut reconnecting = false;
         let mut retry_delay = job.params.min_retry_interval;
 
         'retry: loop {
-            // Wait for the backoff delay, draining the command queue.
-            let tx_opt: Option<Completer<ConnectResponse>> =
+            let should_buf =
+                buf_cfg.allow_send_any_time || (ever_connected && buf_cfg.send_while_disconnected);
+
+            // ---- One connection attempt (or one pass over the server list) ----
+            let attempt: Attempt<B> = if !reconnecting {
+                let n = job.params.servers.len();
+                let mut last_err = None;
+                let mut result = None;
+                for idx in 0..n {
+                    job.server_idx = idx;
+                    match attempt_connect::<B>(&job, &cmd_rx, &mut buf, &buf_cfg, should_buf).await
+                    {
+                        Attempt::Connected(_, _, ack) if ack.reason_code.is_err() => {
+                            last_err = Some(Error::ReasonCode(ack.reason_code, ack.properties));
+                        }
+                        Attempt::Connected(r, w, ack) => {
+                            result = Some((r, w, ack));
+                            break;
+                        }
+                        Attempt::Failed(e) => last_err = Some(e),
+                        Attempt::Aborted => continue 'outer,
+                    }
+                }
+                match result {
+                    Some((r, w, ack)) => Attempt::Connected(r, w, ack),
+                    None => {
+                        Attempt::Failed(last_err.unwrap_or(Error::General("no servers configured")))
+                    }
+                }
+            } else {
                 match reconnect_wait::<B>(retry_delay, &cmd_rx, &mut buf, &buf_cfg).await {
                     WaitOutcome::Abort => break 'retry,
                     WaitOutcome::Retry => {
                         // Advance to the next server in round-robin order.
                         let n = job.params.servers.len();
                         job.server_idx = (job.server_idx + 1) % n;
-                        None
                     }
                     WaitOutcome::Replace(new_job, new_tx) => {
                         // Explicit reconnect/connect: use the new params and
                         // reset the backoff.
-                        job = *new_job;
+                        job = new_job;
                         retry_delay = job.params.min_retry_interval;
-                        Some(new_tx)
+                        tx_opt = Some(new_tx);
                     }
-                };
+                }
+                match attempt_connect::<B>(&job, &cmd_rx, &mut buf, &buf_cfg, should_buf).await {
+                    Attempt::Connected(_, _, ack) if ack.reason_code.is_err() => {
+                        Attempt::Failed(Error::ReasonCode(ack.reason_code, ack.properties))
+                    }
+                    other => other,
+                }
+            };
 
-            match do_connect::<B>(&job).await {
-                Err(e) => {
-                    if matches!(e, Error::Tls(_)) {
-                        let _ = event_tx.send(Event::TlsError(e.to_string())).await;
+            let (mut reader, writer, connack) = match attempt {
+                Attempt::Aborted => break 'retry,
+                Attempt::Failed(err) => {
+                    if matches!(err, Error::Tls(_)) {
+                        let _ = event_tx.send(Event::TlsError(err.to_string())).await;
                     }
-                    if let Some(tx) = tx_opt {
-                        tx.complete(Err(e));
+                    if let Some(tx) = tx_opt.take() {
+                        tx.complete(Err(err));
+                    }
+                    if !reconnecting {
+                        continue 'outer;
                     }
                     retry_delay = (retry_delay * 2).min(job.params.max_retry_interval);
+                    continue 'retry;
                 }
-                Ok((mut reader, writer, connack)) => {
-                    if connack.reason_code as u8 >= 0x80 {
-                        let e = Error::ReasonCode(connack.reason_code, connack.properties);
-                        if let Some(tx) = tx_opt {
-                            tx.complete(Err(e));
-                        }
-                        retry_delay = (retry_delay * 2).min(job.params.max_retry_interval);
-                        continue 'retry;
-                    }
+                Attempt::Connected(r, w, ack) => (r, w, ack),
+            };
 
-                    let limits = SessionLimits::new(&job.params, &connack);
-                    let response = build_connect_response(&job, connack);
-                    job.connected_flag.store(true, Ordering::SeqCst);
-                    let _ = event_tx.send(Event::Connected(response.clone())).await;
-                    if let Some(tx) = tx_opt {
-                        tx.complete(Ok(response));
-                    }
+            // ---- Connected ----
+            let limits = SessionLimits::new(&job.params, &connack);
+            let response = build_connect_response(&job, connack);
+            // Set the flag before resolving the token so `is_connected()` is
+            // true as soon as `wait()` / `.await` returns in the caller.
+            job.connected_flag.store(true, Ordering::SeqCst);
+            ever_connected = true;
+            let _ = event_tx.send(Event::Connected(response.clone())).await;
+            if let Some(tx) = tx_opt.take() {
+                tx.complete(Ok(response));
+            }
 
-                    let mut session = Session::<B>::new(
-                        writer,
-                        job.params.ver,
-                        job.params.keep_alive_duration(),
-                        event_tx.clone(),
-                        job.persist.clone(),
-                        limits,
-                    );
+            let mut session = Session::<B>::new(
+                writer,
+                job.params.ver,
+                job.params.keep_alive_duration(),
+                event_tx.clone(),
+                job.persist.clone(),
+                limits,
+            );
+            let result = session
+                .serve(&mut reader, &cmd_rx, &mut buf, buf_cfg.restore_msgs)
+                .await;
+            if let Some(p) = &session.persist {
+                let _ = p.lock().unwrap().close();
+            }
 
-                    // Restore persisted in-flight messages, then flush the
-                    // disconnected buffer into the reconnected session.
-                    if buf_cfg.restore_msgs && session.restore().await.is_err() {
-                        retry_delay = (retry_delay * 2).min(job.params.max_retry_interval);
-                        continue 'retry;
+            match result {
+                // Clean disconnect: back to waiting for a Connect.
+                Ok(()) => continue 'outer,
+                Err(e) => {
+                    job.connected_flag.store(false, Ordering::SeqCst);
+                    let _ = event_tx.send(Event::ConnectionLost(e)).await;
+                    if !job.params.auto_reconnect {
+                        continue 'outer;
                     }
-                    while let Some(cmd) = buf.pop_front() {
-                        if session.handle_command(cmd).await.is_err() {
-                            buf.clear();
-                            break;
-                        }
-                    }
-
-                    let result = session.run(&mut reader, &cmd_rx).await;
-                    if let Some(p) = &session.persist {
-                        let _ = p.lock().unwrap().close();
-                    }
-
-                    match result {
-                        Ok(()) => break 'retry, // clean disconnect
-                        Err(e) => {
-                            job.connected_flag.store(false, Ordering::SeqCst);
-                            let _ = event_tx.send(Event::ConnectionLost(e)).await;
-                            // Reset backoff on each successful-then-lost connection.
-                            retry_delay = job.params.min_retry_interval;
-                        }
-                    }
+                    // Start (or restart) backing off from the minimum.
+                    reconnecting = true;
+                    retry_delay = job.params.min_retry_interval;
                 }
             }
         } // 'retry

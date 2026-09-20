@@ -27,6 +27,19 @@ Version 2.0 is a rewrite of the library in pure Rust. The dependency on the Paho
 - A broker-initiated DISCONNECT (v5) now fires the `disconnected` callback *and* `connection_lost`, and triggers auto-reconnect if enabled — matching the v1.x / Paho C behaviour. Previously it suppressed both.
 - Large publish payloads (over 16 KiB) are written to the transport from their own buffer, without being copied into the send buffer; QoS 1/2 messages are encoded once for both persistence and transmission.
 
+### Behaviour
+
+- **[Breaking]** An acknowledgement carrying an error reason code fails the operation's token with `Error::ReasonCode(code, properties)` — for `publish()` (PUBACK or PUBREC/PUBCOMP), `subscribe()`, and `unsubscribe()` — matching how a refused CONNACK fails `connect()`. `subscribe_many()` and `unsubscribe_many()` still resolve `Ok` with one code per filter, since they may succeed partially. Previously PUBACK, SUBACK and UNSUBACK errors resolved `Ok` with the code inside the response while PUBREC errors failed the token.
+- `ConnectOptions::connect_timeout` is honoured (default 30 s) and bounds the whole attempt — TCP connect, TLS/WebSocket handshake, CONNECT and CONNACK — failing the token with `Error::Timeout`. Zero disables it. `disconnect()` called during a pending connect cancels the attempt at once; a second `connect()` while one is in progress fails with "connect already in progress".
+- `Token<T>` is now a proper shared handle: every clone resolves with the same result, `try_wait()` no longer consumes it, and a completed token can be awaited again. `Error` implements `Clone` to make this possible (an `io::Error` is cloned as a new error of the same kind and message).
+- A Will's MQTT v5 properties (Will Delay Interval, Message Expiry, Content Type, user properties, …) are sent; they were dropped. Setting them on a v3 connection is `Error::WrongMqttVersion`.
+- `ws://` and `wss://` URIs are refused with `Error::WebSocketNotSupported` when the client is built without a WebSocket feature; they used to be treated as plain TCP / TLS.
+- A failure while restoring persisted messages on (re)connect is now reported as a lost connection (`connection_lost` callback, auto-reconnect if enabled) instead of leaving the client reporting itself connected with no session.
+- Persisted QoS 1/2 messages re-sent on connect respect `max_inflight`, queuing behind the limit like new publishes.
+- Packet identifiers are never reused while the previous operation with that identifier is still unacknowledged.
+- A QoS 2 publish refused at PUBREC is removed from persistence, so it is not re-sent on the next connect.
+- `AsyncClient` no longer relies on `unsafe impl Send/Sync`; `UserPersistence` holds its store behind a `Mutex` so the types are thread-safe by construction.
+
 ### API
 
 - **[Breaking]** `QOS_0`, `QOS_1`, `QOS_2` are `QoS` values and `MQTT_VERSION_*` are `MqttVersion` values, rather than `i32` / `u8`. Code that passes the named constants is unaffected (`Message::new(topic, payload, QOS_1)` still works). Code that passed integer literals or variables must convert: `QoS::try_from(n)?`, `MqttVersion::try_from(n)?`. The lossy `From<i32>` for `QoS` and `From<u8>` for `MqttVersion` — which mapped invalid values to a default — are removed.

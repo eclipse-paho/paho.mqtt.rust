@@ -66,15 +66,35 @@ use std::{
 
 /// Typed shared state for a [`Token`].
 struct FutureData<T> {
+    /// The outcome, once known. It stays here for the life of the token so
+    /// that every clone, and every call to `try_wait`, observes it.
     result: Option<Result<T>>,
-    waker: Option<Waker>,
+    /// Wakers of every task currently waiting on this token or a clone of it.
+    wakers: Vec<Waker>,
 }
 
 impl<T> Default for FutureData<T> {
     fn default() -> Self {
         Self {
             result: None,
-            waker: None,
+            wakers: Vec::new(),
+        }
+    }
+}
+
+impl<T> FutureData<T> {
+    /// Stores `result` and wakes everyone waiting.
+    fn set(&mut self, result: Result<T>) {
+        self.result = Some(result);
+        for w in self.wakers.drain(..) {
+            w.wake();
+        }
+    }
+
+    /// Registers `waker` unless an equivalent one is already registered.
+    fn register(&mut self, waker: &Waker) {
+        if !self.wakers.iter().any(|w| w.will_wake(waker)) {
+            self.wakers.push(waker.clone());
         }
     }
 }
@@ -110,11 +130,7 @@ impl<T: 'static + Send> Completer<T> {
     pub(crate) fn complete(self, result: Result<T>) {
         let inner = self.inner.clone();
         std::mem::forget(self);
-        let mut data = inner.lock().unwrap();
-        data.result = Some(result);
-        if let Some(w) = data.waker.take() {
-            w.wake();
-        }
+        inner.lock().unwrap().set(result);
     }
 }
 
@@ -122,10 +138,7 @@ impl<T: 'static + Send> Drop for Completer<T> {
     fn drop(&mut self) {
         let mut data = self.inner.lock().unwrap();
         if data.result.is_none() {
-            data.result = Some(Err(Error::Disconnected));
-            if let Some(w) = data.waker.take() {
-                w.wake();
-            }
+            data.set(Err(Error::Disconnected));
         }
     }
 }
@@ -138,6 +151,11 @@ impl<T: 'static + Send> Drop for Completer<T> {
 ///
 /// Tokens are _eagerly started_: the operation begins when the `AsyncClient`
 /// method is called, not when the token is polled or `.await`-ed.
+///
+/// A token may be cloned; every clone refers to the same operation and every
+/// one of them resolves with (a clone of) the same result. The result is
+/// retained, so [`try_wait`](Self::try_wait) can be called repeatedly and a
+/// token can be `.await`-ed after it has already completed.
 pub struct Token<T: 'static + Send> {
     inner: Arc<Mutex<FutureData<T>>>,
 }
@@ -159,22 +177,24 @@ impl<T: 'static + Send> Token<T> {
     pub(crate) fn from_err(err: Error) -> Self {
         let inner = Arc::new(Mutex::new(FutureData {
             result: Some(Err(err)),
-            waker: None,
+            wakers: Vec::new(),
         }));
         Self { inner }
     }
+}
 
+impl<T: 'static + Send + Clone> Token<T> {
     /// Blocks the caller until the asynchronous operation completes.
     pub fn wait(self) -> Result<T> {
         block_on(self)
     }
 
     /// Non-blocking check — returns `Some(result)` if complete, `None` if
-    /// still pending.
+    /// still pending. Does not consume the result: a later `wait()` or
+    /// `.await` returns it again.
     pub fn try_wait(&mut self) -> Option<Result<T>> {
-        self.now_or_never()
+        self.inner.lock().unwrap().result.clone()
     }
-
     /// Blocks the caller for at most `dur`, returning `Err(Error::Timeout)`
     /// if the operation does not complete in time.
     pub fn wait_for(self, dur: Duration) -> Result<T> {
@@ -200,17 +220,15 @@ impl<T: 'static + Send> Clone for Token<T> {
     }
 }
 
-unsafe impl<T: 'static + Send> Send for Token<T> {}
-
-impl<T: 'static + Send> Future for Token<T> {
+impl<T: 'static + Send + Clone> Future for Token<T> {
     type Output = Result<T>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let mut data = self.inner.lock().unwrap();
-        match data.result.take() {
-            Some(r) => Poll::Ready(r),
+        match &data.result {
+            Some(r) => Poll::Ready(r.clone()),
             None => {
-                data.waker = Some(cx.waker().clone());
+                data.register(cx.waker());
                 Poll::Pending
             }
         }
@@ -316,5 +334,57 @@ mod tests {
         if tok.try_wait().is_some() {
             panic!("should be pending");
         }
+    }
+
+    /// Every clone of a token resolves with the same result, and the result
+    /// survives being observed.
+    #[test]
+    fn test_clones_all_observe_the_result() {
+        let (tok, comp) = ConnectToken::new();
+        let tok2 = tok.clone();
+        let mut tok3 = tok.clone();
+        comp.complete(Ok(ConnectResponse {
+            server_uri: "tcp://x".into(),
+            ..ConnectResponse::default()
+        }));
+        assert_eq!(tok.wait().unwrap().server_uri, "tcp://x");
+        assert_eq!(tok2.wait().unwrap().server_uri, "tcp://x");
+        assert_eq!(tok3.try_wait().unwrap().unwrap().server_uri, "tcp://x");
+        // try_wait does not consume: a second call and a final wait both work.
+        assert!(tok3.try_wait().is_some());
+        assert_eq!(tok3.wait().unwrap().server_uri, "tcp://x");
+    }
+
+    /// Two tasks waiting on clones of one token are both woken on completion.
+    #[test]
+    fn test_clones_waiting_concurrently_are_both_woken() {
+        use std::thread;
+        let (tok, comp) = ConnectToken::new();
+        let tok2 = tok.clone();
+        let a = thread::spawn(move || tok.wait());
+        let b = thread::spawn(move || tok2.wait());
+        thread::sleep(Duration::from_millis(50)); // let both register wakers
+        comp.complete(Ok(ConnectResponse::default()));
+        assert!(a.join().unwrap().is_ok());
+        assert!(b.join().unwrap().is_ok());
+    }
+
+    /// An error result is cloned for each observer too.
+    #[test]
+    fn test_error_result_is_observable_twice() {
+        let (mut tok, comp) = ConnectToken::new();
+        comp.complete(Err(Error::Timeout));
+        assert!(matches!(tok.try_wait(), Some(Err(Error::Timeout))));
+        assert!(matches!(tok.wait(), Err(Error::Timeout)));
+    }
+
+    /// The runtime dropping the completer resolves every clone.
+    #[test]
+    fn test_completer_drop_resolves_all_clones() {
+        let (tok, comp) = ConnectToken::new();
+        let tok2 = tok.clone();
+        drop(comp);
+        assert!(matches!(tok.wait(), Err(Error::Disconnected)));
+        assert!(matches!(tok2.wait(), Err(Error::Disconnected)));
     }
 }

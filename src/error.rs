@@ -38,6 +38,10 @@ pub enum Error {
     /// Attempting a TLS connection when the TLS feature is not enabled.
     #[error("TLS not supported by library")]
     TlsNotSupported,
+    /// Attempting a WebSocket connection (`ws://` or `wss://`) when the
+    /// WebSocket feature is not enabled.
+    #[error("WebSocket not supported by library")]
+    WebSocketNotSupported,
     /// A TLS handshake failure.
     #[error("TLS error: {0}")]
     Tls(String),
@@ -88,6 +92,37 @@ pub enum Error {
     GeneralString(String),
 }
 
+/// `io::Error` is not `Clone`, so the I/O variant is cloned by re-creating an
+/// error of the same kind carrying the original's message. The `source()`
+/// chain of the original is not preserved. Every other variant clones its
+/// payload directly. Cloning exists so that a [`Token`](crate::Token) result
+/// can be observed by more than one holder of the token.
+impl Clone for Error {
+    fn clone(&self) -> Self {
+        use Error::*;
+        match self {
+            Failure => Failure,
+            Disconnected => Disconnected,
+            TlsNotSupported => TlsNotSupported,
+            WebSocketNotSupported => WebSocketNotSupported,
+            Tls(s) => Tls(s.clone()),
+            WrongMqttVersion => WrongMqttVersion,
+            Protocol(e) => Protocol(*e),
+            Publish(s, m) => Publish(s.clone(), m.clone()),
+            ReasonCode(rc, props) => ReasonCode(*rc, props.clone()),
+            BadTopicFilter => BadTopicFilter,
+            Io(e) => Io(io::Error::new(e.kind(), e.to_string())),
+            Utf8(e) => Utf8(*e),
+            MissingTlsOptions => MissingTlsOptions,
+            BadProperty => BadProperty,
+            Conversion => Conversion,
+            Timeout => Timeout,
+            General(s) => General(s),
+            GeneralString(s) => GeneralString(s.clone()),
+        }
+    }
+}
+
 impl From<&'static str> for Error {
     /// Create a general error from a string.
     fn from(descr: &'static str) -> Error {
@@ -130,5 +165,18 @@ mod tests {
     fn test_error_from_string() {
         let s = String::from("oops");
         assert!(matches!(Error::from(s), Error::GeneralString(_)));
+    }
+
+    #[test]
+    fn test_io_error_clone_keeps_kind_and_message() {
+        let e = Error::Io(io::Error::new(io::ErrorKind::ConnectionRefused, "nope"));
+        let c = e.clone();
+        match (&e, &c) {
+            (Error::Io(a), Error::Io(b)) => {
+                assert_eq!(a.kind(), b.kind());
+                assert_eq!(a.to_string(), b.to_string());
+            }
+            _ => panic!("clone changed variant"),
+        }
     }
 }

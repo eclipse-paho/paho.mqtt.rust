@@ -29,6 +29,7 @@ use std::{
     fmt,
     io::Write,
     path::{Path, PathBuf},
+    sync::Mutex,
 };
 
 /// Return value for a successful persistence operation
@@ -163,7 +164,11 @@ pub trait ClientPersistence: Send {
 /////////////////////////////////////////////////////////////////////////////
 
 /// A wrapper around a user-defined client persistence object.
-pub struct UserPersistence(Box<ClientPersistenceBox>);
+///
+/// The store is held behind a `Mutex` so that the wrapper — and therefore
+/// [`CreateOptions`](crate::CreateOptions) and the client that retains them —
+/// is `Sync` without requiring `ClientPersistence` implementations to be.
+pub struct UserPersistence(Mutex<ClientPersistenceBox>);
 
 impl UserPersistence {
     /// Creates a new user persistence object.
@@ -175,13 +180,13 @@ impl UserPersistence {
 impl UserPersistence {
     /// Extracts the inner [`ClientPersistence`] implementation.
     pub fn into_inner(self) -> Box<dyn ClientPersistence> {
-        *self.0
+        self.0.into_inner().unwrap_or_else(|e| e.into_inner())
     }
 }
 
 impl From<Box<dyn ClientPersistence>> for UserPersistence {
     fn from(persistence: ClientPersistenceBox) -> Self {
-        Self(Box::new(persistence))
+        Self(Mutex::new(persistence))
     }
 }
 

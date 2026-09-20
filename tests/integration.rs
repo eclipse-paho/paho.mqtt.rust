@@ -485,6 +485,305 @@ fn test_lwt() {
     sub.disconnect(None).wait().ok();
 }
 
+/// A v5 Will's properties reach the broker: a subscriber receives the LWT
+/// with the user property the will was given.
+#[test]
+fn test_lwt_v5_properties() {
+    use mqtt::{Property, PropertyId, PropertyValue};
+    let lwt_topic = topic!("lwt-v5");
+
+    let sub = mqtt::AsyncClient::new(HOST).unwrap();
+    sub.connect(mqtt::ConnectOptions::new_v5())
+        .wait()
+        .expect("sub connect failed");
+    let rx = sub.start_consuming();
+    sub.subscribe(lwt_topic, mqtt::QOS_1)
+        .wait()
+        .expect("subscribe failed");
+
+    {
+        let mut will = mqtt::Message::new(lwt_topic, "gone", mqtt::QOS_1);
+        will.props.push(Property::new(
+            PropertyId::UserProperty,
+            PropertyValue::StringPair("cause".into(), "test".into()),
+        ));
+        will.props.push(Property::new(
+            PropertyId::ContentType,
+            PropertyValue::String("text/plain".into()),
+        ));
+        let conn_opts = mqtt::ConnectOptionsBuilder::new_v5()
+            .will_message(will)
+            .finalize();
+        let lwt_cli = mqtt::AsyncClient::new(HOST).unwrap();
+        lwt_cli
+            .connect(conn_opts)
+            .wait()
+            .expect("lwt connect failed");
+        // Dropped without a DISCONNECT: the broker publishes the will.
+    }
+
+    let msg = rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("LWT not received within timeout")
+        .expect("connection lost");
+    assert_eq!(msg.topic(), lwt_topic);
+    assert_eq!(
+        msg.properties().get(PropertyId::ContentType),
+        Some(&PropertyValue::String("text/plain".into())),
+        "will properties were not forwarded"
+    );
+    assert_eq!(
+        msg.properties().get(PropertyId::UserProperty),
+        Some(&PropertyValue::StringPair("cause".into(), "test".into()))
+    );
+    sub.disconnect(None).wait().ok();
+}
+
+/// Will properties on a v3 connection are rejected up front.
+#[test]
+fn test_lwt_props_need_v5() {
+    use mqtt::{Property, PropertyId, PropertyValue};
+    let mut will = mqtt::Message::new(topic!("lwt-v3"), "gone", mqtt::QOS_0);
+    will.props.push(Property::new(
+        PropertyId::ContentType,
+        PropertyValue::String("text/plain".into()),
+    ));
+    let conn_opts = mqtt::ConnectOptionsBuilder::new_v3()
+        .will_message(will)
+        .finalize();
+    let cli = mqtt::AsyncClient::new(HOST).unwrap();
+    assert!(matches!(
+        cli.connect(conn_opts).wait(),
+        Err(mqtt::Error::WrongMqttVersion)
+    ));
+    assert!(!cli.is_connected());
+}
+
+/////////////////////////////////////////////////////////////////////////////
+// Connect timeout and cancellation
+/////////////////////////////////////////////////////////////////////////////
+
+/// A TCP listener that accepts connections and never answers, standing in for
+/// a broker that hangs after the transport is up.
+fn silent_listener() -> (std::net::TcpListener, String) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let uri = format!("tcp://{}", listener.local_addr().unwrap());
+    (listener, uri)
+}
+
+/// `connect_timeout` bounds the whole attempt, including waiting for CONNACK.
+#[test]
+fn test_connect_timeout_waiting_for_connack() {
+    let (listener, uri) = silent_listener();
+    // Keep the accepted socket alive so the client sees an open connection.
+    let accepted = std::thread::spawn(move || listener.accept().map(|(s, _)| s));
+
+    let cli = mqtt::AsyncClient::new(uri).unwrap();
+    let conn_opts = mqtt::ConnectOptionsBuilder::new()
+        .connect_timeout(Duration::from_millis(500))
+        .finalize();
+    let start = std::time::Instant::now();
+    let res = cli.connect(conn_opts).wait_for(Duration::from_secs(5));
+    let elapsed = start.elapsed();
+
+    assert!(matches!(res, Err(mqtt::Error::Timeout)), "got {res:?}");
+    assert!(
+        elapsed >= Duration::from_millis(450) && elapsed < Duration::from_secs(3),
+        "timed out after {elapsed:?}"
+    );
+    assert!(!cli.is_connected());
+    drop(accepted);
+}
+
+/// `disconnect()` during a hanging connect cancels the attempt immediately
+/// and resolves both tokens.
+#[test]
+fn test_disconnect_cancels_pending_connect() {
+    let (listener, uri) = silent_listener();
+    let accepted = std::thread::spawn(move || listener.accept().map(|(s, _)| s));
+
+    let cli = mqtt::AsyncClient::new(uri).unwrap();
+    let conn_opts = mqtt::ConnectOptionsBuilder::new()
+        .connect_timeout(Duration::from_secs(30))
+        .finalize();
+    let conn_tok = cli.connect(conn_opts);
+    std::thread::sleep(Duration::from_millis(200));
+
+    let start = std::time::Instant::now();
+    cli.disconnect(None)
+        .wait_for(Duration::from_secs(5))
+        .expect("disconnect should resolve");
+    // The connect token fails promptly rather than waiting out its 30 s.
+    let res = conn_tok.wait_for(Duration::from_secs(5));
+    assert!(res.is_err(), "connect should not succeed: {res:?}");
+    assert!(start.elapsed() < Duration::from_secs(3));
+    assert!(!cli.is_connected());
+
+    // The client is still usable afterwards.
+    let cli2 = mqtt::AsyncClient::new(HOST).unwrap();
+    cli2.connect(None).wait().expect("fresh connect");
+    cli2.disconnect(None).wait().ok();
+    drop(accepted);
+}
+
+/// A second `connect()` while one is in progress fails on its own rather
+/// than disturbing the first.
+#[test]
+fn test_second_connect_while_connecting_is_rejected() {
+    let (listener, uri) = silent_listener();
+    let accepted = std::thread::spawn(move || listener.accept().map(|(s, _)| s));
+
+    let cli = mqtt::AsyncClient::new(uri).unwrap();
+    let conn_opts = mqtt::ConnectOptionsBuilder::new()
+        .connect_timeout(Duration::from_millis(700))
+        .finalize();
+    let first = cli.connect(conn_opts.clone());
+    std::thread::sleep(Duration::from_millis(100));
+    let second = cli.connect(conn_opts);
+
+    assert!(matches!(
+        second.wait_for(Duration::from_secs(2)),
+        Err(mqtt::Error::General("connect already in progress"))
+    ));
+    assert!(matches!(
+        first.wait_for(Duration::from_secs(5)),
+        Err(mqtt::Error::Timeout)
+    ));
+    drop(accepted);
+}
+
+/////////////////////////////////////////////////////////////////////////////
+// Error reason codes in acknowledgements
+//
+// Mosquitto has nothing configured that it would refuse, so these run
+// against a scripted broker built on the codec: it accepts the connection
+// and answers every SUBSCRIBE, UNSUBSCRIBE, and QoS 1/2 PUBLISH with
+// `NotAuthorized`.
+/////////////////////////////////////////////////////////////////////////////
+
+/// Serves one client connection, refusing everything after CONNECT.
+fn refusing_broker() -> (String, std::thread::JoinHandle<()>) {
+    use bytes::BytesMut;
+    use mqtt::paho_mqtt_codec::{ConnAck, Packet, PubAck, RawPacket, ReasonCode, SubAck, UnsubAck};
+    use std::io::{Read, Write};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let uri = format!("tcp://{}", listener.local_addr().unwrap());
+    let handle = std::thread::spawn(move || {
+        let (mut sock, _) = listener.accept().unwrap();
+        sock.set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let mut buf = BytesMut::with_capacity(1024);
+        let mut ver = mqtt::MqttVersion::V5;
+        let mut tmp = [0u8; 1024];
+        loop {
+            let n = match sock.read(&mut tmp) {
+                Ok(0) | Err(_) => return,
+                Ok(n) => n,
+            };
+            buf.extend_from_slice(&tmp[..n]);
+            while let Some(raw) = RawPacket::decode(&mut buf).unwrap() {
+                let reply = match Packet::from_raw(raw, ver).unwrap() {
+                    Packet::Connect(c) => {
+                        ver = c.version;
+                        Some(Packet::ConnAck(ConnAck::new(false, ReasonCode::Success)))
+                    }
+                    Packet::Subscribe(s) => Some(Packet::SubAck(SubAck::new(
+                        s.packet_id,
+                        vec![ReasonCode::NotAuthorized; s.subscriptions.len()],
+                    ))),
+                    Packet::Unsubscribe(u) => Some(Packet::UnsubAck(UnsubAck::new(
+                        u.packet_id,
+                        vec![ReasonCode::NotAuthorized; u.topic_filters.len()],
+                    ))),
+                    Packet::Publish(p) => match (p.qos, p.packet_id) {
+                        (mqtt::QoS::QoS1, Some(id)) => {
+                            let mut a = PubAck::new(id);
+                            a.reason_code = ReasonCode::NotAuthorized;
+                            Some(Packet::PubAck(a))
+                        }
+                        (mqtt::QoS::QoS2, Some(id)) => {
+                            let mut a = PubAck::new(id);
+                            a.reason_code = ReasonCode::NotAuthorized;
+                            Some(Packet::PubRec(a))
+                        }
+                        _ => None,
+                    },
+                    Packet::PingReq => Some(Packet::PingResp),
+                    Packet::Disconnect(_) => return,
+                    _ => None,
+                };
+                if let Some(pkt) = reply {
+                    let mut out = BytesMut::new();
+                    pkt.encode(&mut out, ver).unwrap();
+                    sock.write_all(&out).unwrap();
+                }
+            }
+        }
+    });
+    (uri, handle)
+}
+
+fn not_authorized(res: &mqtt::Result<impl std::fmt::Debug>) -> bool {
+    matches!(
+        res,
+        Err(mqtt::Error::ReasonCode(mqtt::ReasonCode::NotAuthorized, _))
+    )
+}
+
+/// Single-target operations fail their token on an error reason code;
+/// many-target operations resolve `Ok` with the per-filter codes.
+#[test]
+fn test_ack_error_codes_policy() {
+    let (uri, broker) = refusing_broker();
+    let cli = mqtt::AsyncClient::new(uri).unwrap();
+    cli.connect(mqtt::ConnectOptions::new_v5())
+        .wait()
+        .expect("connect");
+
+    // subscribe(): one filter → its error fails the token.
+    let res = cli.subscribe(topic!("denied"), mqtt::QOS_1).wait();
+    assert!(not_authorized(&res), "subscribe: {res:?}");
+
+    // subscribe_many(): partial success is possible → always Ok with codes.
+    let rsp = cli
+        .subscribe_many(&[topic!("a"), topic!("b")], &[mqtt::QOS_1, mqtt::QOS_0])
+        .wait()
+        .expect("subscribe_many resolves Ok even when refused");
+    assert_eq!(
+        rsp.reason_codes,
+        vec![
+            mqtt::ReasonCode::NotAuthorized,
+            mqtt::ReasonCode::NotAuthorized
+        ]
+    );
+
+    // publish() QoS 1 → PUBACK error, QoS 2 → PUBREC error; both fail.
+    let res = cli
+        .publish(mqtt::Message::new(topic!("denied"), "x", mqtt::QOS_1))
+        .wait();
+    assert!(not_authorized(&res), "publish qos1: {res:?}");
+    let res = cli
+        .publish(mqtt::Message::new(topic!("denied"), "x", mqtt::QOS_2))
+        .wait();
+    assert!(not_authorized(&res), "publish qos2: {res:?}");
+
+    // unsubscribe() / unsubscribe_many() follow the subscribe rule.
+    let res = cli.unsubscribe(topic!("denied")).wait();
+    assert!(not_authorized(&res), "unsubscribe: {res:?}");
+    let rsp = cli
+        .unsubscribe_many(&[topic!("a"), topic!("b")])
+        .wait()
+        .expect("unsubscribe_many resolves Ok");
+    assert_eq!(rsp.reason_codes.len(), 2);
+
+    // The connection is intact throughout: a rejected operation is that
+    // operation's failure, not the session's.
+    assert!(cli.is_connected());
+    cli.disconnect(None).wait().ok();
+    broker.join().unwrap();
+}
+
 /////////////////////////////////////////////////////////////////////////////
 // Reconnect
 /////////////////////////////////////////////////////////////////////////////
