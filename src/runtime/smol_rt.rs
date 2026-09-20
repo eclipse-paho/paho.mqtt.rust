@@ -42,12 +42,16 @@ use smol::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf, split};
 #[cfg(any(feature = "smol-tls", feature = "smol-websocket"))]
 use smol::net::TcpStream;
 
+#[cfg(feature = "smol-tls")]
+use super::smol_conn::TlsConnection;
 #[cfg(unix)]
 use super::smol_conn::UnixConnection;
-#[cfg(feature = "smol-tls")]
-use super::smol_conn::{TlsConnection, make_tls_config};
 #[cfg(feature = "smol-websocket")]
-use super::smol_conn::{WsConnection, build_ws_request};
+use super::smol_conn::WsConnection;
+#[cfg(feature = "smol-tls")]
+use super::tls_config::make_tls_config;
+#[cfg(feature = "smol-websocket")]
+use super::ws_util::build_ws_request;
 use super::{
     backend::{Backend, Sleep},
     commands::{BufConfig, ConnectParams, ServerAddr},

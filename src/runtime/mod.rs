@@ -43,6 +43,12 @@ pub(crate) mod backend;
 #[cfg(any(feature = "tokio", feature = "smol"))]
 pub(crate) mod session;
 
+#[cfg(any(feature = "tls", feature = "smol-tls", feature = "openssl"))]
+pub(crate) mod tls_config;
+
+#[cfg(any(feature = "websocket", feature = "smol-websocket"))]
+pub(crate) mod ws_util;
+
 #[cfg(feature = "tokio")]
 pub(crate) mod tokio_conn;
 

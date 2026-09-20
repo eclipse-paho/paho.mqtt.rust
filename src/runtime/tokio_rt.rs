@@ -44,14 +44,20 @@ use tokio::{
 #[cfg(feature = "tls")]
 use tokio_rustls::TlsConnector;
 
+#[cfg(all(feature = "openssl", not(feature = "tls")))]
+use super::tls_config::make_openssl_config;
+#[cfg(feature = "tls")]
+use super::tls_config::make_tls_config;
+#[cfg(all(feature = "openssl", not(feature = "tls")))]
+use super::tokio_conn::OpenSslConnection;
+#[cfg(feature = "tls")]
+use super::tokio_conn::TlsConnection;
 #[cfg(unix)]
 use super::tokio_conn::UnixConnection;
-#[cfg(all(feature = "openssl", not(feature = "tls")))]
-use super::tokio_conn::{OpenSslConnection, make_openssl_config};
-#[cfg(feature = "tls")]
-use super::tokio_conn::{TlsConnection, make_tls_config};
 #[cfg(feature = "websocket")]
-use super::tokio_conn::{WsConnection, build_ws_request};
+use super::tokio_conn::WsConnection;
+#[cfg(feature = "websocket")]
+use super::ws_util::build_ws_request;
 use super::{
     backend::{Backend, Sleep},
     commands::{BufConfig, ConnectParams, ServerAddr},

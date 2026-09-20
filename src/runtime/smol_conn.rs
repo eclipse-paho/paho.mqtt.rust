@@ -21,8 +21,9 @@
 //! Smol-based connection types for the MQTT client.
 //!
 //! Provides transport implementations of the shared [`Connection`] trait:
-//! [`TcpConnection`], [`UnixConnection`], [`TlsConnection`], and
-//! [`WsConnection`], together with the TLS configuration helper functions.
+//! `TcpConnection`, `UnixConnection`, `TlsConnection` (`smol-tls`), and
+//! `WsConnection` (`smol-websocket`). The TLS and WebSocket configuration helpers they use
+//! live in `super::tls_config` and `super::ws_util`.
 //!
 //! TLS support requires the `smol-tls` feature (`futures-rustls`).
 //! WebSocket support requires the `smol-websocket` feature (`async-tungstenite`).
@@ -33,18 +34,13 @@ use std::{
     task::{Context, Poll},
 };
 
+use super::connection::Connection;
 #[cfg(unix)]
 use smol::net::unix::UnixStream;
 use smol::{
     io::{AsyncRead, AsyncWrite},
     net::TcpStream,
 };
-#[cfg(feature = "smol-tls")]
-use std::sync::Arc as StdArc;
-
-use super::connection::Connection;
-#[cfg(any(feature = "smol-tls", feature = "smol-websocket"))]
-use crate::{Error, Result};
 
 /////////////////////////////////////////////////////////////////////////////
 
@@ -138,9 +134,6 @@ impl TlsConnection {
 
 #[cfg(feature = "smol-tls")]
 impl_connection!(TlsConnection);
-
-#[cfg(feature = "smol-tls")]
-type TlsResult<T> = std::result::Result<T, rustls::Error>;
 
 /////////////////////////////////////////////////////////////////////////////
 
@@ -302,249 +295,6 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for WsConnection<S> {
 
 #[cfg(feature = "smol-websocket")]
 impl<S: AsyncRead + AsyncWrite + Send + Unpin + 'static> Connection for WsConnection<S> {}
-
-/// Builds an HTTP upgrade request for a WebSocket MQTT connection.
-#[cfg(feature = "smol-websocket")]
-pub(super) fn build_ws_request(
-    url: &str,
-    http_headers: &std::collections::HashMap<String, String>,
-) -> Result<async_tungstenite::tungstenite::handshake::client::Request> {
-    use async_tungstenite::tungstenite::{
-        client::IntoClientRequest,
-        http::header::{HeaderName, HeaderValue},
-    };
-
-    let mut request = url
-        .into_client_request()
-        .map_err(|e| Error::GeneralString(e.to_string()))?;
-
-    {
-        let headers = request.headers_mut();
-        headers.insert(
-            HeaderName::from_static("sec-websocket-protocol"),
-            HeaderValue::from_static("mqtt"),
-        );
-        for (name, value) in http_headers {
-            if let (Ok(h_name), Ok(h_val)) =
-                (name.parse::<HeaderName>(), value.parse::<HeaderValue>())
-            {
-                headers.insert(h_name, h_val);
-            }
-        }
-    }
-
-    Ok(request)
-}
-
-/////////////////////////////////////////////////////////////////////////////
-
-/// A [`rustls::client::ServerCertVerifier`] that accepts any certificate.
-///
-/// Used when `TlsOptions::enable_server_cert_auth` is `false`.
-#[cfg(feature = "smol-tls")]
-#[derive(Debug)]
-struct NoCertVerifier;
-
-#[cfg(feature = "smol-tls")]
-impl rustls::client::danger::ServerCertVerifier for NoCertVerifier {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &rustls::pki_types::CertificateDer<'_>,
-        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
-        _server_name: &rustls::pki_types::ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: rustls::pki_types::UnixTime,
-    ) -> TlsResult<rustls::client::danger::ServerCertVerified> {
-        Ok(rustls::client::danger::ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        _message: &[u8],
-        _cert: &rustls::pki_types::CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> TlsResult<rustls::client::danger::HandshakeSignatureValid> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        _message: &[u8],
-        _cert: &rustls::pki_types::CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> TlsResult<rustls::client::danger::HandshakeSignatureValid> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        use rustls::SignatureScheme::*;
-        vec![
-            RSA_PKCS1_SHA1,
-            ECDSA_SHA1_Legacy,
-            RSA_PKCS1_SHA256,
-            ECDSA_NISTP256_SHA256,
-            RSA_PKCS1_SHA384,
-            ECDSA_NISTP384_SHA384,
-            RSA_PKCS1_SHA512,
-            ECDSA_NISTP521_SHA512,
-            RSA_PSS_SHA256,
-            RSA_PSS_SHA384,
-            RSA_PSS_SHA512,
-            ED25519,
-            ED448,
-        ]
-    }
-}
-
-/// Filters the ring provider's cipher suites to those named in `spec`.
-///
-/// `spec` is a colon- or comma-separated list of rustls suite names.
-/// Matching is case-insensitive.  Returns an error if no names match.
-#[cfg(feature = "smol-tls")]
-fn filter_cipher_suites(spec: &str) -> Result<Vec<rustls::SupportedCipherSuite>> {
-    let provider = rustls::crypto::ring::default_provider();
-    let requested: std::collections::HashSet<String> = spec
-        .split([':', ','])
-        .map(|s| s.trim().to_ascii_uppercase())
-        .filter(|s| !s.is_empty())
-        .collect();
-
-    let filtered: Vec<rustls::SupportedCipherSuite> = provider
-        .cipher_suites
-        .iter()
-        .filter(|cs| {
-            let name = format!("{:?}", cs.suite()).to_ascii_uppercase();
-            requested.contains(&name)
-        })
-        .copied()
-        .collect();
-
-    if filtered.is_empty() {
-        return Err(Error::GeneralString(format!(
-            "no recognized cipher suites in '{spec}'; \
-            use rustls names such as TLS13_AES_256_GCM_SHA384"
-        )));
-    }
-    Ok(filtered)
-}
-
-/// Builds a [`rustls::ClientConfig`] from [`TlsOptions`].
-///
-/// Identical logic to the tokio backend's `make_tls_config`; only the
-/// async wrapper crate differs (`futures-rustls` vs `tokio-rustls`).
-#[cfg(feature = "smol-tls")]
-pub(super) fn make_tls_config(tls: &crate::TlsOptions) -> Result<StdArc<rustls::ClientConfig>> {
-    use crate::TlsVersion;
-    use rustls::RootCertStore;
-    use std::io::BufReader;
-
-    if !tls.private_key_password.is_empty() {
-        return Err(Error::General(
-            "encrypted private keys are not supported with the rustls TLS backend",
-        ));
-    }
-
-    // ---- Root certificate store ----
-    let mut root_store = RootCertStore::empty();
-
-    if !tls.disable_default_trust_store {
-        let native_certs = rustls_native_certs::load_native_certs().map_err(Error::Io)?;
-        for cert in native_certs {
-            let _ = root_store.add(cert);
-        }
-    }
-
-    if !tls.trust_store.as_os_str().is_empty() {
-        let f = std::fs::File::open(&tls.trust_store).map_err(Error::Io)?;
-        let mut r = BufReader::new(f);
-        for cert in rustls_pemfile::certs(&mut r) {
-            root_store
-                .add(cert.map_err(Error::Io)?)
-                .map_err(|e| Error::GeneralString(e.to_string()))?;
-        }
-    }
-
-    if !tls.ca_path.as_os_str().is_empty() {
-        for entry in std::fs::read_dir(&tls.ca_path).map_err(Error::Io)? {
-            let path = entry.map_err(Error::Io)?.path();
-            if path.is_file()
-                && let Ok(f) = std::fs::File::open(&path)
-            {
-                let mut r = BufReader::new(f);
-                for cert in rustls_pemfile::certs(&mut r).flatten() {
-                    let _ = root_store.add(cert);
-                }
-            }
-        }
-    }
-
-    // ---- Crypto provider (cipher suites) ----
-    let mut provider = rustls::crypto::ring::default_provider();
-    if !tls.enabled_cipher_suites.is_empty() {
-        provider.cipher_suites = filter_cipher_suites(&tls.enabled_cipher_suites)?;
-    }
-
-    // ---- Protocol versions ----
-    let versions: &[&'static rustls::SupportedProtocolVersion] = match tls.version {
-        TlsVersion::Default | TlsVersion::Tls1_2 => {
-            &[&rustls::version::TLS12, &rustls::version::TLS13]
-        }
-        TlsVersion::Tls1_0 | TlsVersion::Tls1_1 => {
-            log::warn!(
-                "TLS 1.0/1.1 are not supported by the rustls backend; \
-                 using TLS 1.2 as the minimum version"
-            );
-            &[&rustls::version::TLS12, &rustls::version::TLS13]
-        }
-    };
-
-    // ---- Config builder ----
-    let builder = rustls::ClientConfig::builder_with_provider(StdArc::new(provider))
-        .with_protocol_versions(versions)
-        .map_err(|e| Error::GeneralString(e.to_string()))?;
-
-    // ---- Certificate verification ----
-    let wants_client = if tls.enable_server_cert_auth {
-        builder.with_root_certificates(root_store)
-    } else {
-        builder
-            .dangerous()
-            .with_custom_certificate_verifier(StdArc::new(NoCertVerifier))
-    };
-
-    // ---- Client authentication ----
-    let mut config = if !tls.key_store.as_os_str().is_empty() {
-        let cert_f = std::fs::File::open(&tls.key_store).map_err(Error::Io)?;
-        let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
-            rustls_pemfile::certs(&mut BufReader::new(cert_f))
-                .collect::<std::result::Result<Vec<_>, _>>()
-                .map_err(Error::Io)?;
-
-        let key_path = if !tls.private_key.as_os_str().is_empty() {
-            &tls.private_key
-        } else {
-            &tls.key_store
-        };
-        let key_f = std::fs::File::open(key_path).map_err(Error::Io)?;
-        let key = rustls_pemfile::private_key(&mut BufReader::new(key_f))
-            .map_err(Error::Io)?
-            .ok_or_else(|| Error::General("no private key found in key store"))?;
-
-        wants_client
-            .with_client_auth_cert(certs, key)
-            .map_err(|e| Error::GeneralString(e.to_string()))?
-    } else {
-        wants_client.with_no_client_auth()
-    };
-
-    // ---- ALPN protocols ----
-    if !tls.protos.is_empty() {
-        config.alpn_protocols = tls.protos.iter().map(|p| p.as_bytes().to_vec()).collect();
-    }
-
-    Ok(StdArc::new(config))
-}
-
 /////////////////////////////////////////////////////////////////////////////
 //                              Unit Tests
 /////////////////////////////////////////////////////////////////////////////
