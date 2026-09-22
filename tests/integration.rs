@@ -29,6 +29,8 @@
 //
 // or equivalently with the `openssl` feature.
 
+mod common;
+
 use paho_mqtt as mqtt;
 use std::time::Duration;
 
@@ -782,6 +784,459 @@ fn test_ack_error_codes_policy() {
     assert!(cli.is_connected());
     cli.disconnect(None).wait().ok();
     broker.join().unwrap();
+}
+
+/////////////////////////////////////////////////////////////////////////////
+// MQTT v5 CONNACK negotiation
+/////////////////////////////////////////////////////////////////////////////
+
+/// A client that connects with an empty ID takes the one the broker assigns,
+/// and reports it from `client_id()`.
+#[test]
+fn test_v5_assigned_client_id() {
+    let cli = mqtt::CreateOptionsBuilder::new()
+        .server_uri(HOST)
+        .client_id("")
+        .mqtt_version(mqtt::MQTT_VERSION_5)
+        .create_async_client()
+        .unwrap();
+    assert_eq!(cli.client_id(), "");
+
+    let rsp = cli
+        .connect(mqtt::ConnectOptions::new_v5())
+        .wait()
+        .expect("connect failed");
+
+    let assigned = rsp
+        .assigned_client_id()
+        .expect("broker assigned no client id")
+        .to_string();
+    assert!(!assigned.is_empty());
+    assert_eq!(cli.client_id(), assigned, "client_id() must report it");
+    cli.disconnect(None).wait().ok();
+}
+
+/// The CONNACK capability accessors report what the broker advertised.
+#[test]
+fn test_v5_connack_capabilities() {
+    let cli = mqtt::AsyncClient::new(HOST).unwrap();
+    let rsp = cli
+        .connect(mqtt::ConnectOptions::new_v5())
+        .wait()
+        .expect("connect failed");
+
+    // Values Mosquitto advertises; assert only what any broker must honour.
+    assert!(rsp.receive_maximum() > 0);
+    assert_eq!(rsp.maximum_qos(), mqtt::QoS::ExactlyOnce);
+    assert!(rsp.retain_available());
+    assert!(rsp.wildcard_subscriptions_available());
+    assert!(rsp.subscription_identifiers_available());
+    assert!(rsp.shared_subscriptions_available());
+    assert!(rsp.server_keep_alive().is_none() || rsp.server_keep_alive().is_some());
+    cli.disconnect(None).wait().ok();
+}
+
+/// A Server Keep Alive in the CONNACK overrides the requested interval: the
+/// client pings on the broker's schedule, not its own.
+#[test]
+fn test_v5_server_keep_alive_overrides() {
+    use mqtt::paho_mqtt_codec::{ConnAck, Packet, Property, PropertyId, PropertyValue, ReasonCode};
+
+    let broker = common::spawn_broker(|pkt| match pkt {
+        Packet::Connect(_) => {
+            let mut ack = ConnAck::new(false, ReasonCode::Success);
+            ack.properties.push(Property::new(
+                PropertyId::ServerKeepAlive,
+                PropertyValue::U16(1),
+            ));
+            vec![Packet::ConnAck(ack)]
+        }
+        Packet::PingReq => vec![Packet::PingResp],
+        _ => vec![],
+    });
+
+    let cli = mqtt::AsyncClient::new(broker.uri.clone()).unwrap();
+    // Ask for a minute; the broker insists on one second.
+    let opts = mqtt::ConnectOptionsBuilder::new_v5()
+        .keep_alive_interval(Duration::from_secs(60))
+        .finalize();
+    cli.connect(opts).wait().expect("connect failed");
+
+    let pinged = broker.wait_until(Duration::from_secs(5), |pkts| {
+        pkts.iter().any(|p| matches!(p, Packet::PingReq))
+    });
+    assert!(pinged, "no PINGREQ within 5s; server keep-alive ignored");
+
+    cli.disconnect(None).wait().ok();
+    broker.join();
+}
+
+/// The broker's Receive Maximum caps the in-flight window even when the
+/// client asked for an unlimited one.
+#[test]
+fn test_v5_receive_maximum_caps_inflight() {
+    use mqtt::paho_mqtt_codec::{ConnAck, Packet, Property, PropertyId, PropertyValue, ReasonCode};
+
+    // Advertise room for exactly one unacknowledged publish, and never ack.
+    let broker = common::spawn_broker(|pkt| match pkt {
+        Packet::Connect(_) => {
+            let mut ack = ConnAck::new(false, ReasonCode::Success);
+            ack.properties.push(Property::new(
+                PropertyId::ReceiveMaximum,
+                PropertyValue::U16(1),
+            ));
+            vec![Packet::ConnAck(ack)]
+        }
+        _ => vec![],
+    });
+
+    let cli = mqtt::AsyncClient::new(broker.uri.clone()).unwrap();
+    let opts = mqtt::ConnectOptionsBuilder::new_v5()
+        .max_inflight(0) // unlimited, as far as this client is concerned
+        .finalize();
+    cli.connect(opts).wait().expect("connect failed");
+
+    for i in 0..4 {
+        let _tok = cli.publish(mqtt::Message::new(
+            topic!("recv-max"),
+            format!("m{i}"),
+            mqtt::QOS_1,
+        ));
+    }
+    std::thread::sleep(Duration::from_millis(400));
+
+    let publishes = broker
+        .received()
+        .iter()
+        .filter(|p| matches!(p, Packet::Publish(_)))
+        .count();
+    assert_eq!(
+        publishes, 1,
+        "sent {publishes} publishes into a window of 1"
+    );
+
+    drop(cli);
+    broker.join();
+}
+
+/////////////////////////////////////////////////////////////////////////////
+// MQTT v5 topic aliases
+/////////////////////////////////////////////////////////////////////////////
+
+/// Connect properties advertising a topic-alias maximum to the broker.
+#[cfg(test)]
+fn alias_max_props(max: u16) -> mqtt::Properties {
+    use mqtt::{Property, PropertyId, PropertyValue};
+    let mut props = mqtt::Properties::new();
+    props.push(Property::new(
+        PropertyId::TopicAliasMaximum,
+        PropertyValue::U16(max),
+    ));
+    props
+}
+
+/// A publish whose topic alias exceeds what the broker allows fails its own
+/// token, rather than being sent and earning a DISCONNECT.
+#[test]
+fn test_v5_outbound_topic_alias_limits() {
+    use mqtt::paho_mqtt_codec::{ConnAck, Packet, Property, PropertyId, PropertyValue, ReasonCode};
+
+    let broker = common::spawn_broker(|pkt| match pkt {
+        Packet::Connect(_) => {
+            let mut ack = ConnAck::new(false, ReasonCode::Success);
+            ack.properties.push(Property::new(
+                PropertyId::TopicAliasMaximum,
+                PropertyValue::U16(2),
+            ));
+            vec![Packet::ConnAck(ack)]
+        }
+        _ => vec![],
+    });
+
+    let cli = mqtt::AsyncClient::new(broker.uri.clone()).unwrap();
+    cli.connect(mqtt::ConnectOptions::new_v5())
+        .wait()
+        .expect("connect failed");
+
+    let publish_with_alias = |alias: u16| {
+        let mut msg = mqtt::Message::new(topic!("alias"), "x", mqtt::QOS_0);
+        msg.props.push(Property::new(
+            PropertyId::TopicAlias,
+            PropertyValue::U16(alias),
+        ));
+        cli.publish(msg).wait()
+    };
+
+    // Above the broker's maximum, and the reserved value 0, are refused.
+    for bad in [3, 9, 0] {
+        let res = publish_with_alias(bad);
+        assert!(
+            matches!(
+                res,
+                Err(mqtt::Error::ReasonCode(
+                    mqtt::ReasonCode::TopicAliasInvalid,
+                    _
+                ))
+            ),
+            "alias {bad} should be refused, got {res:?}"
+        );
+    }
+    // Within the maximum it goes out normally.
+    publish_with_alias(2).expect("alias 2 is within the broker's maximum");
+    assert!(
+        cli.is_connected(),
+        "a refused alias must not end the session"
+    );
+
+    cli.disconnect(None).wait().ok();
+    broker.join();
+}
+
+/// An inbound PUBLISH that carries only an alias is delivered with the topic
+/// name the alias was established with.
+#[test]
+fn test_v5_inbound_topic_alias_resolved() {
+    use mqtt::paho_mqtt_codec::{
+        ConnAck, Packet, Property, PropertyId, PropertyValue, Publish, ReasonCode, SubAck,
+    };
+
+    let aliased = |topic: &str, alias: u16, payload: &'static str| {
+        let mut p = Publish::new(topic.to_string(), payload);
+        p.properties.push(Property::new(
+            PropertyId::TopicAlias,
+            PropertyValue::U16(alias),
+        ));
+        Packet::Publish(p)
+    };
+
+    let broker = common::spawn_broker(move |pkt| match pkt {
+        Packet::Connect(_) => vec![Packet::ConnAck(ConnAck::new(false, ReasonCode::Success))],
+        Packet::Subscribe(s) => vec![
+            Packet::SubAck(SubAck::new(s.packet_id, vec![ReasonCode::GrantedQos0])),
+            // First establishes alias 1 for the topic, then uses it alone.
+            aliased(topic!("aliased"), 1, "first"),
+            aliased("", 1, "second"),
+        ],
+        _ => vec![],
+    });
+
+    let cli = mqtt::AsyncClient::new(broker.uri.clone()).unwrap();
+    let rx = cli.start_consuming();
+    let opts = mqtt::ConnectOptionsBuilder::new_v5()
+        .properties(alias_max_props(10))
+        .finalize();
+    cli.connect(opts).wait().expect("connect failed");
+    cli.subscribe(topic!("aliased"), mqtt::QOS_0)
+        .wait()
+        .expect("subscribe failed");
+
+    for expected in ["first", "second"] {
+        let msg = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("no message")
+            .expect("connection lost");
+        assert_eq!(msg.payload_str(), expected);
+        assert_eq!(
+            msg.topic(),
+            topic!("aliased"),
+            "alias was not resolved to its topic"
+        );
+    }
+
+    cli.disconnect(None).wait().ok();
+    broker.join();
+}
+
+/// An inbound alias above the maximum we advertised is a protocol error: the
+/// client closes the connection and tells the broker why (§3.3.2.3.4, §4.13).
+#[test]
+fn test_v5_inbound_topic_alias_out_of_range_disconnects() {
+    use mqtt::paho_mqtt_codec::{
+        ConnAck, Packet, Property, PropertyId, PropertyValue, Publish, ReasonCode, SubAck,
+    };
+
+    let broker = common::spawn_broker(move |pkt| match pkt {
+        Packet::Connect(_) => vec![Packet::ConnAck(ConnAck::new(false, ReasonCode::Success))],
+        Packet::Subscribe(s) => {
+            let mut p = Publish::new(topic!("bad-alias").to_string(), "x");
+            // We advertised a maximum of 2.
+            p.properties
+                .push(Property::new(PropertyId::TopicAlias, PropertyValue::U16(7)));
+            vec![
+                Packet::SubAck(SubAck::new(s.packet_id, vec![ReasonCode::GrantedQos0])),
+                Packet::Publish(p),
+            ]
+        }
+        _ => vec![],
+    });
+
+    let cli = mqtt::AsyncClient::new(broker.uri.clone()).unwrap();
+    let opts = mqtt::ConnectOptionsBuilder::new_v5()
+        .properties(alias_max_props(2))
+        .finalize();
+    cli.connect(opts).wait().expect("connect failed");
+    cli.subscribe(topic!("bad-alias"), mqtt::QOS_0).wait().ok();
+
+    let told = broker.wait_until(Duration::from_secs(5), |pkts| {
+        pkts.iter().any(|p| {
+            matches!(p, Packet::Disconnect(d)
+                if d.reason_code == ReasonCode::TopicAliasInvalid)
+        })
+    });
+    assert!(
+        told,
+        "expected DISCONNECT(TopicAliasInvalid), got {:?}",
+        broker.received()
+    );
+    broker.join();
+}
+
+/////////////////////////////////////////////////////////////////////////////
+// MQTT v5 enhanced authentication
+/////////////////////////////////////////////////////////////////////////////
+
+/// Connect properties naming an authentication method.
+#[cfg(test)]
+fn auth_method_props(method: &str) -> mqtt::Properties {
+    use mqtt::{Property, PropertyId, PropertyValue};
+    let mut props = mqtt::Properties::new();
+    props.push(Property::new(
+        PropertyId::AuthenticationMethod,
+        PropertyValue::String(method.into()),
+    ));
+    props
+}
+
+/// A two-step challenge/response exchange between CONNECT and CONNACK.
+#[test]
+fn test_v5_auth_exchange() {
+    use mqtt::paho_mqtt_codec::{
+        Auth, ConnAck, Packet, Property, PropertyId, PropertyValue, ReasonCode,
+    };
+    use std::sync::{Arc, Mutex};
+
+    let challenge = |data: &'static str| {
+        let mut auth = Auth::new(ReasonCode::ContinueAuthentication);
+        auth.properties.push(Property::new(
+            PropertyId::AuthenticationMethod,
+            PropertyValue::String("SCRAM-TEST".into()),
+        ));
+        auth.properties.push(Property::new(
+            PropertyId::AuthenticationData,
+            PropertyValue::Binary(data.into()),
+        ));
+        Packet::Auth(auth)
+    };
+
+    // CONNECT -> challenge -> (client answers) -> challenge -> CONNACK.
+    let mut step = 0;
+    let broker = common::spawn_broker(move |pkt| match pkt {
+        Packet::Connect(_) => vec![challenge("server-1")],
+        Packet::Auth(_) => {
+            step += 1;
+            if step == 1 {
+                vec![challenge("server-2")]
+            } else {
+                vec![Packet::ConnAck(ConnAck::new(false, ReasonCode::Success))]
+            }
+        }
+        _ => vec![],
+    });
+
+    // The handler records what it was asked and answers in kind.
+    let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let recorder = Arc::clone(&seen);
+
+    let cli = mqtt::AsyncClient::new(broker.uri.clone()).unwrap();
+    let opts = mqtt::ConnectOptionsBuilder::new_v5()
+        .properties(auth_method_props("SCRAM-TEST"))
+        .auth_handler(move |ch| {
+            assert_eq!(ch.method, "SCRAM-TEST");
+            let data = String::from_utf8_lossy(ch.data).to_string();
+            recorder.lock().unwrap().push(data.clone());
+            Ok(format!("client-for-{data}").into_bytes())
+        })
+        .finalize();
+
+    cli.connect(opts).wait().expect("auth exchange failed");
+    assert!(cli.is_connected());
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec!["server-1".to_string(), "server-2".to_string()],
+        "handler should have answered both challenges"
+    );
+
+    // The broker saw both of the client's AUTH packets, each naming the method.
+    let auths: Vec<_> = broker
+        .received()
+        .into_iter()
+        .filter_map(|p| match p {
+            Packet::Auth(a) => Some(a),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(auths.len(), 2);
+    for a in &auths {
+        assert_eq!(a.reason_code, ReasonCode::ContinueAuthentication);
+        assert!(matches!(
+            a.properties.get(PropertyId::AuthenticationMethod),
+            Some(PropertyValue::String(m)) if m == "SCRAM-TEST"
+        ));
+    }
+
+    cli.disconnect(None).wait().ok();
+    broker.join();
+}
+
+/// A handler that refuses abandons the connection attempt with its error.
+#[test]
+fn test_v5_auth_handler_failure_fails_connect() {
+    use mqtt::paho_mqtt_codec::{Auth, Packet, Property, PropertyId, PropertyValue, ReasonCode};
+
+    let broker = common::spawn_broker(move |pkt| match pkt {
+        Packet::Connect(_) => {
+            let mut auth = Auth::new(ReasonCode::ContinueAuthentication);
+            auth.properties.push(Property::new(
+                PropertyId::AuthenticationMethod,
+                PropertyValue::String("SCRAM-TEST".into()),
+            ));
+            vec![Packet::Auth(auth)]
+        }
+        _ => vec![],
+    });
+
+    let cli = mqtt::AsyncClient::new(broker.uri.clone()).unwrap();
+    let opts = mqtt::ConnectOptionsBuilder::new_v5()
+        .properties(auth_method_props("SCRAM-TEST"))
+        .auth_handler(|_| Err(mqtt::Error::General("no credentials")))
+        .finalize();
+
+    let res = cli.connect(opts).wait();
+    assert!(
+        matches!(res, Err(mqtt::Error::General("no credentials"))),
+        "got {res:?}"
+    );
+    assert!(!cli.is_connected());
+    broker.join();
+}
+
+/// The two halves of enhanced authentication must be configured together.
+#[test]
+fn test_auth_configuration_is_checked() {
+    let cli = mqtt::AsyncClient::new(HOST).unwrap();
+
+    // A method with no handler to answer its challenges.
+    let opts = mqtt::ConnectOptionsBuilder::new_v5()
+        .properties(auth_method_props("SCRAM-TEST"))
+        .finalize();
+    assert!(cli.connect(opts).wait().is_err());
+
+    // A handler with no method for the broker to run.
+    let opts = mqtt::ConnectOptionsBuilder::new_v5()
+        .auth_handler(|_| Ok(Vec::new()))
+        .finalize();
+    assert!(cli.connect(opts).wait().is_err());
+    assert!(!cli.is_connected());
 }
 
 /////////////////////////////////////////////////////////////////////////////

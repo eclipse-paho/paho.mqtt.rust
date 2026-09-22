@@ -25,7 +25,10 @@
 //! This contains the structures to define the options for connecting to the
 //! MQTT broker/server.
 
-use crate::{Error, Message, Properties, Result, TlsOptions};
+use crate::{
+    Error, Message, Properties, Result, TlsOptions,
+    auth::{AuthChallenge, AuthHandler},
+};
 use paho_mqtt_codec::types::*;
 use std::{collections::HashMap, time::Duration};
 
@@ -70,6 +73,10 @@ pub struct ConnectOptions {
     pub max_retry_interval: Duration,
     /// The connect properties (MQTT v5 only)
     pub props: Properties,
+    /// Handler for an MQTT v5 enhanced-authentication exchange. Required
+    /// when [`props`](Self::props) names an `AuthenticationMethod`, and
+    /// meaningless without one.
+    pub auth_handler: Option<AuthHandler>,
     /// HTTP headers for websocket connections
     pub http_headers: HashMap<String, String>,
     /// The HTTP proxy (insecure), if any
@@ -151,7 +158,23 @@ impl ConnectOptions {
                 return Err(Error::MissingTlsOptions);
             }
         }
-        Ok(())
+
+        // Enhanced authentication needs both halves: a method for the broker
+        // to run and a handler to answer its challenges. Either alone is a
+        // configuration mistake that would otherwise surface as a puzzling
+        // refusal from the broker, or as an ignored handler.
+        match (
+            crate::auth::auth_method(&self.props).is_some(),
+            self.auth_handler.is_some(),
+        ) {
+            (true, false) => Err(Error::General(
+                "connect properties name an AuthenticationMethod but no auth handler is set",
+            )),
+            (false, true) => Err(Error::General(
+                "an auth handler is set but the connect properties name no AuthenticationMethod",
+            )),
+            _ => Ok(()),
+        }
     }
 
     /// Gets the MQTT protocol version that should be used for the
@@ -187,6 +210,54 @@ impl ConnectOptions {
     /// Gets the "clean start" setting in the options.
     ///
     /// This is only used in MQTT v5 connections.
+    ///
+    /// # Clean start and session expiry
+    ///
+    /// MQTT v5 replaced v3's single "clean session" flag with two
+    /// independent controls, and both matter for whether a session survives:
+    ///
+    /// - **Clean Start** (this flag) decides what happens to an *existing*
+    ///   session at connect time: `true` discards it and starts fresh,
+    ///   `false` resumes it if the server still has one.
+    /// - **Session Expiry Interval** (the `SessionExpiryInterval` property in
+    ///   [`props`](ConnectOptions::props)) decides how long the server keeps
+    ///   the session *after* the connection ends, in seconds. It defaults to
+    ///   **0**, meaning the session ends with the connection.
+    ///
+    /// So `clean_start(false)` alone does not give a durable session: with
+    /// the default expiry of 0 the server discards the state as soon as the
+    /// client disconnects, and the next connect gets
+    /// `session_present == false`. To resume across connections, set both —
+    /// `clean_start(false)` and a non-zero `SessionExpiryInterval` (0xFFFFFFFF
+    /// means "never expire"):
+    ///
+    /// ```no_run
+    /// use paho_mqtt as mqtt;
+    /// use mqtt::{Property, PropertyId, PropertyValue};
+    ///
+    /// let mut props = mqtt::Properties::new();
+    /// props.push(Property::new(
+    ///     PropertyId::SessionExpiryInterval,
+    ///     PropertyValue::U32(3600), // keep my session for an hour
+    /// ));
+    ///
+    /// let opts = mqtt::ConnectOptionsBuilder::new_v5()
+    ///     .clean_start(false)
+    ///     .properties(props)
+    ///     .finalize();
+    /// ```
+    ///
+    /// A session expiry may also be sent on DISCONNECT (in
+    /// [`DisconnectOptions::props`](crate::DisconnectOptions)) to change the
+    /// interval agreed at connect time, though it cannot revive a session
+    /// that was established with an expiry of 0.
+    ///
+    /// The client's own persistence is independent of all this: it stores
+    /// in-flight QoS 1/2 messages so they can be re-sent, but only the
+    /// server decides whether the *session* (subscriptions, queued messages)
+    /// still exists. Check
+    /// [`ConnectResponse::session_present`](crate::ConnectResponse) to find
+    /// out which happened.
     pub fn clean_start(&self) -> bool {
         self.clean_start && self.mqtt_version >= MqttVersion::V5
     }
@@ -226,6 +297,7 @@ impl Default for ConnectOptions {
             min_retry_interval: Duration::from_secs(1),
             max_retry_interval: Duration::from_secs(60),
             props: Properties::default(),
+            auth_handler: None,
             http_headers: HashMap::new(),
             http_proxy: String::new(),
             https_proxy: String::new(),
@@ -485,6 +557,18 @@ impl ConnectOptionsBuilder {
         // TODO: Lower limit? Ensure max >= min?
         self.0.min_retry_interval = min_retry_interval;
         self.0.max_retry_interval = max_retry_interval;
+        self
+    }
+
+    /// Sets the handler for an MQTT v5 enhanced-authentication exchange.
+    ///
+    /// The connect properties must also name an `AuthenticationMethod`; see
+    /// [`AuthHandler`] for the whole picture and an example.
+    pub fn auth_handler<F>(&mut self, handler: F) -> &mut Self
+    where
+        F: Fn(&AuthChallenge<'_>) -> Result<Vec<u8>> + Send + Sync + 'static,
+    {
+        self.0.auth_handler = Some(AuthHandler::new(handler));
         self
     }
 

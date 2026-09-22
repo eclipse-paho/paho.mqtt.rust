@@ -100,6 +100,9 @@ pub(crate) struct InnerAsyncClient {
     connected: Arc<AtomicBool>,
     /// The MQTT version of the connection.
     mqtt_version: AtomicU32,
+    /// The identifier the server assigned, when the client connected with an
+    /// empty one. Set by the event loop before the connect token resolves.
+    assigned_id: Arc<RwLock<Option<String>>>,
     /// The options used to create the client.
     opts: CreateOptions,
     /// The options for the most recent connection attempt.
@@ -197,6 +200,7 @@ impl AsyncClient {
             cmd_tx,
             connected: Arc::new(AtomicBool::new(false)),
             mqtt_version: AtomicU32::new(create_ver as u32),
+            assigned_id: Arc::new(RwLock::new(None)),
             opts,
             conn_opts: RwLock::new(initial_conn_opts),
             callback_context: Mutex::new(CallbackContext::default()),
@@ -303,6 +307,7 @@ impl AsyncClient {
             will,
             ver,
             props: opts.props,
+            auth: opts.auth_handler,
             #[cfg(any(feature = "tls", feature = "openssl", feature = "smol-tls"))]
             tls: opts.tls,
             #[cfg(any(feature = "websocket", feature = "smol-websocket"))]
@@ -318,6 +323,7 @@ impl AsyncClient {
             params: Box::new(params),
             tx: comp,
             connected_flag: Arc::clone(&self.inner.connected),
+            assigned_id: Arc::clone(&self.inner.assigned_id),
             persist: self.inner.persist.as_ref().map(Arc::clone),
         };
 
@@ -1150,8 +1156,16 @@ impl AsyncClient {
     }
 
     /// Returns the client ID used for the client instance.
-    pub fn client_id(&self) -> &str {
-        &self.inner.opts.client_id
+    ///
+    /// Normally the identifier given at creation. A client that connects
+    /// with an empty ID is assigned one by the server (MQTT v5 Assigned
+    /// Client Identifier); from the moment that connection completes, this
+    /// returns the assigned identifier, which is also what a reconnect uses.
+    pub fn client_id(&self) -> String {
+        match self.inner.assigned_id.read().unwrap().as_ref() {
+            Some(id) => id.clone(),
+            None => self.inner.opts.client_id.clone(),
+        }
     }
 
     /// Returns the server URI used for connection.

@@ -57,6 +57,9 @@ pub use paho_mqtt_codec::{
 };
 
 /// The asynchronous API
+pub mod auth;
+pub use crate::auth::{AuthCallback, AuthChallenge, AuthHandler};
+
 pub mod async_client;
 pub use crate::async_client::{
     AsyncClient, ConnectedCallback, ConnectionLostCallback, DisconnectedCallback,

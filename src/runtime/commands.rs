@@ -26,7 +26,7 @@
 #[cfg(any(feature = "websocket", feature = "smol-websocket"))]
 use std::collections::HashMap;
 use std::{
-    sync::{Arc, Mutex, atomic::AtomicBool},
+    sync::{Arc, Mutex, RwLock, atomic::AtomicBool},
     time::Duration,
 };
 
@@ -146,6 +146,9 @@ pub(crate) struct ConnectParams {
     pub ver: MqttVersion,
     /// MQTT v5 CONNECT properties; empty for v3.1.1.
     pub props: CodecProperties,
+    /// Handler for the v5 enhanced-authentication exchange, when the connect
+    /// properties name an `AuthenticationMethod`.
+    pub auth: Option<crate::AuthHandler>,
     /// TLS options; `Some` only when using a TLS transport.
     #[cfg(any(feature = "tls", feature = "openssl", feature = "smol-tls"))]
     pub tls: Option<crate::TlsOptions>,
@@ -190,23 +193,86 @@ impl ConnectParams {
 /// Per-session limits, fixed once the CONNACK has arrived.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct SessionLimits {
-    /// Maximum concurrent outbound QoS 1/2 publishes; 0 means unlimited.
+    /// Effective cap on concurrent outbound QoS 1/2 publishes: the lesser of
+    /// the configured `max_inflight` and the server's Receive Maximum.
+    /// 0 means unlimited (only reachable on v3, which has no Receive Maximum).
     pub max_inflight: usize,
     /// Largest inbound packet accepted by the framing layer, in bytes.
     pub max_packet_size: u32,
     /// Largest packet the server said it will accept (CONNACK
     /// `MaximumPacketSize`), if any. Outbound packets above it are refused.
     pub server_max_packet_size: Option<u32>,
+    /// Highest topic alias the *server* accepts (CONNACK `TopicAliasMaximum`,
+    /// 0 when absent — aliases not permitted). Outbound publishes above it
+    /// are refused before they reach the wire.
+    pub server_topic_alias_max: u16,
+    /// Highest topic alias *we* accept, as advertised in our own CONNECT
+    /// properties (0 when we did not offer any). An inbound alias above it
+    /// is a protocol error by the server.
+    pub topic_alias_max: u16,
 }
 
 impl SessionLimits {
     /// Limits for a session on `params` whose CONNACK was `connack`.
     pub fn new(params: &ConnectParams, connack: &ConnAck) -> Self {
         Self {
-            max_inflight: params.max_inflight,
+            max_inflight: effective_max_inflight(params, connack),
             max_packet_size: params.max_packet_size(),
             server_max_packet_size: server_max_packet_size(connack),
+            server_topic_alias_max: u16_prop(&connack.properties, PropertyId::TopicAliasMaximum)
+                .unwrap_or(0),
+            topic_alias_max: u16_prop(&params.props, PropertyId::TopicAliasMaximum).unwrap_or(0),
         }
+    }
+}
+
+/// Reads a two-byte property, if present with the right type.
+fn u16_prop(props: &CodecProperties, id: PropertyId) -> Option<u16> {
+    match props.get(id) {
+        Some(PropertyValue::U16(n)) => Some(*n),
+        _ => None,
+    }
+}
+
+/// The number of QoS 1/2 publishes that may be in flight at once.
+///
+/// MQTT v5 §3.2.2.3.3: the server's Receive Maximum is how many unacknowledged
+/// QoS 1/2 PUBLISH packets it will accept, defaulting to 65 535 when the
+/// property is absent; exceeding it earns a DISCONNECT with
+/// `ReceiveMaximumExceeded`. The client's own `max_inflight` narrows that
+/// further. v3 has no such property, so the configured value stands alone
+/// (0 = unlimited).
+fn effective_max_inflight(params: &ConnectParams, connack: &ConnAck) -> usize {
+    if !params.ver.is_v5() {
+        return params.max_inflight;
+    }
+    let server = u16_prop(&connack.properties, PropertyId::ReceiveMaximum)
+        .filter(|&n| n > 0)
+        .unwrap_or(u16::MAX) as usize;
+    if params.max_inflight == 0 {
+        server
+    } else {
+        params.max_inflight.min(server)
+    }
+}
+
+/// The keep-alive the session must use.
+///
+/// MQTT v5 §3.2.2.3.2: a Server Keep Alive in the CONNACK replaces whatever
+/// the client asked for.
+pub(crate) fn negotiated_keep_alive(params: &ConnectParams, connack: &ConnAck) -> Duration {
+    match u16_prop(&connack.properties, PropertyId::ServerKeepAlive) {
+        Some(secs) if params.ver.is_v5() => Duration::from_secs(secs as u64),
+        _ => params.keep_alive_duration(),
+    }
+}
+
+/// The client identifier the server assigned, when the client sent an empty
+/// one (MQTT v5 §3.2.2.3.7).
+pub(crate) fn assigned_client_id(connack: &ConnAck) -> Option<String> {
+    match connack.properties.get(PropertyId::AssignedClientIdentifier) {
+        Some(PropertyValue::String(s)) if !s.is_empty() => Some(s.clone()),
+        _ => None,
     }
 }
 
@@ -236,6 +302,10 @@ pub(crate) enum Command {
         tx: Completer<ConnectResponse>,
         /// Set to `true` before resolving `tx` on success; cleared on failure.
         connected_flag: Arc<AtomicBool>,
+        /// Receives the identifier the server assigned when the client
+        /// connected with an empty one, written before `tx` resolves so
+        /// `client_id()` is correct as soon as `connect()` returns.
+        assigned_id: Arc<RwLock<Option<String>>>,
         /// Persistence store, opened for this connection (if any).
         persist: Option<Arc<Mutex<Box<dyn ClientPersistence>>>>,
     },
@@ -340,6 +410,7 @@ mod tests {
             will: None,
             ver: MqttVersion::V5,
             props,
+            auth: None,
             #[cfg(any(feature = "tls", feature = "openssl", feature = "smol-tls"))]
             tls: None,
             #[cfg(any(feature = "websocket", feature = "smol-websocket"))]
@@ -391,5 +462,126 @@ mod tests {
             PropertyValue::U32(0),
         ));
         assert_eq!(params_with(props).max_packet_size(), MAX_PACKET_SIZE);
+    }
+
+    fn connack_with(props: Vec<Property>) -> ConnAck {
+        let mut ack = ConnAck::new(false, ReasonCode::Success);
+        for p in props {
+            ack.properties.push(p);
+        }
+        ack
+    }
+
+    fn params_v(ver: MqttVersion, max_inflight: usize) -> ConnectParams {
+        ConnectParams {
+            ver,
+            max_inflight,
+            keep_alive_secs: 60,
+            ..params_with(CodecProperties::new())
+        }
+    }
+
+    // ---- Receive Maximum ----
+
+    #[test]
+    fn test_receive_maximum_caps_configured_inflight() {
+        let ack = connack_with(vec![Property::new(
+            PropertyId::ReceiveMaximum,
+            PropertyValue::U16(5),
+        )]);
+        // Unlimited locally: the server's window is the cap.
+        assert_eq!(
+            SessionLimits::new(&params_v(MqttVersion::V5, 0), &ack).max_inflight,
+            5
+        );
+        // The smaller of the two wins, either way round.
+        assert_eq!(
+            SessionLimits::new(&params_v(MqttVersion::V5, 2), &ack).max_inflight,
+            2
+        );
+        assert_eq!(
+            SessionLimits::new(&params_v(MqttVersion::V5, 50), &ack).max_inflight,
+            5
+        );
+    }
+
+    #[test]
+    fn test_receive_maximum_defaults_and_v3() {
+        let bare = connack_with(vec![]);
+        // v5 with no property: the specification's default of 65 535.
+        assert_eq!(
+            SessionLimits::new(&params_v(MqttVersion::V5, 0), &bare).max_inflight,
+            u16::MAX as usize
+        );
+        // v3 has no Receive Maximum, so the configured value stands alone.
+        assert_eq!(
+            SessionLimits::new(&params_v(MqttVersion::V3_1_1, 0), &bare).max_inflight,
+            0
+        );
+        assert_eq!(
+            SessionLimits::new(&params_v(MqttVersion::V3_1_1, 7), &bare).max_inflight,
+            7
+        );
+    }
+
+    // ---- Server Keep Alive ----
+
+    #[test]
+    fn test_server_keep_alive_overrides_request() {
+        let ack = connack_with(vec![Property::new(
+            PropertyId::ServerKeepAlive,
+            PropertyValue::U16(15),
+        )]);
+        let p = params_v(MqttVersion::V5, 0);
+        assert_eq!(negotiated_keep_alive(&p, &ack), Duration::from_secs(15));
+
+        // Absent: our own interval stands.
+        assert_eq!(
+            negotiated_keep_alive(&p, &connack_with(vec![])),
+            Duration::from_secs(60)
+        );
+        // v3 has no such property, so ours stands even if one is present.
+        let p3 = params_v(MqttVersion::V3_1_1, 0);
+        assert_eq!(negotiated_keep_alive(&p3, &ack), Duration::from_secs(60));
+    }
+
+    // ---- Assigned Client Identifier ----
+
+    #[test]
+    fn test_assigned_client_id() {
+        let ack = connack_with(vec![Property::new(
+            PropertyId::AssignedClientIdentifier,
+            PropertyValue::String("auto-42".into()),
+        )]);
+        assert_eq!(assigned_client_id(&ack), Some(String::from("auto-42")));
+        assert_eq!(assigned_client_id(&connack_with(vec![])), None);
+    }
+
+    // ---- Topic alias maxima ----
+
+    #[test]
+    fn test_topic_alias_maxima_come_from_both_sides() {
+        let ack = connack_with(vec![Property::new(
+            PropertyId::TopicAliasMaximum,
+            PropertyValue::U16(8),
+        )]);
+        let mut ours = CodecProperties::new();
+        ours.push(Property::new(
+            PropertyId::TopicAliasMaximum,
+            PropertyValue::U16(3),
+        ));
+        let params = ConnectParams {
+            ver: MqttVersion::V5,
+            props: ours,
+            ..params_with(CodecProperties::new())
+        };
+        let limits = SessionLimits::new(&params, &ack);
+        assert_eq!(limits.server_topic_alias_max, 8, "what the server accepts");
+        assert_eq!(limits.topic_alias_max, 3, "what we accept");
+
+        // Absent on both sides means aliases are not in use.
+        let limits = SessionLimits::new(&params_v(MqttVersion::V5, 0), &connack_with(vec![]));
+        assert_eq!(limits.server_topic_alias_max, 0);
+        assert_eq!(limits.topic_alias_max, 0);
     }
 }

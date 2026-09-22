@@ -339,11 +339,12 @@ impl Client {
         self.cli.start_consuming_events(buffer_lim)
     }
 
-    /// Returns client ID used for client instance
+    /// Returns the client ID used for the client instance.
     ///
-    /// Client ID is returned as a rust String as set in a
-    /// CreateOptionsBuilder for symmetry
-    pub fn client_id(&self) -> &str {
+    /// See [`AsyncClient::client_id`] — a server-assigned identifier
+    /// replaces the configured one once a connection has been made with an
+    /// empty ID.
+    pub fn client_id(&self) -> String {
         self.cli.client_id()
     }
 

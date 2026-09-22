@@ -27,6 +27,15 @@ Version 2.0 is a rewrite of the library in pure Rust. The dependency on the Paho
 - A broker-initiated DISCONNECT (v5) now fires the `disconnected` callback *and* `connection_lost`, and triggers auto-reconnect if enabled — matching the v1.x / Paho C behaviour. Previously it suppressed both.
 - Large publish payloads (over 16 KiB) are written to the transport from their own buffer, without being copied into the send buffer; QoS 1/2 messages are encoded once for both persistence and transmission.
 
+### MQTT v5
+
+- The client now honours the properties the server sends in its CONNACK. **Receive Maximum** caps the in-flight window (narrowed further by `max_inflight`), **Server Keep Alive** replaces the requested keep-alive, **Assigned Client Identifier** becomes the client's identity — reported by `client_id()` and used by later reconnects — and **Maximum Packet Size** and **Topic Alias Maximum** bound what is sent.
+- **Topic aliases** work in both directions. An inbound PUBLISH carrying an alias is delivered with the topic name the alias stands for; an outbound alias outside the server's range fails that publish with `Error::ReasonCode(TopicAliasInvalid)` instead of provoking a disconnect.
+- **Enhanced authentication** (AUTH) is supported: name an `AuthenticationMethod` in the connect properties and supply `ConnectOptionsBuilder::auth_handler`, and the client answers the broker's challenges until it accepts or refuses. See the new `paho_mqtt::auth` module. Client-initiated re-authentication is not implemented.
+- When a protocol fault ends a v5 session, the client sends a DISCONNECT carrying the reason code before closing, rather than dropping the socket silently.
+- `ConnectResponse` gained accessors for everything the CONNACK can report: `receive_maximum()`, `maximum_packet_size()`, `topic_alias_maximum()`, `maximum_qos()`, `retain_available()`, `wildcard_subscriptions_available()`, `subscription_identifiers_available()`, `shared_subscriptions_available()`, `server_keep_alive()`, `assigned_client_id()`, `server_reference()`, and `reason_string()`. Each falls back to the specification's default when the property is absent.
+- **[Breaking]** `AsyncClient::client_id()` and `Client::client_id()` return `String` rather than `&str`, so they can report a server-assigned identifier. This matches the v1.x signature.
+
 ### Behaviour
 
 - **[Breaking]** An acknowledgement carrying an error reason code fails the operation's token with `Error::ReasonCode(code, properties)` — for `publish()` (PUBACK or PUBREC/PUBCOMP), `subscribe()`, and `unsubscribe()` — matching how a refused CONNACK fails `connect()`. `subscribe_many()` and `unsubscribe_many()` still resolve `Ok` with one code per filter, since they may succeed partially. Previously PUBACK, SUBACK and UNSUBACK errors resolved `Ok` with the code inside the response while PUBREC errors failed the token.

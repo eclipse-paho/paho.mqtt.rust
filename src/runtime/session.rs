@@ -31,7 +31,7 @@ use std::{
     io,
     pin::pin,
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, RwLock,
         atomic::{AtomicBool, Ordering},
     },
     time::Duration,
@@ -40,13 +40,17 @@ use std::{
 use bytes::{Bytes, BytesMut};
 use futures::{FutureExt, select};
 use paho_mqtt_codec::{
-    ConnAck, Disconnect, MqttVersion, Packet, Properties, PubAck, QoS, RawPacket, ReasonCode,
-    RetainHandling as CodecRetainHandling, Subscribe, Subscription, Unsubscribe,
+    Auth, ConnAck, Disconnect, MqttVersion, Packet, Properties, Property, PropertyId,
+    PropertyValue, PubAck, QoS, RawPacket, ReasonCode, RetainHandling as CodecRetainHandling,
+    Subscribe, Subscription, Unsubscribe,
 };
 
 use super::{
     backend::{Backend, Sleep},
-    commands::{BufConfig, Command, ConnectParams, Event, SessionLimits},
+    commands::{
+        BufConfig, Command, ConnectParams, Event, SessionLimits, assigned_client_id,
+        negotiated_keep_alive,
+    },
 };
 use crate::{
     Error, Message, Result,
@@ -99,21 +103,69 @@ impl RuntimeHandle {
 /// first or if the connection closes.
 async fn recv_connack<B: Backend>(
     reader: &mut B::Reader,
+    writer: &mut B::Writer,
     buf: &mut BytesMut,
-    ver: MqttVersion,
-    max_packet_size: u32,
+    p: &ConnectParams,
 ) -> Result<ConnAck> {
     loop {
         if B::read_buf(reader, buf).await? == 0 {
             return Err(Error::Disconnected);
         }
-        if let Some(raw) = RawPacket::decode_max(buf, max_packet_size)? {
-            match Packet::from_raw(raw, ver)? {
+        while let Some(raw) = RawPacket::decode_max(buf, p.max_packet_size())? {
+            match Packet::from_raw(raw, p.ver)? {
                 Packet::ConnAck(ack) => return Ok(ack),
+                // Enhanced authentication: the broker challenges, the
+                // handler answers, and this repeats until a CONNACK
+                // arrives or either side gives up (§4.12).
+                Packet::Auth(auth) if auth.reason_code == ReasonCode::ContinueAuthentication => {
+                    let reply = auth_response(p, &auth.properties)?;
+                    let mut out = BytesMut::with_capacity(64);
+                    Packet::Auth(reply).encode(&mut out, p.ver)?;
+                    B::write_all(writer, &out).await?;
+                    B::flush(writer).await?;
+                }
+                Packet::Auth(_) => return Err(Error::General("unexpected AUTH reason code")),
                 _ => return Err(Error::General("expected CONNACK")),
             }
         }
     }
+}
+
+/// Builds the client's answer to one authentication challenge.
+///
+/// The method is taken from our own CONNECT properties rather than the
+/// broker's echo of it, and is always included: §3.15.2.2.2 requires every
+/// AUTH to name the method, and it must match the one from CONNECT.
+fn auth_response(p: &ConnectParams, challenge_props: &Properties) -> Result<Auth> {
+    let (Some(handler), Some(method)) = (&p.auth, crate::auth::auth_method(&p.props)) else {
+        // `ConnectOptions::check` rejects this combination before we get
+        // here; a broker that sends AUTH unasked reaches it.
+        return Err(Error::General(
+            "broker requested authentication but none was configured",
+        ));
+    };
+
+    let data = handler.respond(&crate::AuthChallenge {
+        method,
+        data: crate::auth::auth_data(challenge_props),
+        props: challenge_props,
+    })?;
+
+    let mut props = Properties::new();
+    props.push(Property::new(
+        PropertyId::AuthenticationMethod,
+        PropertyValue::String(method.into()),
+    ));
+    if !data.is_empty() {
+        props.push(Property::new(
+            PropertyId::AuthenticationData,
+            PropertyValue::Binary(data.into()),
+        ));
+    }
+
+    let mut auth = Auth::new(ReasonCode::ContinueAuthentication);
+    auth.properties = props;
+    Ok(auth)
 }
 
 /// What woke the session loop.
@@ -127,6 +179,22 @@ enum LoopEvent {
 }
 
 // Session
+
+/// The reason code to put in a DISCONNECT when a session ends because of a
+/// protocol fault, or `None` when there is nothing to tell the peer.
+///
+/// Only faults we attribute to the peer are reported: a packet that would
+/// not decode or broke a rule ([`Error::Protocol`], carrying the codec's own
+/// classification) and a violation we detected ourselves
+/// ([`Error::ReasonCode`]). An I/O failure, a keep-alive timeout, or a closed
+/// socket leave nothing to send to.
+fn disconnect_reason(err: &Error) -> Option<ReasonCode> {
+    match err {
+        Error::Protocol(e) => Some(e.reason_code()),
+        Error::ReasonCode(rc, _) => Some(*rc),
+        _ => None,
+    }
+}
 
 /// A QoS 1/2 publish waiting for an in-flight slot.
 enum Deferred {
@@ -200,6 +268,10 @@ struct Session<B: Backend> {
     persist: Option<Arc<Mutex<Box<dyn ClientPersistence>>>>,
     /// Limits fixed once the CONNACK arrived.
     limits: SessionLimits,
+    /// Topic alias → topic name, for inbound PUBLISH packets that carry an
+    /// alias instead of (or as well as) the name. Valid only for this
+    /// connection, so a new session starts with an empty map (§3.3.2.3.4).
+    topic_aliases: HashMap<u16, String>,
     /// QoS 1/2 publishes deferred because the in-flight limit was reached —
     /// new commands and persisted messages awaiting re-transmission alike.
     /// Drained one-for-one as PUBACK/PUBCOMP ACKs arrive.
@@ -233,6 +305,7 @@ impl<B: Backend> Session<B> {
             ping_outstanding: false,
             persist,
             limits,
+            topic_aliases: HashMap::new(),
             inflight_deferred: VecDeque::new(),
             sent_packet: false,
         }
@@ -472,6 +545,27 @@ impl<B: Backend> Session<B> {
         buf: &mut VecDeque<Command>,
         restore: bool,
     ) -> Result<()> {
+        let res = self.serve_inner(reader, cmd_rx, buf, restore).await;
+
+        // A v5 receiver that rejects a packet must say why before closing
+        // (§4.13). Best-effort: the connection may already be gone, and the
+        // original error is what the caller hears either way.
+        if let Err(e) = &res
+            && self.ver.is_v5()
+            && let Some(rc) = disconnect_reason(e)
+        {
+            let _ = self.send(&Packet::Disconnect(Disconnect::new(rc))).await;
+        }
+        res
+    }
+
+    async fn serve_inner(
+        &mut self,
+        reader: &mut B::Reader,
+        cmd_rx: &async_channel::Receiver<Command>,
+        buf: &mut VecDeque<Command>,
+        restore: bool,
+    ) -> Result<()> {
         if restore {
             self.restore().await?;
         }
@@ -479,6 +573,35 @@ impl<B: Backend> Session<B> {
             self.handle_command(cmd).await?;
         }
         self.run(reader, cmd_rx).await
+    }
+
+    /// Resolves the topic of an inbound PUBLISH that carries a topic alias,
+    /// and records the mapping (§3.3.2.3.4).
+    ///
+    /// A packet with a name *and* an alias establishes or replaces the
+    /// mapping; one with an alias and an empty name uses it. An alias of 0,
+    /// one above the maximum we advertised, or one we have never been given
+    /// a name for is a protocol error, reported as `TopicAliasInvalid` so
+    /// the DISCONNECT carries the code the specification asks for.
+    fn resolve_topic_alias(&mut self, pub_pkt: &mut paho_mqtt_codec::Publish) -> Result<()> {
+        let alias = match pub_pkt.properties.get(PropertyId::TopicAlias) {
+            Some(PropertyValue::U16(n)) => *n,
+            _ => return Ok(()),
+        };
+        let invalid = || Error::ReasonCode(ReasonCode::TopicAliasInvalid, Properties::new());
+
+        if alias == 0 || alias > self.limits.topic_alias_max {
+            return Err(invalid());
+        }
+        if pub_pkt.topic.is_empty() {
+            match self.topic_aliases.get(&alias) {
+                Some(topic) => pub_pkt.topic = topic.clone(),
+                None => return Err(invalid()),
+            }
+        } else {
+            self.topic_aliases.insert(alias, pub_pkt.topic.clone());
+        }
+        Ok(())
     }
 
     /// Main event loop: read from `reader`, dispatch commands from `cmd_rx`,
@@ -677,36 +800,39 @@ impl<B: Backend> Session<B> {
             }
 
             // ---- Inbound application message ----
-            Packet::Publish(pub_pkt) => match pub_pkt.qos {
-                QoS::QoS0 => {
-                    let msg = Message::from(pub_pkt);
-                    let _ = self.event_tx.send(Event::MessageArrived(msg)).await;
-                }
-                QoS::QoS1 => {
-                    let id = pub_pkt.packet_id.unwrap_or(0);
-                    let msg = Message::from(pub_pkt);
-                    let _ = self.event_tx.send(Event::MessageArrived(msg)).await;
-                    let ack = PubAck::new(id);
-                    self.send(&Packet::PubAck(ack)).await?;
-                }
-                QoS::QoS2 => {
-                    let id = pub_pkt.packet_id.unwrap_or(0);
-                    // Persist the inbound QoS 2 PUBLISH before acknowledging
-                    // so we can redeliver the message on reconnect.
-                    let mut enc_buf = BytesMut::with_capacity(256);
-                    let packet = Packet::Publish(pub_pkt);
-                    if packet.encode(&mut enc_buf, self.ver).is_ok() {
-                        self.persist_put(&format!("r{id}"), vec![&enc_buf]);
+            Packet::Publish(mut pub_pkt) => {
+                self.resolve_topic_alias(&mut pub_pkt)?;
+                match pub_pkt.qos {
+                    QoS::QoS0 => {
+                        let msg = Message::from(pub_pkt);
+                        let _ = self.event_tx.send(Event::MessageArrived(msg)).await;
                     }
-                    let Packet::Publish(pub_pkt) = packet else {
-                        unreachable!()
-                    };
-                    let msg = Message::from(pub_pkt);
-                    self.pending_pub2_in.insert(id, msg);
-                    let rec = PubAck::new(id);
-                    self.send(&Packet::PubRec(rec)).await?;
+                    QoS::QoS1 => {
+                        let id = pub_pkt.packet_id.unwrap_or(0);
+                        let msg = Message::from(pub_pkt);
+                        let _ = self.event_tx.send(Event::MessageArrived(msg)).await;
+                        let ack = PubAck::new(id);
+                        self.send(&Packet::PubAck(ack)).await?;
+                    }
+                    QoS::QoS2 => {
+                        let id = pub_pkt.packet_id.unwrap_or(0);
+                        // Persist the inbound QoS 2 PUBLISH before acknowledging
+                        // so we can redeliver the message on reconnect.
+                        let mut enc_buf = BytesMut::with_capacity(256);
+                        let packet = Packet::Publish(pub_pkt);
+                        if packet.encode(&mut enc_buf, self.ver).is_ok() {
+                            self.persist_put(&format!("r{id}"), vec![&enc_buf]);
+                        }
+                        let Packet::Publish(pub_pkt) = packet else {
+                            unreachable!()
+                        };
+                        let msg = Message::from(pub_pkt);
+                        self.pending_pub2_in.insert(id, msg);
+                        let rec = PubAck::new(id);
+                        self.send(&Packet::PubRec(rec)).await?;
+                    }
                 }
-            },
+            }
 
             // ---- QoS 2 inbound: PUBREL → send PUBCOMP, deliver message ----
             Packet::PubRel(rel) => {
@@ -716,6 +842,17 @@ impl<B: Backend> Session<B> {
                 }
                 let comp = PubAck::new(rel.packet_id);
                 self.send(&Packet::PubComp(comp)).await?;
+            }
+
+            // ---- Enhanced authentication ----
+            // Re-authentication (§4.12.1) is always started by the client,
+            // and this client never starts one, so an AUTH here is the
+            // broker breaking the protocol.
+            Packet::Auth(_) => {
+                return Err(Error::ReasonCode(
+                    ReasonCode::ProtocolError,
+                    Properties::new(),
+                ));
             }
 
             // ---- Keep-alive response ----
@@ -773,6 +910,19 @@ impl<B: Backend> Session<B> {
                             props,
                             tx,
                         }));
+                    return Ok(false);
+                }
+
+                // The server states the highest alias it will accept (0, the
+                // default, means none at all); sending a larger one earns a
+                // DISCONNECT, so fail this publish instead (§3.2.2.3.8).
+                if let Some(PropertyValue::U16(alias)) = props.get(PropertyId::TopicAlias)
+                    && (*alias == 0 || *alias > self.limits.server_topic_alias_max)
+                {
+                    tx.complete(Err(Error::ReasonCode(
+                        ReasonCode::TopicAliasInvalid,
+                        Properties::new(),
+                    )));
                     return Ok(false);
                 }
 
@@ -910,6 +1060,7 @@ struct ConnectJob {
     /// Index into `params.servers` for the current connection attempt.
     server_idx: usize,
     connected_flag: Arc<AtomicBool>,
+    assigned_id: Arc<RwLock<Option<String>>>,
     persist: Option<Arc<Mutex<Box<dyn ClientPersistence>>>>,
 }
 
@@ -945,7 +1096,7 @@ async fn do_connect<B: Backend>(job: &ConnectJob) -> Result<(B::Reader, B::Write
 
     // ---- Wait for CONNACK ----
     let mut read_buf = BytesMut::with_capacity(256);
-    let connack = recv_connack::<B>(&mut reader, &mut read_buf, p.ver, p.max_packet_size()).await?;
+    let connack = recv_connack::<B>(&mut reader, &mut writer, &mut read_buf, p).await?;
 
     Ok((reader, writer, connack))
 }
@@ -995,12 +1146,14 @@ fn handle_offline_command(
             params,
             tx,
             connected_flag,
+            assigned_id,
             persist,
         } => Offline::Connect(
             Box::new(ConnectJob {
                 params,
                 server_idx: 0,
                 connected_flag,
+                assigned_id,
                 persist,
             }),
             tx,
@@ -1274,6 +1427,16 @@ pub(crate) async fn run_event_loop<B: Backend>(
 
             // ---- Connected ----
             let limits = SessionLimits::new(&job.params, &connack);
+            let keep_alive = negotiated_keep_alive(&job.params, &connack);
+
+            // An assigned identifier replaces the empty one we sent, so that
+            // `client_id()` reports it and a later reconnect resumes the same
+            // session rather than asking for another new one.
+            if let Some(id) = assigned_client_id(&connack) {
+                *job.assigned_id.write().unwrap() = Some(id.clone());
+                job.params.client_id = id;
+            }
+
             let response = build_connect_response(&job, connack);
             // Set the flag before resolving the token so `is_connected()` is
             // true as soon as `wait()` / `.await` returns in the caller.
@@ -1287,7 +1450,7 @@ pub(crate) async fn run_event_loop<B: Backend>(
             let mut session = Session::<B>::new(
                 writer,
                 job.params.ver,
-                job.params.keep_alive_duration(),
+                keep_alive,
                 event_tx.clone(),
                 job.persist.clone(),
                 limits,

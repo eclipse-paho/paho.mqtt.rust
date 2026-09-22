@@ -202,8 +202,12 @@ impl<'a> Topic<'a> {
     ///
     /// Note that using an alias is only valid with an MQTT v5 connection,
     /// and the value must be in the range of 1 - TopicAliasMaximum as the
-    /// broker reported in the CONNACK packet. The alias is only valid
-    /// for a single connection. It should be reset on a reconnect.
+    /// broker reported in the CONNACK packet. An alias outside that range
+    /// is refused before the message is sent: the delivery token fails with
+    /// [`Error::ReasonCode`] carrying
+    /// [`ReasonCode::TopicAliasInvalid`](crate::ReasonCode),
+    /// leaving the connection intact. The alias is only valid for a single
+    /// connection. It should be reset on a reconnect.
     ///
     /// This can be called a second time to change the alias setting.
     /// Using an alias of zero on a subsequent call instructs this object to
@@ -366,8 +370,12 @@ impl<'a> SyncTopic<'a> {
     ///
     /// Note that using an alias is only valid with an MQTT v5 connection,
     /// and the value must be in the range of 1 - TopicAliasMaximum as the
-    /// broker reported in the CONNACK packet. The alias is only valid
-    /// for a single connection. It should be reset on a reconnect.
+    /// broker reported in the CONNACK packet. An alias outside that range
+    /// is refused before the message is sent: the delivery token fails with
+    /// [`Error::ReasonCode`] carrying
+    /// [`ReasonCode::TopicAliasInvalid`](crate::ReasonCode),
+    /// leaving the connection intact. The alias is only valid for a single
+    /// connection. It should be reset on a reconnect.
     ///
     /// This can be called a second time to change the alias setting.
     /// Using an alias of zero on a subsequent call instructs this object to
