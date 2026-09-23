@@ -24,8 +24,9 @@
 //! The MQTT client can use persistence to store in-flight messages so they
 //! can be recovered in the event of an application crash or restart.
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use std::{
+    collections::HashMap,
     fmt,
     io::Write,
     path::{Path, PathBuf},
@@ -187,6 +188,91 @@ impl UserPersistence {
 impl From<Box<dyn ClientPersistence>> for UserPersistence {
     fn from(persistence: ClientPersistenceBox) -> Self {
         Self(Mutex::new(persistence))
+    }
+}
+
+/////////////////////////////////////////////////////////////////////////////
+//                          MemPersistence
+/////////////////////////////////////////////////////////////////////////////
+
+/// A persistence store held in memory.
+///
+/// In-flight messages already survive a dropped connection without any store
+/// at all — the client carries them across a reconnect itself. A store is
+/// what carries them across a *process*, so an in-memory one cannot do the
+/// job [`FilePersistence`] does, and choosing it is close to choosing
+/// [`PersistenceType::None`].
+///
+/// It is useful where a real store would be in the way: tests that want to
+/// see what the client persisted, and applications that want the
+/// bookkeeping without touching a filesystem — a read-only root, or a
+/// platform where the client has nowhere to write.
+///
+/// ```
+/// use paho_mqtt as mqtt;
+///
+/// let cli = mqtt::CreateOptionsBuilder::new()
+///     .server_uri("tcp://localhost:1883")
+///     .persistence(mqtt::MemPersistence::new())
+///     .create_async_client();
+/// ```
+#[derive(Debug, Default)]
+pub struct MemPersistence {
+    store: HashMap<String, Vec<u8>>,
+}
+
+impl MemPersistence {
+    /// Creates an empty store.
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl ClientPersistence for MemPersistence {
+    /// Nothing to open: the store is created empty and stays in this
+    /// process, so it holds nothing from a previous run to reopen.
+    fn open(&mut self, _client_id: &str, _server_uri: &str) -> Result<()> {
+        Ok(())
+    }
+
+    fn close(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    fn put(&mut self, key: &str, buffers: Vec<&[u8]>) -> Result<()> {
+        self.store.insert(key.to_string(), buffers.concat());
+        Ok(())
+    }
+
+    fn get(&mut self, key: &str) -> Result<Vec<u8>> {
+        self.store
+            .get(key)
+            .cloned()
+            .ok_or_else(|| Error::General("key not found"))
+    }
+
+    fn remove(&mut self, key: &str) -> Result<()> {
+        self.store.remove(key);
+        Ok(())
+    }
+
+    fn keys(&mut self) -> Result<Vec<String>> {
+        Ok(self.store.keys().cloned().collect())
+    }
+
+    fn clear(&mut self) -> Result<()> {
+        self.store.clear();
+        Ok(())
+    }
+
+    fn contains_key(&mut self, key: &str) -> bool {
+        self.store.contains_key(key)
+    }
+}
+
+impl From<MemPersistence> for PersistenceType {
+    fn from(p: MemPersistence) -> Self {
+        PersistenceType::User(UserPersistence::new(Box::new(p)))
     }
 }
 
@@ -373,5 +459,36 @@ mod tests {
         let mut p2 = FilePersistence::new(tmp.path());
         p2.open("cli", "tcp://localhost:1883").expect("reopen");
         assert_eq!(p2.get("persist_me").expect("get"), b"data");
+    }
+
+    // ---- MemPersistence ----
+
+    #[test]
+    fn test_mem_persistence_round_trip() {
+        let mut p = MemPersistence::new();
+        p.open("client", "tcp://localhost:1883").unwrap();
+
+        // Buffers are stored concatenated, as the runtime writes a packet
+        // header and payload separately.
+        p.put("s1", vec![b"head".as_slice(), b"tail".as_slice()])
+            .unwrap();
+        assert_eq!(p.get("s1").unwrap(), b"headtail");
+        assert!(p.contains_key("s1"));
+        assert_eq!(p.keys().unwrap(), vec!["s1".to_string()]);
+
+        p.remove("s1").unwrap();
+        assert!(!p.contains_key("s1"));
+        assert!(p.get("s1").is_err());
+
+        p.put("s2", vec![b"x".as_slice()]).unwrap();
+        p.clear().unwrap();
+        assert!(p.keys().unwrap().is_empty());
+        p.close().unwrap();
+    }
+
+    #[test]
+    fn test_mem_persistence_is_a_persistence_type() {
+        let pt: PersistenceType = MemPersistence::new().into();
+        assert!(matches!(pt, PersistenceType::User(_)));
     }
 }

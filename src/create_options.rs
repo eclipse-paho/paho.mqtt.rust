@@ -176,8 +176,26 @@ pub struct CreateOptions {
     pub delete_oldest: bool,
     /// Restore messages from persistence on create - or clear it.
     pub restore_msgs: bool,
-    /// Whether to persist QoS0 publish commands - an option to not persist them.
-    /// Defaults to true.
+    /// Whether a QoS 0 publish made while disconnected is queued for the
+    /// next connection. Defaults to `true`.
+    ///
+    /// Only meaningful together with
+    /// [`send_while_disconnected`](Self::send_while_disconnected): it decides
+    /// what that buffer does with a QoS 0 message. `true` queues it like any
+    /// other, to go out on the next connection; `false` drops it, completing
+    /// its token with `Ok` as though it had been sent — which is all QoS 0
+    /// ever promises, since a message delivered at most once may be
+    /// delivered not at all.
+    ///
+    /// Set it to `false` for data that is only worth sending while it is
+    /// fresh — a periodic reading, say, where the value that arrives after a
+    /// long outage is of no use and would only crowd out a current one.
+    ///
+    /// The name comes from the v1.x API, where the buffer and the
+    /// persistence store were the same mechanism. QoS 0 messages are never
+    /// written to a [`ClientPersistence`] store by
+    /// this client: with nothing to acknowledge, there is no state to
+    /// recover.
     pub persist_qos0: bool,
     /// The MQTT protocol version to use for connections from this client.
     /// Defaults to v5, which enables a persistence store compatible with
@@ -434,7 +452,11 @@ impl CreateOptionsBuilder {
         self
     }
 
-    /// If set, QoS0 publish commands are persisted. Defaults to true.
+    /// Whether a QoS 0 publish made while disconnected is queued for the
+    /// next connection, or dropped. Defaults to `true`.
+    ///
+    /// See [`CreateOptions::persist_qos0`] for what this does and when to
+    /// turn it off.
     pub fn persist_qos0(mut self, persist: bool) -> Self {
         self.opts.persist_qos0 = persist;
         self

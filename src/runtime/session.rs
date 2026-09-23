@@ -196,12 +196,187 @@ fn disconnect_reason(err: &Error) -> Option<ReasonCode> {
     }
 }
 
-/// A QoS 1/2 publish waiting for an in-flight slot.
+/// Whether the server resumed the session we asked it to.
+///
+/// v3.1.1 and v5 say so in the CONNACK. v3.1 has no Session Present flag, so
+/// there is nothing to go by but our own request: a clean session certainly
+/// started fresh, and anything else is assumed to have continued — the
+/// forgiving reading, since treating a live session as lost would throw away
+/// messages the server is still waiting to have completed.
+fn session_resumed(params: &ConnectParams, connack: &ConnAck) -> bool {
+    match params.ver {
+        MqttVersion::V3_1 => !params.clean_start,
+        _ => connack.session_present,
+    }
+}
+
+/// Rebuilds session state from a persistence store written by an earlier run
+/// of the program.
+///
+/// Outbound entries (`s{id}`) hold either the original PUBLISH, if it has not
+/// been acknowledged at all, or a PUBREL once the server has taken delivery
+/// (§4.4); each is reinstated in the phase its stored packet implies, with an
+/// orphan completer, since the token that started it belonged to a process
+/// that is no longer running. Inbound entries (`r{id}`) are QoS 2 messages
+/// that were PUBREC'd but not yet released.
+///
+/// Nothing is sent here: [`Session::resume`] decides what goes back on the
+/// wire once the CONNACK says whether the session survived. An entry that
+/// cannot be decoded is skipped rather than failing the connection — it is
+/// one message lost, against a store that may be from an older version of
+/// the program or a different protocol level.
+fn load_persisted(
+    state: &mut SessionState,
+    persist: Option<&Arc<Mutex<Box<dyn ClientPersistence>>>>,
+    ver: MqttVersion,
+) {
+    let Some(persist) = persist else {
+        return;
+    };
+    let Ok(keys) = persist.lock().unwrap().keys() else {
+        return;
+    };
+
+    for key in &keys {
+        let Ok(data) = persist.lock().unwrap().get(key) else {
+            continue;
+        };
+        let mut buf = BytesMut::from(data.as_slice());
+        let pkt = match RawPacket::decode(&mut buf) {
+            Ok(Some(raw)) => match Packet::from_raw(raw, ver) {
+                Ok(p) => p,
+                Err(_) => continue,
+            },
+            _ => continue,
+        };
+
+        match (key.as_bytes().first(), pkt) {
+            (Some(b's'), Packet::Publish(pub_pkt)) => {
+                let Some(id) = pub_pkt.packet_id else {
+                    continue;
+                };
+                state.next_id = state.next_id.max(id);
+                state.insert(
+                    id,
+                    Completer::orphan(),
+                    PublishPhase::AwaitingAck(Box::new(pub_pkt)),
+                    false,
+                );
+            }
+            (Some(b's'), Packet::PubRel(rel)) => {
+                state.next_id = state.next_id.max(rel.packet_id);
+                state.insert(
+                    rel.packet_id,
+                    Completer::orphan(),
+                    PublishPhase::AwaitingPubComp,
+                    false,
+                );
+            }
+            (Some(b'r'), Packet::Publish(pub_pkt)) => {
+                let id = pub_pkt.packet_id.unwrap_or(0);
+                state.next_id = state.next_id.max(id);
+                state.pending_pub2_in.insert(id, Message::from(pub_pkt));
+            }
+            _ => {}
+        }
+    }
+}
+
+/// A publish waiting for a slot in the in-flight window.
 enum Deferred {
     /// A `Command::Publish` from the API, not yet assigned a packet ID.
     Command(Command),
-    /// A persisted PUBLISH awaiting re-transmission under its original ID.
-    Restored(paho_mqtt_codec::Publish),
+    /// An established in-flight message, awaiting (re-)transmission under the
+    /// identifier it already holds in [`SessionState::inflight`].
+    Retransmit(u16),
+}
+
+/// How far a QoS 1/2 publish has got, and what has to be re-sent if the
+/// session is resumed on a new connection (§4.4).
+enum PublishPhase {
+    /// Awaiting PUBACK (QoS 1) or PUBREC (QoS 2). The PUBLISH is kept so it
+    /// can be re-sent with DUP set.
+    AwaitingAck(Box<paho_mqtt_codec::Publish>),
+    /// PUBREC arrived and PUBREL went out; awaiting PUBCOMP. The message
+    /// itself is finished with — only the PUBREL is re-sent, never the
+    /// PUBLISH, since the server has already taken delivery of it.
+    AwaitingPubComp,
+}
+
+/// One outbound QoS 1/2 publish that has not yet completed.
+struct InflightPublish {
+    /// Resolved when the final acknowledgement arrives, or when the message
+    /// is abandoned. An orphan completer for a message recovered from
+    /// persistence, whose original token is long gone.
+    tx: Completer<PublishResponse>,
+    phase: PublishPhase,
+    /// `false` while the message is queued for a free window slot; only sent
+    /// messages count against the in-flight limit.
+    sent: bool,
+    /// Order the message was first handed to the session, so a
+    /// re-transmission preserves it (§4.6).
+    seq: u64,
+}
+
+impl InflightPublish {
+    /// The QoS of the underlying message, or `None` once only a PUBREL is
+    /// outstanding.
+    fn qos(&self) -> Option<QoS> {
+        match &self.phase {
+            PublishPhase::AwaitingAck(p) => Some(p.qos),
+            PublishPhase::AwaitingPubComp => None,
+        }
+    }
+}
+
+/// The message state of an MQTT session, which outlives any one connection.
+///
+/// A session is the client's and server's shared memory of what is still in
+/// flight. It survives a dropped connection — that is the whole point of
+/// resuming rather than starting clean — so it lives here rather than in
+/// [`Session`], and is handed from one connection to the next.
+///
+/// Persistence mirrors it for crash recovery: everything here can be rebuilt
+/// by [`load_persisted`] from a store written by a previous run of the
+/// program.
+#[derive(Default)]
+struct SessionState {
+    /// Outbound QoS 1/2 publishes awaiting acknowledgement, by packet ID.
+    inflight: HashMap<u16, InflightPublish>,
+    /// Inbound QoS 2 messages that have been PUBREC'd, held until PUBREL
+    /// says to deliver them.
+    pending_pub2_in: HashMap<u16, Message>,
+    /// Last packet identifier handed out.
+    next_id: u16,
+    /// Counter behind [`InflightPublish::seq`].
+    next_seq: u64,
+    /// Whether a persistence store has already been read into this state;
+    /// only the first connection of a session needs to.
+    loaded: bool,
+}
+
+impl SessionState {
+    /// Records `record` under `id`, stamped with the next sequence number.
+    fn insert(&mut self, id: u16, tx: Completer<PublishResponse>, phase: PublishPhase, sent: bool) {
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        self.inflight.insert(
+            id,
+            InflightPublish {
+                tx,
+                phase,
+                sent,
+                seq,
+            },
+        );
+    }
+
+    /// Packet IDs of every in-flight message, oldest first.
+    fn ids_in_order(&self) -> Vec<u16> {
+        let mut ids: Vec<_> = self.inflight.iter().map(|(id, r)| (r.seq, *id)).collect();
+        ids.sort_unstable();
+        ids.into_iter().map(|(_, id)| id).collect()
+    }
 }
 
 /// Resolves a publish token from its PUBACK/PUBCOMP: `Ok` for a success
@@ -247,14 +422,8 @@ struct Session<B: Backend> {
     keep_alive: Duration,
     /// Reusable scratch buffer for packet encoding.
     write_buf: BytesMut,
-    /// Monotonically increasing packet-ID counter (wraps; skips 0).
-    next_id: u16,
-    /// Pending QoS 1 outbound publishes awaiting PUBACK.
-    pending_pub1: HashMap<u16, Completer<PublishResponse>>,
-    /// Pending QoS 2 outbound publishes awaiting PUBCOMP.
-    pending_pub2: HashMap<u16, Completer<PublishResponse>>,
-    /// Pending inbound QoS 2 messages awaiting PUBREL (packet_id → message).
-    pending_pub2_in: HashMap<u16, Message>,
+    /// Message state carried across the connections of one session.
+    state: SessionState,
     /// Pending SUBSCRIBE operations awaiting SUBACK, with the `single` flag
     /// that decides how an error code in the SUBACK is reported.
     pending_sub: HashMap<u16, (Completer<SubscribeResponse>, bool)>,
@@ -289,16 +458,14 @@ impl<B: Backend> Session<B> {
         event_tx: async_channel::Sender<Event>,
         persist: Option<Arc<Mutex<Box<dyn ClientPersistence>>>>,
         limits: SessionLimits,
+        state: SessionState,
     ) -> Self {
         Self {
             writer,
             ver,
             keep_alive,
             write_buf: BytesMut::with_capacity(256),
-            next_id: 0,
-            pending_pub1: HashMap::new(),
-            pending_pub2: HashMap::new(),
-            pending_pub2_in: HashMap::new(),
+            state,
             pending_sub: HashMap::new(),
             pending_unsub: HashMap::new(),
             event_tx,
@@ -314,16 +481,19 @@ impl<B: Backend> Session<B> {
     /// Returns `true` if any outbound operations are waiting for broker ACKs
     /// or are queued in the in-flight deferred buffer.
     fn has_pending(&self) -> bool {
-        !self.pending_pub1.is_empty()
-            || !self.pending_pub2.is_empty()
+        !self.state.inflight.is_empty()
             || !self.pending_sub.is_empty()
             || !self.pending_unsub.is_empty()
             || !self.inflight_deferred.is_empty()
     }
 
-    /// Number of outbound QoS 1/2 publishes currently awaiting broker ACKs.
+    /// Number of outbound QoS 1/2 publishes occupying the in-flight window.
+    ///
+    /// A message queued for a free slot does not count until it is sent; one
+    /// awaiting PUBCOMP still does, since its packet identifier is not free
+    /// until the exchange finishes.
     fn inflight_count(&self) -> usize {
-        self.pending_pub1.len() + self.pending_pub2.len()
+        self.state.inflight.values().filter(|r| r.sent).count()
     }
 
     /// `true` when another QoS 1/2 publish may go out now.
@@ -339,40 +509,39 @@ impl<B: Backend> Session<B> {
                 Some(Deferred::Command(cmd)) => {
                     self.handle_command(cmd).await?;
                 }
-                Some(Deferred::Restored(pkt)) => self.send_restored(pkt).await?,
+                Some(Deferred::Retransmit(id)) => self.send_inflight(id).await?,
                 None => break,
             }
         }
         Ok(())
     }
 
-    /// Re-transmits a persisted QoS 1/2 PUBLISH under its original packet
-    /// identifier with DUP set, registering an orphan completer so the ACK
-    /// cleans up the persistence entry without resolving any user token.
-    async fn send_restored(&mut self, mut pub_pkt: paho_mqtt_codec::Publish) -> Result<()> {
-        let Some(pid) = pub_pkt.packet_id else {
-            return Ok(());
+    /// Sends (or re-sends) the in-flight message held under `id`.
+    ///
+    /// A message still awaiting its first acknowledgement goes out as a
+    /// PUBLISH with DUP set; one that has been PUBREC'd goes out as a PUBREL.
+    /// Marks the record as occupying a window slot.
+    async fn send_inflight(&mut self, id: u16) -> Result<()> {
+        let packet = match self.state.inflight.get(&id) {
+            Some(rec) => match &rec.phase {
+                PublishPhase::AwaitingAck(pub_pkt) => {
+                    let mut p = (**pub_pkt).clone();
+                    p.dup = true;
+                    Packet::Publish(p)
+                }
+                PublishPhase::AwaitingPubComp => Packet::PubRel(PubAck::new(id)),
+            },
+            None => return Ok(()),
         };
-        let qos = pub_pkt.qos;
-        pub_pkt.dup = true;
-        self.send(&Packet::Publish(pub_pkt)).await?;
-        let comp = Completer::orphan();
-        match qos {
-            QoS::QoS1 => {
-                self.pending_pub1.insert(pid, comp);
-            }
-            QoS::QoS2 => {
-                self.pending_pub2.insert(pid, comp);
-            }
-            QoS::QoS0 => {}
+        if let Some(rec) = self.state.inflight.get_mut(&id) {
+            rec.sent = true;
         }
-        Ok(())
+        self.send(&packet).await
     }
 
     /// `true` if `id` is currently in use by any outstanding operation.
     fn id_in_use(&self, id: u16) -> bool {
-        self.pending_pub1.contains_key(&id)
-            || self.pending_pub2.contains_key(&id)
+        self.state.inflight.contains_key(&id)
             || self.pending_sub.contains_key(&id)
             || self.pending_unsub.contains_key(&id)
     }
@@ -399,12 +568,12 @@ impl<B: Backend> Session<B> {
     /// and silently replace its completer.
     fn alloc_id(&mut self) -> u16 {
         loop {
-            self.next_id = self.next_id.wrapping_add(1);
-            if self.next_id == 0 {
-                self.next_id = 1;
+            self.state.next_id = self.state.next_id.wrapping_add(1);
+            if self.state.next_id == 0 {
+                self.state.next_id = 1;
             }
-            if !self.id_in_use(self.next_id) {
-                return self.next_id;
+            if !self.id_in_use(self.state.next_id) {
+                return self.state.next_id;
             }
         }
     }
@@ -451,91 +620,82 @@ impl<B: Backend> Session<B> {
         Ok(())
     }
 
-    /// Restores in-flight QoS 1/2 messages from the persistence store after a
-    /// successful connect.
+    /// Brings the carried session state into line with what the server
+    /// remembers, then puts everything outstanding back on the wire.
     ///
-    /// Outbound messages (persistence keys `s{id}`) are re-decoded, marked
-    /// DUP, and retransmitted.  An orphan [`Completer`] is registered for each
-    /// so that the arriving PUBACK/PUBCOMP removes the persistence entry
-    /// without resolving any user token (the original token is long gone).
-    /// `next_id` is advanced past all restored packet IDs to prevent
-    /// collisions with new allocations.
+    /// When `resumed` is false the server has no memory of this session —
+    /// either we asked for a clean start, or it lost ours. What that means
+    /// per message:
     ///
-    /// Inbound QoS 2 messages awaiting PUBREL (keys `r{id}`) are reloaded
-    /// into `pending_pub2_in`; when the broker re-sends PUBREL the message
-    /// is delivered and PUBCOMP is sent normally.
-    ///
-    /// Returns early without error if there is no persistence store.  Any
-    /// individual key that fails to decode is silently skipped; a transport
-    /// error aborts the restore and bubbles up via `Err`.
-    async fn restore(&mut self) -> Result<()> {
-        let keys = {
-            let Some(persist) = &self.persist else {
-                return Ok(());
-            };
-            match persist.lock().unwrap().keys() {
-                Ok(k) => k,
-                Err(_) => return Ok(()),
-            }
-        };
-
-        for key in &keys {
-            let data = {
-                let Some(persist) = &self.persist else {
-                    return Ok(());
-                };
-                match persist.lock().unwrap().get(key) {
-                    Ok(d) => d,
-                    Err(_) => continue,
-                }
-            };
-
-            let mut buf = BytesMut::from(data.as_slice());
-            let raw = match RawPacket::decode(&mut buf) {
-                Ok(Some(r)) => r,
-                _ => continue,
-            };
-            let pkt = match Packet::from_raw(raw, self.ver) {
-                Ok(p) => p,
-                Err(_) => continue,
-            };
-
-            if key.starts_with('s') {
-                // Outbound QoS 1/2 PUBLISH — retransmit with DUP=true, subject
-                // to the same in-flight limit as new publishes.
-                if let Packet::Publish(pub_pkt) = pkt {
-                    let Some(pid) = pub_pkt.packet_id else {
-                        continue;
-                    };
-                    if pid > self.next_id {
-                        self.next_id = pid;
-                    }
-                    if self.inflight_slot_free() {
-                        self.send_restored(pub_pkt).await?;
-                    } else {
-                        self.inflight_deferred
-                            .push_back(Deferred::Restored(pub_pkt));
-                    }
-                }
-            } else if key.starts_with('r') {
-                // Inbound QoS 2 awaiting PUBREL — reload so PUBREL is handled.
-                if let Packet::Publish(pub_pkt) = pkt {
-                    let id = pub_pkt.packet_id.unwrap_or(0);
-                    let msg = Message::from(pub_pkt);
-                    self.pending_pub2_in.insert(id, msg);
-                }
-            }
+    /// * **QoS 1** is re-sent. Its contract is at-least-once, and a message
+    ///   the server never acknowledged may never have arrived.
+    /// * **QoS 2 is abandoned**, and its token fails. Exactly-once is a
+    ///   guarantee made *within* a session: once the server has forgotten
+    ///   the exchange, re-sending could duplicate a message it already
+    ///   delivered, and staying silent would leave the caller waiting for a
+    ///   PUBCOMP that can never come. Quietly downgrading to at-least-once
+    ///   would break the contract the caller asked for, so the failure is
+    ///   reported instead.
+    /// * **Inbound QoS 2** state is dropped: the server will not re-send the
+    ///   PUBRELs those messages are waiting for.
+    async fn resume(&mut self, resumed: bool) -> Result<()> {
+        if !resumed {
+            self.discard_unresumable();
         }
 
+        // Re-send in the order the messages were first published (§4.6),
+        // respecting the in-flight window as new publishes do.
+        for id in self.state.ids_in_order() {
+            if self.inflight_slot_free() {
+                self.send_inflight(id).await?;
+            } else {
+                if let Some(rec) = self.state.inflight.get_mut(&id) {
+                    rec.sent = false;
+                }
+                self.inflight_deferred.push_back(Deferred::Retransmit(id));
+            }
+        }
         Ok(())
     }
 
+    /// Drops the state a server that did not resume our session cannot
+    /// honour, failing the tokens that can no longer be completed.
+    fn discard_unresumable(&mut self) {
+        let abandon: Vec<u16> = self
+            .state
+            .inflight
+            .iter()
+            .filter(|(_, r)| r.qos() != Some(QoS::QoS1))
+            .map(|(id, _)| *id)
+            .collect();
+
+        for id in abandon {
+            if let Some(rec) = self.state.inflight.remove(&id) {
+                self.persist_remove(&format!("s{id}"));
+                rec.tx.complete(Err(Error::General(
+                    "server did not resume the session; QoS 2 delivery abandoned",
+                )));
+            }
+        }
+
+        for id in self
+            .state
+            .pending_pub2_in
+            .keys()
+            .copied()
+            .collect::<Vec<_>>()
+        {
+            self.persist_remove(&format!("r{id}"));
+        }
+        self.state.pending_pub2_in.clear();
+    }
+
     /// Brings a freshly connected session up and runs it to completion:
-    /// restores persisted in-flight messages (if `restore`), flushes the
+    /// re-sends whatever the session still has outstanding, flushes the
     /// commands buffered while disconnected, then services the connection
-    /// until it ends.
+    /// until it ends. `resumed` says whether the server kept our session.
     ///
-    /// Any failure — restore, flush, or run — surfaces as one `Err`, so the
+    /// Any failure — resume, flush, or run — surfaces as one `Err`, so the
     /// caller tears the session down the same way in every case. Commands
     /// still in `buf` when a flush fails stay there for the next connection.
     async fn serve(
@@ -543,9 +703,9 @@ impl<B: Backend> Session<B> {
         reader: &mut B::Reader,
         cmd_rx: &async_channel::Receiver<Command>,
         buf: &mut VecDeque<Command>,
-        restore: bool,
+        resumed: bool,
     ) -> Result<()> {
-        let res = self.serve_inner(reader, cmd_rx, buf, restore).await;
+        let res = self.serve_inner(reader, cmd_rx, buf, resumed).await;
 
         // A v5 receiver that rejects a packet must say why before closing
         // (§4.13). Best-effort: the connection may already be gone, and the
@@ -564,11 +724,9 @@ impl<B: Backend> Session<B> {
         reader: &mut B::Reader,
         cmd_rx: &async_channel::Receiver<Command>,
         buf: &mut VecDeque<Command>,
-        restore: bool,
+        resumed: bool,
     ) -> Result<()> {
-        if restore {
-            self.restore().await?;
-        }
+        self.resume(resumed).await?;
         while let Some(cmd) = buf.pop_front() {
             self.handle_command(cmd).await?;
         }
@@ -740,9 +898,10 @@ impl<B: Backend> Session<B> {
             // `connect()`. The persisted copy is removed either way — the
             // broker has answered, so there is nothing left to retry.
             Packet::PubAck(ack) => {
-                if let Some(tx) = self.pending_pub1.remove(&ack.packet_id) {
+                if let Some(rec) = self.state.inflight.remove(&ack.packet_id) {
                     self.persist_remove(&format!("s{}", ack.packet_id));
-                    tx.complete(publish_outcome(ack.reason_code, ack.properties));
+                    rec.tx
+                        .complete(publish_outcome(ack.reason_code, ack.properties));
                 }
                 self.drain_deferred().await?;
             }
@@ -750,22 +909,42 @@ impl<B: Backend> Session<B> {
             // ---- QoS 2 outbound: PUBREC → send PUBREL ----
             Packet::PubRec(rec) => {
                 if rec.reason_code.is_err() {
-                    if let Some(tx) = self.pending_pub2.remove(&rec.packet_id) {
+                    if let Some(inflight) = self.state.inflight.remove(&rec.packet_id) {
                         self.persist_remove(&format!("s{}", rec.packet_id));
-                        tx.complete(Err(Error::ReasonCode(rec.reason_code, rec.properties)));
+                        inflight
+                            .tx
+                            .complete(Err(Error::ReasonCode(rec.reason_code, rec.properties)));
                     }
                     self.drain_deferred().await?;
                     return Ok(());
                 }
+
+                // The server has taken delivery, so the message itself is
+                // finished with: from here only a PUBREL is owed, and that
+                // is what a resumed session must re-send (§4.4). Replacing
+                // the persisted PUBLISH with the PUBREL keeps the store in
+                // step, so a crash now cannot resurrect the message.
                 let rel = PubAck::new(rec.packet_id);
+                if let Some(inflight) = self.state.inflight.get_mut(&rec.packet_id) {
+                    inflight.phase = PublishPhase::AwaitingPubComp;
+                    inflight.sent = true;
+                }
+                let mut enc = BytesMut::with_capacity(8);
+                if Packet::PubRel(rel.clone())
+                    .encode(&mut enc, self.ver)
+                    .is_ok()
+                {
+                    self.persist_put(&format!("s{}", rec.packet_id), vec![&enc]);
+                }
                 self.send(&Packet::PubRel(rel)).await?;
             }
 
             // ---- QoS 2 outbound: PUBCOMP → resolve token ----
             Packet::PubComp(comp) => {
-                if let Some(tx) = self.pending_pub2.remove(&comp.packet_id) {
+                if let Some(rec) = self.state.inflight.remove(&comp.packet_id) {
                     self.persist_remove(&format!("s{}", comp.packet_id));
-                    tx.complete(publish_outcome(comp.reason_code, comp.properties));
+                    rec.tx
+                        .complete(publish_outcome(comp.reason_code, comp.properties));
                 }
                 self.drain_deferred().await?;
             }
@@ -827,7 +1006,7 @@ impl<B: Backend> Session<B> {
                             unreachable!()
                         };
                         let msg = Message::from(pub_pkt);
-                        self.pending_pub2_in.insert(id, msg);
+                        self.state.pending_pub2_in.insert(id, msg);
                         let rec = PubAck::new(id);
                         self.send(&Packet::PubRec(rec)).await?;
                     }
@@ -836,7 +1015,7 @@ impl<B: Backend> Session<B> {
 
             // ---- QoS 2 inbound: PUBREL → send PUBCOMP, deliver message ----
             Packet::PubRel(rel) => {
-                if let Some(msg) = self.pending_pub2_in.remove(&rel.packet_id) {
+                if let Some(msg) = self.state.pending_pub2_in.remove(&rel.packet_id) {
                     self.persist_remove(&format!("r{}", rel.packet_id));
                     let _ = self.event_tx.send(Event::MessageArrived(msg)).await;
                 }
@@ -941,6 +1120,11 @@ impl<B: Backend> Session<B> {
                     properties: props,
                 };
 
+                // Kept so the message can be re-sent with DUP if the
+                // connection drops before it is acknowledged. The payload is
+                // reference-counted, so this copies only the topic and
+                // properties.
+                let retain_copy = (qos != QoS::QoS0).then(|| Box::new(pub_pkt.clone()));
                 let packet = Packet::Publish(pub_pkt);
 
                 // Encode once: the header lands in `write_buf` and the payload
@@ -975,20 +1159,14 @@ impl<B: Backend> Session<B> {
 
                 self.write_frame(payload).await?;
 
-                match qos {
-                    QoS::QoS0 => {
-                        tx.complete(Ok(PublishResponse::default()));
+                match (id, retain_copy) {
+                    // QoS 0 is complete the moment it is written.
+                    (_, None) => tx.complete(Ok(PublishResponse::default())),
+                    (Some(id), Some(pub_pkt)) => {
+                        self.state
+                            .insert(id, tx, PublishPhase::AwaitingAck(pub_pkt), true);
                     }
-                    QoS::QoS1 => {
-                        if let Some(id) = id {
-                            self.pending_pub1.insert(id, tx);
-                        }
-                    }
-                    QoS::QoS2 => {
-                        if let Some(id) = id {
-                            self.pending_pub2.insert(id, tx);
-                        }
-                    }
+                    (None, Some(_)) => unreachable!("QoS 1/2 always has a packet ID"),
                 }
             }
 
@@ -1333,6 +1511,10 @@ pub(crate) async fn run_event_loop<B: Backend>(
     let mut ever_connected = false;
 
     'outer: loop {
+        // Message state belongs to the session, not the connection, so it is
+        // built here and handed from one connection to the next.
+        let mut state = SessionState::default();
+
         // ---- Wait for a Connect command ----
         let (mut job, mut tx_opt) = loop {
             let cmd = match cmd_rx.recv().await {
@@ -1428,6 +1610,26 @@ pub(crate) async fn run_event_loop<B: Backend>(
             // ---- Connected ----
             let limits = SessionLimits::new(&job.params, &connack);
             let keep_alive = negotiated_keep_alive(&job.params, &connack);
+            let resumed = session_resumed(&job.params, &connack);
+
+            // A clean start throws away whatever the previous session left
+            // behind: the server has already discarded its half, so the
+            // store holds nothing that can still be completed.
+            if job.params.clean_start
+                && let Some(p) = &job.persist
+            {
+                let _ = p.lock().unwrap().clear();
+                state = SessionState::default();
+            }
+
+            // Read a store written by an earlier run of the program into the
+            // session state. Only the first connection needs to: from then
+            // on the in-memory state is the authority and the store mirrors
+            // it.
+            if buf_cfg.restore_msgs && !state.loaded {
+                load_persisted(&mut state, job.persist.as_ref(), job.params.ver);
+            }
+            state.loaded = true;
 
             // An assigned identifier replaces the empty one we sent, so that
             // `client_id()` reports it and a later reconnect resumes the same
@@ -1454,13 +1656,15 @@ pub(crate) async fn run_event_loop<B: Backend>(
                 event_tx.clone(),
                 job.persist.clone(),
                 limits,
+                state,
             );
-            let result = session
-                .serve(&mut reader, &cmd_rx, &mut buf, buf_cfg.restore_msgs)
-                .await;
+            let result = session.serve(&mut reader, &cmd_rx, &mut buf, resumed).await;
             if let Some(p) = &session.persist {
                 let _ = p.lock().unwrap().close();
             }
+            // Carry what is still in flight into the next connection of this
+            // session; a clean disconnect below drops it.
+            state = session.state;
 
             match result {
                 // Clean disconnect: back to waiting for a Connect.
@@ -1478,4 +1682,70 @@ pub(crate) async fn run_event_loop<B: Backend>(
             }
         } // 'retry
     } // 'outer
+}
+
+/////////////////////////////////////////////////////////////////////////////
+//                              Unit Tests
+/////////////////////////////////////////////////////////////////////////////
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Token;
+    fn params(ver: MqttVersion, clean_start: bool) -> ConnectParams {
+        ConnectParams {
+            servers: Vec::new(),
+            client_id: String::new(),
+            clean_start,
+            keep_alive_secs: 0,
+            user_name: None,
+            password: None,
+            will: None,
+            ver,
+            props: Properties::new(),
+            auth: None,
+            #[cfg(any(feature = "tls", feature = "openssl", feature = "smol-tls"))]
+            tls: None,
+            #[cfg(any(feature = "websocket", feature = "smol-websocket"))]
+            http_headers: Default::default(),
+            auto_reconnect: false,
+            min_retry_interval: Duration::ZERO,
+            max_retry_interval: Duration::ZERO,
+            max_inflight: 0,
+            connect_timeout: Duration::ZERO,
+        }
+    }
+
+    /// v3.1.1 and v5 are told by the CONNACK; v3.1 has no such flag, so the
+    /// client's own request is all there is to go on.
+    #[test]
+    fn test_session_resumed() {
+        let ack = |present| ConnAck::new(present, ReasonCode::Success);
+
+        for ver in [MqttVersion::V3_1_1, MqttVersion::V5] {
+            assert!(session_resumed(&params(ver, false), &ack(true)), "{ver}");
+            assert!(!session_resumed(&params(ver, false), &ack(false)), "{ver}");
+        }
+
+        assert!(session_resumed(
+            &params(MqttVersion::V3_1, false),
+            &ack(false)
+        ));
+        assert!(!session_resumed(
+            &params(MqttVersion::V3_1, true),
+            &ack(false)
+        ));
+    }
+
+    /// Re-transmission follows the order the messages were published, not
+    /// the arbitrary order of the hash map that holds them.
+    #[test]
+    fn test_inflight_ids_in_publish_order() {
+        let mut state = SessionState::default();
+        for id in [9_u16, 3, 7] {
+            let (_tok, comp) = Token::<PublishResponse>::new();
+            state.insert(id, comp, PublishPhase::AwaitingPubComp, true);
+        }
+        assert_eq!(state.ids_in_order(), vec![9, 3, 7]);
+    }
 }

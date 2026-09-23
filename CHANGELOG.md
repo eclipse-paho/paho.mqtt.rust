@@ -36,6 +36,15 @@ Version 2.0 is a rewrite of the library in pure Rust. The dependency on the Paho
 - `ConnectResponse` gained accessors for everything the CONNACK can report: `receive_maximum()`, `maximum_packet_size()`, `topic_alias_maximum()`, `maximum_qos()`, `retain_available()`, `wildcard_subscriptions_available()`, `subscription_identifiers_available()`, `shared_subscriptions_available()`, `server_keep_alive()`, `assigned_client_id()`, `server_reference()`, and `reason_string()`. Each falls back to the specification's default when the property is absent.
 - **[Breaking]** `AsyncClient::client_id()` and `Client::client_id()` return `String` rather than `&str`, so they can report a server-assigned identifier. This matches the v1.x signature.
 
+### Sessions and persistence
+
+- In-flight QoS 1/2 messages now belong to the session rather than to one connection: they survive a dropped connection and are re-sent, in publish order and with DUP set, on the reconnect that resumes the session — with or without a persistence store. Previously every reconnect dropped them and failed their tokens.
+- A QoS 2 message that the server has taken delivery of (PUBREC) is completed by re-sending the **PUBREL**, never the message. Its persisted entry is replaced with the PUBREL at that moment, so a crash cannot resurrect a message the server already holds.
+- The CONNACK's Session Present flag is honoured. When the server did not resume the session, QoS 1 messages are re-sent, inbound QoS 2 state is dropped, and outstanding QoS 2 publishes fail rather than hanging: exactly-once cannot be honoured once the server has forgotten the exchange, and downgrading silently to at-least-once would break the caller's contract.
+- Connecting with `clean_start` clears the persistence store, instead of restoring state for a session the server has already discarded.
+- New `MemPersistence`, a `HashMap`-backed `ClientPersistence` for tests and for applications that want the bookkeeping without touching a filesystem.
+- `CreateOptions::persist_qos0` is documented: it decides whether a QoS 0 publish made while disconnected is queued for the next connection or dropped. QoS 0 messages are never written to a persistence store.
+
 ### Behaviour
 
 - **[Breaking]** An acknowledgement carrying an error reason code fails the operation's token with `Error::ReasonCode(code, properties)` — for `publish()` (PUBACK or PUBREC/PUBCOMP), `subscribe()`, and `unsubscribe()` — matching how a refused CONNACK fails `connect()`. `subscribe_many()` and `unsubscribe_many()` still resolve `Ok` with one code per filter, since they may succeed partially. Previously PUBACK, SUBACK and UNSUBACK errors resolved `Ok` with the code inside the response while PUBREC errors failed the token.

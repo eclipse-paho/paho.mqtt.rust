@@ -77,7 +77,7 @@ pub use crate::error::{Error, Result};
 pub use crate::event::Event;
 pub use crate::message::{Message, MessageBuilder};
 pub use crate::persistence::{
-    ClientPersistence, ClientPersistenceBox, FilePersistence, PERSISTENCE_ERROR,
+    ClientPersistence, ClientPersistenceBox, FilePersistence, MemPersistence, PERSISTENCE_ERROR,
     PERSISTENCE_SUCCESS, PersistenceType, UserPersistence,
 };
 pub use crate::properties::{

@@ -1240,6 +1240,355 @@ fn test_auth_configuration_is_checked() {
 }
 
 /////////////////////////////////////////////////////////////////////////////
+// Session state across connections
+/////////////////////////////////////////////////////////////////////////////
+
+/// Connect options for a durable session that reconnects quickly.
+#[cfg(test)]
+fn resuming_opts() -> mqtt::ConnectOptions {
+    mqtt::ConnectOptionsBuilder::new_v5()
+        .clean_start(false)
+        .automatic_reconnect(Duration::from_millis(100), Duration::from_millis(500))
+        .finalize()
+}
+
+/// Once the server has taken delivery of a QoS 2 message (PUBREC), what is
+/// persisted is the PUBREL — not the original PUBLISH, which must never be
+/// sent again (§4.4).
+#[test]
+fn test_qos2_persists_pubrel_after_pubrec() {
+    use mqtt::paho_mqtt_codec::{ConnAck, Packet, PubAck, ReasonCode};
+
+    // Acknowledge the PUBLISH with a PUBREC, then say nothing more, leaving
+    // the exchange parked at exactly the phase under test.
+    let broker = common::spawn_broker(|pkt| match pkt {
+        Packet::Connect(_) => vec![Packet::ConnAck(ConnAck::new(false, ReasonCode::Success))],
+        Packet::Publish(p) => match p.packet_id {
+            Some(id) => vec![Packet::PubRec(PubAck::new(id))],
+            None => vec![],
+        },
+        _ => vec![],
+    });
+
+    let store = common::SpyPersistence::new();
+    let cli = mqtt::CreateOptionsBuilder::new()
+        .server_uri(broker.uri.clone())
+        .mqtt_version(mqtt::MQTT_VERSION_5)
+        .user_persistence(store.clone())
+        .create_async_client()
+        .unwrap();
+    cli.connect(mqtt::ConnectOptions::new_v5())
+        .wait()
+        .expect("connect failed");
+
+    let _tok = cli.publish(mqtt::Message::new(topic!("qos2-rel"), "x", mqtt::QOS_2));
+
+    // Wait for the exchange to reach the PUBREL.
+    let got = broker.wait_until(Duration::from_secs(5), |pkts| {
+        pkts.iter().any(|p| matches!(p, Packet::PubRel(_)))
+    });
+    assert!(got, "client did not send PUBREL");
+    std::thread::sleep(Duration::from_millis(100));
+
+    let keys = store.keys();
+    assert_eq!(keys.len(), 1, "expected one persisted entry, got {keys:?}");
+    match store.packet(&keys[0], mqtt::MqttVersion::V5) {
+        Some(Packet::PubRel(_)) => {}
+        other => panic!("persisted {other:?}, expected a PUBREL"),
+    }
+
+    drop(cli);
+    broker.join();
+}
+
+/// A QoS 1 publish left unacknowledged when the connection drops is re-sent,
+/// with DUP set, on the reconnect that resumes the session — with no
+/// persistence store involved.
+#[test]
+fn test_inflight_qos1_resent_across_reconnect() {
+    use mqtt::paho_mqtt_codec::{ConnAck, Packet, PubAck, ReasonCode};
+
+    let broker = common::spawn_broker_seq(2, |pkt, conn| match (pkt, conn) {
+        // First connection: accept, then drop it the moment the publish
+        // arrives, leaving the message unacknowledged.
+        (Packet::Connect(_), 0) => {
+            vec![Packet::ConnAck(ConnAck::new(false, ReasonCode::Success))].into()
+        }
+        (Packet::Publish(_), 0) => common::Reply::close_after(vec![]),
+        // Second connection: the session is resumed.
+        (Packet::Connect(_), _) => {
+            vec![Packet::ConnAck(ConnAck::new(true, ReasonCode::Success))].into()
+        }
+        // ... and this time the re-sent message is acknowledged.
+        (Packet::Publish(p), _) => match p.packet_id {
+            Some(id) => vec![Packet::PubAck(PubAck::new(id))].into(),
+            None => common::Reply::none(),
+        },
+        _ => common::Reply::none(),
+    });
+
+    let cli = mqtt::AsyncClient::new(broker.uri.clone()).unwrap();
+    cli.connect(resuming_opts()).wait().expect("connect failed");
+
+    // The token stays pending across the reconnect and completes when the
+    // re-sent copy is finally acknowledged.
+    let tok = cli.publish(mqtt::Message::new(topic!("resend"), "x", mqtt::QOS_1));
+    tok.wait_for(Duration::from_secs(10))
+        .expect("publish never completed across the reconnect");
+
+    let publishes: Vec<_> = broker
+        .received()
+        .into_iter()
+        .filter_map(|p| match p {
+            Packet::Publish(p) => Some(p),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(publishes.len(), 2, "message should have been sent twice");
+    assert!(!publishes[0].dup, "the first send is not a duplicate");
+    assert!(publishes[1].dup, "the re-send must set DUP (MQTT-3.3.1-1)");
+    assert_eq!(publishes[0].packet_id, publishes[1].packet_id);
+
+    cli.disconnect(None).wait().ok();
+    broker.join();
+}
+
+/// A QoS 2 message parked at PUBREC is completed by re-sending the PUBREL,
+/// never the message, when the session resumes.
+#[test]
+fn test_inflight_qos2_resends_pubrel_across_reconnect() {
+    use mqtt::paho_mqtt_codec::{ConnAck, Packet, PubAck, ReasonCode};
+
+    let broker = common::spawn_broker_seq(2, |pkt, conn| match (pkt, conn) {
+        (Packet::Connect(_), 0) => {
+            vec![Packet::ConnAck(ConnAck::new(false, ReasonCode::Success))].into()
+        }
+        // Take delivery of the message...
+        (Packet::Publish(p), 0) => match p.packet_id {
+            Some(id) => vec![Packet::PubRec(PubAck::new(id))].into(),
+            None => common::Reply::none(),
+        },
+        // ... then die holding the PUBREL, without ever sending PUBCOMP.
+        (Packet::PubRel(_), 0) => common::Reply::close_after(vec![]),
+        (Packet::Connect(_), _) => {
+            vec![Packet::ConnAck(ConnAck::new(true, ReasonCode::Success))].into()
+        }
+        // The resumed session must offer the PUBREL again, which we complete.
+        (Packet::PubRel(r), _) => vec![Packet::PubComp(PubAck::new(r.packet_id))].into(),
+        _ => common::Reply::none(),
+    });
+
+    let cli = mqtt::AsyncClient::new(broker.uri.clone()).unwrap();
+    cli.connect(resuming_opts()).wait().expect("connect failed");
+
+    let tok = cli.publish(mqtt::Message::new(topic!("qos2-resume"), "x", mqtt::QOS_2));
+    tok.wait_for(Duration::from_secs(10))
+        .expect("QoS 2 publish never completed across the reconnect");
+
+    let pkts = broker.received();
+    let publishes = pkts
+        .iter()
+        .filter(|p| matches!(p, Packet::Publish(_)))
+        .count();
+    let pubrels = pkts
+        .iter()
+        .filter(|p| matches!(p, Packet::PubRel(_)))
+        .count();
+    assert_eq!(publishes, 1, "the message must not be published again");
+    assert_eq!(pubrels, 2, "the PUBREL, and only it, is what gets re-sent");
+
+    cli.disconnect(None).wait().ok();
+    broker.join();
+}
+
+/// When the server does not resume the session, a QoS 1 message is re-sent
+/// but a QoS 2 exchange cannot be completed, so its token fails rather than
+/// waiting for a PUBCOMP that will never come.
+#[test]
+fn test_unresumed_session_discards_qos2_and_resends_qos1() {
+    use mqtt::paho_mqtt_codec::{ConnAck, Packet, PubAck, ReasonCode};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    // Drop the connection once both messages are outstanding: the QoS 1
+    // unacknowledged, the QoS 2 parked at PUBREC.
+    let seen_qos2 = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&seen_qos2);
+
+    let broker = common::spawn_broker_seq(2, move |pkt, conn| match (pkt, conn) {
+        (Packet::Connect(_), 0) => {
+            vec![Packet::ConnAck(ConnAck::new(false, ReasonCode::Success))].into()
+        }
+        (Packet::Publish(p), 0) => match (p.qos, p.packet_id) {
+            (mqtt::QoS::ExactlyOnce, Some(id)) => {
+                flag.store(true, Ordering::SeqCst);
+                common::Reply::close_after(vec![Packet::PubRec(PubAck::new(id))])
+            }
+            _ => common::Reply::none(), // leave the QoS 1 unacknowledged
+        },
+        // Second connection: no session (session_present = false).
+        (Packet::Connect(_), _) => {
+            vec![Packet::ConnAck(ConnAck::new(false, ReasonCode::Success))].into()
+        }
+        (Packet::Publish(p), _) => match p.packet_id {
+            Some(id) => vec![Packet::PubAck(PubAck::new(id))].into(),
+            None => common::Reply::none(),
+        },
+        _ => common::Reply::none(),
+    });
+
+    let cli = mqtt::AsyncClient::new(broker.uri.clone()).unwrap();
+    cli.connect(resuming_opts()).wait().expect("connect failed");
+
+    let qos1 = cli.publish(mqtt::Message::new(topic!("unresumed-1"), "a", mqtt::QOS_1));
+    let qos2 = cli.publish(mqtt::Message::new(topic!("unresumed-2"), "b", mqtt::QOS_2));
+
+    // The QoS 1 message survives the reconnect and is acknowledged.
+    qos1.wait_for(Duration::from_secs(10))
+        .expect("QoS 1 should be re-sent to a server with no session");
+
+    // The QoS 2 exchange cannot be completed, and says so.
+    let res = qos2.wait_for(Duration::from_secs(10));
+    assert!(
+        seen_qos2.load(Ordering::SeqCst),
+        "QoS 2 never reached PUBREC"
+    );
+    assert!(
+        res.is_err(),
+        "QoS 2 should have been abandoned, got {res:?}"
+    );
+
+    // No PUBREL was offered for a session the server does not have.
+    let pubrels = broker
+        .received()
+        .iter()
+        .filter(|p| matches!(p, Packet::PubRel(_)))
+        .count();
+    assert_eq!(
+        pubrels, 0,
+        "must not send PUBREL into a session-less server"
+    );
+
+    cli.disconnect(None).wait().ok();
+    broker.join();
+}
+
+/// A clean start discards whatever a previous run left in the store: it is
+/// state for a session the server has already thrown away.
+#[test]
+fn test_clean_start_clears_persistence() {
+    use mqtt::paho_mqtt_codec::{ConnAck, Packet, Publish, QoS, ReasonCode};
+
+    let broker = common::spawn_broker(|pkt| match pkt {
+        Packet::Connect(_) => vec![Packet::ConnAck(ConnAck::new(false, ReasonCode::Success))],
+        _ => vec![],
+    });
+
+    // A store as an earlier run would have left it: one unacknowledged QoS 1.
+    let store = common::SpyPersistence::new();
+    let mut stale = Publish::new(topic!("stale").to_string(), "old");
+    stale.qos = QoS::AtLeastOnce;
+    stale.packet_id = Some(9);
+    store.preload("s9", &Packet::Publish(stale), mqtt::MqttVersion::V5);
+    assert_eq!(store.keys(), vec!["s9".to_string()]);
+
+    let cli = mqtt::CreateOptionsBuilder::new()
+        .server_uri(broker.uri.clone())
+        .mqtt_version(mqtt::MQTT_VERSION_5)
+        .user_persistence(store.clone())
+        .create_async_client()
+        .unwrap();
+    let opts = mqtt::ConnectOptionsBuilder::new_v5()
+        .clean_start(true)
+        .finalize();
+    cli.connect(opts).wait().expect("connect failed");
+    std::thread::sleep(Duration::from_millis(200));
+
+    assert!(
+        store.keys().is_empty(),
+        "clean start left {:?} behind",
+        store.keys()
+    );
+    let republished = broker
+        .received()
+        .iter()
+        .filter(|p| matches!(p, Packet::Publish(_)))
+        .count();
+    assert_eq!(
+        republished, 0,
+        "nothing should be restored into a clean session"
+    );
+
+    cli.disconnect(None).wait().ok();
+    broker.join();
+}
+
+/// A store written by an earlier run is read back and its messages re-sent
+/// when the session resumes.
+#[test]
+fn test_persisted_messages_restored_on_connect() {
+    use mqtt::paho_mqtt_codec::{ConnAck, Packet, PubAck, Publish, QoS, ReasonCode};
+
+    let broker = common::spawn_broker(|pkt| match pkt {
+        Packet::Connect(_) => vec![Packet::ConnAck(ConnAck::new(true, ReasonCode::Success))],
+        Packet::Publish(p) => match p.packet_id {
+            Some(id) => vec![Packet::PubAck(PubAck::new(id))],
+            None => vec![],
+        },
+        Packet::PubRel(r) => vec![Packet::PubComp(PubAck::new(r.packet_id))],
+        _ => vec![],
+    });
+
+    // One message never acknowledged, and one already PUBREC'd.
+    let store = common::SpyPersistence::new();
+    let mut unacked = Publish::new(topic!("restored").to_string(), "a");
+    unacked.qos = QoS::AtLeastOnce;
+    unacked.packet_id = Some(4);
+    store.preload("s4", &Packet::Publish(unacked), mqtt::MqttVersion::V5);
+    store.preload("s5", &Packet::PubRel(PubAck::new(5)), mqtt::MqttVersion::V5);
+
+    let cli = mqtt::CreateOptionsBuilder::new()
+        .server_uri(broker.uri.clone())
+        .mqtt_version(mqtt::MQTT_VERSION_5)
+        .user_persistence(store.clone())
+        .create_async_client()
+        .unwrap();
+    cli.connect(resuming_opts()).wait().expect("connect failed");
+
+    let done = broker.wait_until(Duration::from_secs(5), |pkts| {
+        pkts.iter().any(|p| matches!(p, Packet::Publish(_)))
+            && pkts.iter().any(|p| matches!(p, Packet::PubRel(_)))
+    });
+    assert!(
+        done,
+        "restored messages were not re-sent: {:?}",
+        broker.received()
+    );
+
+    // The PUBLISH goes out as a duplicate; the PUBREC'd one only as a PUBREL.
+    let publishes: Vec<_> = broker
+        .received()
+        .into_iter()
+        .filter_map(|p| match p {
+            Packet::Publish(p) => Some(p),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(publishes.len(), 1);
+    assert!(publishes[0].dup, "a restored message is a re-send");
+    assert_eq!(publishes[0].packet_id, Some(4));
+
+    // Both complete, so the store empties.
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(store.keys().is_empty(), "left {:?}", store.keys());
+
+    cli.disconnect(None).wait().ok();
+    broker.join();
+}
+
+/////////////////////////////////////////////////////////////////////////////
 // Reconnect
 /////////////////////////////////////////////////////////////////////////////
 

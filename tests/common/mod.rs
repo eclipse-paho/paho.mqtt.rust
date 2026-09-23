@@ -25,7 +25,117 @@ use paho_mqtt::{
     paho_mqtt_codec::{Packet, RawPacket},
 };
 
-/// A broker that serves exactly one connection from a handler closure.
+/// What a handler wants done in response to one packet.
+pub struct Reply {
+    /// Packets to send back, in order.
+    pub packets: Vec<Packet>,
+    /// Drop the connection once they have gone out — how a test provokes a
+    /// reconnect.
+    pub close: bool,
+}
+
+impl Reply {
+    /// Send nothing and keep the connection.
+    pub fn none() -> Self {
+        Self {
+            packets: Vec::new(),
+            close: false,
+        }
+    }
+
+    /// Send these packets, then drop the connection.
+    pub fn close_after(packets: Vec<Packet>) -> Self {
+        Self {
+            packets,
+            close: true,
+        }
+    }
+}
+
+impl From<Vec<Packet>> for Reply {
+    fn from(packets: Vec<Packet>) -> Self {
+        Self {
+            packets,
+            close: false,
+        }
+    }
+}
+
+/// A persistence store the test can look inside.
+///
+/// Every clone shares one map, so a test can watch what the client writes
+/// while the client owns its own handle to the same store.
+#[derive(Clone, Default)]
+pub struct SpyPersistence(Arc<Mutex<std::collections::HashMap<String, Vec<u8>>>>);
+
+impl SpyPersistence {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The keys currently held, sorted.
+    pub fn keys(&self) -> Vec<String> {
+        let mut k: Vec<_> = self.0.lock().unwrap().keys().cloned().collect();
+        k.sort();
+        k
+    }
+
+    /// Decodes the packet stored under `key`, for the given version.
+    pub fn packet(&self, key: &str, ver: MqttVersion) -> Option<Packet> {
+        let data = self.0.lock().unwrap().get(key).cloned()?;
+        let mut buf = BytesMut::from(data.as_slice());
+        let raw = RawPacket::decode(&mut buf).ok()??;
+        Packet::from_raw(raw, ver).ok()
+    }
+
+    /// Writes an entry directly, to set up a store as a previous run of the
+    /// program would have left it.
+    pub fn preload(&self, key: &str, packet: &Packet, ver: MqttVersion) {
+        let mut buf = BytesMut::new();
+        packet.encode(&mut buf, ver).unwrap();
+        self.0.lock().unwrap().insert(key.to_string(), buf.to_vec());
+    }
+}
+
+impl paho_mqtt::ClientPersistence for SpyPersistence {
+    fn open(&mut self, _client_id: &str, _server_uri: &str) -> paho_mqtt::Result<()> {
+        Ok(())
+    }
+    fn close(&mut self) -> paho_mqtt::Result<()> {
+        Ok(())
+    }
+    fn put(&mut self, key: &str, buffers: Vec<&[u8]>) -> paho_mqtt::Result<()> {
+        self.0
+            .lock()
+            .unwrap()
+            .insert(key.to_string(), buffers.concat());
+        Ok(())
+    }
+    fn get(&mut self, key: &str) -> paho_mqtt::Result<Vec<u8>> {
+        self.0
+            .lock()
+            .unwrap()
+            .get(key)
+            .cloned()
+            .ok_or(paho_mqtt::Error::General("key not found"))
+    }
+    fn remove(&mut self, key: &str) -> paho_mqtt::Result<()> {
+        self.0.lock().unwrap().remove(key);
+        Ok(())
+    }
+    fn keys(&mut self) -> paho_mqtt::Result<Vec<String>> {
+        Ok(self.0.lock().unwrap().keys().cloned().collect())
+    }
+    fn clear(&mut self) -> paho_mqtt::Result<()> {
+        self.0.lock().unwrap().clear();
+        Ok(())
+    }
+    fn contains_key(&mut self, key: &str) -> bool {
+        self.0.lock().unwrap().contains_key(key)
+    }
+}
+
+/// A broker that serves one or more connections from a handler closure.
 pub struct ScriptedBroker {
     /// URI to hand to `AsyncClient::new`.
     pub uri: String,
@@ -77,53 +187,70 @@ pub fn spawn_broker<F>(mut handler: F) -> ScriptedBroker
 where
     F: FnMut(&Packet) -> Vec<Packet> + Send + 'static,
 {
+    spawn_broker_seq(1, move |pkt, _| Reply::from(handler(pkt)))
+}
+
+/// Starts a broker that serves up to `max_conns` connections in turn.
+///
+/// The handler additionally receives the zero-based number of the connection
+/// the packet arrived on, so a test can answer the first connection
+/// differently from the reconnect that follows it — which is how session
+/// resumption gets under test.
+pub fn spawn_broker_seq<F>(max_conns: usize, mut handler: F) -> ScriptedBroker
+where
+    F: FnMut(&Packet, usize) -> Reply + Send + 'static,
+{
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let uri = format!("tcp://{}", listener.local_addr().unwrap());
     let received = Arc::new(Mutex::new(Vec::new()));
     let recorded = Arc::clone(&received);
 
     let handle = std::thread::spawn(move || {
-        let Ok((mut sock, _)) = listener.accept() else {
-            return;
-        };
-        sock.set_read_timeout(Some(Duration::from_secs(30)))
-            .unwrap();
-        let mut buf = BytesMut::with_capacity(1024);
-        let mut tmp = [0u8; 1024];
-        // Until CONNECT names a version, decode as v5; CONNECT is
-        // self-describing, so this only has to be a placeholder.
-        let mut ver = MqttVersion::V5;
-
-        loop {
-            let n = match sock.read(&mut tmp) {
-                Ok(0) | Err(_) => return,
-                Ok(n) => n,
+        for conn in 0..max_conns {
+            let Ok((mut sock, _)) = listener.accept() else {
+                return;
             };
-            buf.extend_from_slice(&tmp[..n]);
+            sock.set_read_timeout(Some(Duration::from_secs(30)))
+                .unwrap();
+            let mut buf = BytesMut::with_capacity(1024);
+            let mut tmp = [0u8; 1024];
+            // Until CONNECT names a version, decode as v5; CONNECT is
+            // self-describing, so this only has to be a placeholder.
+            let mut ver = MqttVersion::V5;
 
-            while let Some(raw) = match RawPacket::decode(&mut buf) {
-                Ok(r) => r,
-                Err(_) => return,
-            } {
-                let Ok(packet) = Packet::from_raw(raw, ver) else {
-                    return;
+            'conn: loop {
+                let n = match sock.read(&mut tmp) {
+                    Ok(0) | Err(_) => break 'conn,
+                    Ok(n) => n,
                 };
-                if let Packet::Connect(c) = &packet {
-                    ver = c.version;
-                }
-                let is_disconnect = matches!(packet, Packet::Disconnect(_));
-                recorded.lock().unwrap().push(packet.clone());
+                buf.extend_from_slice(&tmp[..n]);
 
-                for reply in handler(&packet) {
-                    let mut out = BytesMut::new();
-                    if reply.encode(&mut out, ver).is_err() || sock.write_all(&out).is_err() {
+                while let Some(raw) = match RawPacket::decode(&mut buf) {
+                    Ok(r) => r,
+                    Err(_) => return,
+                } {
+                    let Ok(packet) = Packet::from_raw(raw, ver) else {
                         return;
+                    };
+                    if let Packet::Connect(c) = &packet {
+                        ver = c.version;
+                    }
+                    let is_disconnect = matches!(packet, Packet::Disconnect(_));
+                    recorded.lock().unwrap().push(packet.clone());
+
+                    let reply = handler(&packet, conn);
+                    for pkt in reply.packets {
+                        let mut out = BytesMut::new();
+                        if pkt.encode(&mut out, ver).is_err() || sock.write_all(&out).is_err() {
+                            break 'conn;
+                        }
+                    }
+                    if reply.close || is_disconnect {
+                        break 'conn;
                     }
                 }
-                if is_disconnect {
-                    return;
-                }
             }
+            drop(sock);
         }
     });
 
