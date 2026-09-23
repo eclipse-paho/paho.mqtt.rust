@@ -781,6 +781,49 @@ fn test_ack_error_codes_policy() {
 }
 
 /////////////////////////////////////////////////////////////////////////////
+// Client identifier
+/////////////////////////////////////////////////////////////////////////////
+
+/// The configured client identifier is what goes out in the CONNECT packet.
+#[test]
+fn test_connect_uses_configured_client_id() {
+    use mqtt::paho_mqtt_codec::{ConnAck, Packet, ReasonCode};
+
+    let broker = common::spawn_broker(|pkt| match pkt {
+        Packet::Connect(_) => vec![Packet::ConnAck(ConnAck::new(false, ReasonCode::Success))],
+        _ => vec![],
+    });
+
+    let cli = mqtt::CreateOptionsBuilder::new()
+        .server_uri(broker.uri.clone())
+        .client_id("paho-rust-v2-id-test")
+        .create_async_client()
+        .unwrap();
+    assert_eq!(cli.client_id(), "paho-rust-v2-id-test");
+
+    cli.connect(None).wait().expect("connect failed");
+
+    let connects: Vec<_> = broker
+        .received()
+        .into_iter()
+        .filter_map(|p| match p {
+            Packet::Connect(c) => Some(c),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(connects.len(), 1);
+    assert_eq!(
+        connects[0].client_id, "paho-rust-v2-id-test",
+        "the configured identifier must reach the broker"
+    );
+    // No identifier was assigned, so the configured one still stands.
+    assert_eq!(cli.client_id(), "paho-rust-v2-id-test");
+
+    cli.disconnect(None).wait().ok();
+    broker.join();
+}
+
+/////////////////////////////////////////////////////////////////////////////
 // MQTT v5 CONNACK negotiation
 /////////////////////////////////////////////////////////////////////////////
 

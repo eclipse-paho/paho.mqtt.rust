@@ -1354,19 +1354,14 @@ mod tests {
         assert!(cli.is_ok(), "Error creating async client");
     }
 
+    // A client built from options carries the identifier it was given.
+    // Whether that identifier reaches the broker is a question for
+    // `test_connect_uses_configured_client_id` in tests/integration.rs.
     #[test]
     fn test_with_client_id() {
         let options = CreateOptionsBuilder::new().client_id("test1").finalize();
-        let client = AsyncClient::new(options);
-        assert!(
-            client.is_ok(),
-            "Error in creating async client with client_id"
-        );
-        let tok = client.unwrap().connect(None);
-        match tok.wait() {
-            Ok(_) => (),
-            Err(e) => println!("(Error) {}", e),
-        }
+        let cli = AsyncClient::new(options).expect("creating a client with a client_id");
+        assert_eq!(cli.client_id(), "test1");
     }
 
     // Test immutable user data without any lock
