@@ -40,6 +40,30 @@ are required. These are detailed in the
 
 
 
+## Building and testing
+
+The repository holds three crates: `paho-mqtt` (the client), `paho-mqtt-codec`
+(the MQTT packet codec, usable on its own), and `paho-mqtt-sys` (bindings to
+the Paho **C** library, used by the 1.x client and maintained for its users).
+Version 2 of the client is pure Rust and needs no C toolchain.
+
+```bash
+cargo build
+cargo test                                             # unit tests; no broker needed
+cargo fmt --all                                        # stable toolchain
+cargo clippy --no-deps --all-targets -- -D warnings
+```
+
+`./buildtst.sh` runs what CI runs — the feature matrix on stable and the MSRV,
+clippy, docs, the codec's `no_std` build, and the benchmark compile. Add
+`--integration`, `--fuzz`, or `--bench` for the slower checks.
+
+The integration tests need a Mosquitto broker on localhost; the configuration
+is given at the top of `tests/integration.rs`. Please include tests with a
+change: unit tests in the module for anything self-contained, and an
+integration test where the behaviour involves a broker. `tests/common/` has
+scripted servers for cases a real broker will not produce on demand.
+
 ## Developer resources:
 
 

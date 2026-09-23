@@ -12,9 +12,12 @@ authors = ["Frank Pagliughi <fpagliughi@mindspring.com>"]
 homepage = "https://github.com/eclipse/paho.mqtt.rust"
 repository = "https://github.com/eclipse/paho.mqtt.rust"
 keywords = [ "MQTT", "IoT", "Paho", "messaging" ]
+categories = [ "network-programming", "asynchronous" ]
 license = "EPL-2.0"
+readme = "README.md"
 description = """
-The Eclipse Paho MQTT Rust client library.
+The Eclipse Paho MQTT Rust client library. A pure-Rust MQTT v5, v3.1.1, and
+v3.1 client, with no dependency on a C library.
 """
 
 [features]

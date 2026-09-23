@@ -7,7 +7,9 @@ authors = ["Frank Pagliughi <fpagliughi@mindspring.com>"]
 homepage = "https://github.com/eclipse/paho.mqtt.rust"
 repository = "https://github.com/eclipse/paho.mqtt.rust"
 keywords = ["MQTT", "IoT", "Paho", "messaging", "codec"]
+categories = [ "network-programming", "encoding", "no-std" ]
 license = "EPL-2.0"
+readme = "README.md"
 description = "Pure-Rust, no_std MQTT v3.1, v3.1.1, and v5 packet encoder/decoder for clients, brokers, and tools."
 
 [features]

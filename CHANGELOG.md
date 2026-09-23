@@ -9,7 +9,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased] - v2.0.0
 
-Version 2.0 is a rewrite of the library in pure Rust. The dependency on the Paho C library, and the `paho-mqtt-sys` FFI crate, are gone; the MQTT protocol is implemented by a new, separately published codec crate, `paho-mqtt-codec`, which has its own [CHANGELOG](paho-mqtt-codec/CHANGELOG.md). The public API is kept as close to v1.x as the rewrite allows; the items marked **[Breaking]** below are the places application code may need to change.
+Version 2.0 is a rewrite of the library in pure Rust. It no longer depends on the Paho C library or on the `paho-mqtt-sys` FFI crate; the MQTT protocol is implemented by a new, separately published codec crate, `paho-mqtt-codec`, which has its own [CHANGELOG](paho-mqtt-codec/CHANGELOG.md). (`paho-mqtt-sys` itself continues to be maintained and released for v1.x users.) The public API is kept as close to v1.x as the rewrite allows; the items marked **[Breaking]** below are the places application code may need to change.
 
 ### Architecture
 
@@ -81,7 +81,8 @@ Version 2.0 is a rewrite of the library in pure Rust. The dependency on the Paho
 
 - `paho-mqtt-codec` has Criterion benchmarks (`cargo bench -p paho-mqtt-codec`) and two `cargo-fuzz` targets; CI runs the benchmarks' compile and a short fuzz pass on every change, and builds the codec for a bare-metal `no_std` target.
 - `buildtst.sh` mirrors the CI matrix (feature sets × stable/MSRV, clippy, docs, no_std, benches) with `--integration`, `--fuzz`, and `--bench` options.
-- Integration tests (`tests/integration.rs`) run against a local Mosquitto on both runtimes, including WebSocket and v3.1.
+- Integration tests run against a local Mosquitto on both runtimes, including WebSocket, Unix sockets, and v3.1. Behaviour a stock broker will not produce — a refused subscription, an imposed keep-alive, enhanced authentication, a session it declines to resume, a TLS certificate naming the wrong host, an HTTP proxy — is tested against scripted servers built on `paho-mqtt-codec` (`tests/common/`). The TLS tests generate their own certificates, so no broker TLS configuration is needed and none of the suite is `#[ignore]`d.
+- `README.md` is rewritten for v2, and its code examples are compiled by `tests/readme.rs` so they cannot fall out of date.
 
 ## [v0.14.0](https://github.com/eclipse/paho.mqtt.rust/compare/v0.13.4..v0.14.0) - (2026-03-25)
 

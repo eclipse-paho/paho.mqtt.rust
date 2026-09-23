@@ -19,25 +19,125 @@
  *    Frank Pagliughi - initial implementation and documentation
  *******************************************************************************/
 
-//! This is the Eclipse Paho MQTT client library for the Rust language.
+//! The [Eclipse Paho](http://eclipse.org/paho) MQTT client library for Rust.
+//!
+//! A pure-Rust MQTT v5 / v3.1.1 / v3.1 client: no C library, no build-time
+//! toolchain beyond Cargo. It speaks TCP, TLS, WebSocket, and Unix-domain
+//! sockets, and runs its protocol on either [tokio] or [smol] without
+//! changing anything an application sees.
+//!
+//! [tokio]: https://tokio.rs
+//! [smol]: https://github.com/smol-rs/smol
+//!
+//! # Choosing an API
+//!
+//! Two clients share one implementation:
+//!
+//! * [`AsyncClient`] returns a [`Token<T>`](Token) for every operation.
+//!   Tokens are futures, so `.await` them; they can also be waited on from
+//!   a thread with [`Token::wait`], which is what the token/wait style of
+//!   the v1.x API did.
+//! * [`Client`] wraps `AsyncClient` and blocks on every call, for programs
+//!   with no async runtime of their own.
+//!
+//! ```no_run
+//! use paho_mqtt as mqtt;
+//!
+//! # fn main() -> mqtt::Result<()> {
+//! let cli = mqtt::Client::new("mqtt://localhost:1883")?;
+//! cli.connect(None)?;
+//! cli.publish(mqtt::Message::new("test", "Hello world!", mqtt::QOS_1))?;
+//! cli.disconnect(None)?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! # Tokens start immediately
+//!
+//! Unlike most Rust futures, a [`Token`] is not lazy. The operation begins
+//! when the method is called, not when the token is polled — so a token may
+//! be dropped, awaited later, or handed to another thread, and the publish
+//! still happens. A token may also be cloned, and every clone resolves with
+//! the same result.
+//!
+//! ```no_run
+//! # use paho_mqtt as mqtt;
+//! # fn f(cli: &mqtt::AsyncClient, msg: mqtt::Message) -> mqtt::Result<()> {
+//! let tok = cli.publish(msg);   // already on its way
+//! // ... other work ...
+//! tok.wait()?;                  // or `tok.await?`
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! # Transports
+//!
+//! The URI scheme picks the transport, and a scheme the build does not
+//! support is refused rather than quietly downgraded:
+//!
+//! | Scheme | Transport | Feature |
+//! |---|---|---|
+//! | `mqtt://`, `tcp://` | TCP | — |
+//! | `mqtts://`, `ssl://`, `tls://` | TLS | `tls`, `openssl`, or `smol-tls` |
+//! | `ws://` | WebSocket | `websocket` or `smol-websocket` |
+//! | `wss://` | WebSocket over TLS | the two above together |
+//! | `unix://` | Unix-domain socket (\*nix) | — |
+//!
+//! TLS is configured with [`TlsOptions`]; `ws://` and `wss://` can be
+//! tunnelled through an HTTP proxy set on [`ConnectOptions`].
+//!
+//! # Runtimes
+//!
+//! The protocol runs on an internal async task. Which executor drives it is
+//! a build-time choice — the `tokio` feature (default) or `smol` — and
+//! [`RuntimeMode`] decides whether that task joins the application's
+//! runtime or one the library owns. No public API is an `async fn`, so the
+//! crate can be used from any executor whichever backend is compiled in.
+//!
+//! When [`RuntimeMode::Auto`] borrows the application's runtime, *blocking*
+//! on a token from that same runtime can stall the thread the protocol
+//! needs; inside async code, await the token instead. [`Client`], whose
+//! whole API blocks, uses the library's own runtime for this reason.
 //!
 //! # Crate Features
 //!
-//! * **tokio** *(default)*
-//!   Enables the Tokio-based internal async runtime for pure-Rust MQTT I/O.
+//! Default: `tokio`.
 //!
-//! * **tls**
-//!   Enables TLS/SSL transport via [`rustls`](https://docs.rs/rustls) and
-//!   [`tokio-rustls`](https://docs.rs/tokio-rustls). Adds support for
-//!   `ssl://`, `mqtts://`, and `tls://` URIs. Implies the `tokio` feature.
+//! | Feature | Description |
+//! |---|---|
+//! | `tokio` *(default)* | Tokio-based internal runtime |
+//! | `tls` | TLS via [rustls](https://docs.rs/rustls); implies `tokio` |
+//! | `openssl` | TLS via the system OpenSSL; implies `tokio` |
+//! | `openssl-vendored` | As `openssl`, building OpenSSL from source |
+//! | `websocket` | WebSocket transport; implies `tokio` |
+//! | `smol` | Smol-based internal runtime |
+//! | `smol-tls` | TLS via rustls; implies `smol` |
+//! | `smol-websocket` | WebSocket transport; implies `smol` |
+//! | `serde` | `Serialize`/`Deserialize` for message and property types |
 //!
-//! * **serde**
-//!   Serialization support for messages.
+//! With both `tokio` and `smol` enabled, tokio wins. OpenSSL is tokio-only.
+//!
+//! # MQTT v5
+//!
+//! Version 5 is the default protocol level. [`Properties`] travel on every
+//! packet that allows them, [`ConnectResponse`] reports everything the
+//! broker advertised in its CONNACK, and [`ReasonCode`] carries the outcome
+//! of each operation. The [`auth`] module covers enhanced authentication.
+//! For an earlier level, use [`ConnectOptionsBuilder::new_v3`] or set the
+//! version explicitly.
+//!
+//! # Persistence
+//!
+//! In-flight QoS 1 and 2 messages survive a dropped connection on their
+//! own: the client carries them across the reconnect. A
+//! [`ClientPersistence`] store — [`FilePersistence`], [`MemPersistence`],
+//! or your own — is what carries them across a restart of the program.
 //!
 //! # Logging
 //!
-//! The library uses the standard Rust log facility with the target/module
-//! "paho_mqtt".
+//! The library logs through the [`log`](https://docs.rs/log) crate under
+//! the target `paho_mqtt`. Since the protocol is implemented here, `trace`
+//! shows everything on the wire.
 
 #![deny(missing_docs)]
 
