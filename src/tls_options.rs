@@ -62,17 +62,33 @@ pub struct TlsOptions {
     pub enable_server_cert_auth: bool,
     /// The TLS version to use.
     pub version: TlsVersion,
-    /// Whether to carry out post-connect checks, including that a certificate
-    /// matches the given host name.
+    /// Whether the broker's certificate must name the host connected to.
+    ///
+    /// Independent of [`enable_server_cert_auth`](Self::enable_server_cert_auth),
+    /// which decides whether the certificate chain is checked at all. With
+    /// the chain checked and this off, the certificate must still come from
+    /// a trusted CA and be in date, but may name some other host — for a
+    /// broker reached by IP address, through a tunnel, or on a test rig.
+    ///
+    /// Defaults to `true`. Turning it off is a real weakening: any host
+    /// holding any certificate from a trusted CA is then accepted.
     pub verify: bool,
     /// The path to the CA certificates, if specified.
     pub ca_path: PathBuf,
     /// The TLS error callback.
     pub on_tls_error: Option<Arc<TlsErrorCallback>>,
 
-    // TODO: PSK callback and context
-    /// Don't load default TLS CA. Should be used together with PSK to make
-    /// sure regular servers with certificate in place is not accepted.
+    /// Don't load the default TLS CA certificates.
+    ///
+    /// Leaves the trust store holding only what
+    /// [`trust_store`](Self::trust_store) and [`ca_path`](Self::ca_path)
+    /// put there, so a broker presenting a certificate from a public CA is
+    /// not accepted just because the system trusts that CA.
+    //
+    // Pre-shared keys (the v1.x `ssl_psk` callback) are not supported.
+    // rustls, the default backend, does not expose external PSKs at all;
+    // implementing them for OpenSSL alone would mean an option that silently
+    // does nothing on the backend most builds use. Deferred past 2.0.
     pub disable_default_trust_store: bool,
     /// The list of ALPN protocols available to be negotiated.
     pub protos: Vec<String>,
@@ -189,8 +205,10 @@ impl TlsOptionsBuilder {
         self
     }
 
-    /// Whether to carry out post-connect checks, including that a
-    /// certificate matches the given host name.
+    /// Whether the broker's certificate must name the host connected to.
+    ///
+    /// See [`TlsOptions::verify`]; defaults to `true`, and turning it off
+    /// keeps chain verification but drops the identity check.
     pub fn verify(&mut self, on: bool) -> &mut Self {
         self.0.verify = on;
         self
@@ -215,10 +233,11 @@ impl TlsOptionsBuilder {
         self
     }
 
-    /// Don't load the default TLS CA.
+    /// Don't load the default TLS CA certificates.
     ///
-    /// This should be used together with PSK to make sure
-    /// regular servers with certificate in place is not accepted.
+    /// Use this when the broker's certificate comes from a private CA given
+    /// with [`trust_store`](Self::trust_store) or [`ca_path`](Self::ca_path),
+    /// so that a certificate from any public CA is not accepted as well.
     pub fn disable_default_trust_store(&mut self, disable: bool) -> &mut Self {
         self.0.disable_default_trust_store = disable;
         self

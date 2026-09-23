@@ -176,8 +176,8 @@ impl AsyncClient {
 
         #[cfg(all(feature = "smol", not(feature = "tokio")))]
         let (rt, rt_ownership) = {
-            use crate::runtime::{RuntimeHandle, SmolOwnership, get_or_create_shared_executor};
-            let executor = get_or_create_shared_executor();
+            use crate::runtime::{RuntimeHandle, SmolOwnership, resolve_executor};
+            let executor = resolve_executor(&opts.runtime_mode);
             let rt = RuntimeHandle::spawn(&executor, buf_cfg);
             (rt, SmolOwnership::Shared(executor))
         };
@@ -312,6 +312,13 @@ impl AsyncClient {
             tls: opts.tls,
             #[cfg(any(feature = "websocket", feature = "smol-websocket"))]
             http_headers: opts.http_headers,
+            #[cfg(any(feature = "websocket", feature = "smol-websocket"))]
+            http_proxy: opts.http_proxy,
+            #[cfg(any(
+                all(feature = "websocket", any(feature = "tls", feature = "openssl")),
+                all(feature = "smol-websocket", feature = "smol-tls")
+            ))]
+            https_proxy: opts.https_proxy,
             auto_reconnect: opts.auto_reconnect,
             min_retry_interval: opts.min_retry_interval,
             max_retry_interval: opts.max_retry_interval,

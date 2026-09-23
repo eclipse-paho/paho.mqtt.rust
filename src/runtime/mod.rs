@@ -47,6 +47,9 @@ pub(crate) mod session;
 pub(crate) mod tls_config;
 
 #[cfg(any(feature = "websocket", feature = "smol-websocket"))]
+pub(crate) mod proxy;
+
+#[cfg(any(feature = "websocket", feature = "smol-websocket"))]
 pub(crate) mod ws_util;
 
 #[cfg(feature = "tokio")]
@@ -71,7 +74,7 @@ pub(crate) use session::RuntimeHandle;
 pub(crate) use tokio_rt::resolve_runtime;
 
 #[cfg(all(feature = "smol", not(feature = "tokio")))]
-pub(crate) use smol_rt::{SmolOwnership, get_or_create_shared_executor};
+pub(crate) use smol_rt::{SmolOwnership, resolve_executor};
 
 /// Unified runtime-ownership type for the active backend.
 #[cfg(feature = "tokio")]

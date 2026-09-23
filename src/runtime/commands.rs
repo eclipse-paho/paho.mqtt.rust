@@ -155,6 +155,15 @@ pub(crate) struct ConnectParams {
     /// HTTP headers included in the WebSocket upgrade request.
     #[cfg(any(feature = "websocket", feature = "smol-websocket"))]
     pub http_headers: HashMap<String, String>,
+    /// Proxy to tunnel a `ws://` connection through; empty for a direct one.
+    #[cfg(any(feature = "websocket", feature = "smol-websocket"))]
+    pub http_proxy: String,
+    /// Proxy to tunnel a `wss://` connection through; empty for a direct one.
+    #[cfg(any(
+        all(feature = "websocket", any(feature = "tls", feature = "openssl")),
+        all(feature = "smol-websocket", feature = "smol-tls")
+    ))]
+    pub https_proxy: String,
     /// Whether the event loop should automatically reconnect on session loss.
     pub auto_reconnect: bool,
     /// Minimum backoff interval between reconnect attempts.
@@ -415,6 +424,13 @@ mod tests {
             tls: None,
             #[cfg(any(feature = "websocket", feature = "smol-websocket"))]
             http_headers: HashMap::new(),
+            #[cfg(any(feature = "websocket", feature = "smol-websocket"))]
+            http_proxy: String::new(),
+            #[cfg(any(
+                all(feature = "websocket", any(feature = "tls", feature = "openssl")),
+                all(feature = "smol-websocket", feature = "smol-tls")
+            ))]
+            https_proxy: String::new(),
             auto_reconnect: false,
             min_retry_interval: Duration::ZERO,
             max_retry_interval: Duration::ZERO,

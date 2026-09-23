@@ -90,19 +90,55 @@ pub(crate) enum SmolOwnership {
 /// `executor.run(future::pending())` indefinitely.
 static SHARED_EXECUTOR: OnceLock<Arc<smol::Executor<'static>>> = OnceLock::new();
 
-/// Returns the process-wide shared executor, creating it on first call.
-pub(crate) fn get_or_create_shared_executor() -> Arc<smol::Executor<'static>> {
-    SHARED_EXECUTOR
+/// Returns the executor to run this client's event loop on, honouring `mode`.
+///
+/// smol has no ambient runtime to discover or borrow — an executor is just
+/// an object, and someone has to run it — so
+/// [`Auto`](crate::RuntimeMode::Auto) and
+/// [`Shared(n)`](crate::RuntimeMode::Shared) both mean the process-wide
+/// executor, with `n` deciding how many threads drive it.
+///
+/// # Panics
+///
+/// On [`ApplicationRuntime`](crate::RuntimeMode::ApplicationRuntime), which
+/// cannot be honoured here: there is no current executor to attach to. This
+/// mirrors the tokio backend, which panics when that mode is chosen with no
+/// runtime running.
+pub(crate) fn resolve_executor(
+    mode: &crate::create_options::RuntimeMode,
+) -> Arc<smol::Executor<'static>> {
+    use crate::create_options::RuntimeMode;
+
+    let threads = match mode {
+        RuntimeMode::Auto => 1,
+        RuntimeMode::Shared(n) => (*n).max(1),
+        RuntimeMode::ApplicationRuntime => panic!(
+            "RuntimeMode::ApplicationRuntime is not supported by the smol backend: \
+             smol has no ambient executor to borrow. Use RuntimeMode::Auto or Shared(n)."
+        ),
+    };
+
+    let existing = SHARED_EXECUTOR.get().is_some();
+    let ex = SHARED_EXECUTOR
         .get_or_init(|| {
             let ex = Arc::new(smol::Executor::new());
-            let ex2 = ex.clone();
-            std::thread::Builder::new()
-                .name("mqtt-smol".to_string())
-                .spawn(move || smol::block_on(ex2.run(std::future::pending::<()>())))
-                .expect("spawn mqtt-smol executor thread");
+            for i in 0..threads {
+                let ex = ex.clone();
+                std::thread::Builder::new()
+                    .name(format!("mqtt-smol-{i}"))
+                    .spawn(move || smol::block_on(ex.run(std::future::pending::<()>())))
+                    .expect("spawn mqtt-smol executor thread");
+            }
             ex
         })
-        .clone()
+        .clone();
+
+    // As with the tokio backend, the thread count is honoured only by
+    // whichever client creates the executor.
+    if existing && matches!(mode, RuntimeMode::Shared(n) if (*n).max(1) != threads) {
+        warn!("Ignoring num_threads: the shared smol executor already exists");
+    }
+    ex
 }
 
 impl RuntimeHandle {
@@ -166,6 +202,47 @@ impl Sleep for SmolSleep {
 /// Bytes read from the transport per `read_buf` call.
 const READ_CHUNK: usize = 4096;
 
+/// Opens a TCP connection to `host:port`, tunnelling through `proxy_uri` if
+/// one is configured.
+///
+/// See [`super::proxy`]; the tunnel is transparent once established, so a
+/// TLS handshake or WebSocket upgrade runs over it unchanged.
+#[cfg(feature = "smol-websocket")]
+async fn tcp_maybe_proxied(proxy_uri: &str, host: &str, port: u16) -> Result<TcpStream> {
+    use super::proxy;
+
+    if proxy_uri.is_empty() {
+        let tcp = TcpStream::connect((host, port)).await?;
+        tcp.set_nodelay(true)?;
+        return Ok(tcp);
+    }
+
+    let proxy = proxy::parse(proxy_uri)?;
+    let mut tcp = TcpStream::connect((proxy.host.as_str(), proxy.port)).await?;
+    tcp.set_nodelay(true)?;
+    tcp.write_all(&proxy::connect_request(&proxy, host, port))
+        .await?;
+    tcp.flush().await?;
+
+    let mut buf = Vec::with_capacity(256);
+    let mut tmp = [0u8; 512];
+    loop {
+        let n = tcp.read(&mut tmp).await?;
+        if n == 0 {
+            return Err(Error::General("proxy closed the connection"));
+        }
+        buf.extend_from_slice(&tmp[..n]);
+        if let Some(end) = proxy::check_response(&buf)? {
+            if end != buf.len() {
+                // Nothing should arrive before we have spoken, and the extra
+                // bytes cannot be pushed back into the socket.
+                return Err(Error::General("proxy sent data before the tunnel was open"));
+            }
+            return Ok(tcp);
+        }
+    }
+}
+
 /// The smol [`Backend`].
 pub(crate) struct SmolBackend;
 
@@ -211,8 +288,7 @@ impl Backend for SmolBackend {
             ServerAddr::Ws { host, port, path } => {
                 let url = format!("ws://{}:{}{}", host, port, path);
                 let request = build_ws_request(&url, &p.http_headers)?;
-                let tcp = TcpStream::connect((host.as_str(), *port)).await?;
-                tcp.set_nodelay(true)?;
+                let tcp = tcp_maybe_proxied(&p.http_proxy, host.as_str(), *port).await?;
                 let (ws, _) = async_tungstenite::client_async(request, tcp)
                     .await
                     .map_err(|e| Error::GeneralString(e.to_string()))?;
@@ -235,8 +311,7 @@ impl Backend for SmolBackend {
                         Error::GeneralString(format!("invalid TLS server name: {}", host))
                     })?
                     .to_owned();
-                let tcp = TcpStream::connect((host.as_str(), *port)).await?;
-                tcp.set_nodelay(true)?;
+                let tcp = tcp_maybe_proxied(&p.https_proxy, host.as_str(), *port).await?;
                 let tls_stream = connector
                     .connect(server_name, tcp)
                     .await

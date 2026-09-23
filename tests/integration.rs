@@ -21,13 +21,9 @@
 //   protocol websockets
 //   allow_anonymous true
 //
-// TLS tests (`tls_*`) are marked `#[ignore]` because they require additional
-// broker configuration (listener on 8883, server cert/key) and a local CA
-// certificate file.  Run them explicitly with:
-//
-//   cargo test --features tls tls_ -- --ignored
-//
-// or equivalently with the `openssl` feature.
+// The TLS tests need no broker configuration: they start their own TLS
+// broker with a throw-away certificate (see `tests/common`), so they run as
+// part of the normal suite with the `tls` or `smol-tls` feature.
 
 mod common;
 
@@ -39,8 +35,6 @@ const HOST: &str = "tcp://localhost:1883";
 const UNIX_HOST: &str = "unix:///tmp/mosquitto.sock";
 #[cfg(any(feature = "websocket", feature = "smol-websocket"))]
 const WS_HOST: &str = "ws://localhost:9001";
-#[cfg(any(feature = "tls", feature = "openssl"))]
-const TLS_HOST: &str = "tls://localhost:8883";
 
 const TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -1237,6 +1231,201 @@ fn test_auth_configuration_is_checked() {
         .finalize();
     assert!(cli.connect(opts).wait().is_err());
     assert!(!cli.is_connected());
+}
+
+/////////////////////////////////////////////////////////////////////////////
+// TLS certificate and host-name verification
+//
+// These run against a TLS broker started by the test, presenting a
+// certificate from a throw-away CA that names `broker.invalid` while the
+// client connects to `127.0.0.1`. The mismatch is the point: it is the only
+// way to see whether the name is being checked.
+/////////////////////////////////////////////////////////////////////////////
+
+#[cfg(any(feature = "tls", feature = "smol-tls"))]
+mod tls_verify {
+    use super::*;
+    use mqtt::paho_mqtt_codec::{ConnAck, Packet, ReasonCode};
+
+    /// Accepts any connection that gets through the handshake.
+    fn accepting(pkt: &Packet) -> Vec<Packet> {
+        match pkt {
+            Packet::Connect(_) => vec![Packet::ConnAck(ConnAck::new(false, ReasonCode::Success))],
+            _ => vec![],
+        }
+    }
+
+    fn connect_with(
+        certs: &common::TestCerts,
+        uri: &str,
+        trust: bool,
+        cert_auth: bool,
+        verify: bool,
+    ) -> mqtt::Result<mqtt::ConnectResponse> {
+        let mut builder = mqtt::TlsOptionsBuilder::new();
+        if trust {
+            builder.trust_store(certs.ca_path());
+        }
+        let tls = builder
+            .enable_server_cert_auth(cert_auth)
+            .verify(verify)
+            .finalize();
+        let opts = mqtt::ConnectOptionsBuilder::new()
+            .tls_options(tls)
+            .connect_timeout(Duration::from_secs(5))
+            .finalize();
+        mqtt::AsyncClient::new(uri.to_string())
+            .unwrap()
+            .connect(opts)
+            .wait_for(Duration::from_secs(10))
+    }
+
+    /// With verification on, a certificate that does not name the host is
+    /// refused — the default, and the safe one.
+    #[test]
+    fn test_tls_hostname_mismatch_refused_by_default() {
+        let certs = common::TestCerts::new("broker.invalid");
+        let broker = common::spawn_tls_broker(&certs, accepting);
+        let res = connect_with(&certs, &broker.uri, true, true, true);
+        assert!(
+            matches!(res, Err(mqtt::Error::Tls(_))),
+            "a mismatched name must fail the handshake, got {res:?}"
+        );
+    }
+
+    /// With `verify(false)` the chain is still checked but the name is not,
+    /// so the same connection succeeds.
+    #[test]
+    fn test_tls_hostname_check_can_be_waived() {
+        let certs = common::TestCerts::new("broker.invalid");
+        let broker = common::spawn_tls_broker(&certs, accepting);
+        connect_with(&certs, &broker.uri, true, true, false)
+            .expect("waiving the name check should let this connect");
+        broker.join();
+    }
+
+    /// Waiving the name check must not quietly waive the chain check: a
+    /// certificate from a CA we do not trust is still refused.
+    #[test]
+    fn test_tls_untrusted_ca_refused_even_without_hostname_check() {
+        let certs = common::TestCerts::new("broker.invalid");
+        let broker = common::spawn_tls_broker(&certs, accepting);
+        // No trust store, so the system roots are used and this CA is unknown.
+        let res = connect_with(&certs, &broker.uri, false, true, false);
+        assert!(
+            matches!(res, Err(mqtt::Error::Tls(_))),
+            "an untrusted CA must still fail, got {res:?}"
+        );
+    }
+
+    /// Turning off certificate authentication altogether accepts anything,
+    /// name and chain alike.
+    #[test]
+    fn test_tls_no_cert_auth_accepts_anything() {
+        let certs = common::TestCerts::new("broker.invalid");
+        let broker = common::spawn_tls_broker(&certs, accepting);
+        connect_with(&certs, &broker.uri, false, false, true)
+            .expect("with cert auth off nothing is checked");
+        broker.join();
+    }
+}
+
+/////////////////////////////////////////////////////////////////////////////
+// HTTP proxy tunnelling (ws://)
+/////////////////////////////////////////////////////////////////////////////
+
+/// A `ws://` connection can be made through an HTTP proxy, which the client
+/// reaches with a `CONNECT` request before speaking MQTT.
+#[cfg(any(feature = "websocket", feature = "smol-websocket"))]
+#[test]
+fn test_ws_through_http_proxy() {
+    let target = WS_HOST.trim_start_matches("ws://").to_string();
+    let proxy = common::spawn_proxy("200 Connection established", Some(target));
+
+    let opts = mqtt::ConnectOptionsBuilder::new_ws()
+        .http_proxy(proxy.uri.clone())
+        .connect_timeout(Duration::from_secs(5))
+        .finalize();
+    let cli = mqtt::AsyncClient::new(WS_HOST).unwrap();
+    cli.connect(opts)
+        .wait_for(Duration::from_secs(10))
+        .expect("connect through the proxy failed");
+    assert!(cli.is_connected());
+
+    // Round-trip a message to prove the tunnel carries MQTT, not just bytes.
+    let rx = cli.start_consuming();
+    cli.subscribe(topic!("proxy"), mqtt::QOS_1)
+        .wait()
+        .expect("subscribe failed");
+    cli.publish(mqtt::Message::new(topic!("proxy"), "through", mqtt::QOS_1))
+        .wait()
+        .expect("publish failed");
+    let msg = rx
+        .recv_timeout(TIMEOUT)
+        .expect("no message")
+        .expect("connection lost");
+    assert_eq!(msg.payload_str(), "through");
+
+    // The proxy was actually asked for a tunnel to the broker.
+    let reqs = proxy.requests();
+    assert_eq!(reqs.len(), 1, "expected one CONNECT, got {reqs:?}");
+    assert!(
+        reqs[0].starts_with(&format!("CONNECT {}", WS_HOST.trim_start_matches("ws://"))),
+        "unexpected request: {}",
+        reqs[0]
+    );
+
+    cli.disconnect(None).wait().ok();
+}
+
+/// A proxy that refuses says why: its status line reaches the caller rather
+/// than a bare connection error.
+#[cfg(any(feature = "websocket", feature = "smol-websocket"))]
+#[test]
+fn test_ws_proxy_refusal_is_reported() {
+    let proxy = common::spawn_proxy("407 Proxy Authentication Required", None);
+
+    let opts = mqtt::ConnectOptionsBuilder::new_ws()
+        .http_proxy(proxy.uri.clone())
+        .connect_timeout(Duration::from_secs(5))
+        .finalize();
+    let cli = mqtt::AsyncClient::new(WS_HOST).unwrap();
+    let res = cli.connect(opts).wait_for(Duration::from_secs(10));
+
+    let msg = match res {
+        Err(e) => e.to_string(),
+        Ok(_) => panic!("connect should have failed"),
+    };
+    assert!(msg.contains("407"), "error should name the refusal: {msg}");
+    assert!(!cli.is_connected());
+}
+
+/// Credentials in the proxy URI become a `Proxy-Authorization` header.
+#[cfg(any(feature = "websocket", feature = "smol-websocket"))]
+#[test]
+fn test_ws_proxy_sends_credentials() {
+    let target = WS_HOST.trim_start_matches("ws://").to_string();
+    let proxy = common::spawn_proxy("200 Connection established", Some(target));
+    // Insert the credentials into the proxy's own URI.
+    let authed = proxy.uri.replace("http://", "http://user:pass@");
+
+    let opts = mqtt::ConnectOptionsBuilder::new_ws()
+        .http_proxy(authed)
+        .connect_timeout(Duration::from_secs(5))
+        .finalize();
+    let cli = mqtt::AsyncClient::new(WS_HOST).unwrap();
+    cli.connect(opts)
+        .wait_for(Duration::from_secs(10))
+        .expect("connect through the proxy failed");
+
+    let reqs = proxy.requests();
+    assert!(
+        reqs[0].contains("Proxy-Authorization: Basic dXNlcjpwYXNz\r\n"),
+        "credentials missing from: {}",
+        reqs[0]
+    );
+
+    cli.disconnect(None).wait().ok();
 }
 
 /////////////////////////////////////////////////////////////////////////////
@@ -2577,31 +2766,43 @@ fn test_ws_publish_subscribe_large() {
 /////////////////////////////////////////////////////////////////////////////
 // TLS transport
 //
-// Requires Mosquitto with TLS listener on port 8883.  Set TLS_CA_FILE below
-// to the path of the CA certificate used to sign the broker's server cert.
-// Marked `#[ignore]` — run with:
-//   cargo test --features tls tls_ -- --ignored
+// Runs against a TLS broker started by the test, presenting a certificate
+// from a throw-away CA (see `common::TestCerts`), so it needs no broker
+// configuration and no certificate files checked into the repository.
 /////////////////////////////////////////////////////////////////////////////
 
-#[cfg(any(feature = "tls", feature = "openssl"))]
+#[cfg(any(feature = "tls", feature = "smol-tls"))]
 #[test]
-#[ignore]
 fn test_tls_connect_publish() {
-    // Path to the CA certificate that signed the broker's server cert.
-    // Adjust to match the local Mosquitto TLS setup.
-    const TLS_CA_FILE: &str = "/etc/mosquitto/certs/ca.crt";
+    use mqtt::paho_mqtt_codec::{ConnAck, Packet, PubAck, ReasonCode};
 
+    let certs = common::TestCerts::new("broker.invalid");
+    let broker = common::spawn_tls_broker(&certs, |pkt| match pkt {
+        Packet::Connect(_) => vec![Packet::ConnAck(ConnAck::new(false, ReasonCode::Success))],
+        Packet::Publish(p) => match p.packet_id {
+            Some(id) => vec![Packet::PubAck(PubAck::new(id))],
+            None => vec![],
+        },
+        _ => vec![],
+    });
+
+    // The certificate names `broker.invalid` but we dial 127.0.0.1, so the
+    // name check is waived; the chain is still verified against our CA.
     let tls = mqtt::TlsOptionsBuilder::new()
-        .trust_store(TLS_CA_FILE)
+        .trust_store(certs.ca_path())
         .enable_server_cert_auth(true)
+        .verify(false)
         .finalize();
-
     let conn_opts = mqtt::ConnectOptionsBuilder::new()
         .tls_options(tls)
+        .connect_timeout(Duration::from_secs(5))
         .finalize();
 
-    let cli = mqtt::AsyncClient::new(TLS_HOST).unwrap();
-    let rsp = cli.connect(conn_opts).wait().expect("tls connect failed");
+    let cli = mqtt::AsyncClient::new(broker.uri.clone()).unwrap();
+    let rsp = cli
+        .connect(conn_opts)
+        .wait_for(Duration::from_secs(10))
+        .expect("tls connect failed");
     assert!(rsp.mqtt_version == 4 || rsp.mqtt_version == 5);
     assert!(cli.is_connected());
 
@@ -2610,9 +2811,10 @@ fn test_tls_connect_publish() {
         "tls-payload",
         mqtt::QOS_1,
     ))
-    .wait()
+    .wait_for(Duration::from_secs(10))
     .expect("tls publish failed");
 
     cli.disconnect(None).wait().expect("tls disconnect failed");
     assert!(!cli.is_connected());
+    broker.join();
 }

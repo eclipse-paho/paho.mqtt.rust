@@ -88,6 +88,19 @@ pub enum RuntimeMode {
     /// or to [`ApplicationRuntime`] if you need the guarantee that no
     /// library-owned runtime is ever created.
     ///
+    /// # Blocking and the borrowed runtime
+    ///
+    /// When this mode borrows the application's runtime, the event loop runs
+    /// as one of that runtime's tasks — so a *blocking* wait made from that
+    /// same runtime can stop the thread the event loop needs. On a
+    /// `current_thread` runtime, `Token::wait()` never returns; on a small
+    /// multi-threaded one it takes a worker out of service, and enough
+    /// concurrent waits will stall it.
+    ///
+    /// Inside async code, `.await` the token rather than waiting on it, and
+    /// the question does not arise. [`Client`], whose whole
+    /// API blocks, sidesteps it by using [`Shared`] when left on `Auto`.
+    ///
     /// [`Shared`]: RuntimeMode::Shared
     /// [`ApplicationRuntime`]: RuntimeMode::ApplicationRuntime
     #[default]

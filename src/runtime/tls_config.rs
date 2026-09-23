@@ -99,6 +99,71 @@ impl rustls::client::danger::ServerCertVerifier for NoCertVerifier {
     }
 }
 
+/// A verifier that checks the certificate chain in full but tolerates a
+/// name that does not match the host connected to.
+///
+/// Used when `TlsOptions::verify` is `false` while
+/// `enable_server_cert_auth` is `true`: the certificate must still be issued
+/// by a trusted CA, be in date, and be valid for its purpose — only the
+/// identity check is waived. That is the case for a broker reached by an
+/// address its certificate does not name: an IP address, a tunnel, a test
+/// rig whose certificate says `localhost`.
+///
+/// It is a real weakening — any host holding *any* certificate from a
+/// trusted CA is accepted — so it is worth less than it looks and should be
+/// a deliberate choice.
+#[cfg(any(feature = "tls", feature = "smol-tls"))]
+#[derive(Debug)]
+struct NoHostnameVerifier(StdArc<rustls::client::WebPkiServerVerifier>);
+
+#[cfg(any(feature = "tls", feature = "smol-tls"))]
+impl rustls::client::danger::ServerCertVerifier for NoHostnameVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &rustls::pki_types::CertificateDer<'_>,
+        intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        server_name: &rustls::pki_types::ServerName<'_>,
+        ocsp_response: &[u8],
+        now: rustls::pki_types::UnixTime,
+    ) -> TlsResult<rustls::client::danger::ServerCertVerified> {
+        use rustls::CertificateError::{NotValidForName, NotValidForNameContext};
+        use rustls::Error::InvalidCertificate;
+
+        match self
+            .0
+            .verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now)
+        {
+            // The one failure this verifier exists to tolerate.
+            Err(InvalidCertificate(NotValidForName | NotValidForNameContext { .. })) => {
+                Ok(rustls::client::danger::ServerCertVerified::assertion())
+            }
+            other => other,
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> TlsResult<rustls::client::danger::HandshakeSignatureValid> {
+        self.0.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> TlsResult<rustls::client::danger::HandshakeSignatureValid> {
+        self.0.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.0.supported_verify_schemes()
+    }
+}
+
 /// Filters the ring provider's default cipher suites to those named in `spec`.
 ///
 /// `spec` is a colon- or comma-separated list of rustls suite names, e.g.
@@ -220,17 +285,33 @@ pub(crate) fn make_tls_config(tls: &crate::TlsOptions) -> Result<StdArc<rustls::
     };
 
     // ---- Config builder ----
-    let builder = rustls::ClientConfig::builder_with_provider(StdArc::new(provider))
+    let provider_arc = StdArc::new(provider);
+    let builder = rustls::ClientConfig::builder_with_provider(provider_arc.clone())
         .with_protocol_versions(versions)
         .map_err(|e| Error::GeneralString(e.to_string()))?;
 
     // ---- Certificate verification ----
-    let wants_client = if tls.enable_server_cert_auth {
-        builder.with_root_certificates(root_store)
-    } else {
-        builder
+    //
+    // Two independent switches, as in the Paho C library:
+    //   enable_server_cert_auth — check the chain at all
+    //   verify                  — check that the name matches the host
+    // Turning the first off makes the second irrelevant.
+    let wants_client = match (tls.enable_server_cert_auth, tls.verify) {
+        (false, _) => builder
             .dangerous()
-            .with_custom_certificate_verifier(StdArc::new(NoCertVerifier))
+            .with_custom_certificate_verifier(StdArc::new(NoCertVerifier)),
+        (true, true) => builder.with_root_certificates(root_store),
+        (true, false) => {
+            let inner = rustls::client::WebPkiServerVerifier::builder_with_provider(
+                StdArc::new(root_store),
+                provider_arc.clone(),
+            )
+            .build()
+            .map_err(|e| Error::GeneralString(e.to_string()))?;
+            builder
+                .dangerous()
+                .with_custom_certificate_verifier(StdArc::new(NoHostnameVerifier(inner)))
+        }
     };
 
     // ---- Client authentication ----
@@ -376,4 +457,25 @@ pub(crate) fn make_openssl_config(tls: &crate::TlsOptions) -> Result<openssl::ss
     }
 
     Ok(builder.build())
+}
+
+/// Prepares the per-connection OpenSSL state for a connection to `host`.
+///
+/// OpenSSL checks the host name separately from the chain, and only per
+/// connection, so `TlsOptions::verify` is applied here rather than on the
+/// connector: with it off the chain is still verified but a certificate
+/// naming some other host is accepted.
+#[cfg(all(feature = "openssl", not(feature = "tls")))]
+pub(crate) fn openssl_ssl_for(
+    connector: &SslConnector,
+    tls: &crate::TlsOptions,
+    host: &str,
+) -> Result<openssl::ssl::Ssl> {
+    let mut config = connector
+        .configure()
+        .map_err(|e| Error::GeneralString(e.to_string()))?;
+    config.set_verify_hostname(tls.enable_server_cert_auth && tls.verify);
+    config
+        .into_ssl(host)
+        .map_err(|e| Error::GeneralString(e.to_string()))
 }

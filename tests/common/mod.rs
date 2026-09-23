@@ -207,50 +207,12 @@ where
 
     let handle = std::thread::spawn(move || {
         for conn in 0..max_conns {
-            let Ok((mut sock, _)) = listener.accept() else {
+            let Ok((sock, _)) = listener.accept() else {
                 return;
             };
             sock.set_read_timeout(Some(Duration::from_secs(30)))
                 .unwrap();
-            let mut buf = BytesMut::with_capacity(1024);
-            let mut tmp = [0u8; 1024];
-            // Until CONNECT names a version, decode as v5; CONNECT is
-            // self-describing, so this only has to be a placeholder.
-            let mut ver = MqttVersion::V5;
-
-            'conn: loop {
-                let n = match sock.read(&mut tmp) {
-                    Ok(0) | Err(_) => break 'conn,
-                    Ok(n) => n,
-                };
-                buf.extend_from_slice(&tmp[..n]);
-
-                while let Some(raw) = match RawPacket::decode(&mut buf) {
-                    Ok(r) => r,
-                    Err(_) => return,
-                } {
-                    let Ok(packet) = Packet::from_raw(raw, ver) else {
-                        return;
-                    };
-                    if let Packet::Connect(c) = &packet {
-                        ver = c.version;
-                    }
-                    let is_disconnect = matches!(packet, Packet::Disconnect(_));
-                    recorded.lock().unwrap().push(packet.clone());
-
-                    let reply = handler(&packet, conn);
-                    for pkt in reply.packets {
-                        let mut out = BytesMut::new();
-                        if pkt.encode(&mut out, ver).is_err() || sock.write_all(&out).is_err() {
-                            break 'conn;
-                        }
-                    }
-                    if reply.close || is_disconnect {
-                        break 'conn;
-                    }
-                }
-            }
-            drop(sock);
+            serve_connection(sock, conn, &recorded, &mut handler);
         }
     });
 
@@ -259,4 +221,244 @@ where
         received,
         handle: Some(handle),
     }
+}
+
+/// Serves one connection: decode packets, record them, and send whatever the
+/// handler asks for. Generic over the stream so the same loop serves a plain
+/// TCP connection and a TLS one.
+fn serve_connection<S, F>(
+    mut sock: S,
+    conn: usize,
+    recorded: &Arc<Mutex<Vec<Packet>>>,
+    handler: &mut F,
+) where
+    S: Read + Write,
+    F: FnMut(&Packet, usize) -> Reply,
+{
+    let mut buf = BytesMut::with_capacity(1024);
+    let mut tmp = [0u8; 1024];
+    // Until CONNECT names a version, decode as v5; CONNECT is
+    // self-describing, so this only has to be a placeholder.
+    let mut ver = MqttVersion::V5;
+
+    loop {
+        let n = match sock.read(&mut tmp) {
+            Ok(0) | Err(_) => return,
+            Ok(n) => n,
+        };
+        buf.extend_from_slice(&tmp[..n]);
+
+        while let Some(raw) = match RawPacket::decode(&mut buf) {
+            Ok(r) => r,
+            Err(_) => return,
+        } {
+            let Ok(packet) = Packet::from_raw(raw, ver) else {
+                return;
+            };
+            if let Packet::Connect(c) = &packet {
+                ver = c.version;
+            }
+            let is_disconnect = matches!(packet, Packet::Disconnect(_));
+            recorded.lock().unwrap().push(packet.clone());
+
+            let reply = handler(&packet, conn);
+            for pkt in reply.packets {
+                let mut out = BytesMut::new();
+                if pkt.encode(&mut out, ver).is_err() || sock.write_all(&out).is_err() {
+                    return;
+                }
+            }
+            if reply.close || is_disconnect {
+                return;
+            }
+        }
+    }
+}
+
+/////////////////////////////////////////////////////////////////////////////
+// TLS
+/////////////////////////////////////////////////////////////////////////////
+
+/// A throw-away certificate authority and a server certificate it signed.
+///
+/// Lets a test connect to `127.0.0.1` while the broker presents a
+/// certificate naming something else, which is the only way to tell whether
+/// host-name verification is actually being done.
+#[cfg(any(feature = "tls", feature = "smol-tls", feature = "openssl"))]
+pub struct TestCerts {
+    /// PEM file holding the CA certificate, for `TlsOptions::trust_store`.
+    pub ca_file: tempfile::TempPath,
+    cert_der: Vec<u8>,
+    key_der: Vec<u8>,
+}
+
+#[cfg(any(feature = "tls", feature = "smol-tls", feature = "openssl"))]
+impl TestCerts {
+    /// Creates a CA and a server certificate valid for `server_name` only.
+    pub fn new(server_name: &str) -> Self {
+        use rcgen::{
+            BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair, KeyUsagePurpose,
+        };
+        use std::io::Write as _;
+
+        let mut ca_params = CertificateParams::new(Vec::new()).unwrap();
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        ca_params
+            .distinguished_name
+            .push(DnType::CommonName, "paho-rust-v2 test CA");
+        ca_params.key_usages = vec![
+            KeyUsagePurpose::KeyCertSign,
+            KeyUsagePurpose::CrlSign,
+            KeyUsagePurpose::DigitalSignature,
+        ];
+        let ca_key = KeyPair::generate().unwrap();
+        let ca_cert = ca_params.clone().self_signed(&ca_key).unwrap();
+        let issuer = Issuer::new(ca_params, ca_key);
+
+        let mut params = CertificateParams::new(vec![server_name.to_string()]).unwrap();
+        params
+            .distinguished_name
+            .push(DnType::CommonName, server_name);
+        let key = KeyPair::generate().unwrap();
+        let cert = params.signed_by(&key, &issuer).unwrap();
+
+        let mut ca_file = tempfile::NamedTempFile::new().unwrap();
+        ca_file.write_all(ca_cert.pem().as_bytes()).unwrap();
+        ca_file.flush().unwrap();
+
+        Self {
+            ca_file: ca_file.into_temp_path(),
+            cert_der: cert.der().to_vec(),
+            key_der: key.serialize_der(),
+        }
+    }
+
+    /// The CA file path, for `TlsOptionsBuilder::trust_store`.
+    pub fn ca_path(&self) -> &std::path::Path {
+        &self.ca_file
+    }
+}
+
+/// Starts a TLS broker presenting `certs`, answering from `handler`.
+///
+/// The returned URI uses `127.0.0.1`, which the certificate does not name —
+/// so whether the handshake succeeds is exactly the question of whether the
+/// client checked the name.
+#[cfg(any(feature = "tls", feature = "smol-tls"))]
+pub fn spawn_tls_broker<F>(certs: &TestCerts, mut handler: F) -> ScriptedBroker
+where
+    F: FnMut(&Packet) -> Vec<Packet> + Send + 'static,
+{
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let uri = format!("tls://{}", listener.local_addr().unwrap());
+    let received = Arc::new(Mutex::new(Vec::new()));
+    let recorded = Arc::clone(&received);
+
+    let cfg = rustls::ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_no_client_auth()
+    .with_single_cert(
+        vec![CertificateDer::from(certs.cert_der.clone())],
+        PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(certs.key_der.clone())),
+    )
+    .unwrap();
+    let cfg = Arc::new(cfg);
+
+    let handle = std::thread::spawn(move || {
+        let Ok((sock, _)) = listener.accept() else {
+            return;
+        };
+        sock.set_read_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+        let Ok(conn) = rustls::ServerConnection::new(cfg) else {
+            return;
+        };
+        let tls = rustls::StreamOwned::new(conn, sock);
+        let mut h = move |p: &Packet, _: usize| Reply::from(handler(p));
+        serve_connection(tls, 0, &recorded, &mut h);
+    });
+
+    ScriptedBroker {
+        uri,
+        received,
+        handle: Some(handle),
+    }
+}
+
+/////////////////////////////////////////////////////////////////////////////
+// HTTP proxy
+/////////////////////////////////////////////////////////////////////////////
+
+/// A fake HTTP proxy, for testing `CONNECT` tunnelling.
+pub struct TestProxy {
+    /// URI to give to `ConnectOptionsBuilder::http_proxy`.
+    pub uri: String,
+    /// The `CONNECT` request lines the proxy received.
+    requests: Arc<Mutex<Vec<String>>>,
+}
+
+impl TestProxy {
+    /// The `CONNECT` requests seen so far.
+    pub fn requests(&self) -> Vec<String> {
+        self.requests.lock().unwrap().clone()
+    }
+}
+
+/// Starts a proxy that answers `CONNECT` with `status`, and — for a 2xx
+/// status — then pipes bytes to and from `target` so the tunnel really works.
+///
+/// `status` is the whole status line, e.g. `"200 Connection established"` or
+/// `"407 Proxy Authentication Required"`.
+pub fn spawn_proxy(status: &'static str, target: Option<String>) -> TestProxy {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let uri = format!("http://{}", listener.local_addr().unwrap());
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let seen = Arc::clone(&requests);
+
+    std::thread::spawn(move || {
+        while let Ok((mut client, _)) = listener.accept() {
+            let seen = Arc::clone(&seen);
+            let target = target.clone();
+            std::thread::spawn(move || {
+                // Read up to the blank line that ends the request headers.
+                let mut head = Vec::new();
+                let mut byte = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") {
+                    match client.read(&mut byte) {
+                        Ok(1) => head.push(byte[0]),
+                        _ => return,
+                    }
+                }
+                let head = String::from_utf8_lossy(&head).to_string();
+                seen.lock().unwrap().push(head.clone());
+
+                let resp = format!("HTTP/1.1 {status}\r\n\r\n");
+                if client.write_all(resp.as_bytes()).is_err() {
+                    return;
+                }
+                if !status.starts_with('2') {
+                    return;
+                }
+
+                // Tunnel: copy in both directions until either end closes.
+                let Some(target) = target else { return };
+                let Ok(upstream) = std::net::TcpStream::connect(&target) else {
+                    return;
+                };
+                let (mut c_rd, mut c_wr) = (client.try_clone().unwrap(), client);
+                let (mut u_rd, mut u_wr) = (upstream.try_clone().unwrap(), upstream);
+                std::thread::spawn(move || {
+                    let _ = std::io::copy(&mut c_rd, &mut u_wr);
+                });
+                let _ = std::io::copy(&mut u_rd, &mut c_wr);
+            });
+        }
+    });
+
+    TestProxy { uri, requests }
 }

@@ -1708,6 +1708,13 @@ mod tests {
             tls: None,
             #[cfg(any(feature = "websocket", feature = "smol-websocket"))]
             http_headers: Default::default(),
+            #[cfg(any(feature = "websocket", feature = "smol-websocket"))]
+            http_proxy: String::new(),
+            #[cfg(any(
+                all(feature = "websocket", any(feature = "tls", feature = "openssl")),
+                all(feature = "smol-websocket", feature = "smol-tls")
+            ))]
+            https_proxy: String::new(),
             auto_reconnect: false,
             min_retry_interval: Duration::ZERO,
             max_retry_interval: Duration::ZERO,

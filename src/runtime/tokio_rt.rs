@@ -44,10 +44,10 @@ use tokio::{
 #[cfg(feature = "tls")]
 use tokio_rustls::TlsConnector;
 
-#[cfg(all(feature = "openssl", not(feature = "tls")))]
-use super::tls_config::make_openssl_config;
 #[cfg(feature = "tls")]
 use super::tls_config::make_tls_config;
+#[cfg(all(feature = "openssl", not(feature = "tls")))]
+use super::tls_config::{make_openssl_config, openssl_ssl_for};
 #[cfg(all(feature = "openssl", not(feature = "tls")))]
 use super::tokio_conn::OpenSslConnection;
 #[cfg(feature = "tls")]
@@ -217,6 +217,47 @@ impl Sleep for TokioSleep {
     }
 }
 
+/// Opens a TCP connection to `host:port`, tunnelling through `proxy_uri` if
+/// one is configured.
+///
+/// See [`super::proxy`]; the tunnel is transparent once established, so a
+/// TLS handshake or WebSocket upgrade runs over it unchanged.
+#[cfg(feature = "websocket")]
+async fn tcp_maybe_proxied(proxy_uri: &str, host: &str, port: u16) -> Result<TcpStream> {
+    use super::proxy;
+
+    if proxy_uri.is_empty() {
+        let tcp = TcpStream::connect((host, port)).await?;
+        tcp.set_nodelay(true)?;
+        return Ok(tcp);
+    }
+
+    let proxy = proxy::parse(proxy_uri)?;
+    let mut tcp = TcpStream::connect((proxy.host.as_str(), proxy.port)).await?;
+    tcp.set_nodelay(true)?;
+    tcp.write_all(&proxy::connect_request(&proxy, host, port))
+        .await?;
+    tcp.flush().await?;
+
+    let mut buf = Vec::with_capacity(256);
+    let mut tmp = [0u8; 512];
+    loop {
+        let n = tcp.read(&mut tmp).await?;
+        if n == 0 {
+            return Err(Error::General("proxy closed the connection"));
+        }
+        buf.extend_from_slice(&tmp[..n]);
+        if let Some(end) = proxy::check_response(&buf)? {
+            if end != buf.len() {
+                // Nothing should arrive before we have spoken, and the extra
+                // bytes cannot be pushed back into the socket.
+                return Err(Error::General("proxy sent data before the tunnel was open"));
+            }
+            return Ok(tcp);
+        }
+    }
+}
+
 /// The Tokio [`Backend`].
 pub(crate) struct TokioBackend;
 
@@ -253,10 +294,7 @@ impl Backend for TokioBackend {
             ServerAddr::Tls { host, port } => {
                 let tls_opts = p.tls.as_ref().ok_or(Error::MissingTlsOptions)?;
                 let connector = make_openssl_config(tls_opts)?;
-                let ssl = connector
-                    .configure()
-                    .and_then(|c| c.into_ssl(host.as_str()))
-                    .map_err(|e| Error::GeneralString(e.to_string()))?;
+                let ssl = openssl_ssl_for(&connector, tls_opts, host.as_str())?;
                 let tcp = TcpStream::connect((host.as_str(), *port)).await?;
                 tcp.set_nodelay(true)?;
                 let mut stream = tokio_openssl::SslStream::new(ssl, tcp)
@@ -273,8 +311,7 @@ impl Backend for TokioBackend {
             ServerAddr::Ws { host, port, path } => {
                 let url = format!("ws://{}:{}{}", host, port, path);
                 let request = build_ws_request(&url, &p.http_headers)?;
-                let tcp = TcpStream::connect((host.as_str(), *port)).await?;
-                tcp.set_nodelay(true)?;
+                let tcp = tcp_maybe_proxied(&p.http_proxy, host.as_str(), *port).await?;
                 let (ws, _) = tokio_tungstenite::client_async(request, tcp)
                     .await
                     .map_err(|e| Error::GeneralString(e.to_string()))?;
@@ -290,8 +327,7 @@ impl Backend for TokioBackend {
                         Error::GeneralString(format!("invalid TLS server name: {}", host))
                     })?
                     .to_owned();
-                let tcp = TcpStream::connect((host.as_str(), *port)).await?;
-                tcp.set_nodelay(true)?;
+                let tcp = tcp_maybe_proxied(&p.https_proxy, host.as_str(), *port).await?;
                 let tls = connector
                     .connect(server_name, tcp)
                     .await
@@ -307,12 +343,8 @@ impl Backend for TokioBackend {
             ServerAddr::Wss { host, port, path } => {
                 let tls_opts = p.tls.as_ref().ok_or(Error::MissingTlsOptions)?;
                 let connector = make_openssl_config(tls_opts)?;
-                let ssl = connector
-                    .configure()
-                    .and_then(|c| c.into_ssl(host.as_str()))
-                    .map_err(|e| Error::GeneralString(e.to_string()))?;
-                let tcp = TcpStream::connect((host.as_str(), *port)).await?;
-                tcp.set_nodelay(true)?;
+                let ssl = openssl_ssl_for(&connector, tls_opts, host.as_str())?;
+                let tcp = tcp_maybe_proxied(&p.https_proxy, host.as_str(), *port).await?;
                 let mut stream = tokio_openssl::SslStream::new(ssl, tcp)
                     .map_err(|e| Error::GeneralString(e.to_string()))?;
                 Pin::new(&mut stream)

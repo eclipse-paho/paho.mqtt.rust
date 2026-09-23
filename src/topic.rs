@@ -420,39 +420,24 @@ impl<'a> SyncTopic<'a> {
 //                          TopicFilter
 /////////////////////////////////////////////////////////////////////////////
 
-/// Checks whether an MQTT topic filter is valid.
+/// Checks whether an MQTT topic filter is valid (§4.7).
 ///
 /// Rules:
 /// - Must not be empty.
 /// - Must not contain the null character (`\0`).
-/// - `+` (single-level wildcard) must occupy an entire level by itself
-/// - `#` (multi-level wildcard) must be the last character and must be either
-///   the only character or preceded by `/`.
+/// - `+` (single-level wildcard) must occupy an entire level by itself.
+/// - `#` (multi-level wildcard) must be the last character and must be
+///   either the only character or preceded by `/`.
+/// - A shared subscription, `$share/{ShareName}/{filter}`, must be
+///   well formed: a non-empty share name containing no `/`, `+`, or `#`,
+///   followed by a filter obeying the rules above.
+///
+/// This is the same check the codec applies when a SUBSCRIBE or UNSUBSCRIBE
+/// is encoded, so a filter accepted here will not be rejected on the way
+/// out. See [`paho_mqtt_codec::topic`] for the underlying functions,
+/// including `split_shared` for taking a shared subscription apart.
 pub fn is_topic_filter_valid(filter: &str) -> bool {
-    if filter.is_empty() || filter.contains('\0') {
-        return false;
-    }
-
-    let fields: Vec<&str> = filter.split('/').collect();
-    let n = fields.len();
-
-    for (i, field) in fields.iter().enumerate() {
-        match *field {
-            "#" => {
-                if i != n - 1 {
-                    return false;
-                }
-            }
-            "+" => (), // '+' as a whole level is fine
-            _ => {
-                if field.contains('#') || field.contains('+') {
-                    return false;
-                }
-            }
-        }
-    }
-
-    true
+    !filter.contains('\0') && paho_mqtt_codec::topic::validate_filter(filter).is_ok()
 }
 
 /// A topic filter.
@@ -652,6 +637,10 @@ mod tests {
         assert!(is_topic_filter_valid("foo/bar/+"));
         assert!(is_topic_filter_valid("+/+/+"));
 
+        // Shared subscriptions, which the filter rules also cover.
+        assert!(is_topic_filter_valid("$share/group/foo/bar"));
+        assert!(is_topic_filter_valid("$share/g/+/baz"));
+        assert!(is_topic_filter_valid("$share/g/#"));
         assert!(TopicFilter::new("foo/bar/baz").is_ok());
         assert!(TopicFilter::new("foo/+/baz").is_ok());
         assert!(TopicFilter::new("+/bar/#").is_ok());
@@ -680,6 +669,14 @@ mod tests {
         assert!(TopicFilter::new("foo/bar+baz").is_err());
         assert!(TopicFilter::new("foo/#/").is_err());
         assert!(TopicFilter::new("hello\0world").is_err());
+
+        // Malformed shared subscriptions, which the hand-rolled check this
+        // delegate replaced let through.
+        assert!(!is_topic_filter_valid("$share/group"));
+        assert!(!is_topic_filter_valid("$share//foo"));
+        assert!(!is_topic_filter_valid("$share/gr+up/foo"));
+        assert!(!is_topic_filter_valid("$share/g/"));
+        assert!(!is_topic_filter_valid("$share/"));
     }
 
     #[test]

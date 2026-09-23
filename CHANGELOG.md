@@ -36,6 +36,15 @@ Version 2.0 is a rewrite of the library in pure Rust. The dependency on the Paho
 - `ConnectResponse` gained accessors for everything the CONNACK can report: `receive_maximum()`, `maximum_packet_size()`, `topic_alias_maximum()`, `maximum_qos()`, `retain_available()`, `wildcard_subscriptions_available()`, `subscription_identifiers_available()`, `shared_subscriptions_available()`, `server_keep_alive()`, `assigned_client_id()`, `server_reference()`, and `reason_string()`. Each falls back to the specification's default when the property is absent.
 - **[Breaking]** `AsyncClient::client_id()` and `Client::client_id()` return `String` rather than `&str`, so they can report a server-assigned identifier. This matches the v1.x signature.
 
+### TLS, proxies, and runtime
+
+- `TlsOptions::verify` is implemented: it controls whether the broker's certificate must name the host connected to, independently of `enable_server_cert_auth`, which controls whether the chain is checked at all. Turning it off keeps full chain verification and waives only the identity check — for a broker reached by IP address, through a tunnel, or on a test rig.
+- `ConnectOptions::http_proxy` and `https_proxy` are implemented: a `ws://` or `wss://` connection is tunnelled through the named HTTP proxy with a `CONNECT` request, including `Proxy-Authorization` when the URI carries credentials. A proxy that refuses reports its status line to the caller.
+- The smol backend honours `RuntimeMode`: `Shared(n)` runs the shared executor on `n` threads. `ApplicationRuntime` panics there with an explanation, as smol has no ambient executor to borrow.
+- **`Client` (the blocking API) now uses the library's own runtime** when left on `RuntimeMode::Auto`, instead of borrowing the caller's. Blocking on a token from the runtime that is driving the event loop could otherwise deadlock. An explicitly chosen mode is unchanged.
+- `is_topic_filter_valid` now applies the codec's rules, so it understands shared subscriptions (`$share/{name}/{filter}`), which it previously accepted while malformed. The rules are re-exported as `paho_mqtt::topic_rules`.
+- Pre-shared keys (v1.x `ssl_psk`) are not supported; rustls, the default TLS backend, has no external-PSK support.
+
 ### Sessions and persistence
 
 - In-flight QoS 1/2 messages now belong to the session rather than to one connection: they survive a dropped connection and are re-sent, in publish order and with DUP set, on the reconnect that resumes the session — with or without a persistence store. Previously every reconnect dropped them and failed their tokens.

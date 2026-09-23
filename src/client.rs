@@ -51,10 +51,35 @@ pub struct Client {
 
 impl Client {
     /// Creates a new MQTT client which can connect to an MQTT broker.
+    ///
+    /// # Runtime
+    ///
+    /// Every call on a `Client` blocks the calling thread until the operation
+    /// finishes, so the event loop must be driven by some *other* thread. To
+    /// guarantee that, a `Client` left on the default
+    /// [`RuntimeMode::Auto`](crate::RuntimeMode::Auto) is switched to
+    /// [`Shared`](crate::RuntimeMode::Shared), which runs the event loop on
+    /// the library's own runtime.
+    ///
+    /// This matters when a `Client` is created inside an async runtime.
+    /// `Auto` would borrow that runtime, and then a blocking call made from
+    /// it — on a `current_thread` runtime, or from every worker of a small
+    /// multi-threaded one — would stop the very thread the event loop needs
+    /// in order to make progress, and the call would never return.
+    ///
+    /// Naming a mode explicitly is respected as given, including
+    /// [`ApplicationRuntime`](crate::RuntimeMode::ApplicationRuntime); if you
+    /// ask for the application's runtime you are taken at your word, and it
+    /// is on you to leave a thread free to drive it. Inside async code,
+    /// prefer [`AsyncClient`] and `.await` over a `Client`.
     pub fn new<T>(opts: T) -> Result<Client>
     where
         T: Into<CreateOptions>,
     {
+        let mut opts: CreateOptions = opts.into();
+        if matches!(opts.runtime_mode, crate::RuntimeMode::Auto) {
+            opts.runtime_mode = crate::RuntimeMode::Shared(0);
+        }
         let async_cli = AsyncClient::new(opts)?;
 
         let cli = Client {
