@@ -781,6 +781,128 @@ fn test_ack_error_codes_policy() {
 }
 
 /////////////////////////////////////////////////////////////////////////////
+// WebSocket over TLS
+/////////////////////////////////////////////////////////////////////////////
+
+/// `wss://` puts the whole stack together: TLS, a WebSocket upgrade, then
+/// MQTT carried in binary frames.
+#[cfg(all(feature = "tls", feature = "websocket"))]
+#[test]
+fn test_wss_connect_publish() {
+    use mqtt::paho_mqtt_codec::{ConnAck, Packet, PubAck, ReasonCode};
+
+    let certs = common::TestCerts::new("broker.invalid");
+    let (broker, uri) = common::spawn_wss_broker(&certs, |pkt| match pkt {
+        Packet::Connect(_) => vec![Packet::ConnAck(ConnAck::new(false, ReasonCode::Success))],
+        Packet::Publish(p) => match p.packet_id {
+            Some(id) => vec![Packet::PubAck(PubAck::new(id))],
+            None => vec![],
+        },
+        _ => vec![],
+    });
+
+    let tls = mqtt::TlsOptionsBuilder::new()
+        .trust_store(certs.ca_path())
+        .verify(false) // the certificate names broker.invalid, we dial 127.0.0.1
+        .finalize();
+    let opts = mqtt::ConnectOptionsBuilder::new_ws()
+        .tls_options(tls)
+        .connect_timeout(Duration::from_secs(5))
+        .finalize();
+
+    let cli = mqtt::AsyncClient::new(uri).unwrap();
+    cli.connect(opts)
+        .wait_for(Duration::from_secs(10))
+        .expect("wss connect failed");
+    assert!(cli.is_connected());
+
+    cli.publish(mqtt::Message::new(
+        topic!("wss"),
+        "over-tls-ws",
+        mqtt::QOS_1,
+    ))
+    .wait_for(Duration::from_secs(10))
+    .expect("wss publish failed");
+
+    // The broker decoded real MQTT out of the WebSocket frames.
+    let published: Vec<_> = broker
+        .received()
+        .into_iter()
+        .filter_map(|p| match p {
+            Packet::Publish(p) => Some(p),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(published.len(), 1);
+    assert_eq!(published[0].topic, topic!("wss"));
+    assert_eq!(&published[0].payload[..], b"over-tls-ws");
+
+    cli.disconnect(None).wait().ok();
+    broker.join();
+}
+
+/////////////////////////////////////////////////////////////////////////////
+// Mutual TLS
+/////////////////////////////////////////////////////////////////////////////
+
+/// A broker may require a certificate from the client as well. Presenting one
+/// gets in; omitting it does not.
+#[cfg(feature = "tls")]
+#[test]
+fn test_mutual_tls() {
+    use mqtt::paho_mqtt_codec::{ConnAck, Packet, ReasonCode};
+
+    let accepting = |pkt: &Packet| match pkt {
+        Packet::Connect(_) => vec![Packet::ConnAck(ConnAck::new(false, ReasonCode::Success))],
+        _ => vec![],
+    };
+
+    let certs = common::TestCerts::new("broker.invalid");
+
+    // With a client certificate from the CA the broker trusts.
+    {
+        let broker = common::spawn_mtls_broker(&certs, accepting);
+        let tls = mqtt::TlsOptionsBuilder::new()
+            .trust_store(certs.ca_path())
+            .key_store(&certs.client_cert_file)
+            .private_key(&certs.client_key_file)
+            .verify(false) // the certificate names broker.invalid, we dial 127.0.0.1
+            .finalize();
+        let opts = mqtt::ConnectOptionsBuilder::new()
+            .tls_options(tls)
+            .connect_timeout(Duration::from_secs(5))
+            .finalize();
+        mqtt::AsyncClient::new(broker.uri.clone())
+            .unwrap()
+            .connect(opts)
+            .wait_for(Duration::from_secs(10))
+            .expect("mutual TLS with a client certificate should connect");
+        broker.join();
+    }
+
+    // Without one, the broker refuses the handshake.
+    {
+        let broker = common::spawn_mtls_broker(&certs, accepting);
+        let tls = mqtt::TlsOptionsBuilder::new()
+            .trust_store(certs.ca_path())
+            .verify(false)
+            .finalize();
+        let opts = mqtt::ConnectOptionsBuilder::new()
+            .tls_options(tls)
+            .connect_timeout(Duration::from_secs(5))
+            .finalize();
+        let res = mqtt::AsyncClient::new(broker.uri.clone())
+            .unwrap()
+            .connect(opts)
+            .wait_for(Duration::from_secs(10));
+        assert!(
+            res.is_err(),
+            "a broker requiring a client certificate must refuse one that has none, got {res:?}"
+        );
+    }
+}
+
+/////////////////////////////////////////////////////////////////////////////
 // Client identifier
 /////////////////////////////////////////////////////////////////////////////
 
@@ -954,6 +1076,170 @@ fn test_v5_receive_maximum_caps_inflight() {
 
     drop(cli);
     broker.join();
+}
+
+/////////////////////////////////////////////////////////////////////////////
+// MQTT v5 maximum packet size
+/////////////////////////////////////////////////////////////////////////////
+
+/// Connect properties advertising the largest packet we will accept.
+#[cfg(test)]
+fn max_packet_props(max: u32) -> mqtt::Properties {
+    use mqtt::{Property, PropertyId, PropertyValue};
+    let mut props = mqtt::Properties::new();
+    props.push(Property::new(
+        PropertyId::MaximumPacketSize,
+        PropertyValue::U32(max),
+    ));
+    props
+}
+
+/// A publish larger than the broker will accept fails its own token, rather
+/// than being sent and earning a DISCONNECT.
+#[test]
+fn test_outbound_packet_over_server_maximum_is_refused() {
+    use mqtt::paho_mqtt_codec::{ConnAck, Packet, Property, PropertyId, PropertyValue, ReasonCode};
+
+    let broker = common::spawn_broker(|pkt| match pkt {
+        Packet::Connect(_) => {
+            let mut ack = ConnAck::new(false, ReasonCode::Success);
+            ack.properties.push(Property::new(
+                PropertyId::MaximumPacketSize,
+                PropertyValue::U32(128),
+            ));
+            vec![Packet::ConnAck(ack)]
+        }
+        _ => vec![],
+    });
+
+    let cli = mqtt::AsyncClient::new(broker.uri.clone()).unwrap();
+    cli.connect(mqtt::ConnectOptions::new_v5())
+        .wait()
+        .expect("connect failed");
+    assert_eq!(
+        cli.connect_options().mqtt_version,
+        mqtt::MqttVersion::V5,
+        "sanity: the negotiated version"
+    );
+
+    // Comfortably over the 128 bytes the broker said it would take.
+    let big = "x".repeat(500);
+    let res = cli
+        .publish(mqtt::Message::new(topic!("too-big"), big, mqtt::QOS_1))
+        .wait();
+    assert!(
+        matches!(
+            res,
+            Err(mqtt::Error::Protocol(
+                mqtt::paho_mqtt_codec::Error::PacketTooLarge
+            ))
+        ),
+        "oversize publish should fail its own token, got {res:?}"
+    );
+
+    // One publish refused locally is not the session's problem.
+    assert!(cli.is_connected());
+    let publishes = broker
+        .received()
+        .iter()
+        .filter(|p| matches!(p, Packet::Publish(_)))
+        .count();
+    assert_eq!(publishes, 0, "nothing oversize should have gone out");
+
+    // A small one still works.
+    cli.publish(mqtt::Message::new(topic!("small"), "ok", mqtt::QOS_0))
+        .wait()
+        .expect("a small publish should still go");
+
+    cli.disconnect(None).wait().ok();
+    broker.join();
+}
+
+/// An inbound packet larger than the maximum we advertised is rejected at the
+/// framing layer, and the broker is told why before the connection closes.
+#[test]
+fn test_inbound_packet_over_our_maximum_is_rejected() {
+    use mqtt::paho_mqtt_codec::{ConnAck, Packet, Publish, ReasonCode, SubAck};
+
+    let broker = common::spawn_broker(move |pkt| match pkt {
+        Packet::Connect(_) => vec![Packet::ConnAck(ConnAck::new(false, ReasonCode::Success))],
+        Packet::Subscribe(s) => vec![
+            Packet::SubAck(SubAck::new(s.packet_id, vec![ReasonCode::GrantedQos0])),
+            // Far larger than the 256 bytes we said we would accept.
+            Packet::Publish(Publish::new(topic!("huge").to_string(), "y".repeat(2000))),
+        ],
+        _ => vec![],
+    });
+
+    let cli = mqtt::AsyncClient::new(broker.uri.clone()).unwrap();
+    let opts = mqtt::ConnectOptionsBuilder::new_v5()
+        .properties(max_packet_props(256))
+        .finalize();
+    cli.connect(opts).wait().expect("connect failed");
+    cli.subscribe(topic!("huge"), mqtt::QOS_0).wait().ok();
+
+    let told = broker.wait_until(Duration::from_secs(5), |pkts| {
+        pkts.iter().any(
+            |p| matches!(p, Packet::Disconnect(d) if d.reason_code == ReasonCode::PacketTooLarge),
+        )
+    });
+    assert!(
+        told,
+        "expected DISCONNECT(PacketTooLarge), got {:?}",
+        broker.received()
+    );
+    broker.join();
+}
+
+/////////////////////////////////////////////////////////////////////////////
+// MQTT v5 subscription identifiers
+/////////////////////////////////////////////////////////////////////////////
+
+/// A subscription identifier given on SUBSCRIBE comes back on every message
+/// delivered for that subscription (§3.8.2.1.2, §3.3.2.3.8), which is how a
+/// client with several overlapping filters tells them apart.
+#[test]
+fn test_v5_subscription_identifier() {
+    use mqtt::{Property, PropertyId, PropertyValue};
+
+    let cli = mqtt::AsyncClient::new(HOST).unwrap();
+    let rsp = cli
+        .connect(mqtt::ConnectOptions::new_v5())
+        .wait()
+        .expect("connect failed");
+    if !rsp.subscription_identifiers_available() {
+        eprintln!("broker does not support subscription identifiers; skipping");
+        cli.disconnect(None).wait().ok();
+        return;
+    }
+
+    let rx = cli.start_consuming();
+
+    let mut props = mqtt::Properties::new();
+    props.push(Property::new(
+        PropertyId::SubscriptionIdentifier,
+        PropertyValue::VarInt(42),
+    ));
+    cli.subscribe_with_options(topic!("subid"), mqtt::QOS_1, None, props)
+        .wait()
+        .expect("subscribe failed");
+
+    cli.publish(mqtt::Message::new(topic!("subid"), "tagged", mqtt::QOS_1))
+        .wait()
+        .expect("publish failed");
+
+    let msg = rx
+        .recv_timeout(TIMEOUT)
+        .expect("no message")
+        .expect("connection lost");
+    assert_eq!(msg.payload_str(), "tagged");
+    assert_eq!(
+        msg.properties().get(PropertyId::SubscriptionIdentifier),
+        Some(&PropertyValue::VarInt(42)),
+        "the broker should tag the message with our subscription identifier"
+    );
+
+    cli.disconnect(None).wait().ok();
 }
 
 /////////////////////////////////////////////////////////////////////////////
@@ -1285,7 +1571,7 @@ fn test_auth_configuration_is_checked() {
 // way to see whether the name is being checked.
 /////////////////////////////////////////////////////////////////////////////
 
-#[cfg(any(feature = "tls", feature = "smol-tls"))]
+#[cfg(any(feature = "tls", feature = "smol-tls", feature = "openssl"))]
 mod tls_verify {
     use super::*;
     use mqtt::paho_mqtt_codec::{ConnAck, Packet, ReasonCode};
@@ -2814,7 +3100,7 @@ fn test_ws_publish_subscribe_large() {
 // configuration and no certificate files checked into the repository.
 /////////////////////////////////////////////////////////////////////////////
 
-#[cfg(any(feature = "tls", feature = "smol-tls"))]
+#[cfg(any(feature = "tls", feature = "smol-tls", feature = "openssl"))]
 #[test]
 fn test_tls_connect_publish() {
     use mqtt::paho_mqtt_codec::{ConnAck, Packet, PubAck, ReasonCode};

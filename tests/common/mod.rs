@@ -288,6 +288,13 @@ fn serve_connection<S, F>(
 pub struct TestCerts {
     /// PEM file holding the CA certificate, for `TlsOptions::trust_store`.
     pub ca_file: tempfile::TempPath,
+    /// PEM file holding a client certificate signed by the same CA, for
+    /// `TlsOptions::key_store`.
+    pub client_cert_file: tempfile::TempPath,
+    /// PEM file holding that certificate's private key, for
+    /// `TlsOptions::private_key`.
+    pub client_key_file: tempfile::TempPath,
+    ca_der: Vec<u8>,
     cert_der: Vec<u8>,
     key_der: Vec<u8>,
 }
@@ -322,12 +329,26 @@ impl TestCerts {
         let key = KeyPair::generate().unwrap();
         let cert = params.signed_by(&key, &issuer).unwrap();
 
-        let mut ca_file = tempfile::NamedTempFile::new().unwrap();
-        ca_file.write_all(ca_cert.pem().as_bytes()).unwrap();
-        ca_file.flush().unwrap();
+        // A client certificate from the same CA, for mutual TLS.
+        let mut client_params = CertificateParams::new(Vec::new()).unwrap();
+        client_params
+            .distinguished_name
+            .push(DnType::CommonName, "paho-rust-v2 test client");
+        let client_key = KeyPair::generate().unwrap();
+        let client_cert = client_params.signed_by(&client_key, &issuer).unwrap();
+
+        let write = |contents: String| {
+            let mut f = tempfile::NamedTempFile::new().unwrap();
+            f.write_all(contents.as_bytes()).unwrap();
+            f.flush().unwrap();
+            f.into_temp_path()
+        };
 
         Self {
-            ca_file: ca_file.into_temp_path(),
+            ca_file: write(ca_cert.pem()),
+            client_cert_file: write(client_cert.pem()),
+            client_key_file: write(client_key.serialize_pem()),
+            ca_der: ca_cert.der().to_vec(),
             cert_der: cert.der().to_vec(),
             key_der: key.serialize_der(),
         }
@@ -339,13 +360,49 @@ impl TestCerts {
     }
 }
 
+/// Starts a TLS broker that additionally *requires* a client certificate
+/// signed by the test CA, for exercising mutual TLS.
+#[cfg(feature = "tls")]
+pub fn spawn_mtls_broker<F>(certs: &TestCerts, handler: F) -> ScriptedBroker
+where
+    F: FnMut(&Packet) -> Vec<Packet> + Send + 'static,
+{
+    use rustls::pki_types::CertificateDer;
+
+    let mut roots = rustls::RootCertStore::empty();
+    roots
+        .add(CertificateDer::from(certs.ca_der.clone()))
+        .unwrap();
+    let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
+        Arc::new(roots),
+        Arc::new(rustls::crypto::ring::default_provider()),
+    )
+    .build()
+    .unwrap();
+    spawn_tls_broker_with(certs, Some(verifier), handler)
+}
+
 /// Starts a TLS broker presenting `certs`, answering from `handler`.
 ///
 /// The returned URI uses `127.0.0.1`, which the certificate does not name —
 /// so whether the handshake succeeds is exactly the question of whether the
 /// client checked the name.
-#[cfg(any(feature = "tls", feature = "smol-tls"))]
-pub fn spawn_tls_broker<F>(certs: &TestCerts, mut handler: F) -> ScriptedBroker
+#[cfg(any(feature = "tls", feature = "smol-tls", feature = "openssl"))]
+pub fn spawn_tls_broker<F>(certs: &TestCerts, handler: F) -> ScriptedBroker
+where
+    F: FnMut(&Packet) -> Vec<Packet> + Send + 'static,
+{
+    spawn_tls_broker_with(certs, None, handler)
+}
+
+/// Shared body of [`spawn_tls_broker`] and [`spawn_mtls_broker`]; `verifier`
+/// is `Some` when a client certificate is required.
+#[cfg(any(feature = "tls", feature = "smol-tls", feature = "openssl"))]
+fn spawn_tls_broker_with<F>(
+    certs: &TestCerts,
+    verifier: Option<Arc<dyn rustls::server::danger::ClientCertVerifier>>,
+    mut handler: F,
+) -> ScriptedBroker
 where
     F: FnMut(&Packet) -> Vec<Packet> + Send + 'static,
 {
@@ -356,12 +413,15 @@ where
     let received = Arc::new(Mutex::new(Vec::new()));
     let recorded = Arc::clone(&received);
 
-    let cfg = rustls::ServerConfig::builder_with_provider(Arc::new(
+    let builder = rustls::ServerConfig::builder_with_provider(Arc::new(
         rustls::crypto::ring::default_provider(),
     ))
     .with_safe_default_protocol_versions()
-    .unwrap()
-    .with_no_client_auth()
+    .unwrap();
+    let cfg = match verifier {
+        Some(v) => builder.with_client_cert_verifier(v),
+        None => builder.with_no_client_auth(),
+    }
     .with_single_cert(
         vec![CertificateDer::from(certs.cert_der.clone())],
         PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(certs.key_der.clone())),
@@ -461,4 +521,115 @@ pub fn spawn_proxy(status: &'static str, target: Option<String>) -> TestProxy {
     });
 
     TestProxy { uri, requests }
+}
+
+/// Starts a `wss://` broker: TLS, then a WebSocket upgrade, then MQTT in
+/// binary frames — the whole stack a `wss://` URI implies.
+#[cfg(all(feature = "tls", feature = "websocket"))]
+pub fn spawn_wss_broker<F>(certs: &TestCerts, mut handler: F) -> (ScriptedBroker, String)
+where
+    F: FnMut(&Packet) -> Vec<Packet> + Send + 'static,
+{
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+    use tungstenite::Message as WsMessage;
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let uri = format!("wss://{addr}");
+    let received = Arc::new(Mutex::new(Vec::new()));
+    let recorded = Arc::clone(&received);
+
+    let cfg = Arc::new(
+        rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![CertificateDer::from(certs.cert_der.clone())],
+            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(certs.key_der.clone())),
+        )
+        .unwrap(),
+    );
+
+    let handle = std::thread::spawn(move || {
+        let Ok((sock, _)) = listener.accept() else {
+            return;
+        };
+        sock.set_read_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+        let Ok(conn) = rustls::ServerConnection::new(cfg) else {
+            return;
+        };
+        let tls = rustls::StreamOwned::new(conn, sock);
+
+        // MQTT over WebSocket negotiates the `mqtt` subprotocol, and the
+        // client checks that the server agreed to it, so echo it back.
+        type WsRequest = tungstenite::handshake::server::Request;
+        type WsResponse = tungstenite::handshake::server::Response;
+        type WsErrorResponse = tungstenite::handshake::server::ErrorResponse;
+
+        #[allow(clippy::result_large_err)] // the shape tungstenite's callback requires
+        fn add_subprotocol(
+            _req: &WsRequest,
+            mut resp: WsResponse,
+        ) -> Result<WsResponse, WsErrorResponse> {
+            resp.headers_mut().insert(
+                "Sec-WebSocket-Protocol",
+                tungstenite::http::HeaderValue::from_static("mqtt"),
+            );
+            Ok(resp)
+        }
+
+        let Ok(mut ws) = tungstenite::accept_hdr(tls, add_subprotocol) else {
+            return;
+        };
+
+        let mut buf = BytesMut::with_capacity(1024);
+        let mut ver = MqttVersion::V5;
+        loop {
+            match ws.read() {
+                Ok(WsMessage::Binary(data)) => buf.extend_from_slice(&data),
+                // Ping/pong and the like are handled by tungstenite itself.
+                Ok(_) => continue,
+                Err(_) => return,
+            }
+
+            while let Some(raw) = match RawPacket::decode(&mut buf) {
+                Ok(r) => r,
+                Err(_) => return,
+            } {
+                let Ok(packet) = Packet::from_raw(raw, ver) else {
+                    return;
+                };
+                if let Packet::Connect(c) = &packet {
+                    ver = c.version;
+                }
+                let is_disconnect = matches!(packet, Packet::Disconnect(_));
+                recorded.lock().unwrap().push(packet.clone());
+
+                for reply in handler(&packet) {
+                    let mut out = BytesMut::new();
+                    if reply.encode(&mut out, ver).is_err()
+                        || ws.send(WsMessage::Binary(out.to_vec())).is_err()
+                    {
+                        return;
+                    }
+                }
+                if is_disconnect {
+                    return;
+                }
+            }
+        }
+    });
+
+    (
+        ScriptedBroker {
+            uri: uri.clone(),
+            received,
+            handle: Some(handle),
+        },
+        uri,
+    )
 }
