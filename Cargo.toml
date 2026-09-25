@@ -5,7 +5,7 @@ resolver = "2"
 
 [package]
 name = "paho-mqtt"
-version = "2.0.0-pre.0"
+version = "2.0.0-pre.1"
 edition = "2024"
 rust-version = "1.89.0"
 authors = ["Frank Pagliughi <fpagliughi@mindspring.com>"]
@@ -16,8 +16,8 @@ categories = [ "network-programming", "asynchronous" ]
 license = "EPL-2.0"
 readme = "README.md"
 description = """
-The Eclipse Paho MQTT Rust client library. A pure-Rust MQTT v5, v3.1.1, and
-v3.1 client, with no dependency on a C library.
+The Eclipse Paho MQTT Rust client library. 
+A pure-Rust MQTT v5, v3.1.1, and v3.1 client.
 """
 
 [features]

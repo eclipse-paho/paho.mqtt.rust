@@ -1,6 +1,6 @@
 // paho-mqtt-codec/src/lib.rs
 //
-// This file is part of the Eclipse Paho MQTT Rust Client library.
+// This file is part of the Eclipse Paho MQTT Rust Codec library.
 
 /*******************************************************************************
  * Copyright (c) 2026 Frank Pagliughi <fpagliughi@mindspring.com>
@@ -21,23 +21,24 @@
 //! Pure-Rust encoding and decoding of MQTT control packets for protocol
 //! versions 3.1, 3.1.1, and 5.0.
 //!
-//! The crate is a wire-format layer only: it converts between typed packet
-//! structs and bytes, and has no dependency on I/O, an async runtime, or any
-//! particular role in the protocol. It is used by the Eclipse Paho MQTT Rust
-//! client, and is equally suited to a broker, a proxy, a protocol analyzer,
-//! or an embedded device (`no_std` with `alloc`).
+//! The crate is a wire-format layer only. It converts between typed packet
+//! structs and bytes, and has no dependency on I/O or any particular runtime.
+//! It is used by the Eclipse Paho MQTT Rust client, and is equally suited to
+//! a broker, a proxy, a protocol analyzer,
+//! or an embedded device.
+//!
+//! It build for `std` or `no_std` (though `no_std` requires `alloc`).
 //!
 //! Every packet type can be both encoded and decoded, so a program can sit
-//! on either end of a connection. Decoding is strict: input that violates
-//! the specification is rejected with an [`Error`] rather than reinterpreted.
+//! on either end of a connection, client or server. Decoding is strict; input
+//! that violates the specification is rejected with an [`Error`].
 
 #![no_std]
 #![deny(missing_docs)]
 
 extern crate alloc;
 
-// `alloc`'s `String` and `Vec` are the same types `std` re-exports, so one
-// import serves both configurations.
+// `alloc`'s `String` and `Vec` are the same types `std` re-exports.
 pub(crate) use alloc::{string::String, vec::Vec};
 
 pub(crate) mod wire;

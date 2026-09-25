@@ -1,6 +1,6 @@
 // paho-mqtt-codec/src/connect.rs
 //
-// This file is part of the Eclipse Paho MQTT Rust Client library.
+// This file is part of the Eclipse Paho MQTT Rust Codec library.
 
 /*******************************************************************************
  * Copyright (c) 2026 Frank Pagliughi <fpagliughi@mindspring.com>
@@ -86,7 +86,8 @@ impl Will {
 pub struct Connect {
     /// Protocol version this CONNECT declares.
     pub version: MqttVersion,
-    /// Whether to start a clean session / discard any existing session state.
+    /// Whether to start a clean session and discard any existing session state.
+    /// This is "clean session" for v3.1 connections.
     pub clean_start: bool,
     /// Keep-alive interval in seconds (0 = disabled).
     pub keep_alive: u16,

@@ -1,6 +1,6 @@
 // paho-mqtt-codec/src/varlen.rs
 //
-// This file is part of the Eclipse Paho MQTT Rust Client library.
+// This file is part of the Eclipse Paho MQTT Rust Codec library.
 
 /*******************************************************************************
  * Copyright (c) 2026 Frank Pagliughi <fpagliughi@mindspring.com>

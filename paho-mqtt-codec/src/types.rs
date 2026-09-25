@@ -1,6 +1,6 @@
 // paho-mqtt-codec/src/types.rs
 //
-// This file is part of the Eclipse Paho MQTT Rust Client library.
+// This file is part of the Eclipse Paho MQTT Rust Codec library.
 
 /*******************************************************************************
  * Copyright (c) 2019-2026 Frank Pagliughi <fpagliughi@mindspring.com>
@@ -18,14 +18,13 @@
  *    Frank Pagliughi - initial implementation and documentation
  *******************************************************************************/
 
-//! MQTT support types: protocol version and quality of service.
+//! MQTT support types.
 //!
 //! Each concept is an enum ([`MqttVersion`], [`QoS`]) with a few named
 //! constants of the same type (`MQTT_VERSION_5`, `QOS_1`, …) as a second
 //! spelling. The constants exist for compatibility with the Paho MQTT Rust
-//! client's earlier API, whose values came from the Paho C library; new code
-//! should prefer the enum variants. The constants may be deprecated in a
-//! future release.
+//! client's earlier v1 API, whose values came from the Paho C library.
+//! New code should typically prefer the enum variants for safety.
 
 use crate::error::Error;
 use core::fmt;
@@ -56,7 +55,8 @@ pub enum MqttVersion {
 }
 
 impl MqttVersion {
-    /// The current v3 revision, v3.1.1.
+    /// The latest v3 revision, v3.1.1.
+    /// Clients should typically use this fo v3 connections.
     pub const V3: MqttVersion = Self::V3_1_1;
     /// Default: (currently v5)
     #[allow(non_upper_case_globals)]
@@ -129,9 +129,22 @@ impl TryFrom<i32> for MqttVersion {
     }
 }
 
+/*
 impl fmt::Display for MqttVersion {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", *self as u8)
+    }
+}
+*/
+
+impl fmt::Display for MqttVersion {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            Self::V3_1 => f.write_str("v3.1"),
+            Self::V3_1_1 => f.write_str("v3.1.1"),
+            Self::V5 => f.write_str("v5"),
+        }
+        //write!(f, "{}", *self as u8)
     }
 }
 
@@ -194,6 +207,7 @@ impl TryFrom<u8> for QoS {
 impl TryFrom<u32> for QoS {
     type Error = Error;
 
+    /// This is a legacy conversion from Paho MQTT v1
     fn try_from(qos: u32) -> Result<Self, Error> {
         u8::try_from(qos)
             .map_err(|_| Error::BadQoS)
@@ -204,6 +218,7 @@ impl TryFrom<u32> for QoS {
 impl TryFrom<i32> for QoS {
     type Error = Error;
 
+    /// This is a legacy conversion from Paho MQTT v1
     fn try_from(qos: i32) -> Result<Self, Error> {
         u8::try_from(qos)
             .map_err(|_| Error::BadQoS)
@@ -222,9 +237,10 @@ mod tests {
 
     #[test]
     fn test_mqtt_version_display() {
-        assert_eq!(MqttVersion::V3_1_1.to_string(), "4");
-        assert_eq!(MqttVersion::V3.to_string(), "4");
-        assert_eq!(MqttVersion::V5.to_string(), "5");
+        assert_eq!(MqttVersion::V3_1.to_string(), "v3.1");
+        assert_eq!(MqttVersion::V3_1_1.to_string(), "v3.1.1");
+        assert_eq!(MqttVersion::V3.to_string(), "v3.1.1");
+        assert_eq!(MqttVersion::V5.to_string(), "v5");
     }
 
     #[test]

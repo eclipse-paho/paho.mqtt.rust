@@ -1,12 +1,16 @@
 # Eclipse Paho MQTT Rust Codec
 
-A pure-Rust encoder and decoder for MQTT control packets, covering protocol versions 3.1, 3.1.1, and 5.0, for the [Eclipse Paho](http://eclipse.org/paho) project.
+A pure-Rust encoder/decoder for MQTT control packets, covering protocol versions 3.1, 3.1.1, and 5.0, for the [Eclipse Paho](http://eclipse.org/paho) project.
 
-This crate is a wire-format layer and nothing else: it converts between typed Rust structs and the bytes that go on the network, with no dependency on I/O, on an async runtime, or on any particular role in the protocol. Every packet type can be both encoded and decoded, so it serves a client, a broker, a proxy, a protocol analyzer, or an embedded device equally. It is the codec used by the [Eclipse Paho MQTT Rust client](https://github.com/eclipse/paho.mqtt.rust), and is usable in a `no_std` environment. Each packet has a single representation that is encoded or decoded according to the connection's negotiated version (v3.1, v3.1.1, or v5).
+For each packet type, there is just one representation. When encoding for v3 connections, the v5 fields like properties and reason codes are ignres. When decoding for v3, if these fields are present, the packet is rejected.
+
+This crate is just the wire-format layer. It converts between typed Rust structs and the bytes that go on the network, with no dependency on I/O or a runtime. Every packet type can be both encoded and decoded, so it serves a client, a broker, a proxy, a protocol analyzer, or an embedded device equally. It is the codec used by the [Eclipse Paho MQTT Rust client](https://github.com/eclipse/paho.mqtt.rust).
+
+This can be built for either a `std` or `no_std` environment.
 
 ## Features
 
-- Every control packet in MQTT v3.1, v3.1.1, and v5.0: CONNECT, CONNACK, PUBLISH, PUBACK, PUBREC, PUBREL, PUBCOMP, SUBSCRIBE, SUBACK, UNSUBSCRIBE, UNSUBACK, PINGREQ, PINGRESP, DISCONNECT, and AUTH. v3.1 (protocol name `MQIsdp`, level 3) differs from v3.1.1 only in CONNECT and CONNACK and is handled alongside it, so a server can still accept the older clients found in the field.
+- Every control packet in MQTT v3.1, v3.1.1, and v5.0: CONNECT, CONNACK, PUBLISH, PUBACK, PUBREC, PUBREL, PUBCOMP, SUBSCRIBE, SUBACK, UNSUBSCRIBE, UNSUBACK, PINGREQ, PINGRESP, DISCONNECT, and AUTH. v3.1 (protocol name `MQIsdp`, level 3) differs from v3.1.1 only in CONNECT and CONNACK and is handled alongside it. A client would normally use v3.1.1 for v3 connections today, but a server can still accept the older clients found in the field.
 - One set of packet types for all three protocol versions. Fields that only exist in v5 (reason codes, properties) are present on every packet and are simply not written to the wire on a v3 connection. CONNECT carries its own version and is decoded without knowing it in advance.
 - Full MQTT v5 property support with typed values, including the shorthand encodings the specification permits when a reason code or property list is absent.
 - Two-phase decoding: a version-independent framing step that pulls one complete packet out of a read buffer (returning `None` until enough bytes have arrived), followed by version-aware parsing.
@@ -33,7 +37,7 @@ The crate still requires a global allocator in that configuration.
 The default behaviour can be altered by enabling or disabling the features:
 
 - _"default"_ - `[std]`
-- _"std"_ - Enables the standard library in this crate and its dependencies. Without it the crate builds against `core` and `alloc` only.
+- _"std"_ - Enables the standard library in this crate and its dependencies. Without it the crate builds against `core` and `alloc` only for `no_std` environments
 - _"serde"_ - Derives `Serialize` and `Deserialize` for the property and enumeration types, so they can be stored or forwarded through `serde`-based formats.
 
 No feature pulls in any I/O or runtime dependency.
@@ -46,15 +50,15 @@ This package uses Rust Edition 2024, and requires an MSRV of 1.89.0. Although it
 
 ## Developing the Crate
 
-The library is a standard Rust "crate" using the _Cargo_ build tool. From this directory, it uses the standard cargo commands for building:
+The library is a standard Rust "crate" using the _Cargo_ build tool. From this directory, it uses the standard cargo commands for building the library:
 
     $ cargo build
 
-Builds the library.
+To build and runs the unit tests:
 
     $ cargo test
 
-Builds and runs the unit tests. The tests are written to pass in both the `std` and `no_std` configurations, so it is worth also running:
+Since the tests are written to pass in both the `std` and `no_std` configurations separately, it is worth also running:
 
     $ cargo test --no-default-features
 
@@ -63,13 +67,13 @@ To confirm the crate really has no dependency on the standard library, build it 
     $ rustup target add riscv32imac-unknown-none-elf
     $ cargo build --no-default-features --target riscv32imac-unknown-none-elf
 
+To generate reference documentation:
+
     $ cargo doc
 
-Generates reference documentation.
+To run the linter with warnings treated as errors, as the CI does:
 
     $ cargo clippy --no-deps --all-targets -- -D warnings
-
-Runs the linter with warnings treated as errors, as the CI does.
 
 Format with the standard stable formatter:
 
@@ -92,7 +96,7 @@ Encode benchmarks reuse one output buffer across iterations, as a network runtim
 
 ### Fuzzing
 
-The decoder is the crate's untrusted-input surface: whatever is on the other end of the socket, or anything in between, can put arbitrary bytes on it. The _fuzz_ directory holds two [cargo-fuzz](https://github.com/rust-fuzz/cargo-fuzz) targets:
+The decoder is the crate's untrusted-input surface. Whatever is on the other end of the socket, or anything in between, can put arbitrary bytes on it. The _fuzz_ directory holds two [cargo-fuzz](https://github.com/rust-fuzz/cargo-fuzz) targets:
 
 - `decode` feeds random, coverage-guided bytes through framing and parsing (`RawPacket::decode` then `Packet::from_raw`) for both protocol versions and checks that nothing panics. Anything that decodes successfully is also re-encoded and decoded again, which must reproduce the same packet.
 - `roundtrip` is structure-aware: it builds *valid* packets of every type from the random input and checks the encoder's invariants — `encode`, `encode_to_bytes`, and `encode_split` agree byte for byte, `encoded_size` is exact, and decoding gives back an equal packet. It reaches the encoder paths that mutating bytes rarely does.
@@ -180,6 +184,8 @@ A CONNECT whose protocol name and level do not name a version the crate speaks d
 
 ## Relationship to the Paho Client
 
-Version 2 of the [`paho-mqtt`](https://crates.io/crates/paho-mqtt) crate uses this codec for all of its wire I/O and re-exports the shared types — `QoS`, `MqttVersion`, `ReasonCode`, and the property types — so applications using that client don't normally depend on this crate directly. (Version 1 of the Paho Rust client wraps the Paho C library and uses it for all wire I/O, not this crate.)
+Version 2 of the [`paho-mqtt`](https://crates.io/crates/paho-mqtt) crate uses this codec for all of its wire I/O and re-exports the shared types — `QoS`, `MqttVersion`, `ReasonCode`, and the property types — so applications using that client don't normally depend on this crate directly.
 
-The codec is developed in the Paho repository but is not tied to the Paho client: any client library, broker, or tool can use it alone.
+Version 1 of the Paho Rust client wraps the Paho C library and uses it for all wire I/O, not this crate.
+
+The codec is part of the Paho repository but is not tied to the Paho client. Any client library, broker, or monitoring tool can use it independently.

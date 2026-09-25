@@ -1,6 +1,6 @@
 // paho-mqtt-codec/src/wire.rs
 //
-// This file is part of the Eclipse Paho MQTT Rust Client library.
+// This file is part of the Eclipse Paho MQTT Rust Codec library.
 
 /*******************************************************************************
  * Copyright (c) 2026 Frank Pagliughi <fpagliughi@mindspring.com>
@@ -28,7 +28,8 @@
 use crate::{Error, Result, String};
 use bytes::{Buf, BufMut, Bytes};
 
-/// Writes a 2-byte big-endian length prefix followed by the UTF-8 bytes of `s`.
+/// Writes a 2-byte big-endian length prefix followed by the UTF-8 string
+/// bytes of `s`.
 ///
 /// Returns [`Error::StringTooLong`] if `s` exceeds 65,535 bytes, or
 /// [`Error::MalformedPacket`] if it contains U+0000, which MQTT forbids in
