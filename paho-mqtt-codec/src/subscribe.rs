@@ -118,7 +118,7 @@ pub struct Subscribe {
 }
 
 impl Subscribe {
-    /// Creates a SUBSCRIBE with no properties.
+    /// Creates a SUBSCRIBE with no properties, valid on any version.
     pub fn new(packet_id: u16, subscriptions: Vec<Subscription>) -> Self {
         Self {
             packet_id,
@@ -240,10 +240,13 @@ impl Subscribe {
 
 /// A SUBACK packet, unified across MQTT v3.1, v3.1.1, and v5.
 ///
-/// In v3 the per-subscription return codes (`0x00`=QoS0, `0x01`=QoS1,
-/// `0x02`=QoS2, `0x80`=Failure) share byte values with
+/// In v3 the per-subscription return codes:
+/// - `0x00` - `0x02` = Max QoS Granted
+/// - `0x80` = Failure
+///
+/// These share byte values with
 /// [`ReasonCode::GrantedQos0`] / `GrantedQos1` / `GrantedQos2` /
-/// [`ReasonCode::UnspecifiedError`], so no translation is needed; any other
+/// [`ReasonCode::UnspecifiedError`], so no translation is needed. Any other
 /// code is rejected on a v3 connection in both directions.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
@@ -257,7 +260,11 @@ pub struct SubAck {
 }
 
 impl SubAck {
-    /// Creates a SUBACK with no properties.
+    /// Creates a SUBACK with no properties, valid on any version.
+    ///
+    /// For v3, the [`ReasonCode`] values are the same as the return codes,
+    /// where `0-2` is the maximum QoS granted for each subscription request,
+    /// or `0x80` indicates a failure.
     pub fn new(packet_id: u16, reason_codes: Vec<ReasonCode>) -> Self {
         Self {
             packet_id,

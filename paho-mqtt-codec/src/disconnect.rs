@@ -56,15 +56,16 @@ pub struct Disconnect {
 }
 
 impl Disconnect {
-    /// Creates a DISCONNECT with no properties.
-    pub fn new(reason_code: ReasonCode) -> Self {
-        Self {
-            reason_code,
-            properties: Properties::new(),
-        }
+    /// Creates a normal DISCONNECT, valid on any version.
+    ///
+    /// A v3 DISCONNECT is nothing but its fixed header, and this is what v5
+    /// encodes in its zero-length shorthand form. Same as
+    /// [`Disconnect::default`].
+    pub fn new() -> Self {
+        Self::default()
     }
 
-    /// Creates a DISCONNECT carrying MQTT v5 properties.
+    /// Creates a DISCONNECT carrying an MQTT v5 reason code and properties.
     ///
     /// v5 only.
     ///
@@ -74,12 +75,21 @@ impl Disconnect {
     /// all, so encoding a non-empty list for v3 is an error rather than a
     /// silent drop — use [`new`](Self::new) for a DISCONNECT that must work on
     /// either version.
-    pub fn with_properties(reason_code: ReasonCode, properties: Properties) -> Self {
+    ///
+    /// `properties` accepts a [`Properties`] or `None`. A reason code with no
+    /// properties is its own one-byte wire form (§3.14.2.2.1), so `None` is
+    /// the usual way to build the DISCONNECT a server sends when it just
+    /// wants to say why.
+    pub fn with_properties<P>(reason_code: ReasonCode, properties: P) -> Self
+    where
+        P: Into<Option<Properties>>,
+    {
         Self {
             reason_code,
-            properties,
+            properties: properties.into().unwrap_or_default(),
         }
     }
+
     /// Returns the remaining-length byte count for version, `ver`.
     ///
     /// When `reason_code` is `NormalDisconnection` and `properties` is empty,
@@ -220,7 +230,7 @@ mod tests {
     fn test_disconnect_v311_ignores_reason_code() {
         // Non-normal reason code is not written on v3.1.1 wire; round-trip
         // decodes as NormalDisconnection.
-        let d = Disconnect::new(ReasonCode::NotAuthorized);
+        let d = Disconnect::with_properties(ReasonCode::NotAuthorized, None);
         let mut dst = BytesMut::new();
         d.encode(&mut dst, v311()).unwrap();
         assert!(dst.is_empty());
@@ -252,7 +262,7 @@ mod tests {
 
     #[test]
     fn test_disconnect_v5_reason_code_encoded() {
-        let d = Disconnect::new(ReasonCode::SessionTakenOver);
+        let d = Disconnect::with_properties(ReasonCode::SessionTakenOver, None);
         let mut dst = BytesMut::new();
         d.encode(&mut dst, v5()).unwrap();
         // Reason code only; the property length is omitted when empty.
@@ -261,24 +271,30 @@ mod tests {
 
     #[test]
     fn test_disconnect_v5_encoded_size_with_reason() {
-        let d = Disconnect::new(ReasonCode::SessionTakenOver);
+        let d = Disconnect::with_properties(ReasonCode::SessionTakenOver, None);
         // Reason code only; the property length is omitted when empty.
         assert_eq!(d.encoded_size(v5()), 1);
     }
 
     #[test]
     fn test_disconnect_v5_round_trip_reason() {
-        round_trip(Disconnect::new(ReasonCode::SessionTakenOver), v5());
+        round_trip(
+            Disconnect::with_properties(ReasonCode::SessionTakenOver, None),
+            v5(),
+        );
     }
 
     #[test]
     fn test_disconnect_v5_round_trip_not_authorized() {
-        round_trip(Disconnect::new(ReasonCode::NotAuthorized), v5());
+        round_trip(
+            Disconnect::with_properties(ReasonCode::NotAuthorized, None),
+            v5(),
+        );
     }
 
     #[test]
     fn test_disconnect_v5_encoded_size_matches_encode() {
-        let d = Disconnect::new(ReasonCode::ServerBusy);
+        let d = Disconnect::with_properties(ReasonCode::ServerBusy, None);
         let mut dst = BytesMut::new();
         d.encode(&mut dst, v5()).unwrap();
         assert_eq!(dst.len(), d.encoded_size(v5()));
@@ -294,10 +310,77 @@ mod tests {
         assert_eq!(d.reason_code, ReasonCode::NormalDisconnection);
         assert_eq!(d.reason_code, ReasonCode::Success, "the two are one code");
         assert!(d.properties.is_empty());
-        assert_eq!(d, Disconnect::new(ReasonCode::NormalDisconnection));
+        assert_eq!(d, Disconnect::new());
+        assert_eq!(
+            d,
+            Disconnect::with_properties(ReasonCode::NormalDisconnection, None)
+        );
+    }
+
+    // ---- new ----
+
+    #[test]
+    fn test_new_is_the_version_neutral_shorthand() {
+        let d = Disconnect::new();
+        assert_eq!(d, Disconnect::default());
+        assert_eq!(d.reason_code, ReasonCode::NormalDisconnection);
+        assert!(d.properties.is_empty());
+        // Nothing but the fixed header, on either version.
+        for ver in [v311(), v5()] {
+            assert_eq!(d.encoded_size(ver), 0);
+            let mut dst = BytesMut::new();
+            d.encode(&mut dst, ver).unwrap();
+            assert!(dst.is_empty(), "{ver}");
+        }
     }
 
     // ---- with_properties ----
+
+    #[test]
+    fn test_with_properties_none_keeps_only_the_reason_code() {
+        let d = Disconnect::with_properties(ReasonCode::ServerBusy, None);
+        assert_eq!(d.reason_code, ReasonCode::ServerBusy);
+        assert!(d.properties.is_empty());
+    }
+
+    /// A normal disconnection is the shorthand however it was built.
+    #[test]
+    fn test_with_properties_normal_and_none_matches_new() {
+        assert_eq!(
+            Disconnect::with_properties(ReasonCode::NormalDisconnection, None),
+            Disconnect::new()
+        );
+    }
+
+    #[test]
+    fn test_with_properties_none_round_trip_v5() {
+        for rc in [
+            ReasonCode::NormalDisconnection,
+            ReasonCode::DisconnectWithWillMessage,
+            ReasonCode::ServerBusy,
+            ReasonCode::SessionTakenOver,
+        ] {
+            let d = Disconnect::with_properties(rc, None);
+            let mut dst = BytesMut::new();
+            d.encode(&mut dst, v5()).unwrap();
+            assert_eq!(dst.len(), d.encoded_size(v5()));
+            round_trip(d, v5());
+        }
+    }
+
+    /// A v3 DISCONNECT has no body, so the reason code is dropped rather than
+    /// refused — unlike properties, which fail to encode.
+    #[test]
+    fn test_reason_code_is_dropped_on_v3() {
+        let d = Disconnect::with_properties(ReasonCode::ServerBusy, None);
+        let mut dst = BytesMut::new();
+        d.encode(&mut dst, v311()).unwrap();
+        assert!(dst.is_empty());
+        assert_eq!(
+            Disconnect::decode(dst.freeze(), v311()).unwrap(),
+            Disconnect::new()
+        );
+    }
 
     /// A ReasonString, as a server explaining itself would send.
     fn reason_props(text: &str) -> Properties {
@@ -319,12 +402,12 @@ mod tests {
         );
     }
 
-    /// With no properties it is indistinguishable from `new`, shorthand
+    /// `None` and an empty `Properties` build the same packet, shorthand
     /// encoding included.
     #[test]
-    fn test_with_properties_empty_matches_new() {
-        let a = Disconnect::with_properties(ReasonCode::SessionTakenOver, Properties::new());
-        let b = Disconnect::new(ReasonCode::SessionTakenOver);
+    fn test_with_properties_none_matches_empty() {
+        let a = Disconnect::with_properties(ReasonCode::SessionTakenOver, None);
+        let b = Disconnect::with_properties(ReasonCode::SessionTakenOver, Properties::new());
         assert_eq!(a, b);
 
         // Reason code only: 1 byte, no property length (§3.14.2.2.1).

@@ -53,7 +53,7 @@ pub struct Will {
 }
 
 impl Will {
-    /// Creates a Will with no properties.
+    /// Creates a Will with no properties, valid on any version.
     pub fn new(
         topic: impl Into<String>,
         payload: impl Into<Bytes>,
@@ -138,6 +138,32 @@ impl Connect {
             version: ver,
             clean_start,
             client_id: client_id.into(),
+            ..Self::default()
+        }
+    }
+
+    /// Creates a minimal `Connect` carrying MQTT v5 Connect Properties.
+    ///
+    /// v5 only.
+    ///
+    /// `SessionExpiryInterval`, `ReceiveMaximum`, `MaximumPacketSize`,
+    /// `TopicAliasMaximum`, `RequestResponseInformation`,
+    /// `RequestProblemInformation`, `AuthenticationMethod`,
+    /// `AuthenticationData`, and `UserProperty` are permitted here
+    /// (§3.1.2.11); [`encode`](Self::encode) rejects anything else, and
+    /// rejects a non-empty set for any version but v5. The Will has its own,
+    /// narrower property set — see [`Will::with_properties`].
+    pub fn with_properties(
+        ver: MqttVersion,
+        clean_start: bool,
+        client_id: impl Into<String>,
+        properties: Properties,
+    ) -> Self {
+        Self {
+            version: ver,
+            clean_start,
+            client_id: client_id.into(),
+            properties,
             ..Self::default()
         }
     }
@@ -363,7 +389,7 @@ pub struct ConnAck {
 }
 
 impl ConnAck {
-    /// Creates a `ConnAck` with no properties (suitable for any version).
+    /// Creates a CONNACK with no properties, valid on any version.
     pub fn new(session_present: bool, reason_code: ReasonCode) -> Self {
         Self {
             session_present,
@@ -1442,6 +1468,72 @@ mod tests {
             false,
             props,
         ));
+        let mut dst = BytesMut::new();
+        assert_eq!(c.encode(&mut dst), Err(Error::ProtocolError));
+    }
+
+    // ---- Connect::with_properties ----
+
+    fn connect_props() -> Properties {
+        let mut props = Properties::new();
+        props.push(Property::new(
+            PropertyId::SessionExpiryInterval,
+            PropertyValue::U32(300),
+        ));
+        props.push(Property::new(
+            PropertyId::ReceiveMaximum,
+            PropertyValue::U16(20),
+        ));
+        props
+    }
+
+    #[test]
+    fn test_connect_with_properties_keeps_all_arguments() {
+        let c = Connect::with_properties(v5(), true, "cli", connect_props());
+        assert_eq!(c.version, v5());
+        assert!(c.clean_start);
+        assert_eq!(c.client_id, "cli");
+        assert_eq!(
+            c.properties.get(PropertyId::SessionExpiryInterval),
+            Some(&PropertyValue::U32(300))
+        );
+        // Everything else is still the default.
+        assert_eq!(c.keep_alive, 0);
+        assert!(c.username.is_none());
+        assert!(c.password.is_none());
+        assert!(c.will.is_none());
+    }
+
+    #[test]
+    fn test_connect_with_properties_empty_matches_new() {
+        assert_eq!(
+            Connect::with_properties(v5(), false, "c", Properties::new()),
+            Connect::new(v5(), false, "c")
+        );
+    }
+
+    #[test]
+    fn test_connect_with_properties_round_trip_v5() {
+        round_trip_connect(Connect::with_properties(v5(), true, "cli", connect_props()));
+    }
+
+    #[test]
+    fn test_connect_with_properties_on_v3_is_an_error() {
+        let c = Connect::with_properties(v311(), true, "c", connect_props());
+        let mut dst = BytesMut::new();
+        assert_eq!(c.encode(&mut dst), Err(Error::ProtocolError));
+    }
+
+    /// The CONNECT context is not the Will's: a Will-only property is refused
+    /// at the packet level.
+    #[test]
+    fn test_connect_with_properties_rejects_a_property_not_allowed_here() {
+        let mut props = Properties::new();
+        props.push(Property::new(
+            PropertyId::WillDelayInterval,
+            PropertyValue::U32(5),
+        ));
+        let c = Connect::with_properties(v5(), true, "c", props);
         let mut dst = BytesMut::new();
         assert_eq!(c.encode(&mut dst), Err(Error::ProtocolError));
     }

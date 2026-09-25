@@ -73,6 +73,7 @@ impl Auth {
             properties,
         }
     }
+
     /// Returns the remaining-length byte count.
     ///
     /// Uses the shorthand form (0) when `reason_code` is `Success` and
@@ -199,10 +200,7 @@ mod tests {
 
     #[test]
     fn test_auth_continue_round_trip() {
-        round_trip(Auth::new(
-            ReasonCode::ContinueAuthentication,
-            None,
-        ));
+        round_trip(Auth::new(ReasonCode::ContinueAuthentication, None));
     }
 
     // ---- ReAuthenticate ----

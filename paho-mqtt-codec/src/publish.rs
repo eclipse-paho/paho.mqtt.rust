@@ -61,7 +61,7 @@ pub struct Publish {
 impl Publish {
     /// Creates a QoS 0 PUBLISH with no DUP, no retain, and no properties.
     pub fn new(topic: impl Into<String>, payload: impl Into<Bytes>) -> Self {
-        Publish {
+        Self {
             dup: false,
             qos: QoS::default(),
             retain: false,
@@ -69,6 +69,37 @@ impl Publish {
             packet_id: None,
             payload: payload.into(),
             properties: Properties::new(),
+        }
+    }
+
+    /// Creates a QoS 0 PUBLISH carrying MQTT v5 properties.
+    ///
+    /// v5 only.
+    ///
+    /// `PayloadFormatIndicator`, `MessageExpiryInterval`, `TopicAlias`,
+    /// `ResponseTopic`, `CorrelationData`, `SubscriptionIdentifier`,
+    /// `ContentType`, and `UserProperty` are permitted here (§3.3.2.3);
+    /// [`encode`](Self::encode) rejects anything else, and rejects a
+    /// non-empty set for any version but v5. `SubscriptionIdentifier` is the
+    /// one property that may repeat, since a message can match several
+    /// subscriptions.
+    ///
+    /// For QoS 1 or 2, set [`qos`](Self::qos) and [`packet_id`](Self::packet_id)
+    /// afterwards; both are required together, and `encode` rejects either
+    /// one without the other.
+    pub fn with_properties(
+        topic: impl Into<String>,
+        payload: impl Into<Bytes>,
+        properties: Properties,
+    ) -> Self {
+        Self {
+            dup: false,
+            qos: QoS::default(),
+            retain: false,
+            topic: topic.into(),
+            packet_id: None,
+            payload: payload.into(),
+            properties,
         }
     }
 
@@ -216,37 +247,39 @@ pub type PubRel = PubAck;
 pub type PubComp = PubAck;
 
 impl PubAck {
-    /// Creates an acknowledgement with a reason code and MQTT v5 properties.
+    /// Creates a plain success acknowledgement, valid on any version.
     ///
-    /// `properties` accepts a [`Properties`] or `None`, which is the same as
-    /// an empty set — most acknowledgements carry no properties, so `None`
-    /// saves naming the type at the call site.
-    ///
-    /// The reason code and properties are v5-only: on a v3 connection the
-    /// reason code cannot be expressed and is dropped, and non-empty
-    /// properties are refused by [`encode`](Self::encode). Use
-    /// [`from_packet_id`](Self::from_packet_id) for the plain success
-    /// acknowledgement that v3 can carry and that v5 encodes in its
-    /// two-byte shorthand form.
-    pub fn new<P>(packet_id: u16, reason_code: ReasonCode, properties: P) -> Self
-    where
-        P: Into<Option<Properties>>,
-    {
-        let properties = properties.into().unwrap_or_default();
-
-        Self {
-            packet_id,
-            reason_code,
-            properties,
-        }
-    }
-
-    /// Creates a success acknowledgement with empty properties.
-    pub fn from_packet_id(packet_id: u16) -> Self {
+    /// This is everything a v3 acknowledgement can carry, and it is what v5
+    /// encodes in its two-byte shorthand form.
+    pub fn new(packet_id: u16) -> Self {
         Self {
             packet_id,
             reason_code: ReasonCode::Success,
             properties: Properties::new(),
+        }
+    }
+
+    /// Creates an acknowledgement with a reason code and MQTT v5 properties.
+    ///
+    /// v5 only.
+    ///
+    /// Both extras are v5-only: on a v3 connection the reason code cannot be
+    /// expressed and is dropped, and non-empty properties are refused by
+    /// [`encode`](Self::encode) — use [`new`](Self::new) for an
+    /// acknowledgement that must work on either version.
+    ///
+    /// `properties` accepts a [`Properties`] or `None`. An empty set is a
+    /// distinct wire form here rather than a different constructor: `None`
+    /// gives the three-byte packet ID + reason code encoding, which is what a
+    /// broker reporting a non-success outcome usually sends.
+    pub fn with_properties<P>(packet_id: u16, reason_code: ReasonCode, properties: P) -> Self
+    where
+        P: Into<Option<Properties>>,
+    {
+        Self {
+            packet_id,
+            reason_code,
+            properties: properties.into().unwrap_or_default(),
         }
     }
 
@@ -317,7 +350,7 @@ impl PubAck {
         };
         expect_end(&payload)?;
 
-        Ok(Self::new(packet_id, reason_code, properties))
+        Ok(Self::with_properties(packet_id, reason_code, properties))
     }
 }
 
@@ -655,6 +688,86 @@ mod tests {
     // PubAck / PubRec / PubRel / PubComp tests
     // ======================================================================
 
+    // ---- Publish::with_properties ----
+
+    fn publish_props() -> Properties {
+        let mut props = Properties::new();
+        props.push(Property::new(
+            PropertyId::ContentType,
+            PropertyValue::String("application/json".into()),
+        ));
+        props.push(Property::new(
+            PropertyId::MessageExpiryInterval,
+            PropertyValue::U32(60),
+        ));
+        props
+    }
+
+    #[test]
+    fn test_publish_with_properties_keeps_all_arguments() {
+        let p = Publish::with_properties("a/b", "hi", publish_props());
+        assert_eq!(p.topic, "a/b");
+        assert_eq!(&p.payload[..], b"hi");
+        assert_eq!(
+            p.properties.get(PropertyId::ContentType),
+            Some(&PropertyValue::String("application/json".into()))
+        );
+        // Same defaults as `new`: QoS 0, no DUP, no retain, no packet ID.
+        assert_eq!(p.qos, QoS::QoS0);
+        assert!(!p.dup);
+        assert!(!p.retain);
+        assert!(p.packet_id.is_none());
+    }
+
+    #[test]
+    fn test_publish_with_properties_empty_matches_new() {
+        assert_eq!(
+            Publish::with_properties("a", "x", Properties::new()),
+            Publish::new("a", "x")
+        );
+    }
+
+    #[test]
+    fn test_publish_with_properties_round_trip_v5() {
+        let p = Publish::with_properties("a/b", "hi", publish_props());
+        let mut dst = BytesMut::new();
+        p.encode(&mut dst, v5()).unwrap();
+        assert_eq!(dst.len(), p.encoded_size(v5()));
+        assert_eq!(Publish::decode(0, dst.freeze(), v5()).unwrap(), p);
+    }
+
+    /// The QoS and packet ID are still set afterwards, and must agree.
+    #[test]
+    fn test_publish_with_properties_promoted_to_qos1_round_trips() {
+        let mut p = Publish::with_properties("a/b", "hi", publish_props());
+        p.qos = QoS::QoS1;
+        p.packet_id = Some(9);
+        let mut dst = BytesMut::new();
+        p.encode(&mut dst, v5()).unwrap();
+        assert_eq!(dst.len(), p.encoded_size(v5()));
+        // flags carry QoS 1 (bit 1).
+        assert_eq!(Publish::decode(0x02, dst.freeze(), v5()).unwrap(), p);
+    }
+
+    #[test]
+    fn test_publish_with_properties_on_v3_is_an_error() {
+        let p = Publish::with_properties("a", "x", publish_props());
+        let mut dst = BytesMut::new();
+        assert_eq!(p.encode(&mut dst, v311()), Err(Error::ProtocolError));
+    }
+
+    #[test]
+    fn test_publish_with_properties_rejects_a_property_not_allowed_here() {
+        let mut props = Properties::new();
+        props.push(Property::new(
+            PropertyId::WillDelayInterval,
+            PropertyValue::U32(5),
+        ));
+        let p = Publish::with_properties("a", "x", props);
+        let mut dst = BytesMut::new();
+        assert_eq!(p.encode(&mut dst, v5()), Err(Error::ProtocolError));
+    }
+
     fn round_trip_puback(ack: PubAck, ver: MqttVersion) {
         let mut dst = BytesMut::new();
         ack.encode(&mut dst, ver).unwrap();
@@ -666,7 +779,7 @@ mod tests {
 
     #[test]
     fn test_puback_encode_v311() {
-        let ack = PubAck::from_packet_id(42);
+        let ack = PubAck::new(42);
         let mut dst = BytesMut::new();
         ack.encode(&mut dst, v311()).unwrap();
         assert_eq!(&dst[..], &[0x00, 0x2A]); // packet_id = 42
@@ -674,14 +787,14 @@ mod tests {
 
     #[test]
     fn test_puback_round_trip_v311() {
-        round_trip_puback(PubAck::from_packet_id(1), v311());
-        round_trip_puback(PubAck::from_packet_id(0xFFFF), v311());
+        round_trip_puback(PubAck::new(1), v311());
+        round_trip_puback(PubAck::new(0xFFFF), v311());
     }
 
     #[test]
     fn test_puback_v311_ignores_reason_code() {
         // Even with a non-Success reason code, v311 wire format is still 2 bytes.
-        let ack = PubAck::new(5, ReasonCode::NotAuthorized, None);
+        let ack = PubAck::with_properties(5, ReasonCode::NotAuthorized, None);
         let mut dst = BytesMut::new();
         ack.encode(&mut dst, v311()).unwrap();
         assert_eq!(dst.len(), 2);
@@ -694,7 +807,7 @@ mod tests {
 
     #[test]
     fn test_puback_v5_shorthand_encode() {
-        let ack = PubAck::from_packet_id(7);
+        let ack = PubAck::new(7);
         let mut dst = BytesMut::new();
         ack.encode(&mut dst, v5()).unwrap();
         assert_eq!(&dst[..], &[0x00, 0x07]); // packet_id only
@@ -702,19 +815,19 @@ mod tests {
 
     #[test]
     fn test_puback_v5_shorthand_encoded_size() {
-        assert_eq!(PubAck::from_packet_id(1).encoded_size(v5()), 2);
+        assert_eq!(PubAck::new(1).encoded_size(v5()), 2);
     }
 
     #[test]
     fn test_puback_v5_shorthand_round_trip() {
-        round_trip_puback(PubAck::from_packet_id(100), v5());
+        round_trip_puback(PubAck::new(100), v5());
     }
 
     // ---- v5 full form (non-Success reason code) ----
 
     #[test]
     fn test_puback_v5_full_encode() {
-        let ack = PubAck::new(3, ReasonCode::NotAuthorized, None);
+        let ack = PubAck::with_properties(3, ReasonCode::NotAuthorized, None);
         let mut dst = BytesMut::new();
         ack.encode(&mut dst, v5()).unwrap();
         // packet_id(2) + reason(1); the property length is omitted when empty.
@@ -723,7 +836,7 @@ mod tests {
 
     #[test]
     fn test_puback_v5_full_round_trip() {
-        let ack = PubAck::new(200, ReasonCode::PacketIdentifierInUse, None);
+        let ack = PubAck::with_properties(200, ReasonCode::PacketIdentifierInUse, None);
         round_trip_puback(ack, v5());
     }
 
@@ -734,7 +847,7 @@ mod tests {
             PropertyId::ReasonString,
             PropertyValue::String("no".into()),
         ));
-        let ack = PubAck::new(3, ReasonCode::NotAuthorized, props);
+        let ack = PubAck::with_properties(3, ReasonCode::NotAuthorized, props);
         let mut dst = BytesMut::new();
         ack.encode(&mut dst, v5()).unwrap();
         // id(2) + reason(1) + props_len(1=5) + [0x1F, 0x00, 0x02, 'n', 'o']
@@ -771,12 +884,12 @@ mod tests {
 
     #[test]
     fn test_puback_encoded_size_v311() {
-        assert_eq!(PubAck::from_packet_id(1).encoded_size(v311()), 2);
+        assert_eq!(PubAck::new(1).encoded_size(v311()), 2);
     }
 
     #[test]
     fn test_puback_encoded_size_v5_full() {
-        let ack = PubAck::new(1, ReasonCode::UnspecifiedError, None);
+        let ack = PubAck::with_properties(1, ReasonCode::UnspecifiedError, None);
         // 2 (id) + 1 (reason); the property length is omitted when empty.
         assert_eq!(ack.encoded_size(v5()), 3);
     }
@@ -784,8 +897,8 @@ mod tests {
     #[test]
     fn test_puback_encoded_size_matches_encode() {
         let cases = [
-            PubAck::from_packet_id(1),
-            PubAck::new(2, ReasonCode::UnspecifiedError, None),
+            PubAck::new(1),
+            PubAck::with_properties(2, ReasonCode::UnspecifiedError, None),
         ];
         for ack in &cases {
             for ver in [v311(), v5()] {
@@ -823,7 +936,7 @@ mod tests {
 
     #[test]
     fn test_puback_encode_props_on_v3_is_protocol_error() {
-        let mut ack = PubAck::from_packet_id(1);
+        let mut ack = PubAck::new(1);
         ack.properties.push(Property::new(
             PropertyId::ReasonString,
             PropertyValue::String("x".into()),
@@ -847,8 +960,8 @@ mod tests {
     }
 
     #[test]
-    fn test_puback_new_keeps_all_arguments() {
-        let ack = PubAck::new(
+    fn test_puback_with_properties_keeps_all_arguments() {
+        let ack = PubAck::with_properties(
             99,
             ReasonCode::NoMatchingSubscribers,
             reason_props("nobody listening"),
@@ -861,34 +974,40 @@ mod tests {
         );
     }
 
-    /// The three spellings of "a plain success ack" agree: `None`, an empty
-    /// `Properties`, and `from_packet_id`.
+    /// The three spellings of "a plain success ack" agree: `new`, and
+    /// `with_properties` with `None` or an empty `Properties`.
     #[test]
-    fn test_puback_new_success_and_empty_matches_from_packet_id() {
-        let expected = PubAck::from_packet_id(4);
-        assert_eq!(PubAck::new(4, ReasonCode::Success, None), expected);
+    fn test_puback_with_properties_success_and_empty_matches_new() {
+        let expected = PubAck::new(4);
         assert_eq!(
-            PubAck::new(4, ReasonCode::Success, Properties::new()),
+            PubAck::with_properties(4, ReasonCode::Success, None),
+            expected
+        );
+        assert_eq!(
+            PubAck::with_properties(4, ReasonCode::Success, Properties::new()),
             expected
         );
     }
 
     /// `properties` takes a `Properties`, a `Some(Properties)`, or `None`.
     #[test]
-    fn test_puback_new_accepts_properties_by_value_or_option() {
+    fn test_puback_with_properties_accepts_properties_by_value_or_option() {
         let props = reason_props("denied");
-        let bare = PubAck::new(1, ReasonCode::NotAuthorized, props.clone());
-        assert_eq!(PubAck::new(1, ReasonCode::NotAuthorized, Some(props)), bare);
+        let bare = PubAck::with_properties(1, ReasonCode::NotAuthorized, props.clone());
+        assert_eq!(
+            PubAck::with_properties(1, ReasonCode::NotAuthorized, Some(props)),
+            bare
+        );
         assert!(
-            PubAck::new(1, ReasonCode::NotAuthorized, None)
+            PubAck::with_properties(1, ReasonCode::NotAuthorized, None)
                 .properties
                 .is_empty()
         );
     }
 
     #[test]
-    fn test_puback_from_packet_id_is_the_default_but_for_the_id() {
-        let ack = PubAck::from_packet_id(4);
+    fn test_puback_new_is_the_default_but_for_the_id() {
+        let ack = PubAck::new(4);
         assert_eq!(ack.reason_code, ReasonCode::Success);
         assert!(ack.properties.is_empty());
         assert_eq!(
@@ -900,14 +1019,14 @@ mod tests {
         );
     }
 
-    /// `new` reaches all three v5 wire forms; which one is used is decided by
-    /// the arguments, not by the constructor.
+    /// `with_properties` reaches all three v5 wire forms; which one is used
+    /// is decided by the arguments, not by the constructor.
     #[test]
-    fn test_puback_new_round_trip_v5_all_forms() {
+    fn test_puback_with_properties_round_trip_v5_all_forms() {
         for ack in [
-            PubAck::new(1, ReasonCode::Success, None),
-            PubAck::new(2, ReasonCode::NotAuthorized, None),
-            PubAck::new(3, ReasonCode::NotAuthorized, reason_props("denied")),
+            PubAck::with_properties(1, ReasonCode::Success, None),
+            PubAck::with_properties(2, ReasonCode::NotAuthorized, None),
+            PubAck::with_properties(3, ReasonCode::NotAuthorized, reason_props("denied")),
         ] {
             let mut dst = BytesMut::new();
             ack.encode(&mut dst, v5()).unwrap();
@@ -917,20 +1036,20 @@ mod tests {
     }
 
     #[test]
-    fn test_puback_new_with_properties_on_v3_is_an_error() {
-        let ack = PubAck::new(1, ReasonCode::Success, reason_props("why"));
+    fn test_puback_with_properties_on_v3_is_an_error() {
+        let ack = PubAck::with_properties(1, ReasonCode::Success, reason_props("why"));
         let mut dst = BytesMut::new();
         assert_eq!(ack.encode(&mut dst, v311()), Err(Error::ProtocolError));
     }
 
     #[test]
-    fn test_puback_new_rejects_a_property_not_allowed_here() {
+    fn test_puback_with_properties_rejects_a_property_not_allowed_here() {
         let mut props = Properties::new();
         props.push(Property::new(
             PropertyId::SubscriptionIdentifier,
             PropertyValue::VarInt(1),
         ));
-        let ack = PubAck::new(1, ReasonCode::Success, props);
+        let ack = PubAck::with_properties(1, ReasonCode::Success, props);
         let mut dst = BytesMut::new();
         assert_eq!(ack.encode(&mut dst, v5()), Err(Error::ProtocolError));
     }
@@ -938,8 +1057,8 @@ mod tests {
     /// The reason code is still checked against the packet type: `new` takes
     /// any `ReasonCode`, and an inappropriate one fails at the `Packet` level.
     #[test]
-    fn test_puback_new_with_a_reason_code_not_allowed_here() {
-        let ack = PubAck::new(1, ReasonCode::GrantedQos2, None);
+    fn test_puback_with_properties_with_a_reason_code_not_allowed_here() {
+        let ack = PubAck::with_properties(1, ReasonCode::GrantedQos2, None);
         let mut dst = BytesMut::new();
         assert_eq!(
             crate::Packet::PubAck(ack).encode(&mut dst, v5()),

@@ -326,9 +326,9 @@ fn puback(u: &mut Unstructured, ver: MqttVersion, ty: PacketType) -> AResult<Pub
     if ver == MqttVersion::V5 {
         let rc = reason_code(u, ty)?;
         let props = properties(u, ver, ty)?;
-        Ok(PubAck::new(id, rc, props))
+        Ok(PubAck::with_properties(id, rc, props))
     } else {
-        Ok(PubAck::from_packet_id(id))
+        Ok(PubAck::new(id))
     }
 }
 
@@ -395,9 +395,9 @@ fn unsuback(u: &mut Unstructured, ver: MqttVersion) -> AResult<UnsubAck> {
         }
         _ => Vec::new(),
     };
-    let mut s = UnsubAck::new(packet_id(u)?, codes);
-    s.properties = properties(u, ver, PacketType::UnsubAck)?;
-    Ok(s)
+    let id = packet_id(u)?;
+    let props = properties(u, ver, PacketType::UnsubAck)?;
+    Ok(UnsubAck::with_properties(id, codes, props))
 }
 
 fn disconnect(u: &mut Unstructured, ver: MqttVersion) -> AResult<Disconnect> {

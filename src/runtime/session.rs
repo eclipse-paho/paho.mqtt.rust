@@ -527,7 +527,7 @@ impl<B: Backend> Session<B> {
                     p.dup = true;
                     Packet::Publish(p)
                 }
-                PublishPhase::AwaitingPubComp => Packet::PubRel(PubAck::from_packet_id(id)),
+                PublishPhase::AwaitingPubComp => Packet::PubRel(PubAck::new(id)),
             },
             None => return Ok(()),
         };
@@ -712,7 +712,9 @@ impl<B: Backend> Session<B> {
             && self.ver.is_v5()
             && let Some(rc) = disconnect_reason(e)
         {
-            let _ = self.send(&Packet::Disconnect(Disconnect::new(rc))).await;
+            let _ = self
+                .send(&Packet::Disconnect(Disconnect::with_properties(rc, None)))
+                .await;
         }
         res
     }
@@ -919,7 +921,7 @@ impl<B: Backend> Session<B> {
                 // is what a resumed session must re-send (§4.4). Replacing
                 // the persisted PUBLISH with the PUBREL keeps the store in
                 // step, so a crash now cannot resurrect the message.
-                let rel = PubAck::from_packet_id(rec.packet_id);
+                let rel = PubAck::new(rec.packet_id);
                 if let Some(inflight) = self.state.inflight.get_mut(&rec.packet_id) {
                     inflight.phase = PublishPhase::AwaitingPubComp;
                     inflight.sent = true;
@@ -985,7 +987,7 @@ impl<B: Backend> Session<B> {
                         let id = pub_pkt.packet_id.unwrap_or(0);
                         let msg = Message::from(pub_pkt);
                         let _ = self.event_tx.send(Event::MessageArrived(msg)).await;
-                        let ack = PubAck::from_packet_id(id);
+                        let ack = PubAck::new(id);
                         self.send(&Packet::PubAck(ack)).await?;
                     }
                     QoS::QoS2 => {
@@ -1002,7 +1004,7 @@ impl<B: Backend> Session<B> {
                         };
                         let msg = Message::from(pub_pkt);
                         self.state.pending_pub2_in.insert(id, msg);
-                        let rec = PubAck::from_packet_id(id);
+                        let rec = PubAck::new(id);
                         self.send(&Packet::PubRec(rec)).await?;
                     }
                 }
@@ -1014,7 +1016,7 @@ impl<B: Backend> Session<B> {
                     self.persist_remove(&format!("r{}", rel.packet_id));
                     let _ = self.event_tx.send(Event::MessageArrived(msg)).await;
                 }
-                let comp = PubAck::from_packet_id(rel.packet_id);
+                let comp = PubAck::new(rel.packet_id);
                 self.send(&Packet::PubComp(comp)).await?;
             }
 

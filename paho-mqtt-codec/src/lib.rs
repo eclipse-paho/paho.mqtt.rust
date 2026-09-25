@@ -32,6 +32,35 @@
 //! Every packet type can be both encoded and decoded, so a program can sit
 //! on either end of a connection, client or server. Decoding is strict; input
 //! that violates the specification is rejected with an [`Error`].
+//!
+//! # Constructors
+//!
+//! MQTT v5 properties are the one field every packet struct carries and most
+//! callers never set, so the constructors follow a single rule:
+//!
+//! - A packet that exists in v3 as well as v5 has a `new` that takes no
+//!   properties, so a v3-only caller is never asked for a type it cannot use,
+//!   and a `with_properties` that takes them. Where a *reason code* is v5-only
+//!   too, `new` leaves that out as well: [`Disconnect::new`],
+//!   [`UnsubAck::new`], and [`PubAck::new`] build the bare packets v3 can
+//!   express, and the reason code moves to `with_properties`.
+//! - [`Auth`], the one packet v5 introduced, takes properties directly in
+//!   `new` — there is no v3 caller to spare, and an AUTH without an
+//!   Authentication Method is meaningless. Its argument accepts a
+//!   [`Properties`] or `None`.
+//!
+//! Encoding a non-empty property set for a v3 connection is an error rather
+//! than a silent drop, so reaching for the wrong constructor is caught rather
+//! than quietly changing what goes on the wire.
+//!
+//! `with_properties` accepts `None` as well as a [`Properties`] wherever an
+//! empty set is an ordinary packet rather than a reason to reach for `new`:
+//! [`PubAck`] (with its `PubRec`/`PubRel`/`PubComp` aliases) and
+//! [`Disconnect`], where a reason code with no properties is its own short
+//! wire form, and [`UnsubAck`], whose reason codes are the point of the
+//! packet. So is [`Auth::new`], the one v5-only packet. There are never more
+//! than two constructors: `new` for the version-neutral minimum, and
+//! `with_properties` for everything v5 adds.
 
 #![no_std]
 #![deny(missing_docs)]

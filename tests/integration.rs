@@ -688,21 +688,18 @@ fn refusing_broker() -> (String, std::thread::JoinHandle<()>) {
                         s.packet_id,
                         vec![ReasonCode::NotAuthorized; s.subscriptions.len()],
                     ))),
-                    Packet::Unsubscribe(u) => Some(Packet::UnsubAck(UnsubAck::new(
+                    Packet::Unsubscribe(u) => Some(Packet::UnsubAck(UnsubAck::with_properties(
                         u.packet_id,
                         vec![ReasonCode::NotAuthorized; u.topic_filters.len()],
+                        None,
                     ))),
                     Packet::Publish(p) => match (p.qos, p.packet_id) {
-                        (mqtt::QoS::QoS1, Some(id)) => Some(Packet::PubAck(PubAck::new(
-                            id,
-                            ReasonCode::NotAuthorized,
-                            None,
-                        ))),
-                        (mqtt::QoS::QoS2, Some(id)) => Some(Packet::PubRec(PubAck::new(
-                            id,
-                            ReasonCode::NotAuthorized,
-                            None,
-                        ))),
+                        (mqtt::QoS::QoS1, Some(id)) => Some(Packet::PubAck(
+                            PubAck::with_properties(id, ReasonCode::NotAuthorized, None),
+                        )),
+                        (mqtt::QoS::QoS2, Some(id)) => Some(Packet::PubRec(
+                            PubAck::with_properties(id, ReasonCode::NotAuthorized, None),
+                        )),
                         _ => None,
                     },
                     Packet::PingReq => Some(Packet::PingResp),
@@ -795,7 +792,7 @@ fn test_wss_connect_publish() {
     let (broker, uri) = common::spawn_wss_broker(&certs, |pkt| match pkt {
         Packet::Connect(_) => vec![Packet::ConnAck(ConnAck::new(false, ReasonCode::Success))],
         Packet::Publish(p) => match p.packet_id {
-            Some(id) => vec![Packet::PubAck(PubAck::from_packet_id(id))],
+            Some(id) => vec![Packet::PubAck(PubAck::new(id))],
             None => vec![],
         },
         _ => vec![],
@@ -1785,7 +1782,7 @@ fn test_qos2_persists_pubrel_after_pubrec() {
     let broker = common::spawn_broker(|pkt| match pkt {
         Packet::Connect(_) => vec![Packet::ConnAck(ConnAck::new(false, ReasonCode::Success))],
         Packet::Publish(p) => match p.packet_id {
-            Some(id) => vec![Packet::PubRec(PubAck::from_packet_id(id))],
+            Some(id) => vec![Packet::PubRec(PubAck::new(id))],
             None => vec![],
         },
         _ => vec![],
@@ -1842,7 +1839,7 @@ fn test_inflight_qos1_resent_across_reconnect() {
         }
         // ... and this time the re-sent message is acknowledged.
         (Packet::Publish(p), _) => match p.packet_id {
-            Some(id) => vec![Packet::PubAck(PubAck::from_packet_id(id))].into(),
+            Some(id) => vec![Packet::PubAck(PubAck::new(id))].into(),
             None => common::Reply::none(),
         },
         _ => common::Reply::none(),
@@ -1886,7 +1883,7 @@ fn test_inflight_qos2_resends_pubrel_across_reconnect() {
         }
         // Take delivery of the message...
         (Packet::Publish(p), 0) => match p.packet_id {
-            Some(id) => vec![Packet::PubRec(PubAck::from_packet_id(id))].into(),
+            Some(id) => vec![Packet::PubRec(PubAck::new(id))].into(),
             None => common::Reply::none(),
         },
         // ... then die holding the PUBREL, without ever sending PUBCOMP.
@@ -1895,7 +1892,7 @@ fn test_inflight_qos2_resends_pubrel_across_reconnect() {
             vec![Packet::ConnAck(ConnAck::new(true, ReasonCode::Success))].into()
         }
         // The resumed session must offer the PUBREL again, which we complete.
-        (Packet::PubRel(r), _) => vec![Packet::PubComp(PubAck::from_packet_id(r.packet_id))].into(),
+        (Packet::PubRel(r), _) => vec![Packet::PubComp(PubAck::new(r.packet_id))].into(),
         _ => common::Reply::none(),
     });
 
@@ -1945,7 +1942,7 @@ fn test_unresumed_session_discards_qos2_and_resends_qos1() {
         (Packet::Publish(p), 0) => match (p.qos, p.packet_id) {
             (mqtt::QoS::ExactlyOnce, Some(id)) => {
                 flag.store(true, Ordering::SeqCst);
-                common::Reply::close_after(vec![Packet::PubRec(PubAck::from_packet_id(id))])
+                common::Reply::close_after(vec![Packet::PubRec(PubAck::new(id))])
             }
             _ => common::Reply::none(), // leave the QoS 1 unacknowledged
         },
@@ -1954,7 +1951,7 @@ fn test_unresumed_session_discards_qos2_and_resends_qos1() {
             vec![Packet::ConnAck(ConnAck::new(false, ReasonCode::Success))].into()
         }
         (Packet::Publish(p), _) => match p.packet_id {
-            Some(id) => vec![Packet::PubAck(PubAck::from_packet_id(id))].into(),
+            Some(id) => vec![Packet::PubAck(PubAck::new(id))].into(),
             None => common::Reply::none(),
         },
         _ => common::Reply::none(),
@@ -2055,10 +2052,10 @@ fn test_persisted_messages_restored_on_connect() {
     let broker = common::spawn_broker(|pkt| match pkt {
         Packet::Connect(_) => vec![Packet::ConnAck(ConnAck::new(true, ReasonCode::Success))],
         Packet::Publish(p) => match p.packet_id {
-            Some(id) => vec![Packet::PubAck(PubAck::from_packet_id(id))],
+            Some(id) => vec![Packet::PubAck(PubAck::new(id))],
             None => vec![],
         },
-        Packet::PubRel(r) => vec![Packet::PubComp(PubAck::from_packet_id(r.packet_id))],
+        Packet::PubRel(r) => vec![Packet::PubComp(PubAck::new(r.packet_id))],
         _ => vec![],
     });
 
@@ -2068,11 +2065,7 @@ fn test_persisted_messages_restored_on_connect() {
     unacked.qos = QoS::AtLeastOnce;
     unacked.packet_id = Some(4);
     store.preload("s4", &Packet::Publish(unacked), mqtt::MqttVersion::V5);
-    store.preload(
-        "s5",
-        &Packet::PubRel(PubAck::from_packet_id(5)),
-        mqtt::MqttVersion::V5,
-    );
+    store.preload("s5", &Packet::PubRel(PubAck::new(5)), mqtt::MqttVersion::V5);
 
     let cli = mqtt::CreateOptionsBuilder::new()
         .server_uri(broker.uri.clone())
@@ -3116,7 +3109,7 @@ fn test_tls_connect_publish() {
     let broker = common::spawn_tls_broker(&certs, |pkt| match pkt {
         Packet::Connect(_) => vec![Packet::ConnAck(ConnAck::new(false, ReasonCode::Success))],
         Packet::Publish(p) => match p.packet_id {
-            Some(id) => vec![Packet::PubAck(PubAck::from_packet_id(id))],
+            Some(id) => vec![Packet::PubAck(PubAck::new(id))],
             None => vec![],
         },
         _ => vec![],

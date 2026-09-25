@@ -51,7 +51,7 @@ pub struct Unsubscribe {
 }
 
 impl Unsubscribe {
-    /// Creates an UNSUBSCRIBE with no properties.
+    /// Creates an UNSUBSCRIBE with no properties, valid on any version.
     pub fn new(packet_id: u16, topic_filters: Vec<String>) -> Self {
         Self {
             packet_id,
@@ -153,11 +153,16 @@ pub struct UnsubAck {
 }
 
 impl UnsubAck {
-    /// Creates an UNSUBACK with no properties.
-    pub fn new(packet_id: u16, reason_codes: Vec<ReasonCode>) -> Self {
+    /// Creates a bare UNSUBACK, the packet identifier and nothing else.
+    ///
+    /// That is the whole of a v3 UNSUBACK, which has neither reason codes nor
+    /// properties. On v5 at least one reason code is required (§3.11.3), so
+    /// this form is a v3 packet only — [`encode`](Self::encode) rejects it
+    /// for v5.
+    pub fn new(packet_id: u16) -> Self {
         Self {
             packet_id,
-            reason_codes,
+            reason_codes: Vec::new(),
             properties: Properties::new(),
         }
     }
@@ -169,16 +174,21 @@ impl UnsubAck {
     /// Only `ReasonString` and `UserProperty` are permitted here (§3.11.2.1);
     /// [`encode`](Self::encode) rejects anything else. On v3 an UNSUBACK is
     /// the packet identifier and nothing more — neither properties nor reason
-    /// codes can be sent — so encoding either for v3 is an error.
-    pub fn with_properties(
-        packet_id: u16,
-        reason_codes: Vec<ReasonCode>,
-        properties: Properties,
-    ) -> Self {
+    /// codes can be sent — so encoding either for v3 is an error; use
+    /// [`new`](Self::new) for that.
+    ///
+    /// `properties` accepts a [`Properties`] or `None`. An empty set is the
+    /// ordinary v5 UNSUBACK — the reason codes are what it exists to carry —
+    /// so `None` is the common case here rather than a reason to reach for
+    /// another constructor.
+    pub fn with_properties<P>(packet_id: u16, reason_codes: Vec<ReasonCode>, properties: P) -> Self
+    where
+        P: Into<Option<Properties>>,
+    {
         Self {
             packet_id,
             reason_codes,
-            properties,
+            properties: properties.into().unwrap_or_default(),
         }
     }
 
@@ -392,7 +402,7 @@ mod tests {
 
     #[test]
     fn test_unsuback_encode_v311() {
-        let ua = UnsubAck::new(42, vec![]);
+        let ua = UnsubAck::new(42);
         let mut dst = BytesMut::new();
         ua.encode(&mut dst, v311()).unwrap();
         assert_eq!(&dst[..], &[0x00, 0x2A]);
@@ -402,7 +412,11 @@ mod tests {
     fn test_unsuback_v311_rejects_reason_codes() {
         // A v3 UNSUBACK cannot carry reason codes; refusing to encode is
         // better than dropping them silently.
-        let ua = UnsubAck::new(1, vec![ReasonCode::Success, ReasonCode::NotAuthorized]);
+        let ua = UnsubAck::with_properties(
+            1,
+            vec![ReasonCode::Success, ReasonCode::NotAuthorized],
+            None,
+        );
         let mut dst = BytesMut::new();
         assert_eq!(ua.encode(&mut dst, v311()), Err(Error::ProtocolError));
         assert!(dst.is_empty());
@@ -411,7 +425,7 @@ mod tests {
     #[test]
     fn test_unsuback_round_trip_v311() {
         // Round-trip always produces empty reason_codes on v3.1.1.
-        let ua = UnsubAck::new(7, vec![]);
+        let ua = UnsubAck::new(7);
         round_trip_unsuback(ua, v311());
     }
 
@@ -420,7 +434,7 @@ mod tests {
         // A v3 UNSUBACK is exactly the packet identifier; a v5 encoding of
         // the same packet carries more and must not decode as v3.
         let mut dst = BytesMut::new();
-        let ua_v5 = UnsubAck::new(3, vec![ReasonCode::Success]);
+        let ua_v5 = UnsubAck::with_properties(3, vec![ReasonCode::Success], None);
         ua_v5.encode(&mut dst, v5()).unwrap();
         assert_eq!(
             UnsubAck::decode(dst.freeze(), v311()),
@@ -432,7 +446,11 @@ mod tests {
 
     #[test]
     fn test_unsuback_encode_v5() {
-        let ua = UnsubAck::new(1, vec![ReasonCode::Success, ReasonCode::NotAuthorized]);
+        let ua = UnsubAck::with_properties(
+            1,
+            vec![ReasonCode::Success, ReasonCode::NotAuthorized],
+            None,
+        );
         let mut dst = BytesMut::new();
         ua.encode(&mut dst, v5()).unwrap();
         // id(2) + props_len(1=0x00) + rc0(0x00) + rc1(0x87)
@@ -441,19 +459,23 @@ mod tests {
 
     #[test]
     fn test_unsuback_round_trip_v5_single() {
-        round_trip_unsuback(UnsubAck::new(5, vec![ReasonCode::Success]), v5());
+        round_trip_unsuback(
+            UnsubAck::with_properties(5, vec![ReasonCode::Success], None),
+            v5(),
+        );
     }
 
     #[test]
     fn test_unsuback_round_trip_v5_multi() {
         round_trip_unsuback(
-            UnsubAck::new(
+            UnsubAck::with_properties(
                 9,
                 vec![
                     ReasonCode::Success,
                     ReasonCode::NoSubscriptionFound,
                     ReasonCode::NotAuthorized,
                 ],
+                None,
             ),
             v5(),
         );
@@ -468,31 +490,35 @@ mod tests {
             Err(Error::ProtocolError)
         );
         // v3.1.1 UNSUBACK has no reason codes at all, so this stays valid.
-        round_trip_unsuback(UnsubAck::new(1, vec![]), v311());
+        round_trip_unsuback(UnsubAck::new(1), v311());
     }
 
     // ---- encoded_size ----
 
     #[test]
     fn test_unsuback_encoded_size_v311() {
-        assert_eq!(UnsubAck::new(1, vec![]).encoded_size(v311()), 2);
+        assert_eq!(UnsubAck::new(1).encoded_size(v311()), 2);
     }
 
     #[test]
     fn test_unsuback_encoded_size_v5() {
-        let ua = UnsubAck::new(1, vec![ReasonCode::Success, ReasonCode::Success]);
+        let ua = UnsubAck::with_properties(1, vec![ReasonCode::Success, ReasonCode::Success], None);
         // 2 (id) + 1 (props VBI) + 2 (reason codes) = 5
         assert_eq!(ua.encoded_size(v5()), 5);
     }
 
     #[test]
     fn test_unsuback_encoded_size_matches_encode() {
-        let ua = UnsubAck::new(3, vec![ReasonCode::Success, ReasonCode::NotAuthorized]);
+        let ua = UnsubAck::with_properties(
+            3,
+            vec![ReasonCode::Success, ReasonCode::NotAuthorized],
+            None,
+        );
         let mut dst = BytesMut::new();
         ua.encode(&mut dst, v5()).unwrap();
         assert_eq!(dst.len(), ua.encoded_size(v5()));
 
-        let ua = UnsubAck::new(3, vec![]);
+        let ua = UnsubAck::new(3);
         let mut dst = BytesMut::new();
         ua.encode(&mut dst, v311()).unwrap();
         assert_eq!(dst.len(), ua.encoded_size(v311()));
@@ -528,7 +554,7 @@ mod tests {
 
     #[test]
     fn test_unsuback_encode_empty_codes_is_protocol_error_on_v5_only() {
-        let ack = UnsubAck::new(1, vec![]);
+        let ack = UnsubAck::new(1);
         let mut dst = BytesMut::new();
         assert_eq!(ack.encode(&mut dst, v5()), Err(Error::ProtocolError));
         assert!(dst.is_empty());
@@ -616,12 +642,50 @@ mod tests {
         assert_eq!(ack.properties.len(), 1);
     }
 
+    /// `None` and an empty `Properties` build the same packet.
     #[test]
-    fn test_unsuback_with_properties_empty_matches_new() {
+    fn test_unsuback_with_properties_none_matches_empty() {
         let codes = vec![ReasonCode::Success];
         assert_eq!(
             UnsubAck::with_properties(1, codes.clone(), Properties::new()),
-            UnsubAck::new(1, codes)
+            UnsubAck::with_properties(1, codes, None)
+        );
+    }
+
+    /// With no codes and no properties, `with_properties` is `new` — the bare
+    /// v3 packet.
+    #[test]
+    fn test_unsuback_with_properties_bare_matches_new() {
+        assert_eq!(UnsubAck::with_properties(1, vec![], None), UnsubAck::new(1));
+    }
+
+    #[test]
+    fn test_unsuback_new_is_the_v3_form() {
+        let ack = UnsubAck::new(9);
+        assert_eq!(ack.packet_id, 9);
+        assert!(ack.reason_codes.is_empty());
+        assert!(ack.properties.is_empty());
+        let mut dst = BytesMut::new();
+        ack.encode(&mut dst, v311()).unwrap();
+        assert_eq!(&dst[..], &[0x00, 0x09]);
+        // v5 requires at least one reason code.
+        let mut dst = BytesMut::new();
+        assert_eq!(ack.encode(&mut dst, v5()), Err(Error::ProtocolError));
+    }
+
+    #[test]
+    fn test_unsuback_with_properties_accepts_properties_by_value_or_option() {
+        let codes = vec![ReasonCode::Success];
+        let props = user_props("k", "v");
+        let bare = UnsubAck::with_properties(1, codes.clone(), props.clone());
+        assert_eq!(
+            UnsubAck::with_properties(1, codes.clone(), Some(props)),
+            bare
+        );
+        assert!(
+            UnsubAck::with_properties(1, codes, None)
+                .properties
+                .is_empty()
         );
     }
 
