@@ -62,7 +62,12 @@ impl Auth {
     /// and §3.15.2.2.2 requires every AUTH to name the method. An AUTH with
     /// no properties is only meaningful as the bare `Success` that ends a
     /// successful exchange, which is `Auth::default()`.
-    pub fn new(reason_code: ReasonCode, properties: Properties) -> Self {
+    pub fn new<P>(reason_code: ReasonCode, properties: P) -> Self
+    where
+        P: Into<Option<Properties>>,
+    {
+        let properties = properties.into().unwrap_or_default();
+
         Self {
             reason_code,
             properties,
@@ -112,10 +117,7 @@ impl Auth {
         };
         expect_end(&payload)?;
 
-        Ok(Self {
-            reason_code,
-            properties,
-        })
+        Ok(Self::new(reason_code, properties))
     }
 }
 
@@ -182,14 +184,14 @@ mod tests {
 
     #[test]
     fn test_auth_continue_encoded_size() {
-        let a = Auth::new(ReasonCode::ContinueAuthentication, Properties::new());
+        let a = Auth::new(ReasonCode::ContinueAuthentication, None);
         // Reason code only; the property length is omitted when empty.
         assert_eq!(a.encoded_size(), 1);
     }
 
     #[test]
     fn test_auth_continue_wire_bytes() {
-        let a = Auth::new(ReasonCode::ContinueAuthentication, Properties::new());
+        let a = Auth::new(ReasonCode::ContinueAuthentication, None);
         let mut dst = BytesMut::new();
         a.encode(&mut dst).unwrap();
         assert_eq!(&dst[..], &[0x18]);
@@ -199,7 +201,7 @@ mod tests {
     fn test_auth_continue_round_trip() {
         round_trip(Auth::new(
             ReasonCode::ContinueAuthentication,
-            Properties::new(),
+            None,
         ));
     }
 
@@ -207,12 +209,12 @@ mod tests {
 
     #[test]
     fn test_auth_reauthenticate_round_trip() {
-        round_trip(Auth::new(ReasonCode::ReAuthenticate, Properties::new()));
+        round_trip(Auth::new(ReasonCode::ReAuthenticate, None));
     }
 
     #[test]
     fn test_auth_reauthenticate_wire_bytes() {
-        let a = Auth::new(ReasonCode::ReAuthenticate, Properties::new());
+        let a = Auth::new(ReasonCode::ReAuthenticate, None);
         let mut dst = BytesMut::new();
         a.encode(&mut dst).unwrap();
         assert_eq!(&dst[..], &[0x19]);
@@ -248,7 +250,7 @@ mod tests {
 
     #[test]
     fn test_encoded_size_matches_encode_continue() {
-        let a = Auth::new(ReasonCode::ContinueAuthentication, Properties::new());
+        let a = Auth::new(ReasonCode::ContinueAuthentication, None);
         let mut dst = BytesMut::new();
         a.encode(&mut dst).unwrap();
         assert_eq!(dst.len(), a.encoded_size());

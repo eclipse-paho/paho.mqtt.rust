@@ -322,12 +322,14 @@ fn publish(u: &mut Unstructured, ver: MqttVersion) -> AResult<Publish> {
 }
 
 fn puback(u: &mut Unstructured, ver: MqttVersion, ty: PacketType) -> AResult<PubAck> {
-    let mut a = PubAck::new(packet_id(u)?);
+    let id = packet_id(u)?;
     if ver == MqttVersion::V5 {
-        a.reason_code = reason_code(u, ty)?;
-        a.properties = properties(u, ver, ty)?;
+        let rc = reason_code(u, ty)?;
+        let props = properties(u, ver, ty)?;
+        Ok(PubAck::new(id, rc, props))
+    } else {
+        Ok(PubAck::from_packet_id(id))
     }
-    Ok(a)
 }
 
 fn subscribe(u: &mut Unstructured, ver: MqttVersion) -> AResult<Subscribe> {

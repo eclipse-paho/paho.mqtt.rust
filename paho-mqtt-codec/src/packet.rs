@@ -826,7 +826,7 @@ mod tests {
 
     #[test]
     fn test_encode_rejects_reason_code_from_wrong_packet() {
-        let mut ack = PubAck::new(1);
+        let mut ack = PubAck::from_packet_id(1);
         ack.reason_code = ReasonCode::SessionTakenOver;
         let mut dst = BytesMut::new();
         assert_eq!(
@@ -897,7 +897,7 @@ mod tests {
     fn test_packet_packet_type() {
         assert_eq!(Packet::PingReq.packet_type(), PacketType::PingReq);
         assert_eq!(
-            Packet::PubRec(PubAck::new(1)).packet_type(),
+            Packet::PubRec(PubAck::from_packet_id(1)).packet_type(),
             PacketType::PubRec
         );
         assert_eq!(
@@ -1000,7 +1000,7 @@ mod tests {
     #[test]
     fn test_encode_split_non_publish_writes_whole_packet() {
         for pkt in [
-            Packet::PubAck(PubAck::new(1)),
+            Packet::PubAck(PubAck::from_packet_id(1)),
             Packet::Subscribe(Subscribe::new(
                 2,
                 alloc::vec![Subscription::new("t", QoS::QoS0)],
@@ -1136,10 +1136,10 @@ mod tests {
         publish.packet_id = Some(0);
         let pkts = [
             Packet::Publish(publish),
-            Packet::PubAck(PubAck::new(0)),
-            Packet::PubRec(PubAck::new(0)),
-            Packet::PubRel(PubAck::new(0)),
-            Packet::PubComp(PubAck::new(0)),
+            Packet::PubAck(PubAck::from_packet_id(0)),
+            Packet::PubRec(PubAck::from_packet_id(0)),
+            Packet::PubRel(PubAck::from_packet_id(0)),
+            Packet::PubComp(PubAck::from_packet_id(0)),
             Packet::Subscribe(Subscribe::new(0, vec![Subscription::new("a", QoS::QoS0)])),
             Packet::SubAck(SubAck::new(0, vec![ReasonCode::Success])),
             Packet::Unsubscribe(Unsubscribe::new(0, vec![String::from("a")])),

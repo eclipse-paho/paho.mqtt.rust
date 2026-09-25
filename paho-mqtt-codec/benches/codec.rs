@@ -125,8 +125,7 @@ fn packets(ver: MqttVersion) -> Vec<(&'static str, Packet)> {
     let mut connack = ConnAck::new(false, ReasonCode::Success);
     connack.properties = props_for(ver);
 
-    let mut puback_rc = PubAck::new(1234);
-    puback_rc.reason_code = ReasonCode::NoMatchingSubscribers;
+    let puback_rc = PubAck::new(1234, ReasonCode::NoMatchingSubscribers, None);
 
     let mut subscribe = Subscribe::new(
         77,
@@ -198,11 +197,11 @@ fn packets(ver: MqttVersion) -> Vec<(&'static str, Packet)> {
             p.qos = QoS::AtMostOnce;
             Packet::Publish(p)
         }),
-        ("puback", Packet::PubAck(PubAck::new(1234))),
+        ("puback", Packet::PubAck(PubAck::from_packet_id(1234))),
         ("puback_reason", Packet::PubAck(puback_rc)),
-        ("pubrec", Packet::PubRec(PubAck::new(1234))),
-        ("pubrel", Packet::PubRel(PubAck::new(1234))),
-        ("pubcomp", Packet::PubComp(PubAck::new(1234))),
+        ("pubrec", Packet::PubRec(PubAck::from_packet_id(1234))),
+        ("pubrel", Packet::PubRel(PubAck::from_packet_id(1234))),
+        ("pubcomp", Packet::PubComp(PubAck::from_packet_id(1234))),
         ("subscribe", Packet::Subscribe(subscribe)),
         ("suback", Packet::SubAck(suback)),
         ("unsubscribe", Packet::Unsubscribe(unsubscribe)),
@@ -323,7 +322,7 @@ fn bench_decode(c: &mut Criterion) {
 /// split into individual frames, independent of parsing.
 fn bench_framing(c: &mut Criterion) {
     let mut stream = BytesMut::new();
-    let ack = Packet::PubAck(PubAck::new(1));
+    let ack = Packet::PubAck(PubAck::from_packet_id(1));
     for _ in 0..1000 {
         ack.encode(&mut stream, MqttVersion::V5).unwrap();
     }
