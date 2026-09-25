@@ -60,12 +60,39 @@ impl Will {
         qos: QoS,
         retain: bool,
     ) -> Self {
-        Will {
+        Self {
             topic: topic.into(),
             payload: payload.into(),
             qos,
             retain,
             properties: Properties::new(),
+        }
+    }
+
+    /// Creates a Will carrying MQTT v5 Will Properties.
+    ///
+    /// v5 only.
+    ///
+    /// The Will has its own property context, narrower than a PUBLISH's:
+    /// `WillDelayInterval`, `PayloadFormatIndicator`, `MessageExpiryInterval`,
+    /// `ContentType`, `ResponseTopic`, `CorrelationData`, and `UserProperty`
+    /// (§3.1.3.2). They are validated when the enclosing CONNECT is encoded,
+    /// against that context rather than the packet's — so a `TopicAlias`,
+    /// legal in a PUBLISH, is rejected here. A CONNECT for v3 cannot carry
+    /// them at all.
+    pub fn with_properties(
+        topic: impl Into<String>,
+        payload: impl Into<Bytes>,
+        qos: QoS,
+        retain: bool,
+        properties: Properties,
+    ) -> Self {
+        Self {
+            topic: topic.into(),
+            payload: payload.into(),
+            qos,
+            retain,
+            properties,
         }
     }
 }
@@ -345,6 +372,29 @@ impl ConnAck {
         }
     }
 
+    /// Creates a `ConnAck` carrying MQTT v5 properties.
+    ///
+    /// v5 only.
+    ///
+    /// This is where a server states its terms: Receive Maximum, Maximum
+    /// Packet Size, Server Keep Alive, Topic Alias Maximum, an assigned
+    /// client identifier, and which optional features it supports. The
+    /// permitted set is in §3.2.2.3; [`encode`](Self::encode) rejects
+    /// anything outside it. Properties cannot be sent on a v3 connection at
+    /// all, so encoding a non-empty list for v3 is an error rather than a
+    /// silent drop — use [`new`](Self::new) for a CONNACK that must work on
+    /// either version.
+    pub fn with_properties(
+        session_present: bool,
+        reason_code: ReasonCode,
+        properties: Properties,
+    ) -> Self {
+        Self {
+            session_present,
+            reason_code,
+            properties,
+        }
+    }
     /// Returns the number of variable-header bytes this packet encodes to
     /// for the given version, `ver` (does **not** include the fixed header or
     /// the remaining-length VBI).
@@ -704,6 +754,157 @@ mod tests {
 
     // ======================================================================
     // Connect tests
+    // ---- with_properties ----
+
+    /// A Receive Maximum, as a server stating its window would send.
+    fn recv_max_props(n: u16) -> Properties {
+        let mut props = Properties::new();
+        props.push(Property::new(
+            PropertyId::ReceiveMaximum,
+            PropertyValue::U16(n),
+        ));
+        props
+    }
+
+    #[test]
+    fn test_connack_with_properties_keeps_all_arguments() {
+        let ack = ConnAck::with_properties(true, ReasonCode::Success, recv_max_props(20));
+        assert!(ack.session_present);
+        assert_eq!(ack.reason_code, ReasonCode::Success);
+        assert_eq!(
+            ack.properties.get(PropertyId::ReceiveMaximum),
+            Some(&PropertyValue::U16(20))
+        );
+    }
+
+    #[test]
+    fn test_connack_with_properties_empty_matches_new() {
+        let a = ConnAck::with_properties(true, ReasonCode::Success, Properties::new());
+        let b = ConnAck::new(true, ReasonCode::Success);
+        assert_eq!(a, b);
+        // Flags + reason code + an empty property length.
+        assert_eq!(a.encoded_size(v5()), 3);
+    }
+
+    #[test]
+    fn test_connack_with_properties_round_trip_v5() {
+        let ack = ConnAck::with_properties(false, ReasonCode::Success, recv_max_props(10));
+
+        let mut dst = BytesMut::new();
+        ack.encode(&mut dst, v5()).unwrap();
+        assert_eq!(
+            dst.len(),
+            ack.encoded_size(v5()),
+            "size must match the encoding"
+        );
+
+        let decoded = ConnAck::decode(dst.freeze(), v5()).unwrap();
+        assert_eq!(decoded, ack);
+    }
+
+    /// The full set a server typically sends, including a repeated
+    /// UserProperty, survives the round trip in order.
+    #[test]
+    fn test_connack_with_properties_multiple_round_trip_v5() {
+        let mut props = recv_max_props(20);
+        props.push(Property::new(
+            PropertyId::AssignedClientIdentifier,
+            PropertyValue::String("auto-42".into()),
+        ));
+        props.push(Property::new(
+            PropertyId::ServerKeepAlive,
+            PropertyValue::U16(30),
+        ));
+        props.push(Property::new(
+            PropertyId::MaximumPacketSize,
+            PropertyValue::U32(65536),
+        ));
+        props.push(Property::new(
+            PropertyId::RetainAvailable,
+            PropertyValue::Byte(0),
+        ));
+        props.push(Property::new(
+            PropertyId::UserProperty,
+            PropertyValue::StringPair("a".into(), "1".into()),
+        ));
+        props.push(Property::new(
+            PropertyId::UserProperty,
+            PropertyValue::StringPair("b".into(), "2".into()),
+        ));
+        let ack = ConnAck::with_properties(true, ReasonCode::Success, props);
+
+        let mut dst = BytesMut::new();
+        ack.encode(&mut dst, v5()).unwrap();
+        assert_eq!(dst.len(), ack.encoded_size(v5()));
+
+        let decoded = ConnAck::decode(dst.freeze(), v5()).unwrap();
+        assert_eq!(decoded, ack);
+        assert_eq!(decoded.properties.len(), 7);
+        assert!(decoded.session_present);
+    }
+
+    /// A refused connection may still explain itself. The Session Present
+    /// flag is cleared on decode, since a refused connection resumes nothing
+    /// (MQTT-3.2.2-4), but the reason code and properties come through.
+    #[test]
+    fn test_connack_with_properties_on_a_refused_connection() {
+        let mut props = Properties::new();
+        props.push(Property::new(
+            PropertyId::ReasonString,
+            PropertyValue::String("bad credentials".into()),
+        ));
+        let ack = ConnAck::with_properties(true, ReasonCode::NotAuthorized, props);
+
+        let mut dst = BytesMut::new();
+        ack.encode(&mut dst, v5()).unwrap();
+        let decoded = ConnAck::decode(dst.freeze(), v5()).unwrap();
+
+        assert_eq!(decoded.reason_code, ReasonCode::NotAuthorized);
+        assert_eq!(
+            decoded.properties.get(PropertyId::ReasonString),
+            Some(&PropertyValue::String("bad credentials".into()))
+        );
+        assert!(
+            !decoded.session_present,
+            "a refused connection resumes no session"
+        );
+    }
+
+    /// v3 has no properties, so encoding a non-empty list for it fails rather
+    /// than dropping them.
+    ///
+    /// The all-or-nothing guarantee belongs to `Packet::encode`, not to this
+    /// method — the packet encoders write as they go — so the buffer is
+    /// checked through the packet, which is where the promise is made.
+    #[test]
+    fn test_connack_with_properties_on_v3_is_an_error() {
+        let ack = ConnAck::with_properties(false, ReasonCode::Success, recv_max_props(20));
+        let mut dst = BytesMut::new();
+        assert_eq!(ack.encode(&mut dst, v311()), Err(Error::ProtocolError));
+
+        let mut dst = BytesMut::from(&b"before"[..]);
+        assert_eq!(
+            crate::Packet::ConnAck(ack).encode(&mut dst, v311()),
+            Err(Error::ProtocolError)
+        );
+        assert_eq!(&dst[..], b"before", "nothing partial is left behind");
+    }
+
+    /// A property the specification does not allow in a CONNACK is rejected
+    /// when the packet is encoded (§2.2.2.2).
+    #[test]
+    fn test_connack_with_properties_rejects_a_property_not_allowed_here() {
+        let mut props = Properties::new();
+        props.push(Property::new(
+            // A PUBLISH property; meaningless in a CONNACK.
+            PropertyId::ContentType,
+            PropertyValue::String("text/plain".into()),
+        ));
+        let ack = ConnAck::with_properties(false, ReasonCode::Success, props);
+        let mut dst = BytesMut::new();
+        assert_eq!(ack.encode(&mut dst, v5()), Err(Error::ProtocolError));
+    }
+
     // ======================================================================
 
     fn with_ver(conn: Connect, ver: MqttVersion) -> Connect {
@@ -1153,5 +1354,95 @@ mod tests {
         c.username = Some(core::iter::repeat_n('u', 65_536).collect());
         let mut dst = BytesMut::new();
         assert_eq!(c.encode(&mut dst), Err(Error::StringTooLong));
+    }
+
+    // ---- Will::with_properties ----
+
+    fn will_props() -> Properties {
+        let mut props = Properties::new();
+        props.push(Property::new(
+            PropertyId::WillDelayInterval,
+            PropertyValue::U32(30),
+        ));
+        props.push(Property::new(
+            PropertyId::ContentType,
+            PropertyValue::String("text/plain".into()),
+        ));
+        props
+    }
+
+    #[test]
+    fn test_will_with_properties_keeps_all_arguments() {
+        let will = Will::with_properties(
+            "w/last",
+            Bytes::from_static(b"bye"),
+            QoS::QoS2,
+            true,
+            will_props(),
+        );
+        assert_eq!(will.topic, "w/last");
+        assert_eq!(&will.payload[..], b"bye");
+        assert_eq!(will.qos, QoS::QoS2);
+        assert!(will.retain);
+        assert_eq!(
+            will.properties.get(PropertyId::WillDelayInterval),
+            Some(&PropertyValue::U32(30))
+        );
+    }
+
+    #[test]
+    fn test_will_with_properties_empty_matches_new() {
+        assert_eq!(
+            Will::with_properties("w", Bytes::new(), QoS::QoS1, false, Properties::new()),
+            Will::new("w", Bytes::new(), QoS::QoS1, false)
+        );
+    }
+
+    #[test]
+    fn test_will_with_properties_round_trip_v5() {
+        let mut c = Connect::new(v5(), true, "c");
+        c.will = Some(Will::with_properties(
+            "w/last",
+            Bytes::from_static(b"bye"),
+            QoS::QoS1,
+            true,
+            will_props(),
+        ));
+        round_trip_connect(c);
+    }
+
+    #[test]
+    fn test_will_with_properties_on_v3_is_an_error() {
+        let mut c = Connect::new(v311(), true, "c");
+        c.will = Some(Will::with_properties(
+            "w",
+            Bytes::new(),
+            QoS::QoS0,
+            false,
+            will_props(),
+        ));
+        let mut dst = BytesMut::new();
+        assert_eq!(c.encode(&mut dst), Err(Error::ProtocolError));
+    }
+
+    /// Will Properties are validated in the Will context, not the CONNECT's,
+    /// so a property legal in the CONNECT itself is still refused here.
+    #[test]
+    fn test_will_with_properties_rejects_a_property_not_allowed_here() {
+        let mut props = Properties::new();
+        props.push(Property::new(
+            PropertyId::SessionExpiryInterval,
+            PropertyValue::U32(60),
+        ));
+        let mut c = Connect::new(v5(), true, "c");
+        c.will = Some(Will::with_properties(
+            "w",
+            Bytes::new(),
+            QoS::QoS0,
+            false,
+            props,
+        ));
+        let mut dst = BytesMut::new();
+        assert_eq!(c.encode(&mut dst), Err(Error::ProtocolError));
     }
 }

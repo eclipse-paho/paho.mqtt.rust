@@ -213,15 +213,16 @@ fn packets(ver: MqttVersion) -> Vec<(&'static str, Packet)> {
     ];
     if ver == MqttVersion::V5 {
         pkts.push(("disconnect_reason", Packet::Disconnect(disconnect_rc)));
-        let mut auth = Auth::new(ReasonCode::ContinueAuthentication);
-        auth.properties.push(Property::new(
+        let mut auth_props = Properties::new();
+        auth_props.push(Property::new(
             PropertyId::AuthenticationMethod,
             PropertyValue::String("SCRAM-SHA-256".into()),
         ));
-        auth.properties.push(Property::new(
+        auth_props.push(Property::new(
             PropertyId::AuthenticationData,
             PropertyValue::Binary(Bytes::from_static(&[0u8; 32])),
         ));
+        let auth = Auth::new(ReasonCode::ContinueAuthentication, auth_props);
         pkts.push(("auth", Packet::Auth(auth)));
     }
     pkts

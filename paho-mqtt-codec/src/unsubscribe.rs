@@ -53,10 +53,30 @@ pub struct Unsubscribe {
 impl Unsubscribe {
     /// Creates an UNSUBSCRIBE with no properties.
     pub fn new(packet_id: u16, topic_filters: Vec<String>) -> Self {
-        Unsubscribe {
+        Self {
             packet_id,
             topic_filters,
             properties: Properties::new(),
+        }
+    }
+
+    /// Creates an UNSUBSCRIBE carrying MQTT v5 properties.
+    ///
+    /// v5 only.
+    ///
+    /// Only `UserProperty` is permitted here (§3.10.2.1);
+    /// [`encode`](Self::encode) rejects anything else, including the
+    /// `SubscriptionIdentifier` a SUBSCRIBE may carry. A v3 connection cannot
+    /// carry properties at all.
+    pub fn with_properties(
+        packet_id: u16,
+        topic_filters: Vec<String>,
+        properties: Properties,
+    ) -> Self {
+        Self {
+            packet_id,
+            topic_filters,
+            properties,
         }
     }
 
@@ -135,10 +155,30 @@ pub struct UnsubAck {
 impl UnsubAck {
     /// Creates an UNSUBACK with no properties.
     pub fn new(packet_id: u16, reason_codes: Vec<ReasonCode>) -> Self {
-        UnsubAck {
+        Self {
             packet_id,
             reason_codes,
             properties: Properties::new(),
+        }
+    }
+
+    /// Creates an UNSUBACK carrying MQTT v5 properties.
+    ///
+    /// v5 only.
+    ///
+    /// Only `ReasonString` and `UserProperty` are permitted here (§3.11.2.1);
+    /// [`encode`](Self::encode) rejects anything else. On v3 an UNSUBACK is
+    /// the packet identifier and nothing more — neither properties nor reason
+    /// codes can be sent — so encoding either for v3 is an error.
+    pub fn with_properties(
+        packet_id: u16,
+        reason_codes: Vec<ReasonCode>,
+        properties: Properties,
+    ) -> Self {
+        Self {
+            packet_id,
+            reason_codes,
+            properties,
         }
     }
 
@@ -211,7 +251,10 @@ impl UnsubAck {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{MQTT_VERSION_3_1_1, MQTT_VERSION_5};
+    use crate::{
+        Property, PropertyId, PropertyValue,
+        types::{MQTT_VERSION_3_1_1, MQTT_VERSION_5},
+    };
     use alloc::{string::ToString, vec};
     use bytes::BytesMut;
 
@@ -493,5 +536,136 @@ mod tests {
         let mut dst = BytesMut::new();
         assert!(ack.encode(&mut dst, v311()).is_ok());
         assert_eq!(&dst[..], &[0x00, 0x01]);
+    }
+
+    // ---- with_properties ----
+
+    fn user_props(k: &str, v: &str) -> Properties {
+        let mut props = Properties::new();
+        props.push(Property::new(
+            PropertyId::UserProperty,
+            PropertyValue::StringPair(k.into(), v.into()),
+        ));
+        props
+    }
+
+    #[test]
+    fn test_unsubscribe_with_properties_keeps_all_arguments() {
+        let filters = vec!["a/b".to_string()];
+        let unsub = Unsubscribe::with_properties(4, filters.clone(), user_props("why", "done"));
+        assert_eq!(unsub.packet_id, 4);
+        assert_eq!(unsub.topic_filters, filters);
+        assert_eq!(
+            unsub.properties.get(PropertyId::UserProperty),
+            Some(&PropertyValue::StringPair("why".into(), "done".into()))
+        );
+    }
+
+    #[test]
+    fn test_unsubscribe_with_properties_empty_matches_new() {
+        let filters = vec!["a".to_string()];
+        assert_eq!(
+            Unsubscribe::with_properties(1, filters.clone(), Properties::new()),
+            Unsubscribe::new(1, filters)
+        );
+    }
+
+    #[test]
+    fn test_unsubscribe_with_properties_round_trip_v5() {
+        let mut props = user_props("a", "1");
+        props.push(Property::new(
+            PropertyId::UserProperty,
+            PropertyValue::StringPair("b".into(), "2".into()),
+        ));
+        let unsub =
+            Unsubscribe::with_properties(11, vec!["a/+".to_string(), "b/#".to_string()], props);
+
+        let mut dst = BytesMut::new();
+        unsub.encode(&mut dst, v5()).unwrap();
+        assert_eq!(dst.len(), unsub.encoded_size(v5()));
+        assert_eq!(Unsubscribe::decode(dst.freeze(), v5()).unwrap(), unsub);
+    }
+
+    #[test]
+    fn test_unsubscribe_with_properties_on_v3_is_an_error() {
+        let unsub = Unsubscribe::with_properties(1, vec!["a".to_string()], user_props("k", "v"));
+        let mut dst = BytesMut::new();
+        assert_eq!(unsub.encode(&mut dst, v311()), Err(Error::ProtocolError));
+    }
+
+    /// UNSUBSCRIBE takes only UserProperty — not even the ReasonString a
+    /// SUBACK may carry (§3.10.2.1).
+    #[test]
+    fn test_unsubscribe_with_properties_rejects_a_property_not_allowed_here() {
+        let mut props = Properties::new();
+        props.push(Property::new(
+            PropertyId::ReasonString,
+            PropertyValue::String("why".into()),
+        ));
+        let unsub = Unsubscribe::with_properties(1, vec!["a".to_string()], props);
+        let mut dst = BytesMut::new();
+        assert_eq!(unsub.encode(&mut dst, v5()), Err(Error::ProtocolError));
+    }
+
+    #[test]
+    fn test_unsuback_with_properties_keeps_all_arguments() {
+        let codes = vec![ReasonCode::Success, ReasonCode::NoSubscriptionFound];
+        let ack = UnsubAck::with_properties(6, codes.clone(), user_props("k", "v"));
+        assert_eq!(ack.packet_id, 6);
+        assert_eq!(ack.reason_codes, codes);
+        assert_eq!(ack.properties.len(), 1);
+    }
+
+    #[test]
+    fn test_unsuback_with_properties_empty_matches_new() {
+        let codes = vec![ReasonCode::Success];
+        assert_eq!(
+            UnsubAck::with_properties(1, codes.clone(), Properties::new()),
+            UnsubAck::new(1, codes)
+        );
+    }
+
+    #[test]
+    fn test_unsuback_with_properties_round_trip_v5() {
+        let mut props = Properties::new();
+        props.push(Property::new(
+            PropertyId::ReasonString,
+            PropertyValue::String("one was not subscribed".into()),
+        ));
+        props.push(Property::new(
+            PropertyId::UserProperty,
+            PropertyValue::StringPair("a".into(), "1".into()),
+        ));
+        let ack = UnsubAck::with_properties(
+            12,
+            vec![ReasonCode::Success, ReasonCode::NoSubscriptionFound],
+            props,
+        );
+
+        let mut dst = BytesMut::new();
+        ack.encode(&mut dst, v5()).unwrap();
+        assert_eq!(dst.len(), ack.encoded_size(v5()));
+        assert_eq!(UnsubAck::decode(dst.freeze(), v5()).unwrap(), ack);
+    }
+
+    /// On v3 an UNSUBACK is the packet identifier and nothing else, so
+    /// properties are refused — as reason codes already are.
+    #[test]
+    fn test_unsuback_with_properties_on_v3_is_an_error() {
+        let ack = UnsubAck::with_properties(1, vec![], user_props("k", "v"));
+        let mut dst = BytesMut::new();
+        assert_eq!(ack.encode(&mut dst, v311()), Err(Error::ProtocolError));
+    }
+
+    #[test]
+    fn test_unsuback_with_properties_rejects_a_property_not_allowed_here() {
+        let mut props = Properties::new();
+        props.push(Property::new(
+            PropertyId::SubscriptionIdentifier,
+            PropertyValue::VarInt(1),
+        ));
+        let ack = UnsubAck::with_properties(1, vec![ReasonCode::Success], props);
+        let mut dst = BytesMut::new();
+        assert_eq!(ack.encode(&mut dst, v5()), Err(Error::ProtocolError));
     }
 }

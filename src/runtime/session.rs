@@ -163,9 +163,7 @@ fn auth_response(p: &ConnectParams, challenge_props: &Properties) -> Result<Auth
         ));
     }
 
-    let mut auth = Auth::new(ReasonCode::ContinueAuthentication);
-    auth.properties = props;
-    Ok(auth)
+    Ok(Auth::new(ReasonCode::ContinueAuthentication, props))
 }
 
 /// What woke the session loop.
@@ -821,10 +819,7 @@ impl<B: Backend> Session<B> {
                     if !timeout.is_zero() && self.has_pending() {
                         self.drain_pending(reader, &mut read_buf, timeout).await;
                     }
-                    let disc = Disconnect {
-                        reason_code,
-                        properties: props,
-                    };
+                    let disc = Disconnect::with_properties(reason_code, props);
                     let _ = self.send(&Packet::Disconnect(disc)).await;
                     connected_flag.store(false, Ordering::SeqCst);
                     tx.complete(Ok(()));

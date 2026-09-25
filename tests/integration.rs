@@ -1439,16 +1439,16 @@ fn test_v5_auth_exchange() {
     use std::sync::{Arc, Mutex};
 
     let challenge = |data: &'static str| {
-        let mut auth = Auth::new(ReasonCode::ContinueAuthentication);
-        auth.properties.push(Property::new(
+        let mut props = mqtt::Properties::new();
+        props.push(Property::new(
             PropertyId::AuthenticationMethod,
             PropertyValue::String("SCRAM-TEST".into()),
         ));
-        auth.properties.push(Property::new(
+        props.push(Property::new(
             PropertyId::AuthenticationData,
             PropertyValue::Binary(data.into()),
         ));
-        Packet::Auth(auth)
+        Packet::Auth(Auth::new(ReasonCode::ContinueAuthentication, props))
     };
 
     // CONNECT -> challenge -> (client answers) -> challenge -> CONNACK.
@@ -1518,12 +1518,15 @@ fn test_v5_auth_handler_failure_fails_connect() {
 
     let broker = common::spawn_broker(move |pkt| match pkt {
         Packet::Connect(_) => {
-            let mut auth = Auth::new(ReasonCode::ContinueAuthentication);
-            auth.properties.push(Property::new(
+            let mut props = mqtt::Properties::new();
+            props.push(Property::new(
                 PropertyId::AuthenticationMethod,
                 PropertyValue::String("SCRAM-TEST".into()),
             ));
-            vec![Packet::Auth(auth)]
+            vec![Packet::Auth(Auth::new(
+                ReasonCode::ContinueAuthentication,
+                props,
+            ))]
         }
         _ => vec![],
     });

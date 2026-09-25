@@ -53,14 +53,21 @@ pub struct Auth {
 }
 
 impl Auth {
-    /// Creates an AUTH with no properties.
-    pub fn new(reason_code: ReasonCode) -> Self {
+    /// Creates an AUTH packet.
+    ///
+    /// v5 only.
+    ///
+    /// The properties are not incidental here as they are elsewhere: the
+    /// `AuthenticationMethod` and `AuthenticationData` *are* the exchange,
+    /// and §3.15.2.2.2 requires every AUTH to name the method. An AUTH with
+    /// no properties is only meaningful as the bare `Success` that ends a
+    /// successful exchange, which is `Auth::default()`.
+    pub fn new(reason_code: ReasonCode, properties: Properties) -> Self {
         Self {
             reason_code,
-            ..Self::default()
+            properties,
         }
     }
-
     /// Returns the remaining-length byte count.
     ///
     /// Uses the shorthand form (0) when `reason_code` is `Success` and
@@ -175,14 +182,14 @@ mod tests {
 
     #[test]
     fn test_auth_continue_encoded_size() {
-        let a = Auth::new(ReasonCode::ContinueAuthentication);
+        let a = Auth::new(ReasonCode::ContinueAuthentication, Properties::new());
         // Reason code only; the property length is omitted when empty.
         assert_eq!(a.encoded_size(), 1);
     }
 
     #[test]
     fn test_auth_continue_wire_bytes() {
-        let a = Auth::new(ReasonCode::ContinueAuthentication);
+        let a = Auth::new(ReasonCode::ContinueAuthentication, Properties::new());
         let mut dst = BytesMut::new();
         a.encode(&mut dst).unwrap();
         assert_eq!(&dst[..], &[0x18]);
@@ -190,19 +197,22 @@ mod tests {
 
     #[test]
     fn test_auth_continue_round_trip() {
-        round_trip(Auth::new(ReasonCode::ContinueAuthentication));
+        round_trip(Auth::new(
+            ReasonCode::ContinueAuthentication,
+            Properties::new(),
+        ));
     }
 
     // ---- ReAuthenticate ----
 
     #[test]
     fn test_auth_reauthenticate_round_trip() {
-        round_trip(Auth::new(ReasonCode::ReAuthenticate));
+        round_trip(Auth::new(ReasonCode::ReAuthenticate, Properties::new()));
     }
 
     #[test]
     fn test_auth_reauthenticate_wire_bytes() {
-        let a = Auth::new(ReasonCode::ReAuthenticate);
+        let a = Auth::new(ReasonCode::ReAuthenticate, Properties::new());
         let mut dst = BytesMut::new();
         a.encode(&mut dst).unwrap();
         assert_eq!(&dst[..], &[0x19]);
@@ -217,11 +227,7 @@ mod tests {
             PropertyId::AuthenticationMethod,
             PropertyValue::String("SCRAM-SHA-256".to_string()),
         ));
-        let a = Auth {
-            reason_code: ReasonCode::ContinueAuthentication,
-            properties: props,
-        };
-        round_trip(a);
+        round_trip(Auth::new(ReasonCode::ContinueAuthentication, props));
     }
 
     #[test]
@@ -235,18 +241,14 @@ mod tests {
             PropertyId::AuthenticationData,
             PropertyValue::Binary(bytes::Bytes::from_static(b"\x01\x02\x03\x04")),
         ));
-        let a = Auth {
-            reason_code: ReasonCode::ContinueAuthentication,
-            properties: props,
-        };
-        round_trip(a);
+        round_trip(Auth::new(ReasonCode::ContinueAuthentication, props));
     }
 
     // ---- encoded_size matches encode ----
 
     #[test]
     fn test_encoded_size_matches_encode_continue() {
-        let a = Auth::new(ReasonCode::ContinueAuthentication);
+        let a = Auth::new(ReasonCode::ContinueAuthentication, Properties::new());
         let mut dst = BytesMut::new();
         a.encode(&mut dst).unwrap();
         assert_eq!(dst.len(), a.encoded_size());

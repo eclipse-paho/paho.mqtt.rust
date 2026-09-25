@@ -408,9 +408,9 @@ fn disconnect(u: &mut Unstructured, ver: MqttVersion) -> AResult<Disconnect> {
 }
 
 fn auth(u: &mut Unstructured) -> AResult<Auth> {
-    let mut a = Auth::new(reason_code(u, PacketType::Auth)?);
-    a.properties = properties(u, MqttVersion::V5, PacketType::Auth)?;
-    Ok(a)
+    let rc = reason_code(u, PacketType::Auth)?;
+    let props = properties(u, MqttVersion::V5, PacketType::Auth)?;
+    Ok(Auth::new(rc, props))
 }
 
 fn packet(u: &mut Unstructured, ver: MqttVersion) -> AResult<Packet> {

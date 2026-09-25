@@ -43,7 +43,10 @@ use serde::{Deserialize, Serialize};
 /// `NormalDisconnection` and `properties` is always empty on the wire.
 /// In v5, a reason code and optional properties may be present, but if both
 /// are absent the wire form is identical to v3.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// The default is a normal disconnection with no properties, which encodes to
+/// an empty body on every version.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct Disconnect {
     /// Disconnect reason code (v5 only; always `NormalDisconnection` for v3).
@@ -52,24 +55,31 @@ pub struct Disconnect {
     pub properties: Properties,
 }
 
-impl Default for Disconnect {
-    fn default() -> Self {
-        Disconnect {
-            reason_code: ReasonCode::NormalDisconnection,
-            properties: Properties::new(),
-        }
-    }
-}
-
 impl Disconnect {
     /// Creates a DISCONNECT with no properties.
     pub fn new(reason_code: ReasonCode) -> Self {
-        Disconnect {
+        Self {
             reason_code,
             properties: Properties::new(),
         }
     }
 
+    /// Creates a DISCONNECT carrying MQTT v5 properties.
+    ///
+    /// v5 only.
+    ///
+    /// Only `ReasonString`, `ServerReference`, `SessionExpiryInterval`, and
+    /// `UserProperty` are permitted here (§3.14.2.2); [`encode`](Self::encode)
+    /// rejects anything else. Properties cannot be sent on a v3 connection at
+    /// all, so encoding a non-empty list for v3 is an error rather than a
+    /// silent drop — use [`new`](Self::new) for a DISCONNECT that must work on
+    /// either version.
+    pub fn with_properties(reason_code: ReasonCode, properties: Properties) -> Self {
+        Self {
+            reason_code,
+            properties,
+        }
+    }
     /// Returns the remaining-length byte count for version, `ver`.
     ///
     /// When `reason_code` is `NormalDisconnection` and `properties` is empty,
@@ -149,7 +159,7 @@ impl Disconnect {
 mod tests {
     use super::*;
     use crate::{
-        Error,
+        Error, Property, PropertyId, PropertyValue,
         types::{MQTT_VERSION_3_1_1, MQTT_VERSION_5},
     };
     use bytes::BytesMut;
@@ -272,5 +282,149 @@ mod tests {
         let mut dst = BytesMut::new();
         d.encode(&mut dst, v5()).unwrap();
         assert_eq!(dst.len(), d.encoded_size(v5()));
+    }
+
+    /// The derived default must be a *normal* disconnection: the shorthand
+    /// encoding and both `decode` shortcuts depend on it. Deriving gets this
+    /// from `ReasonCode`'s own default, so pin it here rather than trust that
+    /// it stays put.
+    #[test]
+    fn test_default_is_normal_disconnection_with_no_properties() {
+        let d = Disconnect::default();
+        assert_eq!(d.reason_code, ReasonCode::NormalDisconnection);
+        assert_eq!(d.reason_code, ReasonCode::Success, "the two are one code");
+        assert!(d.properties.is_empty());
+        assert_eq!(d, Disconnect::new(ReasonCode::NormalDisconnection));
+    }
+
+    // ---- with_properties ----
+
+    /// A ReasonString, as a server explaining itself would send.
+    fn reason_props(text: &str) -> Properties {
+        let mut props = Properties::new();
+        props.push(Property::new(
+            PropertyId::ReasonString,
+            PropertyValue::String(text.into()),
+        ));
+        props
+    }
+
+    #[test]
+    fn test_with_properties_keeps_both_arguments() {
+        let d = Disconnect::with_properties(ReasonCode::ServerBusy, reason_props("try later"));
+        assert_eq!(d.reason_code, ReasonCode::ServerBusy);
+        assert_eq!(
+            d.properties.get(PropertyId::ReasonString),
+            Some(&PropertyValue::String("try later".into()))
+        );
+    }
+
+    /// With no properties it is indistinguishable from `new`, shorthand
+    /// encoding included.
+    #[test]
+    fn test_with_properties_empty_matches_new() {
+        let a = Disconnect::with_properties(ReasonCode::SessionTakenOver, Properties::new());
+        let b = Disconnect::new(ReasonCode::SessionTakenOver);
+        assert_eq!(a, b);
+
+        // Reason code only: 1 byte, no property length (§3.14.2.2.1).
+        assert_eq!(a.encoded_size(v5()), 1);
+        let mut dst = BytesMut::new();
+        a.encode(&mut dst, v5()).unwrap();
+        assert_eq!(&dst[..], &[ReasonCode::SessionTakenOver as u8]);
+    }
+
+    #[test]
+    fn test_with_properties_round_trip_v5() {
+        let d = Disconnect::with_properties(
+            ReasonCode::ServerShuttingDown,
+            reason_props("maintenance"),
+        );
+
+        let mut dst = BytesMut::new();
+        d.encode(&mut dst, v5()).unwrap();
+        assert_eq!(
+            dst.len(),
+            d.encoded_size(v5()),
+            "size must match the encoding"
+        );
+
+        let decoded = Disconnect::decode(dst.freeze(), v5()).unwrap();
+        assert_eq!(decoded, d);
+    }
+
+    /// A DISCONNECT with several properties, including a repeated
+    /// UserProperty, survives the round trip in order.
+    #[test]
+    fn test_with_properties_multiple_round_trip_v5() {
+        let mut props = reason_props("going away");
+        props.push(Property::new(
+            PropertyId::SessionExpiryInterval,
+            PropertyValue::U32(120),
+        ));
+        props.push(Property::new(
+            PropertyId::UserProperty,
+            PropertyValue::StringPair("a".into(), "1".into()),
+        ));
+        props.push(Property::new(
+            PropertyId::UserProperty,
+            PropertyValue::StringPair("b".into(), "2".into()),
+        ));
+        let d = Disconnect::with_properties(ReasonCode::NormalDisconnection, props);
+
+        let mut dst = BytesMut::new();
+        d.encode(&mut dst, v5()).unwrap();
+        assert_eq!(dst.len(), d.encoded_size(v5()));
+
+        let decoded = Disconnect::decode(dst.freeze(), v5()).unwrap();
+        assert_eq!(decoded, d);
+        assert_eq!(decoded.properties.len(), 4);
+    }
+
+    /// Even `NormalDisconnection` gets the full form once it has something to
+    /// say, rather than the empty shorthand.
+    #[test]
+    fn test_with_properties_defeats_the_shorthand() {
+        let d = Disconnect::with_properties(ReasonCode::NormalDisconnection, reason_props("bye"));
+        assert!(d.encoded_size(v5()) > 1);
+
+        let mut dst = BytesMut::new();
+        d.encode(&mut dst, v5()).unwrap();
+        assert_eq!(dst[0], ReasonCode::NormalDisconnection as u8);
+        assert!(!dst[1..].is_empty(), "the properties must be on the wire");
+    }
+
+    /// v3 has no properties, so encoding a non-empty list for it fails rather
+    /// than dropping them.
+    ///
+    /// The all-or-nothing guarantee belongs to `Packet::encode`, not to this
+    /// method, so the buffer is checked through the packet.
+    #[test]
+    fn test_with_properties_on_v3_is_an_error() {
+        let d = Disconnect::with_properties(ReasonCode::NormalDisconnection, reason_props("bye"));
+        let mut dst = BytesMut::new();
+        assert_eq!(d.encode(&mut dst, v311()), Err(Error::ProtocolError));
+
+        let mut dst = BytesMut::from(&b"before"[..]);
+        assert_eq!(
+            crate::Packet::Disconnect(d).encode(&mut dst, v311()),
+            Err(Error::ProtocolError)
+        );
+        assert_eq!(&dst[..], b"before", "nothing partial is left behind");
+    }
+
+    /// A property the specification does not allow in a DISCONNECT is
+    /// rejected when the packet is encoded (§2.2.2.2).
+    #[test]
+    fn test_with_properties_rejects_a_property_not_allowed_here() {
+        let mut props = Properties::new();
+        props.push(Property::new(
+            // A PUBLISH property; meaningless in a DISCONNECT.
+            PropertyId::ContentType,
+            PropertyValue::String("text/plain".into()),
+        ));
+        let d = Disconnect::with_properties(ReasonCode::NormalDisconnection, props);
+        let mut dst = BytesMut::new();
+        assert_eq!(d.encode(&mut dst, v5()), Err(Error::ProtocolError));
     }
 }

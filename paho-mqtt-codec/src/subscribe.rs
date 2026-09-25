@@ -120,10 +120,30 @@ pub struct Subscribe {
 impl Subscribe {
     /// Creates a SUBSCRIBE with no properties.
     pub fn new(packet_id: u16, subscriptions: Vec<Subscription>) -> Self {
-        Subscribe {
+        Self {
             packet_id,
             subscriptions,
             properties: Properties::new(),
+        }
+    }
+
+    /// Creates a SUBSCRIBE carrying MQTT v5 properties.
+    ///
+    /// v5 only.
+    ///
+    /// Only `SubscriptionIdentifier` and `UserProperty` are permitted here
+    /// (§3.8.2.1), and the identifier at most once — unlike in a PUBLISH,
+    /// where the server may send several. [`encode`](Self::encode) rejects
+    /// anything else. A v3 connection cannot carry properties at all.
+    pub fn with_properties(
+        packet_id: u16,
+        subscriptions: Vec<Subscription>,
+        properties: Properties,
+    ) -> Self {
+        Self {
+            packet_id,
+            subscriptions,
+            properties,
         }
     }
 
@@ -239,10 +259,30 @@ pub struct SubAck {
 impl SubAck {
     /// Creates a SUBACK with no properties.
     pub fn new(packet_id: u16, reason_codes: Vec<ReasonCode>) -> Self {
-        SubAck {
+        Self {
             packet_id,
             reason_codes,
             properties: Properties::new(),
+        }
+    }
+
+    /// Creates a SUBACK carrying MQTT v5 properties.
+    ///
+    /// v5 only.
+    ///
+    /// Only `ReasonString` and `UserProperty` are permitted here (§3.9.2.1);
+    /// [`encode`](Self::encode) rejects anything else. A v3 connection
+    /// cannot carry properties at all, and its reason codes are limited to
+    /// the four v3 return codes.
+    pub fn with_properties(
+        packet_id: u16,
+        reason_codes: Vec<ReasonCode>,
+        properties: Properties,
+    ) -> Self {
+        Self {
+            packet_id,
+            reason_codes,
+            properties,
         }
     }
 
@@ -775,5 +815,168 @@ mod tests {
         assert_eq!(ack.encode(&mut dst, v311()), Err(Error::MalformedPacket));
         let mut dst = BytesMut::new();
         assert!(ack.encode(&mut dst, v5()).is_ok());
+    }
+
+    // ---- with_properties ----
+
+    fn user_prop(k: &str, v: &str) -> Property {
+        Property::new(
+            PropertyId::UserProperty,
+            PropertyValue::StringPair(k.into(), v.into()),
+        )
+    }
+
+    fn sub_id_props(id: u32) -> Properties {
+        let mut props = Properties::new();
+        props.push(Property::new(
+            PropertyId::SubscriptionIdentifier,
+            PropertyValue::VarInt(id),
+        ));
+        props
+    }
+
+    #[test]
+    fn test_subscribe_with_properties_keeps_all_arguments() {
+        let subs = vec![Subscription::new("a/b", QoS::AtLeastOnce)];
+        let sub = Subscribe::with_properties(7, subs.clone(), sub_id_props(5));
+        assert_eq!(sub.packet_id, 7);
+        assert_eq!(sub.subscriptions, subs);
+        assert_eq!(
+            sub.properties.get(PropertyId::SubscriptionIdentifier),
+            Some(&PropertyValue::VarInt(5))
+        );
+    }
+
+    #[test]
+    fn test_subscribe_with_properties_empty_matches_new() {
+        let subs = vec![Subscription::new("a", QoS::AtMostOnce)];
+        assert_eq!(
+            Subscribe::with_properties(1, subs.clone(), Properties::new()),
+            Subscribe::new(1, subs)
+        );
+    }
+
+    #[test]
+    fn test_subscribe_with_properties_round_trip_v5() {
+        let mut props = sub_id_props(9);
+        props.push(user_prop("a", "1"));
+        props.push(user_prop("b", "2"));
+        let sub = Subscribe::with_properties(
+            42,
+            vec![
+                Subscription::new("a/+", QoS::AtLeastOnce),
+                Subscription::new("b/#", QoS::ExactlyOnce),
+            ],
+            props,
+        );
+
+        let mut dst = BytesMut::new();
+        sub.encode(&mut dst, v5()).unwrap();
+        assert_eq!(dst.len(), sub.encoded_size(v5()));
+        assert_eq!(Subscribe::decode(dst.freeze(), v5()).unwrap(), sub);
+    }
+
+    #[test]
+    fn test_subscribe_with_properties_on_v3_is_an_error() {
+        let sub = Subscribe::with_properties(
+            1,
+            vec![Subscription::new("a", QoS::AtMostOnce)],
+            sub_id_props(1),
+        );
+        let mut dst = BytesMut::new();
+        assert_eq!(sub.encode(&mut dst, v311()), Err(Error::ProtocolError));
+    }
+
+    /// A repeated SubscriptionIdentifier is allowed in a PUBLISH but not in a
+    /// SUBSCRIBE (§3.8.2.1.2).
+    #[test]
+    fn test_subscribe_with_properties_rejects_repeated_subscription_identifier() {
+        let mut props = sub_id_props(1);
+        props.push(Property::new(
+            PropertyId::SubscriptionIdentifier,
+            PropertyValue::VarInt(2),
+        ));
+        let sub =
+            Subscribe::with_properties(1, vec![Subscription::new("a", QoS::AtMostOnce)], props);
+        let mut dst = BytesMut::new();
+        assert_eq!(sub.encode(&mut dst, v5()), Err(Error::ProtocolError));
+    }
+
+    #[test]
+    fn test_subscribe_with_properties_rejects_a_property_not_allowed_here() {
+        let mut props = Properties::new();
+        props.push(Property::new(
+            PropertyId::ReasonString,
+            PropertyValue::String("why".into()),
+        ));
+        let sub =
+            Subscribe::with_properties(1, vec![Subscription::new("a", QoS::AtMostOnce)], props);
+        let mut dst = BytesMut::new();
+        assert_eq!(sub.encode(&mut dst, v5()), Err(Error::ProtocolError));
+    }
+
+    fn reason_props(text: &str) -> Properties {
+        let mut props = Properties::new();
+        props.push(Property::new(
+            PropertyId::ReasonString,
+            PropertyValue::String(text.into()),
+        ));
+        props
+    }
+
+    #[test]
+    fn test_suback_with_properties_keeps_all_arguments() {
+        let codes = vec![ReasonCode::GrantedQos1, ReasonCode::NotAuthorized];
+        let ack = SubAck::with_properties(3, codes.clone(), reason_props("partly denied"));
+        assert_eq!(ack.packet_id, 3);
+        assert_eq!(ack.reason_codes, codes);
+        assert_eq!(
+            ack.properties.get(PropertyId::ReasonString),
+            Some(&PropertyValue::String("partly denied".into()))
+        );
+    }
+
+    #[test]
+    fn test_suback_with_properties_empty_matches_new() {
+        let codes = vec![ReasonCode::GrantedQos0];
+        assert_eq!(
+            SubAck::with_properties(1, codes.clone(), Properties::new()),
+            SubAck::new(1, codes)
+        );
+    }
+
+    #[test]
+    fn test_suback_with_properties_round_trip_v5() {
+        let mut props = reason_props("one filter refused");
+        props.push(user_prop("k", "v"));
+        let ack = SubAck::with_properties(
+            8,
+            vec![ReasonCode::GrantedQos2, ReasonCode::NotAuthorized],
+            props,
+        );
+
+        let mut dst = BytesMut::new();
+        ack.encode(&mut dst, v5()).unwrap();
+        assert_eq!(dst.len(), ack.encoded_size(v5()));
+        assert_eq!(SubAck::decode(dst.freeze(), v5()).unwrap(), ack);
+    }
+
+    #[test]
+    fn test_suback_with_properties_on_v3_is_an_error() {
+        let ack = SubAck::with_properties(1, vec![ReasonCode::GrantedQos0], reason_props("no"));
+        let mut dst = BytesMut::new();
+        assert_eq!(ack.encode(&mut dst, v311()), Err(Error::ProtocolError));
+    }
+
+    #[test]
+    fn test_suback_with_properties_rejects_a_property_not_allowed_here() {
+        let mut props = Properties::new();
+        props.push(Property::new(
+            PropertyId::SubscriptionIdentifier,
+            PropertyValue::VarInt(1),
+        ));
+        let ack = SubAck::with_properties(1, vec![ReasonCode::GrantedQos0], props);
+        let mut dst = BytesMut::new();
+        assert_eq!(ack.encode(&mut dst, v5()), Err(Error::ProtocolError));
     }
 }
