@@ -198,7 +198,6 @@ fn packets(ver: MqttVersion) -> Vec<(&'static str, Packet)> {
             Packet::Publish(p)
         }),
         ("puback", Packet::PubAck(PubAck::new(1234))),
-        ("puback_reason", Packet::PubAck(puback_rc)),
         ("pubrec", Packet::PubRec(PubAck::new(1234))),
         ("pubrel", Packet::PubRel(PubAck::new(1234))),
         ("pubcomp", Packet::PubComp(PubAck::new(1234))),
@@ -210,7 +209,9 @@ fn packets(ver: MqttVersion) -> Vec<(&'static str, Packet)> {
         ("pingresp", Packet::PingResp),
         ("disconnect", Packet::Disconnect(Disconnect::default())),
     ];
+    // A reason code is a v5-only field, so these three only exist on v5.
     if ver == MqttVersion::V5 {
+        pkts.push(("puback_reason", Packet::PubAck(puback_rc)));
         pkts.push(("disconnect_reason", Packet::Disconnect(disconnect_rc)));
         let mut auth_props = Properties::new();
         auth_props.push(Property::new(
