@@ -154,7 +154,7 @@ impl Disconnect {
         };
         expect_end(&payload)?;
 
-        Ok(Disconnect {
+        Ok(Self {
             reason_code,
             properties,
         })

@@ -246,7 +246,7 @@ impl UnsubAck {
             Vec::new()
         };
 
-        Ok(UnsubAck {
+        Ok(Self {
             packet_id,
             reason_codes,
             properties,

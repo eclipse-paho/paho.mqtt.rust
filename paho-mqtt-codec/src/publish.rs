@@ -179,7 +179,7 @@ impl Publish {
 
         // What's left in `payload` is the application payload
 
-        Ok(Publish {
+        Ok(Self {
             dup,
             qos,
             retain,

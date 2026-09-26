@@ -21,8 +21,8 @@
 //! MQTT CONNECT and CONNACK packets.
 
 use crate::{
-    DecodeOptions, Error, MqttVersion, PacketType, Properties, PropertyContext, QoS, ReasonCode,
-    Result, String,
+    DecodeOptions, Error, MqttVersion, PacketType, Properties, PropertyContext, Publish, QoS,
+    ReasonCode, Result, String,
     wire::{
         binary_wire_size, expect_end, get_binary, get_utf8, put_binary, put_utf8, utf8_wire_size,
     },
@@ -90,6 +90,39 @@ impl Will {
         Self {
             topic: topic.into(),
             payload: payload.into(),
+            qos,
+            retain,
+            properties,
+        }
+    }
+}
+
+/// Converts a PUBLISH into the Will that would publish the same message.
+///
+/// The topic, payload, QoS, retain flag, and properties carry over. `dup` and
+/// `packet_id` are dropped: a Will is not a packet the client sends, it is a
+/// description the server publishes from later, and it assigns those itself.
+///
+/// The properties move across as they are, and the Will context is the
+/// narrower of the two: `TopicAlias` and `SubscriptionIdentifier` are legal in
+/// a PUBLISH but not in a Will (§3.1.3.2). As everywhere else in this crate,
+/// that is caught when the enclosing CONNECT is encoded rather than silently
+/// corrected here. `WillDelayInterval`, which only a Will may carry, can be
+/// pushed afterwards.
+impl From<Publish> for Will {
+    fn from(publish: Publish) -> Self {
+        let Publish {
+            topic,
+            payload,
+            qos,
+            retain,
+            properties,
+            ..
+        } = publish;
+
+        Self {
+            topic,
+            payload,
             qos,
             retain,
             properties,
@@ -1566,6 +1599,81 @@ mod tests {
             false,
             props,
         ));
+        let mut dst = BytesMut::new();
+        assert_eq!(c.encode(&mut dst), Err(Error::ProtocolError));
+    }
+
+    // ---- From<Publish> for Will ----
+
+    #[test]
+    fn test_will_from_publish_carries_the_shared_fields() {
+        let mut p = Publish::builder()
+            .topic("w/last")
+            .payload("bye")
+            .qos_with_id(QoS::QoS1, 9)
+            .retain(true)
+            .properties(will_props())
+            .finalize();
+        p.dup = true;
+
+        let will = Will::from(p);
+        assert_eq!(will.topic, "w/last");
+        assert_eq!(&will.payload[..], b"bye");
+        assert_eq!(will.qos, QoS::QoS1);
+        assert!(will.retain);
+        assert_eq!(will.properties, will_props());
+    }
+
+    /// `dup` and `packet_id` have no Will to belong to; everything else is
+    /// exactly what the equivalent constructor would have built.
+    #[test]
+    fn test_will_from_publish_drops_the_wire_only_fields() {
+        let mut p = Publish::new("w", "bye");
+        p.qos = QoS::QoS2;
+        p.packet_id = Some(77);
+        p.dup = true;
+
+        assert_eq!(
+            Will::from(p),
+            Will::new("w", Bytes::from_static(b"bye"), QoS::QoS2, false)
+        );
+    }
+
+    #[test]
+    fn test_will_from_publish_round_trips_inside_a_connect() {
+        let p = Publish::builder()
+            .topic("w/last")
+            .payload("bye")
+            .qos(QoS::QoS1)
+            .retain(true)
+            .properties(will_props())
+            .finalize();
+
+        let mut c = Connect::new(v5(), true, "cli");
+        c.will = Some(p.into());
+        round_trip_connect(c);
+    }
+
+    /// A PUBLISH-only property survives the conversion and is refused when the
+    /// CONNECT is encoded, rather than being dropped here.
+    #[test]
+    fn test_will_from_publish_defers_context_validation_to_encode() {
+        let mut props = Properties::new();
+        props.push(Property::new(PropertyId::TopicAlias, PropertyValue::U16(1)));
+        let p = Publish::builder()
+            .topic("w")
+            .payload("bye")
+            .properties(props)
+            .finalize();
+
+        let will = Will::from(p);
+        assert_eq!(
+            will.properties.get(PropertyId::TopicAlias),
+            Some(&PropertyValue::U16(1))
+        );
+
+        let mut c = Connect::new(v5(), true, "cli");
+        c.will = Some(will);
         let mut dst = BytesMut::new();
         assert_eq!(c.encode(&mut dst), Err(Error::ProtocolError));
     }

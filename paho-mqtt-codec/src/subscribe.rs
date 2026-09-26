@@ -78,7 +78,7 @@ pub struct Subscription {
 impl Subscription {
     /// Creates a subscription with v5 fields set to their defaults.
     pub fn new(topic_filter: impl Into<String>, qos: QoS) -> Self {
-        Subscription {
+        Self {
             topic_filter: topic_filter.into(),
             qos,
             no_local: false,
@@ -228,7 +228,7 @@ impl Subscribe {
             return Err(Error::ProtocolError); // SUBSCRIBE must have ≥1 filter (MQTT-3.8.3-2)
         }
 
-        Ok(Subscribe {
+        Ok(Self {
             packet_id,
             subscriptions,
             properties,
@@ -355,7 +355,7 @@ impl SubAck {
         if reason_codes.is_empty() {
             return Err(Error::ProtocolError); // one code per filter (MQTT-3.9.3-1)
         }
-        Ok(SubAck {
+        Ok(Self {
             packet_id,
             reason_codes,
             properties,
