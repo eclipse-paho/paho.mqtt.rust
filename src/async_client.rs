@@ -449,12 +449,17 @@ impl AsyncClient {
     pub fn subscribe<S, Q>(&self, topic: S, qos: Q) -> SubscribeToken
     where
         S: Into<String>,
-        Q: Into<QoS>,
+        Q: TryInto<QoS>,
+        Q::Error: Into<Error>,
     {
+        let qos = match qos.try_into() {
+            Ok(q) => q,
+            Err(e) => return SubscribeToken::from_err(e.into()),
+        };
         let (tok, comp) = SubscribeToken::new();
         let cmd = Command::Subscribe {
             single: true,
-            filters: vec![(topic.into(), qos.into(), SubscribeOptions::default())],
+            filters: vec![(topic.into(), qos, SubscribeOptions::default())],
             props: Default::default(),
             tx: comp,
         };
@@ -482,10 +487,15 @@ impl AsyncClient {
     ) -> SubscribeToken
     where
         S: Into<String>,
-        Q: Into<QoS>,
+        Q: TryInto<QoS>,
+        Q::Error: Into<Error>,
         T: Into<SubscribeOptions>,
         P: Into<Option<Properties>>,
     {
+        let qos = match qos.try_into() {
+            Ok(q) => q,
+            Err(e) => return SubscribeToken::from_err(e.into()),
+        };
         let opts: SubscribeOptions = opts.into();
         let props = props.into().unwrap_or_default();
         if let Err(e) = self.require_v5_for_sub_opts(&opts) {
@@ -497,7 +507,7 @@ impl AsyncClient {
         let (tok, comp) = SubscribeToken::new();
         let cmd = Command::Subscribe {
             single: true,
-            filters: vec![(topic.into(), qos.into(), opts)],
+            filters: vec![(topic.into(), qos, opts)],
             props,
             tx: comp,
         };
@@ -517,25 +527,28 @@ impl AsyncClient {
     pub fn subscribe_many<T, Q>(&self, topics: &[T], qos: &[Q]) -> SubscribeManyToken
     where
         T: AsRef<str>,
-        Q: Into<QoS> + Copy,
+        Q: TryInto<QoS> + Copy,
+        Q::Error: Into<Error>,
     {
         let n = topics.len();
         if n != qos.len() {
             return SubscribeManyToken::from_err(Error::General("topics/qos length mismatch"));
         }
 
-        let (tok, comp) = SubscribeManyToken::new();
-        let filters = topics
+        let filters: Result<Vec<_>> = topics
             .iter()
             .zip(qos.iter())
             .map(|(t, q)| {
-                (
-                    t.as_ref().to_string(),
-                    (*q).into(),
-                    SubscribeOptions::default(),
-                )
+                let qos = (*q).try_into().map_err(Into::into)?;
+                Ok((t.as_ref().to_string(), qos, SubscribeOptions::default()))
             })
             .collect();
+        let filters = match filters {
+            Ok(f) => f,
+            Err(e) => return SubscribeManyToken::from_err(e),
+        };
+
+        let (tok, comp) = SubscribeManyToken::new();
 
         let cmd = Command::Subscribe {
             single: false,
@@ -560,9 +573,14 @@ impl AsyncClient {
     pub fn subscribe_many_same_qos<T, Q>(&self, topics: &[T], qos: Q) -> SubscribeManyToken
     where
         T: AsRef<str>,
-        Q: Into<QoS>,
+        Q: TryInto<QoS>,
+        Q::Error: Into<Error>,
     {
-        let qos = vec![qos.into(); topics.len()];
+        let qos = match qos.try_into() {
+            Ok(q) => q,
+            Err(e) => return SubscribeManyToken::from_err(e.into()),
+        };
+        let qos = vec![qos; topics.len()];
         self.subscribe_many(topics, &qos)
     }
 
@@ -584,7 +602,8 @@ impl AsyncClient {
     ) -> SubscribeManyToken
     where
         T: AsRef<str>,
-        Q: Into<QoS> + Copy,
+        Q: TryInto<QoS> + Copy,
+        Q::Error: Into<Error>,
         P: Into<Option<Properties>>,
     {
         let n = topics.len();
@@ -607,7 +626,8 @@ impl AsyncClient {
             .map(|(i, (t, q))| {
                 let sub_opts = opts.get(i).copied().unwrap_or_default();
                 self.require_v5_for_sub_opts(&sub_opts)?;
-                Ok((t.as_ref().to_string(), (*q).into(), sub_opts))
+                let qos = (*q).try_into().map_err(Into::into)?;
+                Ok((t.as_ref().to_string(), qos, sub_opts))
             })
             .collect();
 

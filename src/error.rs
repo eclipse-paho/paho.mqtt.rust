@@ -147,6 +147,16 @@ impl From<Error> for io::Error {
     }
 }
 
+/// A `TryInto<QoS>` (and the like) from a type that cannot fail converts with
+/// `Error = Infallible`. Accepting it here lets one bound,
+/// `Q::Error: Into<Error>`, cover both a plain `QoS` and an integer that has
+/// to be range-checked.
+impl From<core::convert::Infallible> for Error {
+    fn from(never: core::convert::Infallible) -> Self {
+        match never {}
+    }
+}
+
 /// The result type for MQTT operations.
 pub type Result<T> = result::Result<T, Error>;
 

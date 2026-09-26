@@ -30,8 +30,8 @@
 
 use crate::{
     AsyncClient, AsyncReceiver, ConnectOptions, ConnectResponse, CreateOptions, DeliveryToken,
-    DisconnectOptions, Event, Message, MqttVersion, Properties, PublishResponse, QoS, ReasonCode,
-    Result, SubscribeOptions, SubscribeResponse, SyncReceiver, UserData,
+    DisconnectOptions, Error, Event, Message, MqttVersion, Properties, PublishResponse, QoS,
+    ReasonCode, Result, SubscribeOptions, SubscribeResponse, SyncReceiver, UserData,
 };
 use std::time::Duration;
 
@@ -170,7 +170,8 @@ impl Client {
     ///
     pub fn subscribe<Q>(&self, topic: &str, qos: Q) -> Result<SubscribeResponse>
     where
-        Q: Into<QoS>,
+        Q: TryInto<QoS>,
+        Q::Error: Into<Error>,
     {
         self.cli.subscribe(topic, qos).wait_for(self.timeout)
     }
@@ -193,7 +194,8 @@ impl Client {
     ) -> Result<SubscribeResponse>
     where
         S: Into<String>,
-        Q: Into<QoS>,
+        Q: TryInto<QoS>,
+        Q::Error: Into<Error>,
         T: Into<SubscribeOptions>,
         P: Into<Option<Properties>>,
     {
@@ -212,7 +214,8 @@ impl Client {
     pub fn subscribe_many<T, Q>(&self, topics: &[T], qos: &[Q]) -> Result<SubscribeResponse>
     where
         T: AsRef<str>,
-        Q: Into<QoS> + Copy,
+        Q: TryInto<QoS> + Copy,
+        Q::Error: Into<Error>,
     {
         self.cli.subscribe_many(topics, qos).wait_for(self.timeout)
     }
@@ -228,7 +231,8 @@ impl Client {
     pub fn subscribe_many_same_qos<T, Q>(&self, topics: &[T], qos: Q) -> Result<SubscribeResponse>
     where
         T: AsRef<str>,
-        Q: Into<QoS>,
+        Q: TryInto<QoS>,
+        Q::Error: Into<Error>,
     {
         self.cli
             .subscribe_many_same_qos(topics, qos)
@@ -253,7 +257,8 @@ impl Client {
     ) -> Result<SubscribeResponse>
     where
         T: AsRef<str>,
-        Q: Into<QoS> + Copy,
+        Q: TryInto<QoS> + Copy,
+        Q::Error: Into<Error>,
         P: Into<Option<Properties>>,
     {
         self.cli
