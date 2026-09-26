@@ -33,7 +33,9 @@
 //! `properties` is empty, `remaining_length` is 0 and the payload is
 //! omitted entirely.
 
-use crate::{MqttVersion, PacketType, Properties, ReasonCode, Result, wire::expect_end};
+use crate::{
+    Error, MqttVersion, PacketType, Properties, PropertyId, ReasonCode, Result, wire::expect_end,
+};
 use bytes::{Buf, BufMut, Bytes};
 
 #[cfg(feature = "serde")]
@@ -42,6 +44,17 @@ use serde::{Deserialize, Serialize};
 /////////////////////////////////////////////////////////////////////////////
 
 /// An AUTH packet (MQTT v5 only).
+///
+/// Unlike every other packet with a reason code, AUTH has no shorthand form:
+/// §3.15.2 gives no clause letting the Reason Code or the Property Length be
+/// omitted, the way §3.4.2.1 does for PUBACK and §3.14.2.1 for DISCONNECT. It
+/// always encodes to at least the reason code, a property length, and an
+/// `AuthenticationMethod`, which §3.15.2.2.2 requires — receiving an AUTH
+/// without one is a Protocol Error \[MQTT-3.15.2-1\].
+///
+/// [`Auth::default`] therefore names a packet that cannot be sent: it has no
+/// method, so [`encode`](Self::encode) rejects it. It exists because every
+/// packet struct in the crate has a zero value, not because it is useful.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct Auth {
@@ -58,67 +71,70 @@ impl Auth {
     /// v5 only.
     ///
     /// The properties are not incidental here as they are elsewhere: the
-    /// `AuthenticationMethod` and `AuthenticationData` *are* the exchange,
-    /// and §3.15.2.2.2 requires every AUTH to name the method. An AUTH with
-    /// no properties is only meaningful as the bare `Success` that ends a
-    /// successful exchange, which is `Auth::default()`.
+    /// `AuthenticationMethod` and `AuthenticationData` *are* the exchange, and
+    /// §3.15.2.2.2 requires every AUTH to name the method, so `properties`
+    /// must carry one for the packet to encode. `None` is accepted for
+    /// symmetry with the other constructors but yields a packet
+    /// [`encode`](Self::encode) will refuse.
     pub fn new<P>(reason_code: ReasonCode, properties: P) -> Self
     where
         P: Into<Option<Properties>>,
     {
-        let properties = properties.into().unwrap_or_default();
-
         Self {
             reason_code,
-            properties,
+            properties: properties.into().unwrap_or_default(),
         }
+    }
+
+    /// Returns `true` if the properties name an `AuthenticationMethod`, which
+    /// every AUTH must (§3.15.2.2.2).
+    fn has_method(&self) -> bool {
+        self.properties
+            .get(PropertyId::AuthenticationMethod)
+            .is_some()
     }
 
     /// Returns the remaining-length byte count.
     ///
-    /// Uses the shorthand form (0) when `reason_code` is `Success` and
-    /// `properties` is empty.
+    /// AUTH has no shorthand form — see [`Auth`] — so this is always the
+    /// reason code plus the property list.
     pub fn encoded_size(&self) -> usize {
-        match (self.reason_code, self.properties.is_empty()) {
-            (ReasonCode::Success, true) => 0,
-            (_, true) => 1,
-            _ => 1 + self.properties.encoded_size(MqttVersion::V5),
-        }
+        1 + self.properties.encoded_size(MqttVersion::V5)
     }
 
-    /// Encodes the variable header and payload into `dst`.
+    /// Encodes the variable header into `dst`.
     ///
-    /// Uses the shortest form permitted: nothing for `Success` with no
-    /// properties, just the reason code when there are no properties,
-    /// otherwise the full form.
+    /// Returns [`Error::ProtocolError`] if the properties do not name an
+    /// `AuthenticationMethod` (§3.15.2.2.2), or if any property is not
+    /// allowed in an AUTH.
     pub fn encode<B: BufMut>(&self, dst: &mut B) -> Result<()> {
-        match (self.reason_code, self.properties.is_empty()) {
-            (ReasonCode::Success, true) => {}
-            (rc, true) => dst.put_u8(rc as u8),
-            (rc, false) => {
-                dst.put_u8(rc as u8);
-                self.properties.check_context(PacketType::Auth)?;
-                self.properties.encode(dst, MqttVersion::V5)?;
-            }
+        if !self.has_method() {
+            return Err(Error::ProtocolError);
         }
-        Ok(())
+        dst.put_u8(self.reason_code as u8);
+        self.properties.check_context(PacketType::Auth)?;
+        self.properties.encode(dst, MqttVersion::V5)
     }
 
     /// Decodes from the raw `payload` bytes.
+    ///
+    /// Returns [`Error::PacketTooShort`] if the reason code or the property
+    /// length is missing — AUTH has no shorthand form that permits either to
+    /// be omitted — and [`Error::ProtocolError`] if the properties do not
+    /// name an `AuthenticationMethod` \[MQTT-3.15.2-1\].
     pub fn decode(mut payload: Bytes) -> Result<Self> {
         if payload.is_empty() {
-            return Ok(Auth::default());
+            return Err(Error::PacketTooShort);
         }
         let reason_code = ReasonCode::try_from(payload.get_u8())?;
-        // Property length is omitted when the remaining length < 2.
-        let properties = if payload.is_empty() {
-            Properties::new()
-        } else {
-            Properties::decode_in(&mut payload, MqttVersion::V5, PacketType::Auth)?
-        };
+        let properties = Properties::decode_in(&mut payload, MqttVersion::V5, PacketType::Auth)?;
         expect_end(&payload)?;
 
-        Ok(Self::new(reason_code, properties))
+        let auth = Self::new(reason_code, properties);
+        if !auth.has_method() {
+            return Err(Error::ProtocolError);
+        }
+        Ok(auth)
     }
 }
 
@@ -136,6 +152,16 @@ mod tests {
     use alloc::string::ToString;
     use bytes::BytesMut;
 
+    /// Properties naming an authentication method, which every AUTH needs.
+    fn method_props(name: &str) -> Properties {
+        let mut props = Properties::new();
+        props.push(Property::new(
+            PropertyId::AuthenticationMethod,
+            PropertyValue::String(name.to_string()),
+        ));
+        props
+    }
+
     fn round_trip(a: Auth) {
         let mut dst = BytesMut::new();
         a.encode(&mut dst).unwrap();
@@ -144,13 +170,31 @@ mod tests {
         assert_eq!(decoded, a);
     }
 
+    /// AUTH has no clause letting the Property Length be omitted, so a
+    /// reason-code-only body is truncated rather than shorthand.
     #[test]
-    fn test_auth_decode_reason_code_no_props() {
-        // Remaining length 1: reason code only, no property length.
-        let payload = Bytes::from_static(&[0x18]);
-        let a = Auth::decode(payload).unwrap();
-        assert_eq!(a.reason_code, ReasonCode::ContinueAuthentication);
-        assert!(a.properties.is_empty());
+    fn test_auth_decode_reason_code_alone_is_too_short() {
+        assert_eq!(
+            Auth::decode(Bytes::from_static(&[0x18])),
+            Err(Error::PacketTooShort)
+        );
+    }
+
+    /// Nor may the reason code itself be omitted, as it may in a DISCONNECT
+    /// (§3.14.2.1) or a PUBACK (§3.4.2.1).
+    #[test]
+    fn test_auth_decode_empty_body_is_too_short() {
+        assert_eq!(Auth::decode(Bytes::new()), Err(Error::PacketTooShort));
+    }
+
+    /// A well-formed body with no Authentication Method is a Protocol Error
+    /// [MQTT-3.15.2-1]: reason code 0x18, property length 0.
+    #[test]
+    fn test_auth_decode_without_method_is_a_protocol_error() {
+        assert_eq!(
+            Auth::decode(Bytes::from_static(&[0x18, 0x00])),
+            Err(Error::ProtocolError)
+        );
     }
 
     #[test]
@@ -161,61 +205,53 @@ mod tests {
         );
     }
 
-    // ---- shorthand (Success + no props) ----
+    // ---- no shorthand: every AUTH names a method (§3.15.2.2.2) ----
+
+    /// `Auth::default()` is a value, not a sendable packet.
+    #[test]
+    fn test_auth_default_does_not_encode() {
+        let mut dst = BytesMut::new();
+        assert_eq!(Auth::default().encode(&mut dst), Err(Error::ProtocolError));
+    }
 
     #[test]
-    fn test_auth_success_encodes_empty() {
-        let a = Auth::default();
+    fn test_auth_without_method_does_not_encode() {
+        for rc in [
+            ReasonCode::Success,
+            ReasonCode::ContinueAuthentication,
+            ReasonCode::ReAuthenticate,
+        ] {
+            let mut dst = BytesMut::new();
+            assert_eq!(
+                Auth::new(rc, None).encode(&mut dst),
+                Err(Error::ProtocolError),
+                "{rc:?}"
+            );
+        }
+    }
+
+    /// The smallest legal AUTH: reason code, property length, and the method.
+    #[test]
+    fn test_auth_minimal_wire_bytes() {
+        let a = Auth::new(ReasonCode::ContinueAuthentication, method_props("x"));
         let mut dst = BytesMut::new();
         a.encode(&mut dst).unwrap();
-        assert!(dst.is_empty());
+        // 0x18 rc | 0x04 props len | 0x15 method id | 0x00 0x01 'x'
+        assert_eq!(&dst[..], &[0x18, 0x04, 0x15, 0x00, 0x01, b'x']);
+        assert_eq!(a.encoded_size(), dst.len());
     }
 
-    #[test]
-    fn test_auth_success_encoded_size_zero() {
-        assert_eq!(Auth::default().encoded_size(), 0);
-    }
+    // ---- ContinueAuthentication / ReAuthenticate / Success ----
 
     #[test]
-    fn test_auth_success_round_trip() {
-        round_trip(Auth::default());
-    }
-
-    // ---- ContinueAuthentication ----
-
-    #[test]
-    fn test_auth_continue_encoded_size() {
-        let a = Auth::new(ReasonCode::ContinueAuthentication, None);
-        // Reason code only; the property length is omitted when empty.
-        assert_eq!(a.encoded_size(), 1);
-    }
-
-    #[test]
-    fn test_auth_continue_wire_bytes() {
-        let a = Auth::new(ReasonCode::ContinueAuthentication, None);
-        let mut dst = BytesMut::new();
-        a.encode(&mut dst).unwrap();
-        assert_eq!(&dst[..], &[0x18]);
-    }
-
-    #[test]
-    fn test_auth_continue_round_trip() {
-        round_trip(Auth::new(ReasonCode::ContinueAuthentication, None));
-    }
-
-    // ---- ReAuthenticate ----
-
-    #[test]
-    fn test_auth_reauthenticate_round_trip() {
-        round_trip(Auth::new(ReasonCode::ReAuthenticate, None));
-    }
-
-    #[test]
-    fn test_auth_reauthenticate_wire_bytes() {
-        let a = Auth::new(ReasonCode::ReAuthenticate, None);
-        let mut dst = BytesMut::new();
-        a.encode(&mut dst).unwrap();
-        assert_eq!(&dst[..], &[0x19]);
+    fn test_auth_round_trips_every_reason_code() {
+        for rc in [
+            ReasonCode::Success,
+            ReasonCode::ContinueAuthentication,
+            ReasonCode::ReAuthenticate,
+        ] {
+            round_trip(Auth::new(rc, method_props("SCRAM-SHA-256")));
+        }
     }
 
     // ---- with properties ----
@@ -248,7 +284,7 @@ mod tests {
 
     #[test]
     fn test_encoded_size_matches_encode_continue() {
-        let a = Auth::new(ReasonCode::ContinueAuthentication, None);
+        let a = Auth::new(ReasonCode::ContinueAuthentication, method_props("plain"));
         let mut dst = BytesMut::new();
         a.encode(&mut dst).unwrap();
         assert_eq!(dst.len(), a.encoded_size());
@@ -268,5 +304,31 @@ mod tests {
         let mut dst = BytesMut::new();
         a.encode(&mut dst).unwrap();
         assert_eq!(dst.len(), a.encoded_size());
+    }
+
+    // ---- Authentication Data requires an Authentication Method ----
+
+    /// §3.15.2.2.3. Enforced in `Properties`, so this only checks that AUTH
+    /// is wired to it; the rule itself is tested in `properties.rs`.
+    #[test]
+    fn test_auth_rejects_data_without_method() {
+        let mut props = Properties::new();
+        props.push(Property::new(
+            PropertyId::AuthenticationData,
+            PropertyValue::Binary(Bytes::from_static(b"tok")),
+        ));
+        let a = Auth::new(ReasonCode::ContinueAuthentication, props);
+        let mut dst = BytesMut::new();
+        assert_eq!(a.encode(&mut dst), Err(Error::ProtocolError));
+    }
+
+    #[test]
+    fn test_auth_accepts_data_with_method() {
+        let mut props = method_props("SCRAM-SHA-1");
+        props.push(Property::new(
+            PropertyId::AuthenticationData,
+            PropertyValue::Binary(Bytes::from_static(b"tok")),
+        ));
+        round_trip(Auth::new(ReasonCode::ContinueAuthentication, props));
     }
 }

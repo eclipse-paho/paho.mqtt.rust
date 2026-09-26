@@ -23,11 +23,10 @@
 //!
 //! The crate is a wire-format layer only. It converts between typed packet
 //! structs and bytes, and has no dependency on I/O or any particular runtime.
-//! It is used by the Eclipse Paho MQTT Rust client, and is equally suited to
-//! a broker, a proxy, a protocol analyzer,
-//! or an embedded device.
+//! It is used by the Eclipse Paho MQTT Rust client, and is equally suited to a
+//! broker, a proxy, a protocol analyzer, or an embedded device.
 //!
-//! It build for `std` or `no_std` (though `no_std` requires `alloc`).
+//! It builds for `std` or `no_std` (though `no_std` requires `alloc`).
 //!
 //! Every packet type can be both encoded and decoded, so a program can sit
 //! on either end of a connection, client or server. Decoding is strict; input
@@ -66,6 +65,39 @@
 //! fields: properties are rarely the only one a caller wants to change, so
 //! each has `new` and a builder — [`Publish::builder`] and
 //! [`Connect::builder`] — and no `with_properties`.
+
+//! # Version mismatches
+//!
+//! Every packet struct carries the v5 fields whether or not the connection can
+//! use them, so encoding for v3 has to say what happens to a field that
+//! version has no room for. There are two cases, and they are treated
+//! differently on purpose:
+//!
+//! - **The field does not exist in v3.** Properties anywhere, the reason codes
+//!   of DISCONNECT and the PUBACK family, the reason-code list of UNSUBACK, and
+//!   `ConnAck::session_present` on v3.1. Encoding one of these for v3 is an
+//!   [`Error::ProtocolError`]: the caller built something the connection cannot
+//!   express, and writing the packet without it would change what goes on the
+//!   wire without saying so. A v3 PUBACK carrying `NotAuthorized` would arrive
+//!   as `Success`.
+//! - **The field exists in v3 but the value is reserved there.** A CONNACK
+//!   return code outside 0x00–0x05, or a SUBACK return code outside
+//!   0x00–0x02 and 0x80. These are [`Error::MalformedPacket`], matching what
+//!   the decoder must report for the same byte arriving on the wire: the
+//!   packet's format is right and one field holds a value with no meaning.
+//!
+//! Neither case is ever silently dropped.
+//!
+//! # Panics
+//!
+//! The `encode` methods write through [`bytes::BufMut`], which panics rather
+//! than returning an error when the sink is out of room. That cannot happen
+//! for a growable sink such as a [`BytesMut`](bytes::BytesMut) — and
+//! [`Packet::encode`] reserves its exact output up front — but encoding
+//! directly into a fixed buffer, say a `&mut [u8]` on an embedded target, will
+//! panic if the buffer is too small. Size it with
+//! [`Packet::encoded_size`] first. Nothing else in the crate panics; decoding
+//! reports every failure as an [`Error`].
 
 #![no_std]
 #![deny(missing_docs)]

@@ -355,9 +355,13 @@ impl AsyncClient {
         let opts = opts.into().unwrap_or_default();
         debug!("Disconnecting");
 
-        // v5 DISCONNECT properties cannot go on a v3 connection; the codec
-        // would refuse to encode them and the DISCONNECT would never be sent.
-        if let Err(e) = self.require_v5_for_props(&opts.props) {
+        // A v5 reason code and v5 properties cannot go on a v3 connection;
+        // the codec refuses to encode either, and the DISCONNECT would never
+        // be sent.
+        if let Err(e) = self
+            .require_v5_for_props(&opts.props)
+            .and_then(|()| self.require_v5_for_disconnect_reason(opts.reason_code))
+        {
             return Token::<()>::from_err(e);
         }
 
@@ -743,6 +747,19 @@ impl AsyncClient {
     /// current connection is not MQTT v5.
     fn require_v5_for_props(&self, props: &Properties) -> Result<()> {
         if !props.is_empty() && self.mqtt_version() < MqttVersion::V5 {
+            Err(Error::WrongMqttVersion)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Returns `Err(WrongMqttVersion)` if a DISCONNECT reason code other than
+    /// `NormalDisconnection` is requested on a connection that is not MQTT v5.
+    ///
+    /// A v3 DISCONNECT has no body to carry one, so the codec refuses to
+    /// encode it and the DISCONNECT would never be sent.
+    fn require_v5_for_disconnect_reason(&self, rc: ReasonCode) -> Result<()> {
+        if rc != ReasonCode::NormalDisconnection && self.mqtt_version() < MqttVersion::V5 {
             Err(Error::WrongMqttVersion)
         } else {
             Ok(())

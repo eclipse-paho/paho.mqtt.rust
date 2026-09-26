@@ -300,8 +300,26 @@ impl TryFrom<u8> for ReasonCode {
 
     /// Converts a wire byte into a reason code.
     ///
-    /// Returns [`Error::ProtocolError`] for any value not defined by the
-    /// MQTT v5 specification.
+    /// Returns [`Error::ProtocolError`] — not
+    /// [`MalformedPacket`](Error::MalformedPacket) — for any value the MQTT v5
+    /// specification does not define.
+    ///
+    /// The specification gives no receiver-side rule for an unlisted code
+    /// ([MQTT-3.9.3-2] and [MQTT-3.11.3-2] oblige the *sender* to use one of
+    /// the listed values), so the classification follows the definitions in
+    /// §4.13: a Malformed Packet "cannot be parsed", while a Protocol Error is
+    /// "detected after the packet has been parsed and found to contain data
+    /// that is not allowed by the protocol". A reason code is a one-byte field
+    /// that reads successfully and has the right data type; only its value is
+    /// out of range, which is the second case.
+    ///
+    /// This is also the line the specification draws for properties, which are
+    /// the closest analogue: an invalid identifier or a value "not of the
+    /// specified data type" is a Malformed Packet (§2.2.2.2, hence
+    /// [`PropertyId::try_from`](crate::PropertyId)), while an out-of-range
+    /// value is called out as a Protocol Error property by property — a
+    /// `ReceiveMaximum` of 0 (§3.1.2.11.3), a `MaximumPacketSize` of 0
+    /// (§3.1.2.11.4), and so on.
     fn try_from(code: u8) -> Result<Self, Error> {
         use ReasonCode::*;
         let rc = match code {

@@ -258,7 +258,7 @@ impl RawPacket {
         let header = src[0];
         src.advance(1 + varlen_size);
         let payload = src.copy_to_bytes(remaining_len);
-        Ok(Some(RawPacket { header, payload }))
+        Ok(Some(Self { header, payload }))
     }
 }
 
@@ -781,9 +781,11 @@ mod tests {
             Packet::from_raw(raw, v311()),
             Err(Error::UnknownPacketType(PacketType::Auth as u8))
         );
+        // The smallest legal AUTH: Success, then a property list naming the
+        // authentication method, which §3.15.2.2.2 requires.
         let raw = RawPacket {
             header: PacketType::Auth.header_byte(),
-            payload: Bytes::new(),
+            payload: Bytes::from_static(&[0x00, 0x04, 0x15, 0x00, 0x01, b'x']),
         };
         assert!(matches!(Packet::from_raw(raw, v5()), Ok(Packet::Auth(_))));
     }
@@ -819,7 +821,7 @@ mod tests {
         // AUTH with anything but Success/Continue/ReAuthenticate
         let raw = RawPacket {
             header: PacketType::Auth.header_byte(),
-            payload: Bytes::from_static(&[0x80]),
+            payload: Bytes::from_static(&[0x80, 0x04, 0x15, 0x00, 0x01, b'x']),
         };
         assert_eq!(Packet::from_raw(raw, v5()), Err(Error::ProtocolError));
     }
@@ -1195,7 +1197,7 @@ mod tests {
             (T::UnsubAck, &[0x00, 0x01], v311()),
             (T::Disconnect, &[], v311()),
             (T::Disconnect, &[0x00, 0x00], v5()), // rc + empty props
-            (T::Auth, &[0x00, 0x00], v5()),
+            (T::Auth, &[0x00, 0x04, 0x15, 0x00, 0x01, b'x'], v5()), // rc + method
         ];
         for (ty, body, ver) in cases {
             assert!(

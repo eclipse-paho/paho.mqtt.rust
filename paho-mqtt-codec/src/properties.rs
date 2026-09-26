@@ -343,6 +343,14 @@ impl PropertyId {
 impl TryFrom<u8> for PropertyId {
     type Error = Error;
 
+    /// Converts a wire byte into a property identifier.
+    ///
+    /// Returns [`Error::MalformedPacket`] for an identifier the specification
+    /// does not define, which §2.2.2.2 states outright. Contrast
+    /// [`ReasonCode::try_from`](crate::ReasonCode), where an undefined value
+    /// is a `ProtocolError`: the identifier is part of the packet's format,
+    /// whereas a reason code is a correctly-typed field whose value is merely
+    /// out of range.
     fn try_from(b: u8) -> Result<Self> {
         use PropertyId::*;
         match b {
@@ -493,7 +501,7 @@ pub struct Property {
 impl Property {
     /// Creates a new property.
     pub fn new(id: PropertyId, value: PropertyValue) -> Self {
-        Property { id, value }
+        Self { id, value }
     }
 
     /// Wire size: 1 byte for the property ID plus the encoded value size.
@@ -557,7 +565,7 @@ impl Property {
         }
         let id = PropertyId::try_from(src.get_u8())?;
         let value = PropertyValue::decode_typed(id.value_type(), src)?;
-        let prop = Property { id, value };
+        let prop = Self { id, value };
         // The type is right by construction; only the range needs checking.
         prop.check_range()?;
         Ok(prop)
@@ -593,6 +601,13 @@ impl SeenIds {
         Ok(())
     }
 
+    /// Returns `true` if `id` has been recorded. Only meaningful for
+    /// non-repeatable identifiers, which are the only ones `note` records.
+    #[inline]
+    fn has(self, id: PropertyId) -> bool {
+        self.0 & (1u64 << (id as u8)) != 0
+    }
+
     fn mark_invalid(&mut self) {
         self.0 |= Self::INVALID;
     }
@@ -626,6 +641,13 @@ pub struct Properties {
     /// a non-repeatable identifier; `encode` then refuses the whole list.
     seen: SeenIds,
 }
+
+// `PartialEq` is derived over the cached fields as well as `props`, which is
+// only sound because every way of building a `Properties` — `push`, and so
+// `Extend` and `From<Vec<Property>>`, plus `decode_allowed` — maintains them
+// identically from the same input. A future mutator that updated `props`
+// without them would make equality lie; keep them in step or compare `props`
+// alone.
 
 impl Properties {
     /// Creates an empty property list.
@@ -675,16 +697,24 @@ impl Properties {
     /// Number of bytes this encodes to on the wire, including the VBI length prefix.
     ///
     /// Returns 0 for v3 connections — properties are not present on the wire.
+    ///
+    /// A list too long for a variable-byte integer to describe has no valid
+    /// encoding at all; the prefix is sized as if it were the maximum rather
+    /// than wrapping, and [`encode`](Self::encode) reports the real error.
     pub fn encoded_size(&self, ver: MqttVersion) -> usize {
         if ver < MqttVersion::V5 {
             0
         } else {
             let data_len = self.payload_size();
-            varlen::encoded_size(data_len as u32) + data_len
+            let capped = data_len.min(varlen::MAX_VARLEN as usize) as u32;
+            varlen::encoded_size(capped) + data_len
         }
     }
 
     /// Encodes the properties to the wire: VBI(payload_len) followed by each property.
+    ///
+    /// Returns [`Error::VarLenOverflow`] if the list is longer than a
+    /// variable-byte integer can describe ([`varlen::MAX_VARLEN`] bytes).
     ///
     /// Properties do not exist before v5, so on a v3 connection an empty
     /// list writes nothing and a non-empty one is [`Error::ProtocolError`]:
@@ -701,22 +731,45 @@ impl Properties {
         if self.seen.is_invalid() {
             return Err(Error::ProtocolError);
         }
-        varlen::encode(self.payload_size() as u32, dst)?;
+        // A list longer than a variable-byte integer can describe cannot be
+        // encoded; casting would wrap and emit a length prefix that disagrees
+        // with the bytes that follow.
+        let data_len = u32::try_from(self.payload_size()).map_err(|_| Error::VarLenOverflow)?;
+        varlen::encode(data_len, dst)?;
         for prop in &self.props {
             prop.encode(dst)?;
         }
         Ok(())
     }
 
-    /// Checks that every property is allowed in `ctx` (MQTT v5 §2.2.2.2)
-    /// and that none repeats where `ctx` forbids it — in practice, that a
+    /// Authentication Data is meaningless without the method that defines it,
+    /// so including it alone is a Protocol Error (§3.1.2.11.10 for CONNECT,
+    /// §3.2.2.3.18 for CONNACK, §3.15.2.2.3 for AUTH — the three contexts that
+    /// allow the pair at all).
+    ///
+    /// Both identifiers are non-repeatable, so `seen` already records them and
+    /// this costs no extra walk. It cannot be checked in
+    /// [`push`](Self::push), which sees the properties one at a time and in
+    /// any order.
+    #[inline]
+    fn check_auth_pair(seen: SeenIds) -> Result<()> {
+        if seen.has(PropertyId::AuthenticationData) && !seen.has(PropertyId::AuthenticationMethod) {
+            return Err(Error::ProtocolError);
+        }
+        Ok(())
+    }
+
+    /// Checks that every property is allowed in `ctx` (MQTT v5 §2.2.2.2),
+    /// that none repeats where `ctx` forbids it — in practice, that a
     /// `SubscriptionIdentifier` appears at most once outside a PUBLISH
-    /// (§3.8.2.1.2). Returns [`Error::ProtocolError`] otherwise.
+    /// (§3.8.2.1.2) — and that Authentication Data is accompanied by an
+    /// Authentication Method. Returns [`Error::ProtocolError`] otherwise.
     ///
     /// Packet encoders call this; use it directly when assembling properties
     /// for a packet to catch a misplaced one early.
     #[inline]
     pub fn check_context(&self, ctx: impl Into<PropertyContext>) -> Result<()> {
+        Self::check_auth_pair(self.seen)?;
         let ctx = ctx.into();
         let allowed = ctx.allowed_ids();
         let mut sub_ids = 0usize;
@@ -741,6 +794,10 @@ impl Properties {
     /// [`decode_in`](Self::decode_in) to also enforce which properties may
     /// appear in a given packet. Returns an empty collection for v3
     /// connections without consuming any bytes.
+    ///
+    /// Value ranges, repeated non-repeatable identifiers, and Authentication
+    /// Data without an Authentication Method are rejected either way: those
+    /// rules do not depend on which packet carries the properties.
     pub fn decode<B: Buf>(src: &mut B, ver: MqttVersion) -> Result<Self> {
         Self::decode_allowed(src, ver, u64::MAX, true)
     }
@@ -797,6 +854,7 @@ impl Properties {
             payload_size += prop.encoded_size();
             props.push(prop);
         }
+        Self::check_auth_pair(seen)?;
         Ok(Self {
             props,
             payload_size,
@@ -1658,5 +1716,98 @@ mod tests {
                 .is_ok()
         );
         assert!(dst.is_empty());
+    }
+
+    // ---- Authentication Data requires an Authentication Method ----
+
+    fn auth_method(name: &str) -> Property {
+        Property::new(
+            PropertyId::AuthenticationMethod,
+            PropertyValue::String(name.into()),
+        )
+    }
+
+    fn auth_data(bytes: &'static [u8]) -> Property {
+        Property::new(
+            PropertyId::AuthenticationData,
+            PropertyValue::Binary(Bytes::from_static(bytes)),
+        )
+    }
+
+    /// Wire bytes for a property list, built with `encode` — which is
+    /// context-free and so will emit the invalid pair we want to decode.
+    fn to_wire(props: &Properties) -> Bytes {
+        let mut dst = BytesMut::new();
+        props.encode(&mut dst, v5()).unwrap();
+        dst.freeze()
+    }
+
+    #[test]
+    fn test_auth_data_alone_fails_check_context() {
+        let mut props = Properties::new();
+        props.push(auth_data(b"tok"));
+        for ctx in [PacketType::Connect, PacketType::ConnAck, PacketType::Auth] {
+            assert_eq!(
+                props.check_context(ctx),
+                Err(Error::ProtocolError),
+                "{ctx:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_auth_data_with_method_passes_check_context() {
+        let mut props = Properties::new();
+        props.push(auth_method("SCRAM-SHA-1"));
+        props.push(auth_data(b"tok"));
+        assert!(props.check_context(PacketType::Auth).is_ok());
+    }
+
+    /// The rule is about the pair, not the order they were added in.
+    #[test]
+    fn test_auth_data_before_method_is_accepted() {
+        let mut props = Properties::new();
+        props.push(auth_data(b"tok"));
+        props.push(auth_method("SCRAM-SHA-1"));
+        assert!(props.check_context(PacketType::Auth).is_ok());
+    }
+
+    /// A method with no data is fine: it names the method and asks the peer
+    /// to start.
+    #[test]
+    fn test_auth_method_alone_is_accepted() {
+        let mut props = Properties::new();
+        props.push(auth_method("SCRAM-SHA-1"));
+        assert!(props.check_context(PacketType::Auth).is_ok());
+    }
+
+    #[test]
+    fn test_auth_data_alone_is_rejected_on_decode() {
+        let mut props = Properties::new();
+        props.push(auth_data(b"tok"));
+        let wire = to_wire(&props);
+
+        // Both the context-aware and the context-free decoders: the rule does
+        // not depend on which packet carries the properties.
+        assert_eq!(
+            Properties::decode_in(&mut wire.clone(), v5(), PacketType::Auth),
+            Err(Error::ProtocolError)
+        );
+        assert_eq!(
+            Properties::decode(&mut wire.clone(), v5()),
+            Err(Error::ProtocolError)
+        );
+    }
+
+    #[test]
+    fn test_auth_pair_round_trips_on_decode() {
+        let mut props = Properties::new();
+        props.push(auth_method("SCRAM-SHA-1"));
+        props.push(auth_data(b"tok"));
+        let wire = to_wire(&props);
+        assert_eq!(
+            Properties::decode_in(&mut wire.clone(), v5(), PacketType::Auth).unwrap(),
+            props
+        );
     }
 }

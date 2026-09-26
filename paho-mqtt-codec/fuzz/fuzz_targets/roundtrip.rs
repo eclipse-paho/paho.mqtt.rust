@@ -257,6 +257,14 @@ fn properties(
         }
         props.push(property(u, id)?);
     }
+    // Authentication Data without an Authentication Method is a Protocol
+    // Error (§3.1.2.11.10, §3.2.2.3.18, §3.15.2.2.3), so a generated packet
+    // carrying the data must name the method too or it would not encode.
+    if used[PropertyId::AuthenticationData as usize]
+        && !used[PropertyId::AuthenticationMethod as usize]
+    {
+        props.push(property(u, PropertyId::AuthenticationMethod)?);
+    }
     Ok(props)
 }
 
@@ -411,7 +419,12 @@ fn disconnect(u: &mut Unstructured, ver: MqttVersion) -> AResult<Disconnect> {
 
 fn auth(u: &mut Unstructured) -> AResult<Auth> {
     let rc = reason_code(u, PacketType::Auth)?;
-    let props = properties(u, MqttVersion::V5, PacketType::Auth)?;
+    let mut props = properties(u, MqttVersion::V5, PacketType::Auth)?;
+    // Every AUTH must name its authentication method (§3.15.2.2.2), and AUTH
+    // has no shorthand form, so a generated one without it would not encode.
+    if props.get(PropertyId::AuthenticationMethod).is_none() {
+        props.push(property(u, PropertyId::AuthenticationMethod)?);
+    }
     Ok(Auth::new(rc, props))
 }
 

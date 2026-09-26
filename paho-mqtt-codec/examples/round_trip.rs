@@ -23,20 +23,25 @@
 
 use bytes::{Bytes, BytesMut};
 use paho_mqtt_codec::{
-    MqttVersion, Packet, Property, PropertyId, PropertyValue, Publish, QoS, RawPacket, Result,
+    MqttVersion, Packet, Properties, Property, PropertyId, PropertyValue, Publish, QoS, RawPacket,
+    Result,
 };
 
 fn main() -> Result<()> {
     let ver = MqttVersion::V5;
 
     // Build a QoS 1 PUBLISH carrying an MQTT v5 property.
-    let mut publish = Publish::new("sensors/temp", Bytes::from_static(b"21.5"));
-    publish.qos = QoS::AtLeastOnce;
-    publish.packet_id = Some(42);
-    publish.properties.push(Property::new(
+    let mut props = Properties::new();
+    props.push(Property::new(
         PropertyId::MessageExpiryInterval,
         PropertyValue::U32(60),
     ));
+    let publish = Publish::builder()
+        .topic("sensors/temp")
+        .payload(Bytes::from_static(b"21.5"))
+        .qos_with_id(QoS::AtLeastOnce, 42)
+        .properties(props)
+        .finalize();
 
     // Encode it. This is what would be written to the network.
     let mut wire = BytesMut::new();

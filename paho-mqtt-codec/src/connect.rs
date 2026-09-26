@@ -22,7 +22,7 @@
 
 use crate::{
     DecodeOptions, Error, MqttVersion, PacketType, Properties, PropertyContext, Publish, QoS,
-    ReasonCode, Result, String,
+    ReasonCode, Result, String, topic,
     wire::{
         binary_wire_size, expect_end, get_binary, get_utf8, put_binary, put_utf8, utf8_wire_size,
     },
@@ -211,6 +211,12 @@ impl Connect {
     /// the protocol version in [`version`](Self::version).
     pub fn encode<B: BufMut>(&self, dst: &mut B) -> Result<()> {
         let ver = self.version;
+        // v3.1 and v3.1.1 require a username whenever a password is present
+        // (MQTT-3.1.2-22); v5 lifted that restriction. Decode enforces this,
+        // so encoding it would emit a packet this codec would reject.
+        if !ver.is_v5() && self.password.is_some() && self.username.is_none() {
+            return Err(Error::ProtocolError);
+        }
         // Protocol name and level identify the version on the wire.
         put_utf8(ver.protocol_name(), dst)?;
         dst.put_u8(ver as u8);
@@ -243,6 +249,10 @@ impl Connect {
         if let Some(will) = &self.will {
             will.properties.check_context(PropertyContext::Will)?;
             will.properties.encode(dst, ver)?;
+            // A Will Topic is a topic *name*: non-empty, no wildcards
+            // (MQTT-4.7.3-1, §3.3.2.2). Unlike a PUBLISH it has no topic
+            // alias to stand in for it, so an empty one is always invalid.
+            topic::validate_name(&will.topic)?;
             put_utf8(&will.topic, dst)?;
             put_binary(&will.payload, dst)?;
         }
@@ -317,10 +327,11 @@ impl Connect {
         // Will
         let will = if will_flag {
             let will_props = Properties::decode_in(&mut payload, ver, PropertyContext::Will)?;
-            let topic = get_utf8(&mut payload)?;
+            let will_topic = get_utf8(&mut payload)?;
+            topic::validate_name(&will_topic)?;
             let will_payload = get_binary(&mut payload)?;
             Some(Will {
-                topic,
+                topic: will_topic,
                 payload: will_payload,
                 qos: will_qos,
                 retain: will_retain,
@@ -561,14 +572,17 @@ impl ConnAck {
     }
 
     /// Encodes the CONNACK variable header and payload into `dst`.
+    ///
+    /// Returns [`Error::ProtocolError`] if `session_present` is set and `ver`
+    /// is v3.1, which has no Session Present flag — the whole of byte 1 is
+    /// reserved there, so the flag has nowhere to go. See the crate
+    /// documentation on version mismatches.
     pub fn encode<B: BufMut>(&self, dst: &mut B, ver: MqttVersion) -> Result<()> {
+        if self.session_present && ver == MqttVersion::V3_1 {
+            return Err(Error::ProtocolError);
+        }
         // Byte 1: connect acknowledge flags (bit 0 = session_present).
-        // v3.1 has no such flag; the byte is reserved and sent as zero.
-        let flags = if self.session_present && ver != MqttVersion::V3_1 {
-            0x01
-        } else {
-            0x00
-        };
+        let flags = u8::from(self.session_present);
         dst.put_u8(flags);
 
         // Byte 2: return/reason code
@@ -646,7 +660,7 @@ mod tests {
         Property, PropertyId, PropertyValue,
         types::{MQTT_VERSION_3_1_1, MQTT_VERSION_5},
     };
-    use bytes::BytesMut;
+    use bytes::{BufMut, BytesMut};
 
     fn v311() -> MqttVersion {
         MQTT_VERSION_3_1_1
@@ -1361,8 +1375,16 @@ mod tests {
 
     #[test]
     fn test_connack_v3_1_has_no_session_present() {
-        // Encoding never sets the flag on v3.1 ...
+        // v3.1 has no Session Present flag, so setting one is refused rather
+        // than quietly cleared ...
         let ack = ConnAck::new(true, ReasonCode::Success);
+        let mut dst = BytesMut::new();
+        assert_eq!(
+            ack.encode(&mut dst, MqttVersion::V3_1),
+            Err(Error::ProtocolError)
+        );
+        // ... while a cleared flag encodes as the reserved zero byte ...
+        let ack = ConnAck::new(false, ReasonCode::Success);
         let mut dst = BytesMut::new();
         ack.encode(&mut dst, MqttVersion::V3_1).unwrap();
         assert_eq!(&dst[..], &[0x00, 0x00]);
@@ -1387,18 +1409,101 @@ mod tests {
     }
 
     #[test]
-    fn test_connect_decode_password_without_username() {
+    fn test_connect_password_without_username() {
         let mut conn = Connect::new(v311(), true, "c");
         conn.password = Some(Bytes::from_static(b"pw"));
+
+        // Forbidden in v3.1.1 (MQTT-3.1.2-22), on encode as well as decode,
+        // so the bytes have to be assembled by hand to test the decoder.
         let mut dst = BytesMut::new();
-        conn.encode(&mut dst).unwrap();
-        // Forbidden in v3.1.1 (MQTT-3.1.2-22) ...
-        assert_eq!(Connect::decode(dst.freeze()), Err(Error::ProtocolError));
-        // ... but allowed in v5.
+        assert_eq!(conn.encode(&mut dst), Err(Error::ProtocolError));
+
+        let wire = Bytes::from_static(&[
+            0x00, 0x04, b'M', b'Q', b'T', b'T', // protocol name
+            0x04, // level 4 = v3.1.1
+            0x42, // clean session + password, no username
+            0x00, 0x00, // keep-alive
+            0x00, 0x01, b'c', // client id
+            0x00, 0x02, b'p', b'w', // password
+        ]);
+        assert_eq!(Connect::decode(wire), Err(Error::ProtocolError));
+
+        // Allowed in v5, both ways.
         let conn = with_ver(conn, v5());
         let mut dst = BytesMut::new();
         conn.encode(&mut dst).unwrap();
         assert_eq!(Connect::decode(dst.freeze()).unwrap(), conn);
+    }
+
+    // ---- the Will topic is a topic name (MQTT-4.7.3-1, §3.3.2.2) ----
+
+    /// A v3.1.1 CONNECT carrying a Will with topic `topic`, assembled by hand
+    /// so the encoder's own validation does not stand in the way.
+    fn v311_connect_with_will_topic(topic: &str) -> Bytes {
+        let mut b = BytesMut::new();
+        b.put_u16(4);
+        b.put_slice(b"MQTT");
+        b.put_u8(4); // level
+        b.put_u8(0x02 | 0x04); // clean session + will flag
+        b.put_u16(0); // keep-alive
+        b.put_u16(1); // client id
+        b.put_slice(b"c");
+        b.put_u16(topic.len() as u16);
+        b.put_slice(topic.as_bytes());
+        b.put_u16(3); // will payload
+        b.put_slice(b"bye");
+        b.freeze()
+    }
+
+    #[test]
+    fn test_connect_encode_rejects_invalid_will_topic() {
+        for bad in ["a/#", "a/+/b", "#", "+", ""] {
+            let mut c = Connect::new(v5(), true, "cli");
+            c.will = Some(Will::new(bad, Bytes::from_static(b"bye"), QoS::QoS0, false));
+            let mut dst = BytesMut::new();
+            assert_eq!(c.encode(&mut dst), Err(Error::TopicNameInvalid), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn test_connect_decode_rejects_invalid_will_topic() {
+        // The hand-built packet is otherwise well formed.
+        let ok = Connect::decode(v311_connect_with_will_topic("w/last")).unwrap();
+        assert_eq!(ok.will.unwrap().topic, "w/last");
+
+        for bad in ["a/#", "a/+/b", "#", "+", ""] {
+            assert_eq!(
+                Connect::decode(v311_connect_with_will_topic(bad)),
+                Err(Error::TopicNameInvalid),
+                "{bad:?}"
+            );
+        }
+    }
+
+    /// A Will has no topic alias to stand in for an empty topic, so unlike a
+    /// PUBLISH it is invalid on v5 too.
+    #[test]
+    fn test_connect_empty_will_topic_is_invalid_on_v5_as_well() {
+        let mut c = Connect::new(v5(), true, "cli");
+        c.will = Some(Will::with_properties(
+            "",
+            Bytes::new(),
+            QoS::QoS0,
+            false,
+            will_props(),
+        ));
+        let mut dst = BytesMut::new();
+        assert_eq!(c.encode(&mut dst), Err(Error::TopicNameInvalid));
+    }
+
+    /// A Will built from a PUBLISH inherits its topic, which is already
+    /// wildcard-free, so the conversion cannot produce an invalid one.
+    #[test]
+    fn test_will_from_publish_keeps_a_valid_topic() {
+        let p = Publish::new("a/b", "x");
+        let mut c = Connect::new(v5(), true, "cli");
+        c.will = Some(p.into());
+        round_trip_connect(c);
     }
 
     #[test]

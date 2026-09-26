@@ -101,8 +101,7 @@ impl Publish {
     /// efficient solution by using [`Self::encode_header`] and then writing the
     /// payload directly to the output stream.
     ///
-    /// Returns [`Error::ProtocolError`] if `qos > 0` but `packet_id` is `None`
-    /// or `Some(0)`, or if `qos == 0` and `packet_id` is set.
+    /// Returns the same errors as [`encode_header`](Self::encode_header).
     pub fn encode<B: BufMut>(&self, dst: &mut B, ver: MqttVersion) -> Result<()> {
         self.encode_header(dst, ver)?;
         dst.put_slice(&self.payload);
@@ -114,8 +113,16 @@ impl Publish {
     /// separately by the caller.
     ///
     /// Returns [`Error::ProtocolError`] if `qos > 0` but `packet_id` is `None`
-    /// or `Some(0)`, or if `qos == 0` and `packet_id` is set.
+    /// or `Some(0)`, if `qos == 0` and `packet_id` is set, or if `dup` is set
+    /// on a QoS 0 message.
     pub fn encode_header<B: BufMut>(&self, dst: &mut B, ver: MqttVersion) -> Result<()> {
+        // DUP is meaningless without an acknowledgement (MQTT-3.3.1-2), and
+        // the flag lives in the fixed header that `Packet::encode` writes, so
+        // check it here as decode does rather than emit a packet this codec
+        // would reject.
+        if self.dup && self.qos == QoS::QoS0 {
+            return Err(Error::ProtocolError);
+        }
         // Same rules as decode: no wildcards; empty only with a v5 alias.
         if topic::has_wildcards(&self.topic)
             || (self.topic.is_empty()
@@ -375,11 +382,14 @@ impl PubAck {
 
     /// Encodes the variable header into `dst`.
     ///
-    /// Returns [`Error::ProtocolError`] if `packet_id` is 0, or if `ver` is
-    /// v3 and `properties` is not empty (v3 acknowledgements carry only the
-    /// packet identifier; a non-success `reason_code` cannot be expressed
-    /// either and is dropped — see [`PubAck`]).
+    /// Returns [`Error::ProtocolError`] if `packet_id` is 0, or if `ver` is v3
+    /// and either `reason_code` is not `Success` or `properties` is not empty:
+    /// a v3 acknowledgement is exactly the packet identifier, so neither field
+    /// has anywhere to go. See the crate documentation on version mismatches.
     pub fn encode<B: BufMut>(&self, dst: &mut B, ver: MqttVersion) -> Result<()> {
+        if ver != MqttVersion::V5 && self.reason_code != ReasonCode::Success {
+            return Err(Error::ProtocolError);
+        }
         dst.put_u16(check_packet_id(self.packet_id)?);
         if ver != MqttVersion::V5 {
             // Nothing more on the wire; a non-empty list is an error.
@@ -1006,16 +1016,17 @@ mod tests {
         round_trip_puback(PubAck::new(0xFFFF), v311());
     }
 
+    /// A v3 acknowledgement is exactly the packet identifier, so a reason
+    /// code is refused rather than dropped — as properties already were.
     #[test]
-    fn test_puback_v311_ignores_reason_code() {
-        // Even with a non-Success reason code, v311 wire format is still 2 bytes.
+    fn test_puback_v311_rejects_a_reason_code() {
         let ack = PubAck::with_properties(5, ReasonCode::NotAuthorized, None);
         let mut dst = BytesMut::new();
-        ack.encode(&mut dst, v311()).unwrap();
-        assert_eq!(dst.len(), 2);
-        // Decode recovers Success (v311 ignores reason code)
-        let decoded = PubAck::decode(dst.freeze(), v311()).unwrap();
-        assert_eq!(decoded.reason_code, ReasonCode::Success);
+        assert_eq!(ack.encode(&mut dst, v311()), Err(Error::ProtocolError));
+        // `Success` is the one code v3 can express, as the bare two bytes.
+        let mut dst = BytesMut::new();
+        PubAck::new(5).encode(&mut dst, v311()).unwrap();
+        assert_eq!(&dst[..], &[0x00, 0x05]);
     }
 
     // ---- v5 shorthand (Success + empty properties = 2 bytes) ----
@@ -1111,12 +1122,16 @@ mod tests {
 
     #[test]
     fn test_puback_encoded_size_matches_encode() {
+        // A reason code is v5-only, so the second case is v5-only too.
         let cases = [
-            PubAck::new(1),
-            PubAck::with_properties(2, ReasonCode::UnspecifiedError, None),
+            (PubAck::new(1), &[v311(), v5()][..]),
+            (
+                PubAck::with_properties(2, ReasonCode::UnspecifiedError, None),
+                &[v5()][..],
+            ),
         ];
-        for ack in &cases {
-            for ver in [v311(), v5()] {
+        for (ack, vers) in &cases {
+            for &ver in *vers {
                 let mut dst = BytesMut::new();
                 ack.encode(&mut dst, ver).unwrap();
                 assert_eq!(dst.len(), ack.encoded_size(ver));
@@ -1279,6 +1294,53 @@ mod tests {
             crate::Packet::PubAck(ack).encode(&mut dst, v5()),
             Err(Error::ProtocolError)
         );
+    }
+
+    // ---- DUP is meaningless on QoS 0 (MQTT-3.3.1-2) ----
+
+    #[test]
+    fn test_publish_encode_rejects_dup_on_qos0() {
+        let mut p = Publish::new("a", "x");
+        p.dup = true;
+        for ver in [v311(), v5()] {
+            let mut dst = BytesMut::new();
+            assert_eq!(p.encode(&mut dst, ver), Err(Error::ProtocolError), "{ver}");
+            let mut dst = BytesMut::new();
+            assert_eq!(
+                p.encode_header(&mut dst, ver),
+                Err(Error::ProtocolError),
+                "{ver}"
+            );
+        }
+    }
+
+    /// The DUP bit lives in the fixed header, which `Packet::encode` writes
+    /// before the body, so the check has to leave the buffer untouched.
+    #[test]
+    fn test_packet_encode_rejects_dup_on_qos0_without_writing() {
+        let mut p = Publish::new("a", "x");
+        p.dup = true;
+        let mut dst = BytesMut::from(&b"before"[..]);
+        assert_eq!(
+            crate::Packet::Publish(p).encode(&mut dst, v5()),
+            Err(Error::ProtocolError)
+        );
+        assert_eq!(&dst[..], b"before");
+    }
+
+    /// DUP is legal, and round-trips, once the message is acknowledged.
+    #[test]
+    fn test_publish_dup_is_allowed_on_qos1() {
+        let p = PublishBuilder::new()
+            .topic("a")
+            .payload("x")
+            .qos_with_id(QoS::QoS1, 7)
+            .dup(true)
+            .finalize();
+        let mut dst = BytesMut::new();
+        p.encode(&mut dst, v5()).unwrap();
+        // flags: DUP (bit 3) + QoS 1 (bit 1)
+        assert_eq!(Publish::decode(0x0A, dst.freeze(), v5()).unwrap(), p);
     }
 
     // ---- A QoS 0 PUBLISH must not carry a packet identifier ----

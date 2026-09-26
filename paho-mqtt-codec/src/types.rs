@@ -56,7 +56,7 @@ pub enum MqttVersion {
 
 impl MqttVersion {
     /// The latest v3 revision, v3.1.1.
-    /// Clients should typically use this fo v3 connections.
+    /// Clients should typically use this for v3 connections.
     pub const V3: MqttVersion = Self::V3_1_1;
     /// Default: (currently v5)
     #[allow(non_upper_case_globals)]
@@ -129,14 +129,6 @@ impl TryFrom<i32> for MqttVersion {
     }
 }
 
-/*
-impl fmt::Display for MqttVersion {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", *self as u8)
-    }
-}
-*/
-
 impl fmt::Display for MqttVersion {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
@@ -144,7 +136,6 @@ impl fmt::Display for MqttVersion {
             Self::V3_1_1 => f.write_str("v3.1.1"),
             Self::V5 => f.write_str("v5"),
         }
-        //write!(f, "{}", *self as u8)
     }
 }
 

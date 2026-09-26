@@ -29,7 +29,7 @@
 //! v3 DISCONNECT and a v5 normal-disconnect are byte-identical on the
 //! wire.
 
-use crate::{MqttVersion, PacketType, Properties, ReasonCode, Result, wire::expect_end};
+use crate::{Error, MqttVersion, PacketType, Properties, ReasonCode, Result, wire::expect_end};
 use bytes::{Buf, BufMut, Bytes};
 
 #[cfg(feature = "serde")]
@@ -111,12 +111,17 @@ impl Disconnect {
     /// with no properties, just the reason code when there are no
     /// properties, otherwise the full form.
     ///
-    /// On v3 nothing is written; a non-empty `properties` is
-    /// [`Error::ProtocolError`](crate::Error::ProtocolError). A v3 DISCONNECT
-    /// has no reason code, so `reason_code` is not checked for that version.
+    /// A v3 DISCONNECT has no body at all, so on v3 both a `reason_code`
+    /// other than `NormalDisconnection` and a non-empty `properties` are
+    /// [`Error::ProtocolError`] — neither has
+    /// anywhere to go. See the crate documentation on version mismatches.
     pub fn encode<B: BufMut>(&self, dst: &mut B, ver: MqttVersion) -> Result<()> {
         if ver != MqttVersion::V5 {
-            // A v3 DISCONNECT has no body; non-empty properties are an error.
+            // A v3 DISCONNECT is the fixed header and nothing else; a reason
+            // code or properties cannot be expressed.
+            if self.reason_code != ReasonCode::NormalDisconnection {
+                return Err(Error::ProtocolError);
+            }
             return self.properties.encode(dst, ver);
         }
         match (self.reason_code, self.properties.is_empty()) {
@@ -138,11 +143,11 @@ impl Disconnect {
     pub fn decode(mut payload: Bytes, ver: MqttVersion) -> Result<Self> {
         if ver != MqttVersion::V5 {
             expect_end(&payload)?;
-            return Ok(Disconnect::default());
+            return Ok(Self::default());
         }
         // Empty payload (shorthand or v3) → NormalDisconnection, no props.
         if payload.is_empty() {
-            return Ok(Disconnect::default());
+            return Ok(Self::default());
         }
 
         let reason_code = ReasonCode::try_from(payload.get_u8())?;
@@ -226,16 +231,18 @@ mod tests {
         round_trip(Disconnect::default(), v311());
     }
 
+    /// A v3 DISCONNECT has no body, so a reason code is refused rather than
+    /// dropped: the caller believes they are saying why, and silently they
+    /// would not be.
     #[test]
-    fn test_disconnect_v311_ignores_reason_code() {
-        // Non-normal reason code is not written on v3.1.1 wire; round-trip
-        // decodes as NormalDisconnection.
+    fn test_disconnect_v311_rejects_a_reason_code() {
         let d = Disconnect::with_properties(ReasonCode::NotAuthorized, None);
         let mut dst = BytesMut::new();
-        d.encode(&mut dst, v311()).unwrap();
+        assert_eq!(d.encode(&mut dst, v311()), Err(Error::ProtocolError));
+        // `NormalDisconnection` is the one code v3 can express, as nothing.
+        let mut dst = BytesMut::new();
+        Disconnect::new().encode(&mut dst, v311()).unwrap();
         assert!(dst.is_empty());
-        let decoded = Disconnect::decode(dst.freeze(), v311()).unwrap();
-        assert_eq!(decoded.reason_code, ReasonCode::NormalDisconnection);
     }
 
     // ---- v5 shorthand (reason=Normal, no props) ----
@@ -368,18 +375,17 @@ mod tests {
         }
     }
 
-    /// A v3 DISCONNECT has no body, so the reason code is dropped rather than
-    /// refused — unlike properties, which fail to encode.
+    /// A reason code and properties are refused alike on v3: both are v5-only
+    /// fields with nowhere to go in a body the version defines as empty.
     #[test]
-    fn test_reason_code_is_dropped_on_v3() {
-        let d = Disconnect::with_properties(ReasonCode::ServerBusy, None);
-        let mut dst = BytesMut::new();
-        d.encode(&mut dst, v311()).unwrap();
-        assert!(dst.is_empty());
-        assert_eq!(
-            Disconnect::decode(dst.freeze(), v311()).unwrap(),
-            Disconnect::new()
-        );
+    fn test_v5_only_fields_are_refused_alike_on_v3() {
+        for d in [
+            Disconnect::with_properties(ReasonCode::ServerBusy, None),
+            Disconnect::with_properties(ReasonCode::NormalDisconnection, reason_props("bye")),
+        ] {
+            let mut dst = BytesMut::new();
+            assert_eq!(d.encode(&mut dst, v311()), Err(Error::ProtocolError));
+        }
     }
 
     /// A ReasonString, as a server explaining itself would send.

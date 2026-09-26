@@ -555,6 +555,29 @@ fn test_lwt_props_need_v5() {
     assert!(!cli.is_connected());
 }
 
+/// A DISCONNECT reason code is a v5-only field; a v3 DISCONNECT has no body to
+/// carry one, so asking for one is rejected up front rather than sending a
+/// DISCONNECT that silently says nothing.
+#[test]
+fn test_disconnect_reason_code_needs_v5() {
+    let cli = mqtt::AsyncClient::new(HOST).unwrap();
+    cli.connect(mqtt::ConnectOptionsBuilder::new_v3().finalize())
+        .wait()
+        .unwrap();
+
+    let opts = mqtt::DisconnectOptionsBuilder::new()
+        .reason_code(mqtt::ReasonCode::AdministrativeAction)
+        .finalize();
+    assert!(matches!(
+        cli.disconnect(opts).wait(),
+        Err(mqtt::Error::WrongMqttVersion)
+    ));
+
+    // The normal disconnection is the one a v3 connection can express.
+    cli.disconnect(None).wait().unwrap();
+    assert!(!cli.is_connected());
+}
+
 /////////////////////////////////////////////////////////////////////////////
 // Connect timeout and cancellation
 /////////////////////////////////////////////////////////////////////////////
