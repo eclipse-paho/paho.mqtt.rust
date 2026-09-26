@@ -9,8 +9,10 @@ repository = "https://github.com/eclipse/paho.mqtt.rust"
 keywords = ["MQTT", "IoT", "Paho", "messaging", "codec"]
 categories = [ "network-programming", "encoding", "no-std" ]
 license = "EPL-2.0"
-readme = "README.md"
-description = "Pure-Rust, no_std MQTT v3.1, v3.1.1, and v5 packet encoder/decoder for clients, brokers, and tools."
+description = """
+Pure Rust, no_std MQTT v3.1, v3.1.1, and v5 packet encoder/decoder for clients, brokers, and tools.
+This is part of the official Eclipse Paho Rust Client Library, for v2.x and later.
+"""
 
 [features]
 default = ["std"]
@@ -24,6 +26,7 @@ serde = { version = "1.0", default-features = false, features = ["derive", "allo
 
 [dev-dependencies]
 criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
+serde_json = { version = "1", default-features = false, features = ["alloc"] }
 
 [[bench]]
 name = "codec"

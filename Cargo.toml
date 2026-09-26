@@ -14,7 +14,6 @@ repository = "https://github.com/eclipse/paho.mqtt.rust"
 keywords = [ "MQTT", "IoT", "Paho", "messaging" ]
 categories = [ "network-programming", "asynchronous" ]
 license = "EPL-2.0"
-readme = "README.md"
 description = """
 The Eclipse Paho MQTT Rust client library. 
 A pure-Rust MQTT v5, v3.1.1, and v3.1 client.
@@ -33,7 +32,7 @@ websocket = ["dep:tokio-tungstenite", "tokio"]
 serde = ["dep:serde"]
 
 [dependencies]
-paho-mqtt-codec = { path = "paho-mqtt-codec" }
+paho-mqtt-codec = { version = "0.1", path = "paho-mqtt-codec" }
 bytes = "1"
 futures = "0.3"
 futures-timer = "3.0"

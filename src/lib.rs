@@ -23,15 +23,14 @@
 //!
 //! A pure-Rust MQTT v5 / v3.1.1 / v3.1 client: no C library, no build-time
 //! toolchain beyond Cargo. It speaks TCP, TLS, WebSocket, and Unix-domain
-//! sockets, and runs its protocol on either [tokio] or [smol] without
-//! changing anything an application sees.
+//! sockets, and run with either [tokio] or [smol].
 //!
 //! [tokio]: https://tokio.rs
 //! [smol]: https://github.com/smol-rs/smol
 //!
 //! # Choosing an API
 //!
-//! Two clients share one implementation:
+//! There are two clients available:
 //!
 //! * [`AsyncClient`] returns a [`Token<T>`](Token) for every operation.
 //!   Tokens are futures, so `.await` them; they can also be waited on from
@@ -136,8 +135,7 @@
 //! # Logging
 //!
 //! The library logs through the [`log`](https://docs.rs/log) crate under
-//! the target `paho_mqtt`. Since the protocol is implemented here, `trace`
-//! shows everything on the wire.
+//! the target `paho_mqtt`.
 
 #![deny(missing_docs)]
 
@@ -170,33 +168,31 @@ pub use crate::async_client::{
 pub mod client;
 pub use crate::client::Client;
 
-pub use crate::connect_options::{ConnectOptions, ConnectOptionsBuilder};
-pub use crate::create_options::{CreateOptions, CreateOptionsBuilder, RuntimeMode};
-pub use crate::disconnect_options::{DisconnectOptions, DisconnectOptionsBuilder};
-pub use crate::error::{Error, Result};
-pub use crate::event::Event;
-pub use crate::message::{Message, MessageBuilder};
-pub use crate::persistence::{
-    ClientPersistence, ClientPersistenceBox, FilePersistence, MemPersistence, PERSISTENCE_ERROR,
-    PERSISTENCE_SUCCESS, PersistenceType, UserPersistence,
+pub use crate::{
+    connect_options::{ConnectOptions, ConnectOptionsBuilder},
+    create_options::{CreateOptions, CreateOptionsBuilder, RuntimeMode},
+    disconnect_options::{DisconnectOptions, DisconnectOptionsBuilder},
+    error::{Error, Result},
+    event::Event,
+    message::{Message, MessageBuilder},
+    persistence::{
+        ClientPersistence, ClientPersistenceBox, FilePersistence, MemPersistence,
+        PERSISTENCE_ERROR, PERSISTENCE_SUCCESS, PersistenceType, UserPersistence,
+    },
+    properties::{Properties, Property, PropertyCode, PropertyId, PropertyType, PropertyValue},
+    responses::{ConnectResponse, PublishResponse, SubscribeResponse, UnsubscribeResponse},
+    subscribe_options::{
+        NO_RETAIN_AS_PUBLISHED, RETAIN_AS_PUBLISHED, RetainHandling, SUBSCRIBE_LOCAL,
+        SUBSCRIBE_NO_LOCAL, SubscribeOptions, SubscribeOptionsBuilder,
+    },
+    tls_options::{TlsOptions, TlsOptionsBuilder, TlsVersion},
+    token::{
+        ConnectToken, DeliveryToken, SubscribeManyToken, SubscribeToken, Token,
+        UnsubscribeManyToken, UnsubscribeToken,
+    },
+    topic::{SyncTopic, Topic, TopicFilter, is_topic_filter_valid},
+    topic_matcher::TopicMatcher,
 };
-pub use crate::properties::{
-    Properties, Property, PropertyCode, PropertyId, PropertyType, PropertyValue,
-};
-pub use crate::responses::{
-    ConnectResponse, PublishResponse, SubscribeResponse, UnsubscribeResponse,
-};
-pub use crate::subscribe_options::{
-    NO_RETAIN_AS_PUBLISHED, RETAIN_AS_PUBLISHED, RetainHandling, SUBSCRIBE_LOCAL,
-    SUBSCRIBE_NO_LOCAL, SubscribeOptions, SubscribeOptionsBuilder,
-};
-pub use crate::tls_options::{TlsOptions, TlsOptionsBuilder, TlsVersion};
-pub use crate::token::{
-    ConnectToken, DeliveryToken, SubscribeManyToken, SubscribeToken, Token, UnsubscribeManyToken,
-    UnsubscribeToken,
-};
-pub use crate::topic::{SyncTopic, Topic, TopicFilter, is_topic_filter_valid};
-pub use crate::topic_matcher::TopicMatcher;
 
 use std::any::Any;
 

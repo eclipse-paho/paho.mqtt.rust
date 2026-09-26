@@ -20,9 +20,8 @@
 
 //! The Asynchronous client module for the Paho MQTT Rust client library.
 //!
-//! This presents an asynchronous API that is similar to the other Paho MQTT
-//! clients, but uses Token objects that implement the Futures trait, so
-//! can be used in much more flexible ways than the other language clients.
+//! This presents an asynchronous API that can be used with an asynchronous
+//! runtime in the application.
 //!
 //! Asynchronous operations return a `Token` that is a type of future. It
 //! can be used to determine if an operation has completed, block and wait
@@ -239,8 +238,8 @@ impl AsyncClient {
         let explicit: Option<ConnectOptions> = opts.into();
         debug!("Connecting with opts: {:?}", explicit);
 
-        // None → keep the client's current version unchanged.
-        // Some(opts) → use opts.mqtt_version and update the stored version.
+        // None: keep the client's current version unchanged.
+        // Some(opts): use opts.mqtt_version and update the stored version.
         let ver = match &explicit {
             None => self.mqtt_version(),
             Some(o) => {
@@ -353,7 +352,7 @@ impl AsyncClient {
         T: Into<Option<DisconnectOptions>>,
     {
         let opts = opts.into().unwrap_or_default();
-        debug!("Disconnecting");
+        debug!("Disconnecting with opts: {:?}", opts);
 
         // A v5 reason code and v5 properties cannot go on a v3 connection;
         // the codec refuses to encode either, and the DISCONNECT would never

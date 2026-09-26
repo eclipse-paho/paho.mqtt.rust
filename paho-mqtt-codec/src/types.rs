@@ -112,6 +112,7 @@ impl TryFrom<u8> for MqttVersion {
 impl TryFrom<u32> for MqttVersion {
     type Error = Error;
 
+    /// This is a legacy conversion from Paho MQTT v1
     fn try_from(ver: u32) -> Result<Self, Error> {
         u8::try_from(ver)
             .map_err(|_| Error::UnsupportedProtocolVersion)
@@ -122,6 +123,7 @@ impl TryFrom<u32> for MqttVersion {
 impl TryFrom<i32> for MqttVersion {
     type Error = Error;
 
+    /// This is a legacy conversion from Paho MQTT v1
     fn try_from(ver: i32) -> Result<Self, Error> {
         u8::try_from(ver)
             .map_err(|_| Error::UnsupportedProtocolVersion)
@@ -140,39 +142,51 @@ impl fmt::Display for MqttVersion {
 }
 
 /// Supported Quality of Service levels.
+///
+/// The [`AtMostOnce`](Self::AtMostOnce), [`AtLeastOnce`](Self::AtLeastOnce),
+/// and [`ExactlyOnce`](Self::ExactlyOnce) associated constants are a second
+/// spelling of the three variants, for application that prefer them.
+///
+/// With the `serde` feature, a value serializes under the variant name —
+/// `"QoS0"`, `"QoS1"`, `"QoS2"` — and deserializes from either spelling, so
+/// data written by a version of this crate that named the variants
+/// `AtMostOnce` and so on still reads.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[repr(u8)]
 pub enum QoS {
     /// At most once (fire and forget).
     #[default]
-    AtMostOnce = 0,
+    #[cfg_attr(feature = "serde", serde(alias = "AtMostOnce"))]
+    QoS0 = 0,
     /// At least once (acknowledged delivery).
-    AtLeastOnce = 1,
+    #[cfg_attr(feature = "serde", serde(alias = "AtLeastOnce"))]
+    QoS1 = 1,
     /// Exactly once (assured delivery).
-    ExactlyOnce = 2,
+    #[cfg_attr(feature = "serde", serde(alias = "ExactlyOnce"))]
+    QoS2 = 2,
 }
 
 impl QoS {
+    /// At most once (fire and forget). Same as [`QoS::QoS0`].
     #[allow(non_upper_case_globals)]
-    /// At most once.
-    pub const QoS0: QoS = QoS::AtMostOnce;
+    pub const AtMostOnce: QoS = QoS::QoS0;
+    /// At least once (acknowledged delivery). Same as [`QoS::QoS1`].
     #[allow(non_upper_case_globals)]
-    /// At least once.
-    pub const QoS1: QoS = QoS::AtLeastOnce;
+    pub const AtLeastOnce: QoS = QoS::QoS1;
+    /// Exactly once (assured delivery). Same as [`QoS::QoS2`].
     #[allow(non_upper_case_globals)]
-    /// Exactly once.
-    pub const QoS2: QoS = QoS::ExactlyOnce;
+    pub const ExactlyOnce: QoS = QoS::QoS2;
 }
 
 /// Quality of Service Zero: At most once.
-pub const QOS_0: QoS = QoS::AtMostOnce;
+pub const QOS_0: QoS = QoS::QoS0;
 
 /// Quality of Service One: At least once.
-pub const QOS_1: QoS = QoS::AtLeastOnce;
+pub const QOS_1: QoS = QoS::QoS1;
 
 /// Quality of Service Two: Exactly once.
-pub const QOS_2: QoS = QoS::ExactlyOnce;
+pub const QOS_2: QoS = QoS::QoS2;
 
 impl fmt::Display for QoS {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -187,9 +201,9 @@ impl TryFrom<u8> for QoS {
     fn try_from(qos: u8) -> Result<Self, Error> {
         use QoS::*;
         match qos {
-            0 => Ok(AtMostOnce),
-            1 => Ok(AtLeastOnce),
-            2 => Ok(ExactlyOnce),
+            0 => Ok(QoS0),
+            1 => Ok(QoS1),
+            2 => Ok(QoS2),
             _ => Err(Error::BadQoS),
         }
     }
@@ -317,5 +331,52 @@ mod tests {
         assert_eq!(QOS_1, QoS::AtLeastOnce);
         assert_eq!(QOS_2, QoS::ExactlyOnce);
         assert_eq!(QOS_1, QoS::QoS1);
+    }
+
+    // ---- serde representation ----
+
+    /// A value serializes under its variant name, not the word form.
+    #[test]
+    #[cfg(feature = "serde")]
+    fn test_qos_serializes_as_the_variant_name() {
+        for (qos, json) in [
+            (QoS::QoS0, "\"QoS0\""),
+            (QoS::QoS1, "\"QoS1\""),
+            (QoS::QoS2, "\"QoS2\""),
+        ] {
+            assert_eq!(serde_json::to_string(&qos).unwrap(), json);
+        }
+        // The constants are the same values, so they serialize the same way.
+        assert_eq!(
+            serde_json::to_string(&QoS::AtLeastOnce).unwrap(),
+            "\"QoS1\""
+        );
+    }
+
+    /// Both spellings deserialize, so data written when the variants were
+    /// named `AtMostOnce` and so on still reads.
+    #[test]
+    #[cfg(feature = "serde")]
+    fn test_qos_deserializes_from_either_spelling() {
+        for (json, qos) in [
+            ("\"QoS0\"", QoS::QoS0),
+            ("\"QoS1\"", QoS::QoS1),
+            ("\"QoS2\"", QoS::QoS2),
+            ("\"AtMostOnce\"", QoS::QoS0),
+            ("\"AtLeastOnce\"", QoS::QoS1),
+            ("\"ExactlyOnce\"", QoS::QoS2),
+        ] {
+            assert_eq!(serde_json::from_str::<QoS>(json).unwrap(), qos, "{json}");
+        }
+        assert!(serde_json::from_str::<QoS>("\"AtSomePoint\"").is_err());
+    }
+
+    #[test]
+    #[cfg(feature = "serde")]
+    fn test_qos_round_trips_through_serde() {
+        for qos in [QoS::QoS0, QoS::QoS1, QoS::QoS2] {
+            let json = serde_json::to_string(&qos).unwrap();
+            assert_eq!(serde_json::from_str::<QoS>(&json).unwrap(), qos);
+        }
     }
 }
