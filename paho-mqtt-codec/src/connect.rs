@@ -133,6 +133,9 @@ pub struct Connect {
 impl Connect {
     /// Creates a minimal `Connect` for protocol version `ver` (no will, no
     /// credentials, keep-alive 0).
+    ///
+    /// A CONNECT has eight fields, so anything beyond the minimum is built
+    /// with [`builder`](Self::builder) or by setting the fields directly.
     pub fn new(ver: MqttVersion, clean_start: bool, client_id: impl Into<String>) -> Self {
         Self {
             version: ver,
@@ -142,30 +145,11 @@ impl Connect {
         }
     }
 
-    /// Creates a minimal `Connect` carrying MQTT v5 Connect Properties.
+    /// Starts building a CONNECT a field at a time.
     ///
-    /// v5 only.
-    ///
-    /// `SessionExpiryInterval`, `ReceiveMaximum`, `MaximumPacketSize`,
-    /// `TopicAliasMaximum`, `RequestResponseInformation`,
-    /// `RequestProblemInformation`, `AuthenticationMethod`,
-    /// `AuthenticationData`, and `UserProperty` are permitted here
-    /// (§3.1.2.11); [`encode`](Self::encode) rejects anything else, and
-    /// rejects a non-empty set for any version but v5. The Will has its own,
-    /// narrower property set — see [`Will::with_properties`].
-    pub fn with_properties(
-        ver: MqttVersion,
-        clean_start: bool,
-        client_id: impl Into<String>,
-        properties: Properties,
-    ) -> Self {
-        Self {
-            version: ver,
-            clean_start,
-            client_id: client_id.into(),
-            properties,
-            ..Self::default()
-        }
+    /// Shorthand for [`ConnectBuilder::new`].
+    pub fn builder() -> ConnectBuilder {
+        ConnectBuilder::new()
     }
 
     /// Returns the number of variable-header + payload bytes.
@@ -366,6 +350,120 @@ fn reason_to_v311_code(rc: ReasonCode) -> Result<u8> {
         BadUserNameOrPassword => Ok(4),
         NotAuthorized => Ok(5),
         _ => Err(Error::MalformedPacket),
+    }
+}
+
+/////////////////////////////////////////////////////////////////////////////
+
+/// Builder for a [`Connect`] packet.
+///
+/// A CONNECT has eight fields, most of which a given caller leaves alone, so
+/// setting them one at a time reads better than a constructor per
+/// combination. Each setter consumes the builder and returns it, and
+/// [`finalize`](Self::finalize) yields the packet. [`Connect::builder`] is a
+/// shorthand for [`new`](Self::new).
+///
+/// The builder does not validate; as everywhere else in this crate, the packet
+/// is checked when it is encoded. Note that the protocol version is a field of
+/// the packet rather than an argument to `encode`, and that the v3 versions
+/// cannot carry properties — neither the packet's nor the Will's.
+#[derive(Debug, Default, Clone)]
+pub struct ConnectBuilder(Connect);
+
+impl ConnectBuilder {
+    /// Creates a builder for a CONNECT with the default protocol version, an
+    /// empty client identifier, no credentials, no will, and keep-alive 0.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sets the protocol version the CONNECT declares.
+    ///
+    /// Unlike every other packet, this version travels in the packet itself
+    /// and is what [`Connect::encode`] uses.
+    pub fn version(mut self, ver: MqttVersion) -> Self {
+        self.0.version = ver;
+        self
+    }
+
+    /// Sets whether to start a clean session, discarding any session state
+    /// the server holds. This is "clean session" on v3.1 and v3.1.1.
+    pub fn clean_start(mut self, clean_start: bool) -> Self {
+        self.0.clean_start = clean_start;
+        self
+    }
+
+    /// Sets the keep-alive interval in seconds; 0 disables it.
+    pub fn keep_alive(mut self, keep_alive: u16) -> Self {
+        self.0.keep_alive = keep_alive;
+        self
+    }
+
+    /// Sets the client identifier.
+    ///
+    /// An empty identifier asks the server to assign one, which requires a
+    /// clean session on v3.1.1 (§3.1.3.1).
+    pub fn client_id(mut self, client_id: impl Into<String>) -> Self {
+        self.0.client_id = client_id.into();
+        self
+    }
+
+    /// Sets the username.
+    pub fn username(mut self, username: impl Into<String>) -> Self {
+        self.0.username = Some(username.into());
+        self
+    }
+
+    /// Removes any username set earlier.
+    pub fn clear_username(mut self) -> Self {
+        self.0.username = None;
+        self
+    }
+
+    /// Sets the password.
+    pub fn password(mut self, password: impl Into<Bytes>) -> Self {
+        self.0.password = Some(password.into());
+        self
+    }
+
+    /// Removes any password set earlier.
+    pub fn clear_password(mut self) -> Self {
+        self.0.password = None;
+        self
+    }
+
+    /// Sets the Will message, published by the server if the connection ends
+    /// without a DISCONNECT.
+    ///
+    /// A Will carries its own properties, from a narrower set than the
+    /// packet's — see [`Will::with_properties`].
+    pub fn will(mut self, will: impl Into<Will>) -> Self {
+        self.0.will = Some(will.into());
+        self
+    }
+
+    /// Removes any Will set earlier.
+    pub fn clear_will(mut self) -> Self {
+        self.0.will = None;
+        self
+    }
+
+    /// Sets the MQTT v5 Connect Properties.
+    ///
+    /// `SessionExpiryInterval`, `ReceiveMaximum`, `MaximumPacketSize`,
+    /// `TopicAliasMaximum`, `RequestResponseInformation`,
+    /// `RequestProblemInformation`, `AuthenticationMethod`,
+    /// `AuthenticationData`, and `UserProperty` are permitted here
+    /// (§3.1.2.11); encoding rejects anything else, and rejects a non-empty
+    /// set for any version but v5.
+    pub fn properties(mut self, properties: Properties) -> Self {
+        self.0.properties = properties;
+        self
+    }
+
+    /// Finalizes the builder into the packet.
+    pub fn finalize(self) -> Connect {
+        self.0
     }
 }
 
@@ -1472,7 +1570,7 @@ mod tests {
         assert_eq!(c.encode(&mut dst), Err(Error::ProtocolError));
     }
 
-    // ---- Connect::with_properties ----
+    // ---- Connect with properties ----
 
     fn connect_props() -> Properties {
         let mut props = Properties::new();
@@ -1488,38 +1586,25 @@ mod tests {
     }
 
     #[test]
-    fn test_connect_with_properties_keeps_all_arguments() {
-        let c = Connect::with_properties(v5(), true, "cli", connect_props());
-        assert_eq!(c.version, v5());
-        assert!(c.clean_start);
-        assert_eq!(c.client_id, "cli");
-        assert_eq!(
-            c.properties.get(PropertyId::SessionExpiryInterval),
-            Some(&PropertyValue::U32(300))
-        );
-        // Everything else is still the default.
-        assert_eq!(c.keep_alive, 0);
-        assert!(c.username.is_none());
-        assert!(c.password.is_none());
-        assert!(c.will.is_none());
-    }
-
-    #[test]
-    fn test_connect_with_properties_empty_matches_new() {
-        assert_eq!(
-            Connect::with_properties(v5(), false, "c", Properties::new()),
-            Connect::new(v5(), false, "c")
-        );
-    }
-
-    #[test]
     fn test_connect_with_properties_round_trip_v5() {
-        round_trip_connect(Connect::with_properties(v5(), true, "cli", connect_props()));
+        round_trip_connect(
+            Connect::builder()
+                .version(v5())
+                .clean_start(true)
+                .client_id("cli")
+                .properties(connect_props())
+                .finalize(),
+        );
     }
 
     #[test]
     fn test_connect_with_properties_on_v3_is_an_error() {
-        let c = Connect::with_properties(v311(), true, "c", connect_props());
+        let c = Connect::builder()
+            .version(v311())
+            .clean_start(true)
+            .client_id("c")
+            .properties(connect_props())
+            .finalize();
         let mut dst = BytesMut::new();
         assert_eq!(c.encode(&mut dst), Err(Error::ProtocolError));
     }
@@ -1533,7 +1618,129 @@ mod tests {
             PropertyId::WillDelayInterval,
             PropertyValue::U32(5),
         ));
-        let c = Connect::with_properties(v5(), true, "c", props);
+        let c = Connect::builder()
+            .version(v5())
+            .client_id("c")
+            .properties(props)
+            .finalize();
+        let mut dst = BytesMut::new();
+        assert_eq!(c.encode(&mut dst), Err(Error::ProtocolError));
+    }
+
+    // ---- ConnectBuilder ----
+
+    #[test]
+    fn test_connect_builder_default_matches_default() {
+        assert_eq!(ConnectBuilder::new().finalize(), Connect::default());
+        // The default version is v5, so the builder is usable without one.
+        assert_eq!(ConnectBuilder::new().finalize().version, v5());
+    }
+
+    #[test]
+    fn test_connect_builder_shortcut_matches_the_builder() {
+        let a = Connect::builder().client_id("c").finalize();
+        let b = ConnectBuilder::new().client_id("c").finalize();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn test_connect_builder_matches_the_constructor() {
+        assert_eq!(
+            Connect::builder()
+                .version(v311())
+                .clean_start(true)
+                .client_id("cli")
+                .finalize(),
+            Connect::new(v311(), true, "cli")
+        );
+    }
+
+    #[test]
+    fn test_connect_builder_sets_every_field() {
+        let will = Will::new("w/last", Bytes::from_static(b"bye"), QoS::QoS1, true);
+        let c = Connect::builder()
+            .version(v5())
+            .clean_start(true)
+            .keep_alive(30)
+            .client_id("cli")
+            .username("user")
+            .password(Bytes::from_static(b"secret"))
+            .will(will.clone())
+            .properties(connect_props())
+            .finalize();
+
+        assert_eq!(c.version, v5());
+        assert!(c.clean_start);
+        assert_eq!(c.keep_alive, 30);
+        assert_eq!(c.client_id, "cli");
+        assert_eq!(c.username.as_deref(), Some("user"));
+        assert_eq!(c.password.as_deref(), Some(&b"secret"[..]));
+        assert_eq!(c.will, Some(will));
+        assert_eq!(
+            c.properties.get(PropertyId::SessionExpiryInterval),
+            Some(&PropertyValue::U32(300))
+        );
+    }
+
+    /// Later calls win, so a builder can be reconfigured before finalizing.
+    #[test]
+    fn test_connect_builder_setters_overwrite() {
+        let c = Connect::builder()
+            .client_id("first")
+            .client_id("second")
+            .keep_alive(10)
+            .keep_alive(20)
+            .finalize();
+        assert_eq!(c.client_id, "second");
+        assert_eq!(c.keep_alive, 20);
+    }
+
+    /// The `clear_*` setters drop an optional field set earlier.
+    #[test]
+    fn test_connect_builder_optional_fields_can_be_cleared() {
+        let c = Connect::builder()
+            .username("user")
+            .password(Bytes::from_static(b"secret"))
+            .will(Will::new("w", Bytes::new(), QoS::QoS0, false))
+            .clear_username()
+            .clear_password()
+            .clear_will()
+            .finalize();
+        assert!(c.username.is_none());
+        assert!(c.password.is_none());
+        assert!(c.will.is_none());
+    }
+
+    #[test]
+    fn test_connect_builder_full_round_trip_v5() {
+        let c = Connect::builder()
+            .version(v5())
+            .clean_start(true)
+            .keep_alive(60)
+            .client_id("cli")
+            .username("user")
+            .password(Bytes::from_static(b"secret"))
+            .will(Will::with_properties(
+                "w/last",
+                Bytes::from_static(b"bye"),
+                QoS::QoS1,
+                true,
+                will_props(),
+            ))
+            .properties(connect_props())
+            .finalize();
+        round_trip_connect(c);
+    }
+
+    /// The builder does not validate; a v3 packet with properties is caught
+    /// where every other bad packet is, on encode.
+    #[test]
+    fn test_connect_builder_defers_validation_to_encode() {
+        let c = Connect::builder()
+            .version(MqttVersion::V3_1)
+            .client_id("c")
+            .properties(connect_props())
+            .finalize();
         let mut dst = BytesMut::new();
         assert_eq!(c.encode(&mut dst), Err(Error::ProtocolError));
     }

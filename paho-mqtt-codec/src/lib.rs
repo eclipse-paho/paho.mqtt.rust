@@ -61,6 +61,11 @@
 //! packet. So is [`Auth::new`], the one v5-only packet. There are never more
 //! than two constructors: `new` for the version-neutral minimum, and
 //! `with_properties` for everything v5 adds.
+//!
+//! [`Publish`] and [`Connect`] are the exceptions, with seven and eight
+//! fields: properties are rarely the only one a caller wants to change, so
+//! each has `new` and a builder — [`Publish::builder`] and
+//! [`Connect::builder`] — and no `with_properties`.
 
 #![no_std]
 #![deny(missing_docs)]
@@ -87,14 +92,14 @@ pub mod unsubscribe;
 pub mod varlen;
 
 pub use auth::Auth;
-pub use connect::{ConnAck, Connect, Will};
+pub use connect::{ConnAck, Connect, ConnectBuilder, Will};
 pub use disconnect::Disconnect;
 pub use error::{Error, Result};
 pub use packet::{DecodeOptions, MAX_PACKET_SIZE, Packet, PacketType, RawPacket};
 pub use properties::{
     Properties, Property, PropertyContext, PropertyId, PropertyType, PropertyValue,
 };
-pub use publish::{PubAck, PubComp, PubRec, PubRel, Publish};
+pub use publish::{PubAck, PubComp, PubRec, PubRel, Publish, PublishBuilder};
 pub use reason_code::ReasonCode;
 pub use subscribe::{RetainHandling, SubAck, Subscribe, Subscription};
 pub use types::{

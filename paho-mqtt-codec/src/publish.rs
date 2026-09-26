@@ -60,6 +60,10 @@ pub struct Publish {
 
 impl Publish {
     /// Creates a QoS 0 PUBLISH with no DUP, no retain, and no properties.
+    ///
+    /// A PUBLISH has too many fields for a constructor per combination, so
+    /// anything beyond a plain QoS 0 publication is built with
+    /// [`builder`](Self::builder) or by setting the fields directly.
     pub fn new(topic: impl Into<String>, payload: impl Into<Bytes>) -> Self {
         Self {
             dup: false,
@@ -72,35 +76,11 @@ impl Publish {
         }
     }
 
-    /// Creates a QoS 0 PUBLISH carrying MQTT v5 properties.
+    /// Starts building a PUBLISH a field at a time.
     ///
-    /// v5 only.
-    ///
-    /// `PayloadFormatIndicator`, `MessageExpiryInterval`, `TopicAlias`,
-    /// `ResponseTopic`, `CorrelationData`, `SubscriptionIdentifier`,
-    /// `ContentType`, and `UserProperty` are permitted here (§3.3.2.3);
-    /// [`encode`](Self::encode) rejects anything else, and rejects a
-    /// non-empty set for any version but v5. `SubscriptionIdentifier` is the
-    /// one property that may repeat, since a message can match several
-    /// subscriptions.
-    ///
-    /// For QoS 1 or 2, set [`qos`](Self::qos) and [`packet_id`](Self::packet_id)
-    /// afterwards; both are required together, and `encode` rejects either
-    /// one without the other.
-    pub fn with_properties(
-        topic: impl Into<String>,
-        payload: impl Into<Bytes>,
-        properties: Properties,
-    ) -> Self {
-        Self {
-            dup: false,
-            qos: QoS::default(),
-            retain: false,
-            topic: topic.into(),
-            packet_id: None,
-            payload: payload.into(),
-            properties,
-        }
+    /// Shorthand for [`PublishBuilder::new`].
+    pub fn builder() -> PublishBuilder {
+        PublishBuilder::new()
     }
 
     /// Returns the number of variable-header + payload bytes for version, `ver`.
@@ -208,6 +188,100 @@ impl Publish {
             payload,
             properties,
         })
+    }
+}
+
+/////////////////////////////////////////////////////////////////////////////
+
+/// Builder for a [`Publish`] packet.
+///
+/// A PUBLISH has seven fields, most of which a given caller leaves alone, so
+/// setting them one at a time reads better than a constructor with seven
+/// parameters. Each setter consumes the builder and returns it, and
+/// [`finalize`](Self::finalize) yields the packet. [`Publish::builder`] is a
+/// shorthand for [`new`](Self::new).
+///
+/// The builder does not validate; as everywhere else in this crate, the
+/// packet is checked when it is encoded. Two couplings are worth knowing
+/// while building one: QoS 1 and 2 require a packet identifier and QoS 0
+/// forbids one (MQTT-2.2.1-2), and an empty topic name is legal only on v5
+/// with a `TopicAlias` property.
+#[derive(Debug, Default, Clone)]
+pub struct PublishBuilder(Publish);
+
+impl PublishBuilder {
+    /// Creates a builder for a QoS 0 PUBLISH with an empty topic and payload.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sets the topic on which the message is published.
+    pub fn topic(mut self, topic: impl Into<String>) -> Self {
+        self.0.topic = topic.into();
+        self
+    }
+
+    /// Sets the application message payload.
+    pub fn payload(mut self, payload: impl Into<Bytes>) -> Self {
+        self.0.payload = payload.into();
+        self
+    }
+
+    /// Sets the quality of service for the publication.
+    ///
+    /// QoS 1 and 2 also need a [`packet_id`](Self::packet_id); QoS 0 must not
+    /// have one.
+    pub fn qos(mut self, qos: QoS) -> Self {
+        self.0.qos = qos;
+        self
+    }
+
+    /// Sets the packet identifier, or clears it with `None`.
+    ///
+    /// Required for QoS 1 and 2, and forbidden for QoS 0.
+    pub fn packet_id(mut self, packet_id: impl Into<Option<u16>>) -> Self {
+        self.0.packet_id = packet_id.into();
+        self
+    }
+
+    /// Sets the QoS and the packet identifier together, which is what QoS 1
+    /// and 2 need.
+    ///
+    /// Equivalent to [`qos`](Self::qos) followed by
+    /// [`packet_id`](Self::packet_id), spelled as one call so the two cannot
+    /// drift apart.
+    pub fn qos_with_id(self, qos: QoS, packet_id: u16) -> Self {
+        self.qos(qos).packet_id(packet_id)
+    }
+
+    /// Sets whether the broker should retain the message as the last known
+    /// good value for its topic.
+    pub fn retain(mut self, retain: bool) -> Self {
+        self.0.retain = retain;
+        self
+    }
+
+    /// Sets the duplicate-delivery flag.
+    ///
+    /// A sender sets this on a re-delivery of a QoS 1 or 2 message; it is
+    /// always 0 for QoS 0 (MQTT-3.3.1-2).
+    pub fn dup(mut self, dup: bool) -> Self {
+        self.0.dup = dup;
+        self
+    }
+
+    /// Sets the MQTT v5 properties.
+    ///
+    /// Only the PUBLISH properties are permitted (§3.3.2.3); encoding rejects
+    /// anything else, and rejects a non-empty set for any version but v5.
+    pub fn properties(mut self, properties: Properties) -> Self {
+        self.0.properties = properties;
+        self
+    }
+
+    /// Finalizes the builder into the packet.
+    pub fn finalize(self) -> Publish {
+        self.0
     }
 }
 
@@ -688,7 +762,140 @@ mod tests {
     // PubAck / PubRec / PubRel / PubComp tests
     // ======================================================================
 
-    // ---- Publish::with_properties ----
+    // ---- PublishBuilder ----
+
+    #[test]
+    fn test_builder_default_matches_new_with_empty_fields() {
+        assert_eq!(PublishBuilder::new().finalize(), Publish::new("", ""));
+    }
+
+    #[test]
+    fn test_builder_sets_every_field() {
+        let mut props = Properties::new();
+        props.push(Property::new(
+            PropertyId::ContentType,
+            PropertyValue::String("text/plain".into()),
+        ));
+        let p = PublishBuilder::new()
+            .topic("a/b")
+            .payload("hi")
+            .qos(QoS::QoS2)
+            .packet_id(77)
+            .retain(true)
+            .dup(true)
+            .properties(props)
+            .finalize();
+
+        assert_eq!(p.topic, "a/b");
+        assert_eq!(&p.payload[..], b"hi");
+        assert_eq!(p.qos, QoS::QoS2);
+        assert_eq!(p.packet_id, Some(77));
+        assert!(p.retain);
+        assert!(p.dup);
+        assert_eq!(
+            p.properties.get(PropertyId::ContentType),
+            Some(&PropertyValue::String("text/plain".into()))
+        );
+    }
+
+    #[test]
+    fn test_publish_builder_shortcut_matches_the_builder() {
+        let a = Publish::builder().topic("a").payload("x").finalize();
+        let b = PublishBuilder::new().topic("a").payload("x").finalize();
+        assert_eq!(a, b);
+        assert_eq!(a, Publish::new("a", "x"));
+    }
+
+    #[test]
+    fn test_builder_matches_the_constructor() {
+        assert_eq!(
+            PublishBuilder::new().topic("a").payload("x").finalize(),
+            Publish::new("a", "x")
+        );
+    }
+
+    /// Later calls win, so a builder can be reconfigured before finalizing.
+    #[test]
+    fn test_builder_setters_overwrite() {
+        let p = PublishBuilder::new()
+            .topic("first")
+            .topic("second")
+            .qos(QoS::QoS2)
+            .qos(QoS::QoS1)
+            .finalize();
+        assert_eq!(p.topic, "second");
+        assert_eq!(p.qos, QoS::QoS1);
+    }
+
+    #[test]
+    fn test_builder_packet_id_takes_a_value_or_none() {
+        assert_eq!(
+            PublishBuilder::new().packet_id(5).finalize().packet_id,
+            Some(5)
+        );
+        assert_eq!(
+            PublishBuilder::new()
+                .packet_id(Some(5))
+                .finalize()
+                .packet_id,
+            Some(5)
+        );
+        // `None` clears an identifier set earlier, as QoS 0 requires.
+        assert_eq!(
+            PublishBuilder::new()
+                .packet_id(5)
+                .packet_id(None)
+                .finalize()
+                .packet_id,
+            None
+        );
+    }
+
+    #[test]
+    fn test_builder_qos_with_id_sets_both() {
+        let p = PublishBuilder::new()
+            .topic("a")
+            .qos_with_id(QoS::QoS1, 9)
+            .finalize();
+        assert_eq!(p.qos, QoS::QoS1);
+        assert_eq!(p.packet_id, Some(9));
+        assert_eq!(
+            p,
+            PublishBuilder::new()
+                .topic("a")
+                .qos(QoS::QoS1)
+                .packet_id(9)
+                .finalize()
+        );
+    }
+
+    #[test]
+    fn test_builder_qos1_round_trips_v5() {
+        let p = PublishBuilder::new()
+            .topic("a/b")
+            .payload("hi")
+            .qos_with_id(QoS::QoS1, 42)
+            .retain(true)
+            .properties(publish_props())
+            .finalize();
+
+        let mut dst = BytesMut::new();
+        p.encode(&mut dst, v5()).unwrap();
+        assert_eq!(dst.len(), p.encoded_size(v5()));
+        // QoS 1 (bit 1) plus retain (bit 0).
+        assert_eq!(Publish::decode(0x03, dst.freeze(), v5()).unwrap(), p);
+    }
+
+    /// The builder does not validate; a QoS 0 packet with an identifier is
+    /// caught where every other bad packet is, on encode.
+    #[test]
+    fn test_builder_defers_validation_to_encode() {
+        let p = PublishBuilder::new().topic("a").packet_id(1).finalize();
+        let mut dst = BytesMut::new();
+        assert_eq!(p.encode(&mut dst, v5()), Err(Error::ProtocolError));
+    }
+
+    // ---- Publish with properties ----
 
     fn publish_props() -> Properties {
         let mut props = Properties::new();
@@ -703,16 +910,17 @@ mod tests {
         props
     }
 
+    /// Adding properties to a `new` packet leaves every other field alone.
     #[test]
-    fn test_publish_with_properties_keeps_all_arguments() {
-        let p = Publish::with_properties("a/b", "hi", publish_props());
+    fn test_publish_properties_do_not_disturb_the_other_fields() {
+        let mut p = Publish::new("a/b", "hi");
+        p.properties = publish_props();
         assert_eq!(p.topic, "a/b");
         assert_eq!(&p.payload[..], b"hi");
         assert_eq!(
             p.properties.get(PropertyId::ContentType),
             Some(&PropertyValue::String("application/json".into()))
         );
-        // Same defaults as `new`: QoS 0, no DUP, no retain, no packet ID.
         assert_eq!(p.qos, QoS::QoS0);
         assert!(!p.dup);
         assert!(!p.retain);
@@ -720,28 +928,27 @@ mod tests {
     }
 
     #[test]
-    fn test_publish_with_properties_empty_matches_new() {
-        assert_eq!(
-            Publish::with_properties("a", "x", Properties::new()),
-            Publish::new("a", "x")
-        );
-    }
-
-    #[test]
     fn test_publish_with_properties_round_trip_v5() {
-        let p = Publish::with_properties("a/b", "hi", publish_props());
+        let p = PublishBuilder::new()
+            .topic("a/b")
+            .payload("hi")
+            .properties(publish_props())
+            .finalize();
         let mut dst = BytesMut::new();
         p.encode(&mut dst, v5()).unwrap();
         assert_eq!(dst.len(), p.encoded_size(v5()));
         assert_eq!(Publish::decode(0, dst.freeze(), v5()).unwrap(), p);
     }
 
-    /// The QoS and packet ID are still set afterwards, and must agree.
+    /// The QoS and packet ID are set together, and must agree.
     #[test]
     fn test_publish_with_properties_promoted_to_qos1_round_trips() {
-        let mut p = Publish::with_properties("a/b", "hi", publish_props());
-        p.qos = QoS::QoS1;
-        p.packet_id = Some(9);
+        let p = PublishBuilder::new()
+            .topic("a/b")
+            .payload("hi")
+            .properties(publish_props())
+            .qos_with_id(QoS::QoS1, 9)
+            .finalize();
         let mut dst = BytesMut::new();
         p.encode(&mut dst, v5()).unwrap();
         assert_eq!(dst.len(), p.encoded_size(v5()));
@@ -751,7 +958,11 @@ mod tests {
 
     #[test]
     fn test_publish_with_properties_on_v3_is_an_error() {
-        let p = Publish::with_properties("a", "x", publish_props());
+        let p = PublishBuilder::new()
+            .topic("a")
+            .payload("x")
+            .properties(publish_props())
+            .finalize();
         let mut dst = BytesMut::new();
         assert_eq!(p.encode(&mut dst, v311()), Err(Error::ProtocolError));
     }
@@ -763,7 +974,11 @@ mod tests {
             PropertyId::WillDelayInterval,
             PropertyValue::U32(5),
         ));
-        let p = Publish::with_properties("a", "x", props);
+        let p = PublishBuilder::new()
+            .topic("a")
+            .payload("x")
+            .properties(props)
+            .finalize();
         let mut dst = BytesMut::new();
         assert_eq!(p.encode(&mut dst, v5()), Err(Error::ProtocolError));
     }
