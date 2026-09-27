@@ -504,6 +504,54 @@ impl Property {
         Self { id, value }
     }
 
+    /// Create a new byte (u8) property.
+    pub fn new_byte(code: PropertyId, val: u8) -> Self {
+        Self::new(code, PropertyValue::Byte(val))
+    }
+
+    /// Create a new u16 property.
+    pub fn new_u16(code: PropertyId, val: u16) -> Self {
+        Self::new(code, PropertyValue::U16(val))
+    }
+
+    /// Create a new u32 property.
+    pub fn new_u32(code: PropertyId, val: u32) -> Self {
+        Self::new(code, PropertyValue::U32(val))
+    }
+
+    /// Create a new VarInt property.
+    pub fn new_var_int<I>(code: PropertyId, val: I) -> Self
+    where
+        I: Into<u32>,
+    {
+        Self::new(code, PropertyValue::VarInt(val.into()))
+    }
+
+    /// Create a new binary property.
+    pub fn new_binary<B>(code: PropertyId, val: B) -> Self
+    where
+        B: Into<Bytes>,
+    {
+        Self::new(code, PropertyValue::Binary(val.into()))
+    }
+
+    /// Create a new string property.
+    pub fn new_string<S>(code: PropertyId, s: S) -> Self
+    where
+        S: Into<String>,
+    {
+        Self::new(code, PropertyValue::String(s.into()))
+    }
+
+    /// Create a new string property.
+    pub fn new_string_pair<K, V>(code: PropertyId, key: K, val: V) -> Self
+    where
+        K: Into<String>,
+        V: Into<String>,
+    {
+        Self::new(code, PropertyValue::StringPair(key.into(), val.into()))
+    }
+
     /// Wire size: 1 byte for the property ID plus the encoded value size.
     pub fn encoded_size(&self) -> usize {
         1 + self.value.encoded_size()
@@ -677,6 +725,46 @@ impl Properties {
         }
         self.payload_size += prop.encoded_size();
         self.props.push(prop);
+    }
+
+    /// Adds an single-byte property to the collection.
+    pub fn push_byte(&mut self, code: PropertyId, val: u8) {
+        self.push(Property::new_byte(code, val))
+    }
+
+    /// Adds an two-byte integer property to the collection.
+    pub fn push_u16(&mut self, code: PropertyId, val: u16) {
+        self.push(Property::new_u16(code, val))
+    }
+
+    /// Adds a four-byte integer property to the collection.
+    pub fn push_u32(&mut self, code: PropertyId, val: u32) {
+        self.push(Property::new_u32(code, val))
+    }
+
+    /// Adds a binary property to the collection
+    pub fn push_binary<V>(&mut self, code: PropertyId, bin: V)
+    where
+        V: Into<Bytes>,
+    {
+        self.push(Property::new_binary(code, bin))
+    }
+
+    /// Adds a string property to the collection
+    pub fn push_string<S>(&mut self, code: PropertyId, s: S)
+    where
+        S: Into<String>,
+    {
+        self.push(Property::new_string(code, s))
+    }
+
+    /// Adds a string pair property to the collection
+    pub fn push_string_pair<K, V>(&mut self, code: PropertyId, key: K, val: V)
+    where
+        K: Into<String>,
+        V: Into<String>,
+    {
+        self.push(Property::new_string_pair(code, key, val))
     }
 
     /// Returns the value of the first property with the given `id`, or `None`.
