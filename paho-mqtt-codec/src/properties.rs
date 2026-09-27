@@ -742,6 +742,17 @@ impl Properties {
         self.push(Property::new_u32(code, val))
     }
 
+    /// Adds a variable-byte integer property to the collection.
+    ///
+    /// `SubscriptionIdentifier` is the only one, and it is encoded in one to
+    /// four bytes depending on its value rather than always four.
+    pub fn push_var_int<I>(&mut self, code: PropertyId, val: I)
+    where
+        I: Into<u32>,
+    {
+        self.push(Property::new_var_int(code, val))
+    }
+
     /// Adds a binary property to the collection
     pub fn push_binary<V>(&mut self, code: PropertyId, bin: V)
     where
@@ -768,8 +779,143 @@ impl Properties {
     }
 
     /// Returns the value of the first property with the given `id`, or `None`.
+    ///
+    /// This is the borrowing accessor. The typed `get_*` methods below return
+    /// the value already unwrapped, at the cost of a clone for the owned
+    /// types.
     pub fn get(&self, id: PropertyId) -> Option<&PropertyValue> {
         self.props.iter().find(|p| p.id == id).map(|p| &p.value)
+    }
+
+    /// Returns the value of the `idx`-th property with the given `id`, or
+    /// `None`.
+    ///
+    /// Only `UserProperty`, and `SubscriptionIdentifier` in a PUBLISH, may
+    /// appear more than once, so `idx` is 0 for every other identifier.
+    pub fn get_at(&self, id: PropertyId, idx: usize) -> Option<&PropertyValue> {
+        self.props
+            .iter()
+            .filter(|p| p.id == id)
+            .nth(idx)
+            .map(|p| &p.value)
+    }
+
+    /// Returns the value of the first property with the given `id` as a byte,
+    /// or `None` if it is absent or not a byte property.
+    pub fn get_byte(&self, id: PropertyId) -> Option<u8> {
+        self.get_byte_at(id, 0)
+    }
+
+    /// Returns the `idx`-th `id` property's value as a byte.
+    pub fn get_byte_at(&self, id: PropertyId, idx: usize) -> Option<u8> {
+        match self.get_at(id, idx) {
+            Some(PropertyValue::Byte(v)) => Some(*v),
+            _ => None,
+        }
+    }
+
+    /// Returns the value of the first property with the given `id` as a
+    /// two-byte integer, or `None` if it is absent or not a `U16` property.
+    pub fn get_u16(&self, id: PropertyId) -> Option<u16> {
+        self.get_u16_at(id, 0)
+    }
+
+    /// Returns the `idx`-th `id` property's value as a two-byte integer.
+    pub fn get_u16_at(&self, id: PropertyId, idx: usize) -> Option<u16> {
+        match self.get_at(id, idx) {
+            Some(PropertyValue::U16(v)) => Some(*v),
+            _ => None,
+        }
+    }
+
+    /// Returns the value of the first property with the given `id` as a
+    /// 32-bit integer, or `None` if it is absent or holds some other type.
+    ///
+    /// Both wire forms of a 32-bit value are accepted: a `U32` and the
+    /// variable-byte integer of a `SubscriptionIdentifier`. Use
+    /// [`get_var_int`](Self::get_var_int) when the distinction matters.
+    pub fn get_u32(&self, id: PropertyId) -> Option<u32> {
+        self.get_u32_at(id, 0)
+    }
+
+    /// Returns the `idx`-th `id` property's value as a 32-bit integer, from
+    /// either a `U32` or a variable-byte integer.
+    pub fn get_u32_at(&self, id: PropertyId, idx: usize) -> Option<u32> {
+        match self.get_at(id, idx) {
+            Some(PropertyValue::U32(v) | PropertyValue::VarInt(v)) => Some(*v),
+            _ => None,
+        }
+    }
+
+    /// Returns the value of the first property with the given `id` as a
+    /// variable-byte integer, or `None` if it is absent or not a `VarInt`
+    /// property.
+    ///
+    /// Unlike [`get_u32`](Self::get_u32) this is exact about the wire form, so
+    /// it reads a `SubscriptionIdentifier` and nothing else.
+    pub fn get_var_int(&self, id: PropertyId) -> Option<u32> {
+        self.get_var_int_at(id, 0)
+    }
+
+    /// Returns the `idx`-th `id` property's value as a variable-byte integer.
+    ///
+    /// A PUBLISH may carry several `SubscriptionIdentifier`s, one per matching
+    /// subscription (§3.3.2.3.8), which is what `idx` is for.
+    pub fn get_var_int_at(&self, id: PropertyId, idx: usize) -> Option<u32> {
+        match self.get_at(id, idx) {
+            Some(PropertyValue::VarInt(v)) => Some(*v),
+            _ => None,
+        }
+    }
+
+    /// Returns the value of the first property with the given `id` as binary
+    /// data, or `None` if it is absent or not a binary property.
+    ///
+    /// Cloning [`Bytes`] shares the buffer rather than copying it.
+    pub fn get_binary(&self, id: PropertyId) -> Option<Bytes> {
+        self.get_binary_at(id, 0)
+    }
+
+    /// Returns the `idx`-th `id` property's value as binary data.
+    pub fn get_binary_at(&self, id: PropertyId, idx: usize) -> Option<Bytes> {
+        match self.get_at(id, idx) {
+            Some(PropertyValue::Binary(v)) => Some(v.clone()),
+            _ => None,
+        }
+    }
+
+    /// Returns the value of the first property with the given `id` as a
+    /// string, or `None` if it is absent or not a string property.
+    ///
+    /// This allocates; [`get`](Self::get) borrows the string in place.
+    pub fn get_string(&self, id: PropertyId) -> Option<String> {
+        self.get_string_at(id, 0)
+    }
+
+    /// Returns the `idx`-th `id` property's value as a string.
+    pub fn get_string_at(&self, id: PropertyId, idx: usize) -> Option<String> {
+        match self.get_at(id, idx) {
+            Some(PropertyValue::String(v)) => Some(v.clone()),
+            _ => None,
+        }
+    }
+
+    /// Returns the value of the first property with the given `id` as a
+    /// key/value pair, or `None` if it is absent or not a string-pair
+    /// property.
+    ///
+    /// `UserProperty` is the only string pair, and it may repeat — see
+    /// [`get_string_pair_at`](Self::get_string_pair_at).
+    pub fn get_string_pair(&self, id: PropertyId) -> Option<(String, String)> {
+        self.get_string_pair_at(id, 0)
+    }
+
+    /// Returns the `idx`-th `id` property's value as a key/value pair.
+    pub fn get_string_pair_at(&self, id: PropertyId, idx: usize) -> Option<(String, String)> {
+        match self.get_at(id, idx) {
+            Some(PropertyValue::StringPair(k, v)) => Some((k.clone(), v.clone())),
+            _ => None,
+        }
     }
 
     /// Iterates over all properties in order.
@@ -1896,6 +2042,185 @@ mod tests {
         assert_eq!(
             Properties::decode_in(&mut wire.clone(), v5(), PacketType::Auth).unwrap(),
             props
+        );
+    }
+
+    // ---- typed getters ----
+
+    /// One property of every type the `push_*` helpers can produce.
+    fn one_of_each() -> Properties {
+        let mut props = Properties::new();
+        props.push_byte(PropertyId::PayloadFormatIndicator, 1);
+        props.push_u16(PropertyId::ReceiveMaximum, 20);
+        props.push_u32(PropertyId::SessionExpiryInterval, 300);
+        props.push_var_int(PropertyId::SubscriptionIdentifier, 9u32);
+        props.push_binary(PropertyId::CorrelationData, Bytes::from_static(b"\x01\x02"));
+        props.push_string(PropertyId::ContentType, "text/plain");
+        props.push_string_pair(PropertyId::UserProperty, "k", "v");
+        props
+    }
+
+    #[test]
+    fn test_typed_getters_read_each_type() {
+        let props = one_of_each();
+        assert_eq!(props.get_byte(PropertyId::PayloadFormatIndicator), Some(1));
+        assert_eq!(props.get_u16(PropertyId::ReceiveMaximum), Some(20));
+        assert_eq!(props.get_u32(PropertyId::SessionExpiryInterval), Some(300));
+        assert_eq!(
+            props.get_var_int(PropertyId::SubscriptionIdentifier),
+            Some(9)
+        );
+        assert_eq!(
+            props.get_binary(PropertyId::CorrelationData),
+            Some(Bytes::from_static(b"\x01\x02"))
+        );
+        assert_eq!(
+            props.get_string(PropertyId::ContentType).as_deref(),
+            Some("text/plain")
+        );
+        assert_eq!(
+            props.get_string_pair(PropertyId::UserProperty),
+            Some(("k".to_string(), "v".to_string()))
+        );
+    }
+
+    /// An absent identifier is `None` for every accessor.
+    #[test]
+    fn test_typed_getters_on_a_missing_property() {
+        let props = Properties::new();
+        assert_eq!(props.get_byte(PropertyId::PayloadFormatIndicator), None);
+        assert_eq!(props.get_u16(PropertyId::ReceiveMaximum), None);
+        assert_eq!(props.get_u32(PropertyId::SessionExpiryInterval), None);
+        assert_eq!(props.get_var_int(PropertyId::SubscriptionIdentifier), None);
+        assert_eq!(props.get_binary(PropertyId::CorrelationData), None);
+        assert_eq!(props.get_string(PropertyId::ContentType), None);
+        assert_eq!(props.get_string_pair(PropertyId::UserProperty), None);
+    }
+
+    /// Asking for the wrong type is `None`, not a panic or a coercion.
+    #[test]
+    fn test_typed_getters_reject_a_mismatched_type() {
+        let props = one_of_each();
+        assert_eq!(props.get_u32(PropertyId::ReceiveMaximum), None); // it is a U16
+        assert_eq!(props.get_u16(PropertyId::SessionExpiryInterval), None); // a U32
+        assert_eq!(props.get_var_int(PropertyId::SessionExpiryInterval), None); // a U32
+        assert_eq!(props.get_byte(PropertyId::SubscriptionIdentifier), None); // a VarInt
+        assert_eq!(props.get_byte(PropertyId::ContentType), None); // a String
+        assert_eq!(props.get_string(PropertyId::UserProperty), None); // a pair
+        assert_eq!(props.get_string_pair(PropertyId::ContentType), None); // a String
+        assert_eq!(props.get_binary(PropertyId::ContentType), None); // a String
+    }
+
+    /// `UserProperty` is the one that repeats in practice, which is what the
+    /// `_at` accessors are for.
+    #[test]
+    fn test_string_pair_at_walks_repeated_user_properties() {
+        let mut props = Properties::new();
+        props.push_string_pair(PropertyId::UserProperty, "a", "1");
+        props.push_string_pair(PropertyId::UserProperty, "b", "2");
+        props.push_string_pair(PropertyId::UserProperty, "c", "3");
+
+        for (i, (k, v)) in [("a", "1"), ("b", "2"), ("c", "3")].iter().enumerate() {
+            assert_eq!(
+                props.get_string_pair_at(PropertyId::UserProperty, i),
+                Some((k.to_string(), v.to_string())),
+                "index {i}"
+            );
+        }
+        assert_eq!(props.get_string_pair_at(PropertyId::UserProperty, 3), None);
+        // The un-indexed accessor is the first one.
+        assert_eq!(
+            props.get_string_pair(PropertyId::UserProperty),
+            props.get_string_pair_at(PropertyId::UserProperty, 0)
+        );
+    }
+
+    /// `get_at` counts only properties with the requested identifier, not the
+    /// position in the whole list.
+    #[test]
+    fn test_get_at_indexes_within_the_identifier() {
+        let mut props = Properties::new();
+        props.push_string(PropertyId::ContentType, "text/plain");
+        props.push_string_pair(PropertyId::UserProperty, "a", "1");
+        props.push_u16(PropertyId::ReceiveMaximum, 7);
+        props.push_string_pair(PropertyId::UserProperty, "b", "2");
+
+        assert_eq!(
+            props.get_at(PropertyId::UserProperty, 1),
+            Some(&PropertyValue::StringPair("b".into(), "2".into()))
+        );
+        assert_eq!(
+            props.get_at(PropertyId::ReceiveMaximum, 0),
+            props.get(PropertyId::ReceiveMaximum)
+        );
+        assert_eq!(props.get_at(PropertyId::ReceiveMaximum, 1), None);
+    }
+
+    /// `get_u32` takes either 32-bit wire form; `get_var_int` is exact.
+    #[test]
+    fn test_get_u32_reads_both_integer_forms() {
+        let mut props = Properties::new();
+        props.push_var_int(PropertyId::SubscriptionIdentifier, 5u32);
+        props.push_u32(PropertyId::SessionExpiryInterval, 300);
+
+        assert_eq!(props.get_u32(PropertyId::SubscriptionIdentifier), Some(5));
+        assert_eq!(props.get_u32(PropertyId::SessionExpiryInterval), Some(300));
+
+        assert_eq!(
+            props.get_var_int(PropertyId::SubscriptionIdentifier),
+            Some(5)
+        );
+        assert_eq!(props.get_var_int(PropertyId::SessionExpiryInterval), None);
+    }
+
+    /// `push_var_int` agrees with the constructor it wraps, and takes anything
+    /// that converts into a `u32`.
+    #[test]
+    fn test_push_var_int_matches_the_constructor() {
+        let mut a = Properties::new();
+        a.push_var_int(PropertyId::SubscriptionIdentifier, 7u32);
+        let mut b = Properties::new();
+        b.push(Property::new_var_int(
+            PropertyId::SubscriptionIdentifier,
+            7u32,
+        ));
+        assert_eq!(a, b);
+
+        // A narrower integer converts.
+        let mut c = Properties::new();
+        c.push_var_int(PropertyId::SubscriptionIdentifier, 7u16);
+        assert_eq!(c, a);
+    }
+
+    /// A PUBLISH may carry one `SubscriptionIdentifier` per matching
+    /// subscription (§3.3.2.3.8), which is what `_at` is for.
+    #[test]
+    fn test_var_int_at_walks_repeated_subscription_identifiers() {
+        let mut props = Properties::new();
+        for id in [1u32, 2, 3] {
+            props.push_var_int(PropertyId::SubscriptionIdentifier, id);
+        }
+        for (i, want) in [1u32, 2, 3].iter().enumerate() {
+            assert_eq!(
+                props.get_var_int_at(PropertyId::SubscriptionIdentifier, i),
+                Some(*want),
+                "index {i}"
+            );
+            // The lenient accessor walks them too.
+            assert_eq!(
+                props.get_u32_at(PropertyId::SubscriptionIdentifier, i),
+                Some(*want)
+            );
+        }
+        assert_eq!(
+            props.get_var_int_at(PropertyId::SubscriptionIdentifier, 3),
+            None
+        );
+        // Repeating it is only legal in a PUBLISH.
+        assert!(props.check_context(PacketType::Publish).is_ok());
+        assert_eq!(
+            props.check_context(PacketType::Subscribe),
+            Err(Error::ProtocolError)
         );
     }
 }
