@@ -918,7 +918,141 @@ impl Properties {
         }
     }
 
+    /// Iterates over the values of every property with the given `id`, in
+    /// order.
+    ///
+    /// Only `UserProperty`, and `SubscriptionIdentifier` in a PUBLISH, can
+    /// yield more than one. This is v0.14's `iter(code)`; the name differs
+    /// because [`iter`](Self::iter) here walks the whole collection.
+    pub fn get_all(&self, id: PropertyId) -> impl Iterator<Item = &PropertyValue> {
+        self.props
+            .iter()
+            .filter(move |p| p.id == id)
+            .map(|p| &p.value)
+    }
+
+    /// Adds a user property.
+    ///
+    /// Shorthand for [`push_string_pair`](Self::push_string_pair) with
+    /// `UserProperty`, the only string-pair property and the only one an
+    /// application defines for itself.
+    pub fn push_user<K, V>(&mut self, key: K, val: V)
+    where
+        K: Into<String>,
+        V: Into<String>,
+    {
+        self.push_string_pair(PropertyId::UserProperty, key, val)
+    }
+
+    /// Iterates over the user properties as key/value pairs, in order.
+    ///
+    /// Keys are not unique: an application may send the same key more than
+    /// once, and the order is the order they were sent in, which MQTT
+    /// preserves (§3.3.2.3.7).
+    ///
+    /// Unlike v0.14 this borrows rather than allocating a `String` per item;
+    /// `.map(|(k, v)| (k.to_string(), v.to_string()))` recovers the owned form.
+    pub fn user_iter(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.props.iter().filter_map(|p| match (&p.id, &p.value) {
+            (PropertyId::UserProperty, PropertyValue::StringPair(k, v)) => {
+                Some((k.as_str(), v.as_str()))
+            }
+            _ => None,
+        })
+    }
+
+    /// Returns the value of the first user property with the given `key`, or
+    /// `None`.
+    ///
+    /// Use [`user_iter`](Self::user_iter) when a key may appear more than
+    /// once. Borrows rather than allocating, unlike v0.14's
+    /// `find_user_property`; `.map(String::from)` recovers the owned form.
+    pub fn get_user(&self, key: &str) -> Option<&str> {
+        self.user_iter().find(|(k, _)| *k == key).map(|(_, v)| v)
+    }
+
+    /// Obsolete name for [`get_user`](Self::get_user), which this calls.
+    ///
+    /// Kept so code written against the v0.14 client, where this was the only
+    /// spelling, still compiles. Note that it borrows where v0.14 returned an
+    /// owned `String`.
+    #[deprecated(note = "renamed to `get_user`")]
+    pub fn find_user_property(&self, key: &str) -> Option<&str> {
+        self.get_user(key)
+    }
+
+    /// Keeps only the properties for which `f` returns `true`, in order.
+    ///
+    /// This is the general form of [`remove`](Self::remove) and
+    /// [`remove_user`](Self::remove_user), for a condition on the value rather
+    /// than the identifier — dropping every `UserProperty` with an empty
+    /// value, say, or stripping what a server may not forward.
+    ///
+    /// The cached wire size and seen-identifier set are recomputed if anything
+    /// was dropped, so [`encoded_size`](Self::encoded_size) and
+    /// [`encode`](Self::encode) stay correct.
+    pub fn retain<F>(&mut self, f: F)
+    where
+        F: FnMut(&Property) -> bool,
+    {
+        let before = self.props.len();
+        self.props.retain(f);
+        if self.props.len() != before {
+            self.rebuild_cache();
+        }
+    }
+
+    /// Removes every property with the given `id`, returning how many were
+    /// removed.
+    pub fn remove(&mut self, id: PropertyId) -> usize {
+        let before = self.props.len();
+        self.retain(|p| p.id != id);
+        before - self.props.len()
+    }
+
+    /// Removes every user property with the given `key`, returning how many
+    /// were removed.
+    pub fn remove_user(&mut self, key: &str) -> usize {
+        let before = self.props.len();
+        self.retain(|p| {
+            !matches!(
+                (&p.id, &p.value),
+                (PropertyId::UserProperty, PropertyValue::StringPair(k, _)) if k == key
+            )
+        });
+        before - self.props.len()
+    }
+
+    /// Removes every property.
+    pub fn clear(&mut self) {
+        self.props.clear();
+        self.payload_size = 0;
+        self.seen = SeenIds::default();
+    }
+
+    /// Recomputes the cached wire size and seen-identifier set from the
+    /// properties that remain.
+    ///
+    /// Removal is the one operation that cannot update them incrementally: a
+    /// cleared identifier bit may need to stay set for a duplicate further
+    /// along, and the invalid flag does not record which property set it. This
+    /// means removing the offending property also clears that flag, which is
+    /// the behaviour a caller fixing up a list would expect.
+    fn rebuild_cache(&mut self) {
+        self.payload_size = self.props.iter().map(Property::encoded_size).sum();
+        let mut seen = SeenIds::default();
+        for prop in &self.props {
+            if prop.validate().is_err() || seen.note(prop.id).is_err() {
+                seen.mark_invalid();
+            }
+        }
+        self.seen = seen;
+    }
+
     /// Iterates over all properties in order.
+    ///
+    /// See [`get_all`](Self::get_all) to walk just one identifier, and
+    /// [`user_iter`](Self::user_iter) for the user properties as pairs.
     pub fn iter(&self) -> impl Iterator<Item = &Property> {
         self.props.iter()
     }
@@ -1154,7 +1288,7 @@ impl<'a> IntoIterator for &'a Properties {
 mod tests {
     use super::*;
     use crate::types::MQTT_VERSION_5;
-    use alloc::string::ToString;
+    use alloc::{string::ToString, vec};
     use bytes::BytesMut;
 
     fn v5() -> MqttVersion {
@@ -2222,5 +2356,200 @@ mod tests {
             props.check_context(PacketType::Subscribe),
             Err(Error::ProtocolError)
         );
+    }
+
+    // ---- user properties and removal ----
+
+    fn three_users() -> Properties {
+        let mut props = Properties::new();
+        props.push_user("a", "1");
+        props.push_string(PropertyId::ContentType, "text/plain");
+        props.push_user("b", "2");
+        props.push_user("a", "3");
+        props
+    }
+
+    #[test]
+    fn test_push_user_is_a_user_property() {
+        let mut a = Properties::new();
+        a.push_user("k", "v");
+        let mut b = Properties::new();
+        b.push_string_pair(PropertyId::UserProperty, "k", "v");
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn test_user_iter_yields_pairs_in_order_and_skips_others() {
+        let props = three_users();
+        assert_eq!(
+            props.user_iter().collect::<Vec<_>>(),
+            vec![("a", "1"), ("b", "2"), ("a", "3")]
+        );
+        assert_eq!(Properties::new().user_iter().count(), 0);
+    }
+
+    #[test]
+    fn test_get_user_returns_the_first_match() {
+        let props = three_users();
+        // "a" appears twice; the first wins.
+        assert_eq!(props.get_user("a"), Some("1"));
+        assert_eq!(props.get_user("b"), Some("2"));
+        assert_eq!(props.get_user("nope"), None);
+    }
+
+    /// The obsolete name is the new one.
+    #[test]
+    #[allow(deprecated)]
+    fn test_find_user_property_delegates_to_get_user() {
+        let props = three_users();
+        for key in ["a", "b", "nope"] {
+            assert_eq!(props.find_user_property(key), props.get_user(key), "{key}");
+        }
+        assert_eq!(props.find_user_property("a"), Some("1"));
+    }
+
+    #[test]
+    fn test_get_all_walks_one_identifier() {
+        let props = three_users();
+        assert_eq!(props.get_all(PropertyId::UserProperty).count(), 3);
+        assert_eq!(
+            props.get_all(PropertyId::ContentType).collect::<Vec<_>>(),
+            vec![&PropertyValue::String("text/plain".into())]
+        );
+        assert_eq!(props.get_all(PropertyId::ReceiveMaximum).count(), 0);
+    }
+
+    #[test]
+    fn test_remove_user_takes_every_entry_with_that_key() {
+        let mut props = three_users();
+        assert_eq!(props.remove_user("a"), 2);
+        assert_eq!(props.user_iter().collect::<Vec<_>>(), vec![("b", "2")]);
+        // The non-user property is untouched.
+        assert_eq!(
+            props.get_string(PropertyId::ContentType).as_deref(),
+            Some("text/plain")
+        );
+        assert_eq!(props.remove_user("gone"), 0);
+    }
+
+    #[test]
+    fn test_remove_takes_every_property_with_that_id() {
+        let mut props = three_users();
+        assert_eq!(props.remove(PropertyId::UserProperty), 3);
+        assert_eq!(props.len(), 1);
+        assert_eq!(props.remove(PropertyId::ContentType), 1);
+        assert!(props.is_empty());
+        assert_eq!(props.remove(PropertyId::ContentType), 0);
+    }
+
+    #[test]
+    fn test_clear_empties_the_collection() {
+        let mut props = three_users();
+        props.clear();
+        assert!(props.is_empty());
+        assert_eq!(props.encoded_size(v5()), 1); // just the zero-length VBI
+        assert_eq!(props, Properties::new());
+    }
+
+    #[test]
+    fn test_retain_keeps_only_what_the_predicate_wants() {
+        let mut props = three_users();
+        // Drop the user properties whose key is "a".
+        props.retain(|p| {
+            !matches!(
+                (&p.id, &p.value),
+                (PropertyId::UserProperty, PropertyValue::StringPair(k, _)) if k == "a"
+            )
+        });
+        assert_eq!(props.user_iter().collect::<Vec<_>>(), vec![("b", "2")]);
+        assert_eq!(
+            props.get_string(PropertyId::ContentType).as_deref(),
+            Some("text/plain")
+        );
+    }
+
+    /// The condition can be on the value, which is what `remove` and
+    /// `remove_user` cannot express.
+    #[test]
+    fn test_retain_can_filter_on_the_value() {
+        let mut props = Properties::new();
+        props.push_user("keep", "yes");
+        props.push_user("drop", "");
+        props.push_user("also", "yes");
+        props.retain(|p| !matches!(&p.value, PropertyValue::StringPair(_, v) if v.is_empty()));
+        assert_eq!(
+            props.user_iter().collect::<Vec<_>>(),
+            vec![("keep", "yes"), ("also", "yes")]
+        );
+    }
+
+    #[test]
+    fn test_retain_everything_and_nothing() {
+        let mut all = three_users();
+        let before = all.clone();
+        all.retain(|_| true);
+        assert_eq!(all, before);
+
+        let mut none = three_users();
+        none.retain(|_| false);
+        assert!(none.is_empty());
+        assert_eq!(none, Properties::new());
+    }
+
+    /// `remove` and `remove_user` are `retain` underneath, so they must agree.
+    #[test]
+    fn test_remove_agrees_with_the_equivalent_retain() {
+        let mut a = three_users();
+        a.remove(PropertyId::UserProperty);
+        let mut b = three_users();
+        b.retain(|p| p.id != PropertyId::UserProperty);
+        assert_eq!(a, b);
+    }
+
+    /// Removal has to keep the cached wire size in step, or `encode` writes a
+    /// length prefix that disagrees with the bytes after it.
+    #[test]
+    fn test_removal_keeps_the_cached_size_correct() {
+        for remove in [
+            |p: &mut Properties| {
+                p.remove_user("a");
+            },
+            |p: &mut Properties| {
+                p.remove(PropertyId::UserProperty);
+            },
+            |p: &mut Properties| {
+                p.remove(PropertyId::ContentType);
+            },
+            |p: &mut Properties| p.clear(),
+            |p: &mut Properties| p.retain(|prop| prop.id == PropertyId::ContentType),
+            |p: &mut Properties| p.retain(|_| false),
+        ] {
+            let mut props = three_users();
+            remove(&mut props);
+
+            let mut dst = BytesMut::new();
+            props.encode(&mut dst, v5()).unwrap();
+            assert_eq!(dst.len(), props.encoded_size(v5()));
+            // And the bytes still decode back to the same collection.
+            assert_eq!(Properties::decode(&mut dst.freeze(), v5()).unwrap(), props);
+        }
+    }
+
+    /// Removing a duplicate frees the identifier for re-use, and removing the
+    /// property that invalidated the list clears that too.
+    #[test]
+    fn test_removal_rebuilds_the_seen_set() {
+        let mut props = Properties::new();
+        props.push_u16(PropertyId::ReceiveMaximum, 10);
+        props.push_u16(PropertyId::ReceiveMaximum, 20); // a repeat: invalid
+        let mut dst = BytesMut::new();
+        assert_eq!(props.encode(&mut dst, v5()), Err(Error::ProtocolError));
+
+        // Dropping both and pushing one again is a valid list.
+        assert_eq!(props.remove(PropertyId::ReceiveMaximum), 2);
+        props.push_u16(PropertyId::ReceiveMaximum, 30);
+        let mut dst = BytesMut::new();
+        props.encode(&mut dst, v5()).unwrap();
+        assert_eq!(props.get_u16(PropertyId::ReceiveMaximum), Some(30));
     }
 }
