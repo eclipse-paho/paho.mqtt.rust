@@ -460,12 +460,36 @@ impl AsyncClient {
     /// error immediately if there's a problem creating or queuing the
     /// message.
     ///
-    /// Returns a Publish Error on failure so that the original message
-    /// can be recovered and sent again.
+    /// On failure returns [`Error::Publish`], which carries the cause and
+    /// hands the message back, so that a message which never reached the
+    /// broker can be kept and sent again:
+    ///
+    /// ```no_run
+    /// # use paho_mqtt as mqtt;
+    /// # fn main() -> mqtt::Result<()> {
+    /// # let cli = mqtt::AsyncClient::new("mqtt://localhost:1883")?;
+    /// let mut msg = mqtt::Message::new("data", "payload", mqtt::QOS_1);
+    /// while let Err(mqtt::Error::Publish(cause, returned)) = cli.try_publish(msg) {
+    ///     eprintln!("could not queue the message: {cause}");
+    ///     msg = *returned; // ... and try again later
+    /// #   break;
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// Note that [`publish`](Self::publish) fails its token with the *cause*
+    /// alone, having taken the message.
     pub fn try_publish(&self, msg: Message) -> Result<DeliveryToken> {
         debug!("Publish: {:?}", msg);
 
-        self.require_v5_for_props(&msg.props)?;
+        if let Err(cause) = self.require_v5_for_props(&msg.props) {
+            return Err(Error::Publish(Box::new(cause), Box::new(msg)));
+        }
+
+        // Kept aside so that a message handed back is the message given: the
+        // command carries only what goes on the wire.
+        let (dup, msgid) = (msg.dup, msg.msgid);
 
         let Message {
             topic,
@@ -486,8 +510,30 @@ impl AsyncClient {
             tx: comp,
         };
 
-        if self.inner.cmd_tx.send_blocking(cmd).is_err() {
-            return Err(Error::Disconnected);
+        if let Err(e) = self.inner.cmd_tx.send_blocking(cmd) {
+            // A closed channel gives the command back, so the message can be
+            // reassembled rather than lost with it.
+            let Command::Publish {
+                topic,
+                payload,
+                qos,
+                retain,
+                props,
+                ..
+            } = e.into_inner()
+            else {
+                unreachable!("the command sent above is a Publish");
+            };
+            let msg = Message {
+                topic,
+                payload,
+                qos,
+                retain,
+                props,
+                dup,
+                msgid,
+            };
+            return Err(Error::Publish(Box::new(Error::Disconnected), Box::new(msg)));
         }
 
         Ok(tok)
@@ -497,10 +543,16 @@ impl AsyncClient {
     ///
     /// Returns a Delivery Token to track the progress of the operation.
     ///
+    /// A synchronous failure fails the token with the cause — `Disconnected`
+    /// or `WrongMqttVersion`. The message is not handed back, this call having
+    /// taken it; use [`try_publish`](Self::try_publish) to keep it.
     pub fn publish(&self, msg: Message) -> DeliveryToken {
         match self.try_publish(msg) {
-            Ok(tok) => tok,
+            // Unwrap the message this call has taken ownership of, so the
+            // token reports the same cause it always did.
+            Err(Error::Publish(cause, _)) => DeliveryToken::from_err(*cause),
             Err(e) => DeliveryToken::from_err(e),
+            Ok(tok) => tok,
         }
     }
 
@@ -1880,5 +1932,92 @@ mod tests {
 
         let _tok = cli.disconnect(None);
         assert_eq!(*calls.lock().unwrap(), 1);
+    }
+
+    // ----------------------------------------------------------------------
+    // try_publish hands the message back on a synchronous failure
+    // ----------------------------------------------------------------------
+
+    /// A message carrying the protocol's own bookkeeping, to prove the one
+    /// handed back is the one given rather than a rebuild that lost fields.
+    fn marked_message() -> Message {
+        let mut msg = Message::new_retained("data/t", "payload", crate::QOS_2);
+        msg.dup = true;
+        msg.msgid = Some(7);
+        msg
+    }
+
+    fn assert_same(back: &Message, orig: &Message) {
+        assert_eq!(back.topic(), orig.topic());
+        assert_eq!(back.payload(), orig.payload());
+        assert_eq!(back.qos(), orig.qos());
+        assert_eq!(back.retain(), orig.retain());
+        assert_eq!(back.properties(), orig.properties());
+        assert_eq!(back.dup(), orig.dup(), "dup was dropped");
+        assert_eq!(back.msgid(), orig.msgid(), "msgid was dropped");
+    }
+
+    /// With the command channel closed the message cannot be queued, and
+    /// comes back with the cause so the caller can send it again.
+    #[test]
+    fn test_try_publish_returns_the_message_when_disconnected() {
+        let cli = test_client();
+        assert!(cli.inner.cmd_tx.close(), "the channel was already closed");
+
+        let msg = marked_message();
+        match cli.try_publish(msg.clone()) {
+            Err(Error::Publish(cause, back)) => {
+                assert!(matches!(*cause, Error::Disconnected), "{cause}");
+                assert_same(&back, &msg);
+            }
+            Ok(_) => panic!("the message should not have been queued"),
+            Err(e) => panic!("expected the message back, got {e}"),
+        }
+    }
+
+    /// The same for a message the connection's version cannot carry, which
+    /// fails before the message is taken apart at all.
+    #[test]
+    fn test_try_publish_returns_the_message_on_a_version_mismatch() {
+        let cli = AsyncClient::new(
+            CreateOptionsBuilder::new()
+                .server_uri("tcp://localhost:1883")
+                .mqtt_version(MqttVersion::V3_1_1)
+                .finalize(),
+        )
+        .unwrap();
+
+        let mut msg = marked_message();
+        msg.props
+            .push_u32(crate::PropertyId::MessageExpiryInterval, 30);
+
+        match cli.try_publish(msg.clone()) {
+            Err(Error::Publish(cause, back)) => {
+                assert!(matches!(*cause, Error::WrongMqttVersion), "{cause}");
+                assert_same(&back, &msg);
+            }
+            Ok(_) => panic!("the message should not have been queued"),
+            Err(e) => panic!("expected the message back, got {e}"),
+        }
+    }
+
+    /// `publish` has taken the message, so its token reports the cause alone
+    /// rather than an `Error::Publish` holding a message the caller cannot
+    /// use.
+    #[test]
+    fn test_publish_token_reports_the_cause_alone() {
+        let cli = test_client();
+        assert!(cli.inner.cmd_tx.close());
+
+        let err = cli.publish(marked_message()).wait().unwrap_err();
+        assert!(matches!(err, Error::Disconnected), "{err}");
+    }
+
+    /// The error prints as its cause, so a message that is only logged reads
+    /// the same as it did when the variant carried a string.
+    #[test]
+    fn test_publish_error_displays_the_cause() {
+        let err = Error::Publish(Box::new(Error::Disconnected), Box::new(marked_message()));
+        assert_eq!(err.to_string(), Error::Disconnected.to_string());
     }
 }

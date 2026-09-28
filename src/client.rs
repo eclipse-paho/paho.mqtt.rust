@@ -405,8 +405,11 @@ impl Client {
 
     /// Attempts to publish a message without blocking or queuing.
     ///
-    /// Returns a `DeliveryToken` immediately if the message was accepted,
-    /// or an error if the client's command channel is full or closed.
+    /// Returns a `DeliveryToken` immediately if the message was accepted, or
+    /// [`Error::Publish`] — which carries both the
+    /// cause and the message itself, so it can be sent again — if the
+    /// client's command channel is closed or the message needs a protocol
+    /// version the connection is not using.
     pub fn try_publish(&self, msg: Message) -> Result<DeliveryToken> {
         self.cli.try_publish(msg)
     }

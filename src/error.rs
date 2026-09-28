@@ -53,12 +53,21 @@ pub enum Error {
     /// An error from the MQTT codec.
     #[error("{0}")]
     Protocol(#[from] paho_mqtt_codec::Error),
-    /// A synchronous error when publishing: creating or queuing the message.
+    /// A synchronous failure when publishing — creating or queuing the
+    /// message — carrying the cause and the message back to the caller.
     ///
-    /// The message is boxed to keep `Error` small enough to return by value
+    /// Returned only by [`try_publish`](crate::AsyncClient::try_publish) and
+    /// the calls that forward to it, so that a message which never reached
+    /// the broker can be held on to and sent again. `Display` shows the
+    /// cause, so a message that is only logged reads the same as before.
+    ///
+    /// [`publish`](crate::AsyncClient::publish) reports the cause alone on
+    /// its token, since it has taken ownership of the message.
+    ///
+    /// Both halves are boxed to keep `Error` small enough to return by value
     /// cheaply.
     #[error("{0}")]
-    Publish(String, Box<Message>),
+    Publish(Box<Error>, Box<Message>),
     /// An MQTT v5 error from a reason code.
     /// Any reason code >= 0x80 indicates an error.
     #[error("{0}")]

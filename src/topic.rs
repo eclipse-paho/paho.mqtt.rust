@@ -184,7 +184,8 @@ impl<'a> Topic<'a> {
     ///
     /// * `payload` The payload of the message
     ///
-    /// Returns a Publish Error containing the complete message on failure.
+    /// Returns [`Error::Publish`] on failure, holding
+    /// the cause and the complete message.
     pub fn try_publish<V>(&self, payload: V) -> Result<DeliveryToken>
     where
         V: Into<bytes::Bytes>,
@@ -238,7 +239,8 @@ impl<'a> Topic<'a> {
     ///
     /// See [`publish_with_alias()`](Self::publish_with_alias) for more information.
     ///
-    /// Returns a Publish Error containing the complete message on failure.
+    /// Returns [`Error::Publish`] on failure, holding
+    /// the cause and the complete message.
     pub fn try_publish_with_alias<V>(&mut self, alias: u16, payload: V) -> Result<DeliveryToken>
     where
         V: Into<bytes::Bytes>,

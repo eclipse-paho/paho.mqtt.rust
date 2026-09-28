@@ -70,6 +70,7 @@ Version 2.0 is a rewrite of the library in pure Rust. It no longer depends on th
 
 ### API
 
+- **`try_publish` hands the message back again.** A synchronous failure returns `Error::Publish`, which now carries the cause and the message: `Err(Error::Publish(cause, msg))` where `cause` is the `Disconnected` or `WrongMqttVersion` that would otherwise have been returned alone. The message comes back whole, including its `dup` flag and packet identifier. **[Breaking]** the variant is `Publish(Box<Error>, Box<Message>)` rather than `Publish(String, Box<Message>)`; it was previously constructed nowhere, so no code could observe the old shape. `Display` still prints the cause. `publish()` fails its token with the cause alone, unchanged, since it has taken the message.
 - **A callback can now remove or replace itself.** Each callback is held in a slot with a generation counter that every set and removal bumps. The dispatcher takes the callback out to run it outside the lock — so it may call back into the client — and puts it back only if the slot is untouched. It previously restored the callback whenever the slot was empty afterwards, which is exactly what a self-removal leaves behind, so `remove_*_callback()` and `remove_callbacks()` called from inside a callback were silently undone.
 - `disconnect()` signals the end of the message stream by calling the message callback with `None`. That call no longer happens while holding the callback lock, where a callback that registered or removed anything deadlocked.
 
