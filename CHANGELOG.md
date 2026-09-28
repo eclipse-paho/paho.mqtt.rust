@@ -38,6 +38,7 @@ Version 2.0 is a rewrite of the library in pure Rust. It no longer depends on th
 
 ### TLS, proxies, and runtime
 
+- **`TlsOptions` verifies the broker by default.** `TlsOptions::default()`, `TlsOptions::new()` and `TlsOptionsBuilder::new()` set both `enable_server_cert_auth` and `verify` to `true`, as v1.x did (`enableServerCertAuth = 1`). A derived `Default` had left both `false`, which installed a verifier that accepted any certificate from any issuer — so `TlsOptionsBuilder::new().trust_store(ca).finalize()` ignored the trust store it was given. Applications that relied on the permissive default must now ask for it explicitly with `enable_server_cert_auth(false)`.
 - `TlsOptions::verify` is implemented: it controls whether the broker's certificate must name the host connected to, independently of `enable_server_cert_auth`, which controls whether the chain is checked at all. Turning it off keeps full chain verification and waives only the identity check — for a broker reached by IP address, through a tunnel, or on a test rig.
 - `ConnectOptions::http_proxy` and `https_proxy` are implemented: a `ws://` or `wss://` connection is tunnelled through the named HTTP proxy with a `CONNECT` request, including `Proxy-Authorization` when the URI carries credentials. A proxy that refuses reports its status line to the caller.
 - The smol backend honours `RuntimeMode`: `Shared(n)` runs the shared executor on `n` threads. `ApplicationRuntime` panics there with an explanation, as smol has no ambient executor to borrow.

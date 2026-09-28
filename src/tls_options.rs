@@ -46,7 +46,11 @@ pub enum TlsVersion {
 /////////////////////////////////////////////////////////////////////////////
 
 /// The options for TLS socket connections to the broker.
-#[derive(Default, Clone)]
+///
+/// [`TlsOptions::default()`](Self::default) verifies the broker: both
+/// [`enable_server_cert_auth`](Self::enable_server_cert_auth) and
+/// [`verify`](Self::verify) start `true`, as they did in the v1.x client.
+#[derive(Clone)]
 pub struct TlsOptions {
     /// File name of the trust store.
     pub trust_store: PathBuf,
@@ -59,6 +63,10 @@ pub struct TlsOptions {
     /// The list of cipher suites that the client presents to the server.
     pub enabled_cipher_suites: String,
     /// Whether to enable verification of the server certificate.
+    ///
+    /// Defaults to `true`. Turning it off accepts *any* certificate from
+    /// *any* issuer, which also makes [`verify`](Self::verify) irrelevant;
+    /// it exists for test rigs, not for production.
     pub enable_server_cert_auth: bool,
     /// The TLS version to use.
     pub version: TlsVersion,
@@ -94,8 +102,39 @@ pub struct TlsOptions {
     pub protos: Vec<String>,
 }
 
+impl Default for TlsOptions {
+    /// The default options, which verify the broker's certificate.
+    ///
+    /// Both verification switches start `true`: the chain is checked against
+    /// the trust store, and the certificate must name the host connected to.
+    /// This is what the v1.x client did (`enableServerCertAuth = 1`), and a
+    /// derived `Default` would silently do the opposite.
+    ///
+    /// Every field is named rather than delegating to a derive, so that a
+    /// field added later cannot default to something unsafe by omission.
+    fn default() -> Self {
+        Self {
+            trust_store: PathBuf::new(),
+            key_store: PathBuf::new(),
+            private_key: PathBuf::new(),
+            private_key_password: String::new(),
+            enabled_cipher_suites: String::new(),
+            enable_server_cert_auth: true,
+            version: TlsVersion::Default,
+            verify: true,
+            ca_path: PathBuf::new(),
+            on_tls_error: None,
+            disable_default_trust_store: false,
+            protos: Vec::new(),
+        }
+    }
+}
+
 impl TlsOptions {
     /// Creates a new, default, set of TLS options.
+    ///
+    /// These verify the broker's certificate; see
+    /// [`default`](Self::default).
     pub fn new() -> Self {
         Self::default()
     }
@@ -134,6 +173,10 @@ pub struct TlsOptionsBuilder(TlsOptions);
 
 impl TlsOptionsBuilder {
     /// Creates a new builder with default options.
+    ///
+    /// The defaults verify the broker's certificate — see
+    /// [`TlsOptions::default`]. A trust store is still worth setting: with
+    /// none, verification uses the system root certificates.
     pub fn new() -> Self {
         Self::default()
     }
@@ -194,6 +237,8 @@ impl TlsOptionsBuilder {
     }
 
     /// Enable or disable verification of the server certificate.
+    ///
+    /// On by default. See [`TlsOptions::enable_server_cert_auth`].
     pub fn enable_server_cert_auth(&mut self, on: bool) -> &mut Self {
         self.0.enable_server_cert_auth = on;
         self
@@ -252,5 +297,79 @@ impl TlsOptionsBuilder {
     /// Create the TLS options from the builder.
     pub fn finalize(&self) -> TlsOptions {
         self.0.clone()
+    }
+}
+
+/////////////////////////////////////////////////////////////////////////////
+//                              Unit Tests
+/////////////////////////////////////////////////////////////////////////////
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Verification is on unless the application turns it off. A derived
+    /// `Default` made both switches `false`, which silently accepted any
+    /// certificate from any issuer.
+    #[test]
+    fn test_default_verifies_the_server() {
+        let opts = TlsOptions::default();
+        assert!(opts.enable_server_cert_auth);
+        assert!(opts.verify);
+    }
+
+    /// The three ways of asking for default options agree.
+    #[test]
+    fn test_new_and_builder_match_the_default() {
+        for opts in [
+            TlsOptions::new(),
+            TlsOptionsBuilder::new().finalize(),
+            TlsOptionsBuilder::default().finalize(),
+        ] {
+            assert!(opts.enable_server_cert_auth);
+            assert!(opts.verify);
+        }
+    }
+
+    /// Setting a trust store must not weaken anything: the certificate is
+    /// still checked against it, and must still name the host.
+    #[test]
+    fn test_trust_store_leaves_verification_on() {
+        let opts = TlsOptionsBuilder::new().trust_store("/ca.crt").finalize();
+        assert!(opts.enable_server_cert_auth);
+        assert!(opts.verify);
+        assert_eq!(opts.trust_store, PathBuf::from("/ca.crt"));
+    }
+
+    /// The two switches are independent: waiving the name check keeps the
+    /// chain check, and vice versa.
+    #[test]
+    fn test_the_two_switches_are_independent() {
+        let opts = TlsOptionsBuilder::new().verify(false).finalize();
+        assert!(opts.enable_server_cert_auth, "chain check stays on");
+        assert!(!opts.verify);
+
+        let opts = TlsOptionsBuilder::new()
+            .enable_server_cert_auth(false)
+            .finalize();
+        assert!(!opts.enable_server_cert_auth);
+        assert!(opts.verify, "the name switch is untouched");
+    }
+
+    /// The remaining fields are still empty by default, so turning
+    /// verification on did not quietly set anything else.
+    #[test]
+    fn test_default_leaves_every_other_field_empty() {
+        let opts = TlsOptions::default();
+        assert_eq!(opts.trust_store, PathBuf::new());
+        assert_eq!(opts.key_store, PathBuf::new());
+        assert_eq!(opts.private_key, PathBuf::new());
+        assert!(opts.private_key_password.is_empty());
+        assert!(opts.enabled_cipher_suites.is_empty());
+        assert_eq!(opts.version, TlsVersion::Default);
+        assert_eq!(opts.ca_path, PathBuf::new());
+        assert!(opts.on_tls_error.is_none());
+        assert!(!opts.disable_default_trust_store);
+        assert!(opts.protos.is_empty());
     }
 }
