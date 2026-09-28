@@ -22,11 +22,12 @@
 //! Objects for manipulating and checking message topics.
 //!
 
+#[cfg(any(feature = "tokio", feature = "smol"))]
 use crate::{
-    AsyncClient, Client, DeliveryToken, Error, Message, MessageBuilder, Properties, Property,
-    PropertyId, PropertyValue, QoS, Result, SubscribeOptions, SubscribeResponse,
-    token::SubscribeToken,
+    AsyncClient, Client, DeliveryToken, Message, MessageBuilder, Properties, Property, PropertyId,
+    PropertyValue, QoS, SubscribeOptions, SubscribeResponse, token::SubscribeToken,
 };
+use crate::{Error, Result};
 use std::fmt;
 
 /////////////////////////////////////////////////////////////////////////////
@@ -37,6 +38,7 @@ use std::fmt;
 ///
 /// This keeps message parameters for repeatedly publishing to the same
 /// topic on a server.
+#[cfg(any(feature = "tokio", feature = "smol"))]
 pub struct Topic<'a> {
     /// Reference to the broker that will receive the messages.
     cli: &'a AsyncClient,
@@ -51,6 +53,7 @@ pub struct Topic<'a> {
     alias: u16,
 }
 
+#[cfg(any(feature = "tokio", feature = "smol"))]
 impl<'a> Topic<'a> {
     /// Creates a new topic object for publishing messages.
     ///
@@ -278,11 +281,13 @@ impl<'a> Topic<'a> {
 ///
 /// This keeps message parameters for repeatedly publishing to the same
 /// topic on a server.
+#[cfg(any(feature = "tokio", feature = "smol"))]
 pub struct SyncTopic<'a> {
     cli: &'a Client,
     topic: Topic<'a>,
 }
 
+#[cfg(any(feature = "tokio", feature = "smol"))]
 impl<'a> SyncTopic<'a> {
     /// Creates a new topic object for publishing messages.
     ///

@@ -228,7 +228,7 @@ impl AsyncClient {
             (RuntimeHandle::spawn(&rt_handle, buf_cfg), ownership)
         };
 
-        #[cfg(all(feature = "smol", not(feature = "tokio")))]
+        #[cfg(feature = "smol")]
         let (rt, rt_ownership) = {
             use crate::runtime::{RuntimeHandle, SmolOwnership, resolve_executor};
             let executor = resolve_executor(&opts.runtime_mode);

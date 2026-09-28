@@ -48,7 +48,7 @@ pub(crate) trait Connection:
 /// This is a marker trait that collects the async I/O bounds required by the
 /// event loop into a single name.  Concrete implementations are provided by
 /// each backend module.
-#[cfg(all(feature = "smol", not(feature = "tokio")))]
+#[cfg(feature = "smol")]
 pub(crate) trait Connection:
     futures::io::AsyncRead + futures::io::AsyncWrite + Send + Unpin + 'static
 {

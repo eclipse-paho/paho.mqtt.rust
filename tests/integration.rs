@@ -1,3 +1,5 @@
+// The whole suite drives a client, which needs a runtime backend.
+#![cfg(any(feature = "tokio", feature = "smol"))]
 // tests/integration.rs
 //
 // Integration tests for the Eclipse Paho MQTT Rust client library.

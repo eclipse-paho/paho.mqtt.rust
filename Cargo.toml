@@ -21,8 +21,8 @@ A pure-Rust MQTT v5, v3.1.1, and v3.1 client.
 
 [features]
 default = ["tokio"]
-tokio = ["dep:tokio"]
-smol = ["dep:smol"]
+tokio = ["dep:tokio", "_runtime"]
+smol = ["dep:smol", "_runtime"]
 smol-tls = ["smol", "dep:futures-rustls", "dep:rustls", "dep:rustls-pemfile", "dep:rustls-native-certs"]
 smol-websocket = ["smol", "dep:async-tungstenite"]
 tls = ["dep:tokio-rustls", "dep:rustls", "dep:rustls-pemfile", "dep:rustls-native-certs", "tokio"]
@@ -30,6 +30,12 @@ openssl = ["dep:openssl", "dep:tokio-openssl", "tokio"]
 openssl-vendored = ["openssl", "openssl/vendored"]
 websocket = ["dep:tokio-tungstenite", "tokio"]
 serde = ["dep:serde", "paho-mqtt-codec/serde", "bytes/serde"]
+
+# Internal: set by both backends so that examples and tests which need *some*
+# runtime can say `required-features = ["_runtime"]`. `required-features` is an
+# AND list, so it cannot ask for "tokio or smol" itself. Do not enable it
+# directly; without a backend it is a compile error.
+_runtime = []
 
 [dependencies]
 paho-mqtt-codec = { version = "0.1", path = "paho-mqtt-codec" }
@@ -97,3 +103,79 @@ required-features = ["smol"]
 [[example]]
 name = "smol_math_cli"
 required-features = ["smol"]
+
+[[example]]
+name = "async_persist_publish"
+required-features = ["_runtime"]
+
+[[example]]
+name = "async_publish"
+required-features = ["_runtime"]
+
+[[example]]
+name = "async_publish_time"
+required-features = ["_runtime"]
+
+[[example]]
+name = "async_subscribe"
+required-features = ["_runtime"]
+
+[[example]]
+name = "async_subscribe_v5"
+required-features = ["_runtime"]
+
+[[example]]
+name = "dyn_subscribe"
+required-features = ["_runtime"]
+
+[[example]]
+name = "event_subscribe_v5"
+required-features = ["_runtime"]
+
+[[example]]
+name = "legacy_async_publish"
+required-features = ["_runtime"]
+
+[[example]]
+name = "legacy_async_subscribe"
+required-features = ["_runtime"]
+
+[[example]]
+name = "mqttrs_chat"
+required-features = ["_runtime"]
+
+[[example]]
+name = "rpc_math_cli"
+required-features = ["_runtime"]
+
+[[example]]
+name = "rpc_math_srvr"
+required-features = ["_runtime"]
+
+[[example]]
+name = "sync_consume"
+required-features = ["_runtime"]
+
+[[example]]
+name = "sync_consume_v5"
+required-features = ["_runtime"]
+
+[[example]]
+name = "sync_publish"
+required-features = ["_runtime"]
+
+[[example]]
+name = "tls_publish"
+required-features = ["_runtime"]
+
+[[example]]
+name = "topic_alias_publish"
+required-features = ["_runtime"]
+
+[[example]]
+name = "topic_publish"
+required-features = ["_runtime"]
+
+[[example]]
+name = "ws_publish"
+required-features = ["_runtime"]

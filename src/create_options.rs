@@ -20,10 +20,9 @@
  *    Frank Pagliughi - initial implementation and documentation
  *******************************************************************************/
 
-use crate::{
-    AsyncClient, Client, ClientPersistence, MqttVersion, PersistenceType, Result, UserData,
-    UserPersistence,
-};
+#[cfg(any(feature = "tokio", feature = "smol"))]
+use crate::{AsyncClient, Client, Result};
+use crate::{ClientPersistence, MqttVersion, PersistenceType, UserData, UserPersistence};
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 use std::cmp;
@@ -329,6 +328,7 @@ impl From<CreateOptionsBuilder> for CreateOptions {
 ///     .client_id("client1")
 ///     .finalize();
 ///
+/// # #[cfg(any(feature = "tokio", feature = "smol"))]
 /// let cli = mqtt::AsyncClient::new(opts).unwrap();
 /// ```
 #[derive(Debug, Default)]
@@ -523,11 +523,17 @@ impl CreateOptionsBuilder {
     }
 
     /// Finalize the builder and create an asynchronous client.
+    ///
+    /// Needs a runtime feature (`tokio` or `smol`) to drive the client.
+    #[cfg(any(feature = "tokio", feature = "smol"))]
     pub fn create_async_client(self) -> Result<AsyncClient> {
         AsyncClient::new(self.finalize())
     }
 
     /// Finalize the builder and create a synchronous client.
+    ///
+    /// Needs a runtime feature (`tokio` or `smol`) to drive the client.
+    #[cfg(any(feature = "tokio", feature = "smol"))]
     pub fn create_client(self) -> Result<Client> {
         Client::new(self.finalize())
     }

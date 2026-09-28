@@ -93,7 +93,10 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo doc --workspace --no-deps --all-features
+      # Not --all-features: that would enable both runtime backends, which is
+      # a compile error. One pass per backend instead.
+      - run: cargo doc --workspace --no-deps --features tokio,tls,websocket,serde
+      - run: cargo doc --workspace --no-deps --no-default-features --features smol,smol-tls,smol-websocket,serde
 
   test:
     name: Rust Unit Tests
@@ -171,6 +174,38 @@ jobs:
       - name: Mosquitto log
         if: failure()
         run: cat mosquitto.log
+
+  no-runtime:
+    name: Rust No-Runtime Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      # No backend means no client, but everything that does not need one
+      # must still build: the codec re-exports, messages, properties, topic
+      # matching, tokens, the response and options types, persistence.
+      - name: Build check (no runtime)
+        run: cargo check --no-default-features --all-targets
+
+      - name: Build check (no runtime + serde)
+        run: cargo check --no-default-features --features serde --all-targets
+
+      - name: Unit tests (no runtime)
+        run: cargo test --no-default-features --no-fail-fast
+
+      - name: Clippy lints (no runtime)
+        run: cargo clippy --no-deps --all-targets --no-default-features -- -D warnings
+
+      # Two backends at once must be refused rather than silently picking one.
+      - name: Both backends is a compile error
+        run: |
+          if cargo check --no-default-features --features tokio,smol 2>/dev/null; then
+            echo "expected tokio + smol to fail the build"
+            exit 1
+          fi
 
   codec-no-std:
     name: Codec no_std Tests

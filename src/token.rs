@@ -33,6 +33,7 @@
 //! ```no_run
 //! use paho_mqtt as mqtt;
 //!
+//! # #[cfg(any(feature = "tokio", feature = "smol"))]
 //! # async fn run() -> mqtt::Result<()> {
 //! let cli = mqtt::AsyncClient::new("mqtt://localhost:1883").unwrap();
 //!

@@ -121,6 +121,10 @@ Default: `tokio`.
 | `websocket` | WebSocket transport; implies `tokio` |
 | `serde` | `Serialize`/`Deserialize` for `Message`, the response types, the options types, and the codec's data types (properties, reason codes, QoS, versions) |
 
+Exactly one backend at a time: enabling both `tokio` and `smol` is a compile error, since an application could not tell which runtime it was talking to.
+
+With `--no-default-features` there is no backend and so no client: `AsyncClient`, `Client`, `Topic` and `SyncTopic` are absent, along with `CreateOptionsBuilder::create_async_client`. Everything that does not need a client remains — the codec types, `Message`, `Properties`, `TopicMatcher`, `TopicFilter`, `Token`, the response and options types, persistence and `Error` — which is the build for a tool that handles MQTT data without connecting, or a crate that reads and writes client configuration for an application that links the runtime itself.
+
 ### Smol backend
 
 | Feature | Description |

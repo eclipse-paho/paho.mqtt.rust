@@ -220,10 +220,11 @@ impl From<Box<dyn ClientPersistence>> for UserPersistence {
 /// ```
 /// use paho_mqtt as mqtt;
 ///
-/// let cli = mqtt::CreateOptionsBuilder::new()
+/// let opts = mqtt::CreateOptionsBuilder::new()
 ///     .server_uri("tcp://localhost:1883")
-///     .persistence(mqtt::MemPersistence::new())
-///     .create_async_client();
+///     .persistence(mqtt::MemPersistence::new());
+/// # #[cfg(any(feature = "tokio", feature = "smol"))]
+/// let cli = opts.create_async_client();
 /// ```
 #[derive(Debug, Default)]
 pub struct MemPersistence {

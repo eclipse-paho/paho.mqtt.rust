@@ -43,10 +43,13 @@
 //! use paho_mqtt as mqtt;
 //!
 //! # fn main() -> mqtt::Result<()> {
+//! # #[cfg(any(feature = "tokio", feature = "smol"))]
+//! # {
 //! let cli = mqtt::Client::new("mqtt://localhost:1883")?;
 //! cli.connect(None)?;
 //! cli.publish(mqtt::Message::new("test", "Hello world!", mqtt::QOS_1))?;
 //! cli.disconnect(None)?;
+//! # }
 //! # Ok(())
 //! # }
 //! ```
@@ -61,6 +64,7 @@
 //!
 //! ```no_run
 //! # use paho_mqtt as mqtt;
+//! # #[cfg(any(feature = "tokio", feature = "smol"))]
 //! # fn f(cli: &mqtt::AsyncClient, msg: mqtt::Message) -> mqtt::Result<()> {
 //! let tok = cli.publish(msg);   // already on its way
 //! // ... other work ...
@@ -114,7 +118,24 @@
 //! | `smol-websocket` | WebSocket transport; implies `smol` |
 //! | `serde` | `Serialize`/`Deserialize` for [`Message`], the response and options types, and the codec's data types |
 //!
-//! With both `tokio` and `smol` enabled, tokio wins. OpenSSL is tokio-only.
+//! Exactly one backend at a time: enabling both `tokio` and `smol` is a
+//! compile error, since an application could not tell which runtime it was
+//! talking to. OpenSSL is tokio-only.
+//!
+//! ## Building with no runtime
+//!
+//! `--no-default-features` builds the crate without a backend, and so
+//! without a client: [`AsyncClient`], [`Client`], [`Topic`] and [`SyncTopic`]
+//! are absent, as is [`CreateOptionsBuilder::create_async_client`] and its
+//! blocking counterpart. Everything that does not need one remains — the
+//! codec and its types through this crate's re-exports, [`Message`],
+//! [`Properties`], [`TopicMatcher`], [`TopicFilter`], [`Token`], the response
+//! types, the options types and their builders, persistence, and [`Error`].
+//!
+//! That is the build for code that handles MQTT data without connecting:
+//! a codec-level tool, a library of shared message types, or a configuration
+//! crate that reads and writes [`ConnectOptions`] (with `serde`) for an
+//! application that links a runtime elsewhere.
 //!
 //! # MQTT v5
 //!
@@ -138,7 +159,29 @@
 //! the target `paho_mqtt`.
 
 #![deny(missing_docs)]
+// Without a runtime feature there is no client and no event loop, so the
+// plumbing they would drive — completers, the authentication handler's
+// innards — has no caller inside the crate. It stays as it is, rather than
+// being cfg-ed away piece by piece and changing shape between builds.
+#![cfg_attr(not(any(feature = "tokio", feature = "smol")), allow(dead_code))]
 
+// One backend at a time: the client would otherwise be driven by a runtime
+// the application did not choose, with no way to tell which from the API.
+// `_runtime` only marks that one of them is present, for the sake of Cargo's
+// `required-features`, which cannot say "tokio or smol" itself.
+#[cfg(all(feature = "_runtime", not(any(feature = "tokio", feature = "smol"))))]
+compile_error!(
+    "`_runtime` is internal and marks that a backend is present — enable `tokio` or `smol` instead"
+);
+
+#[cfg(all(feature = "tokio", feature = "smol"))]
+compile_error!(
+    "the `tokio` and `smol` features are mutually exclusive — enable exactly one \
+     (note that `tls`, `openssl` and `websocket` imply `tokio`, while `smol-tls` \
+     and `smol-websocket` imply `smol`)"
+);
+
+#[cfg(any(feature = "tokio", feature = "smol"))]
 #[macro_use]
 extern crate log;
 
@@ -154,18 +197,23 @@ pub use paho_mqtt_codec::{
     MQTT_VERSION_DEFAULT, MqttVersion, QOS_0, QOS_1, QOS_2, QoS, ReasonCode, topic as topic_rules,
 };
 
-/// The asynchronous API
+/// MQTT v5 enhanced authentication
 pub mod auth;
 pub use crate::auth::{AuthCallback, AuthChallenge, AuthHandler};
 
+/// The asynchronous API
+#[cfg(any(feature = "tokio", feature = "smol"))]
 pub mod async_client;
+#[cfg(any(feature = "tokio", feature = "smol"))]
 pub use crate::async_client::{
     AsyncClient, ConnectedCallback, ConnectionLostCallback, DisconnectedCallback,
     MessageArrivedCallback, TlsErrorCallback,
 };
 
 /// The synchronous API
+#[cfg(any(feature = "tokio", feature = "smol"))]
 pub mod client;
+#[cfg(any(feature = "tokio", feature = "smol"))]
 pub use crate::client::Client;
 
 pub use crate::{
@@ -190,9 +238,12 @@ pub use crate::{
         ConnectToken, DeliveryToken, SubscribeManyToken, SubscribeToken, Token,
         UnsubscribeManyToken, UnsubscribeToken,
     },
-    topic::{SyncTopic, Topic, TopicFilter, is_topic_filter_valid},
+    topic::{TopicFilter, is_topic_filter_valid},
     topic_matcher::TopicMatcher,
 };
+
+#[cfg(any(feature = "tokio", feature = "smol"))]
+pub use crate::topic::{SyncTopic, Topic};
 
 use std::any::Any;
 
@@ -242,6 +293,7 @@ pub mod error;
 pub mod event;
 
 /// Internal async runtime and transport abstractions.
+#[cfg(any(feature = "tokio", feature = "smol"))]
 mod runtime;
 
 // --------------------------------------------------------------------------

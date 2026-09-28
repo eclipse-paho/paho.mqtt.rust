@@ -29,7 +29,9 @@
 //! API and the event loop.
 //!
 //! The `tokio` feature (default) selects the tokio backend; the `smol`
-//! feature selects the smol backend.  When both are enabled, tokio wins.
+//! feature selects the smol backend.  Exactly one of them is present:
+//! enabling both is a `compile_error!` in the crate root, so a gate here
+//! need only name its own backend.
 
 #[cfg(any(feature = "tokio", feature = "smol"))]
 pub(crate) mod commands;
@@ -58,10 +60,10 @@ pub(crate) mod tokio_conn;
 #[cfg(feature = "tokio")]
 pub(crate) mod tokio_rt;
 
-#[cfg(all(feature = "smol", not(feature = "tokio")))]
+#[cfg(feature = "smol")]
 pub(crate) mod smol_conn;
 
-#[cfg(all(feature = "smol", not(feature = "tokio")))]
+#[cfg(feature = "smol")]
 pub(crate) mod smol_rt;
 
 #[cfg(any(feature = "tokio", feature = "smol"))]
@@ -73,7 +75,7 @@ pub(crate) use session::RuntimeHandle;
 #[cfg(feature = "tokio")]
 pub(crate) use tokio_rt::resolve_runtime;
 
-#[cfg(all(feature = "smol", not(feature = "tokio")))]
+#[cfg(feature = "smol")]
 pub(crate) use smol_rt::{SmolOwnership, resolve_executor};
 
 /// Unified runtime-ownership type for the active backend.
@@ -81,5 +83,5 @@ pub(crate) use smol_rt::{SmolOwnership, resolve_executor};
 pub(crate) type RtOwnership = tokio_rt::RuntimeOwnership;
 
 /// Unified runtime-ownership type for the active backend.
-#[cfg(all(feature = "smol", not(feature = "tokio")))]
+#[cfg(feature = "smol")]
 pub(crate) type RtOwnership = smol_rt::SmolOwnership;

@@ -19,12 +19,14 @@
  *    Frank Pagliughi - initial implementation and documentation
  *******************************************************************************/
 
+#[cfg(any(feature = "tokio", feature = "smol"))]
+use std::sync::Arc;
 use std::{
     fmt,
     path::{Path, PathBuf},
-    sync::Arc,
 };
 
+#[cfg(any(feature = "tokio", feature = "smol"))]
 use crate::{AsyncClient, TlsErrorCallback};
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
@@ -92,7 +94,11 @@ pub struct TlsOptions {
     ///
     /// Skipped by `serde`: a callback is code, not configuration, so it is
     /// absent from a deserialized value and must be set again.
+    ///
+    /// Present only with a runtime feature (`tokio` or `smol`), the callback
+    /// taking the client that failed to connect.
     #[cfg_attr(feature = "serde", serde(skip))]
+    #[cfg(any(feature = "tokio", feature = "smol"))]
     pub on_tls_error: Option<Arc<TlsErrorCallback>>,
 
     /// Don't load the default TLS CA certificates.
@@ -132,6 +138,7 @@ impl Default for TlsOptions {
             version: TlsVersion::Default,
             verify: true,
             ca_path: PathBuf::new(),
+            #[cfg(any(feature = "tokio", feature = "smol"))]
             on_tls_error: None,
             disable_default_trust_store: false,
             protos: Vec::new(),
@@ -279,6 +286,10 @@ impl TlsOptionsBuilder {
     }
 
     /// Sets the TLS error callback.
+    ///
+    /// Available with a runtime feature (`tokio` or `smol`), the callback
+    /// taking the client that failed to connect.
+    #[cfg(any(feature = "tokio", feature = "smol"))]
     pub fn error_callback<F>(&mut self, cb: F) -> &mut Self
     where
         F: Fn(&AsyncClient, &str) + Send + Sync + 'static,
@@ -377,6 +388,7 @@ mod tests {
         assert!(opts.enabled_cipher_suites.is_empty());
         assert_eq!(opts.version, TlsVersion::Default);
         assert_eq!(opts.ca_path, PathBuf::new());
+        #[cfg(any(feature = "tokio", feature = "smol"))]
         assert!(opts.on_tls_error.is_none());
         assert!(!opts.disable_default_trust_store);
         assert!(opts.protos.is_empty());
@@ -387,14 +399,17 @@ mod tests {
     #[cfg(feature = "serde")]
     #[test]
     fn test_serde_round_trip() {
-        let opts = TlsOptionsBuilder::new()
+        let mut builder = TlsOptionsBuilder::new();
+        builder
             .trust_store("/ca.crt")
             .key_store("/client.pem")
             .enable_server_cert_auth(true)
             .verify(false)
-            .alpn_protos(&["mqtt"])
-            .error_callback(|_, _| {})
-            .finalize();
+            .alpn_protos(&["mqtt"]);
+        #[cfg(any(feature = "tokio", feature = "smol"))]
+        builder.error_callback(|_, _| {});
+        let opts = builder.finalize();
+        #[cfg(any(feature = "tokio", feature = "smol"))]
         assert!(opts.on_tls_error.is_some());
 
         let back: TlsOptions =
@@ -404,6 +419,7 @@ mod tests {
         assert!(back.enable_server_cert_auth);
         assert!(!back.verify);
         assert_eq!(back.protos, vec!["mqtt".to_string()]);
+        #[cfg(any(feature = "tokio", feature = "smol"))]
         assert!(
             back.on_tls_error.is_none(),
             "a callback cannot be read back"
