@@ -118,7 +118,8 @@ impl ConnectOptions {
     }
 
     /// Creates a new, default set of connect options for connecting over
-    /// websockets.
+    /// websockets, which carry a longer keep-alive interval and, as
+    /// elsewhere, MQTT v5.
     pub fn new_ws() -> Self {
         Self {
             keep_alive_interval: DEFAULT_KEEP_ALIVE_INTERVAL_WS,
@@ -324,13 +325,20 @@ impl Default for ConnectOptions {
 pub struct ConnectOptionsBuilder(ConnectOptions);
 
 impl ConnectOptionsBuilder {
-    /// Creates a new `ConnectOptionsBuilder` for MQTT v3.x
+    /// Creates a new `ConnectOptionsBuilder` with the default options, which
+    /// are currently for MQTT v5.
+    ///
+    /// Use [`new_v3`](Self::new_v3) for a v3.1.1 connection. Unlike the v1.x
+    /// client, nothing later in the builder changes the version: it is chosen
+    /// here, or with [`with_mqtt_version`](Self::with_mqtt_version).
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Creates a new `ConnectOptionsBuilder` explicitly for MQTT v3.x
-    /// (although this is currently the default).
+    /// Creates a new `ConnectOptionsBuilder` for MQTT v3.1.1.
+    ///
+    /// The default is v5, so a v3 connection must say so — either here or
+    /// with [`with_mqtt_version`](Self::with_mqtt_version).
     pub fn new_v3() -> Self {
         Self(ConnectOptions::new_v3())
     }
@@ -340,7 +348,9 @@ impl ConnectOptionsBuilder {
         Self(ConnectOptions::new_v5())
     }
 
-    /// Creates a new `ConnectOptionsBuilder` for connecting over websockets.
+    /// Creates a new `ConnectOptionsBuilder` for connecting over websockets,
+    /// with the longer keep-alive interval those need and, by default, MQTT
+    /// v5. See [`new_ws_v3`](Self::new_ws_v3) for v3.1.1.
     pub fn new_ws() -> Self {
         Self(ConnectOptions::new_ws())
     }
@@ -385,8 +395,15 @@ impl ConnectOptionsBuilder {
 
     /// Sets the 'clean session' flag to send to the broker.
     ///
-    /// This is for MQTT v3.x connections only, and if set, will set the
-    /// other options to be compatible with v3.
+    /// This is v3's name for the flag that v5 calls 'clean start', and both
+    /// setters write the same field, so either spelling works on either
+    /// version. Unlike the v1.x client, **this does not change the protocol
+    /// version**: choose that with the constructor or
+    /// [`with_mqtt_version`](Self::with_mqtt_version).
+    ///
+    /// The two getters are version-filtered views of the one flag, so on a v5
+    /// connection [`ConnectOptions::clean_session`] reads `false` however the
+    /// flag was set, and on v3 [`ConnectOptions::clean_start`] does.
     ///
     /// # Arguments
     ///
@@ -399,8 +416,15 @@ impl ConnectOptionsBuilder {
 
     /// Sets the 'clean start' flag to send to the broker.
     ///
-    /// This is for MQTT v5 connections only, and if set, will set the
-    /// other options to be compatible with v5.
+    /// This is v5's name for the flag that v3 calls 'clean session', and both
+    /// setters write the same field, so either spelling works on either
+    /// version. Unlike the v1.x client, **this does not change the protocol
+    /// version**: choose that with the constructor or
+    /// [`with_mqtt_version`](Self::with_mqtt_version).
+    ///
+    /// On v5, a clean start alone does not keep the session from outliving
+    /// the connection; see [`ConnectOptions::clean_start`] for how it and the
+    /// Session Expiry Interval decide that together.
     ///
     /// # Arguments
     ///
@@ -583,6 +607,12 @@ impl ConnectOptionsBuilder {
     }
 
     /// Sets the collection of properties for the connections.
+    ///
+    /// Properties are MQTT v5 only, and — unlike the v1.x client — setting
+    /// them does not switch the options to v5. A non-empty collection on a v3
+    /// connection fails the connect token with
+    /// [`Error::WrongMqttVersion`] rather than
+    /// being dropped on the way to the broker.
     ///
     /// # Arguments
     ///
