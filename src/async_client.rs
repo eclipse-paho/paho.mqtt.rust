@@ -161,16 +161,26 @@ impl<F: ?Sized> Default for Slot<F> {
 }
 
 impl<F: ?Sized> Slot<F> {
-    /// Registers `cb`, replacing whatever was there.
-    fn set(&mut self, cb: Box<F>) {
+    /// Registers `cb`, replacing whatever was there, and returns the
+    /// generation that now identifies it.
+    fn set(&mut self, cb: Box<F>) -> u64 {
         self.cb = Some(cb);
         self.generation = self.generation.wrapping_add(1);
+        self.generation
     }
 
     /// Removes the callback, if any.
     fn clear(&mut self) {
         self.cb = None;
         self.generation = self.generation.wrapping_add(1);
+    }
+
+    /// Removes the callback only if the slot still holds the one identified
+    /// by `generation`, leaving anything the application put there since.
+    fn clear_if(&mut self, generation: u64) {
+        if self.generation == generation {
+            self.clear();
+        }
     }
 
     /// Takes the callback out to be run, with the generation to hand back to
@@ -188,12 +198,28 @@ impl<F: ?Sized> Slot<F> {
     }
 }
 
+/// The generations of the callbacks a message or event stream installed.
+///
+/// `stop_stream` closes a stream's channel by dropping the senders the stream
+/// put in the callback slots. It must drop *those* and nothing else: the
+/// application's own handlers are not the stream's to remove, and a callback
+/// the application has since replaced is no longer the stream's either.
+#[derive(Default)]
+struct StreamSlots {
+    connected: Option<u64>,
+    connection_lost: Option<u64>,
+    disconnected: Option<u64>,
+    message: Option<u64>,
+}
+
 #[derive(Default)]
 struct CallbackContext {
     on_connected: Slot<ConnectedCallback>,
     on_connection_lost: Slot<ConnectionLostCallback>,
     on_disconnected: Slot<DisconnectedCallback>,
     on_message_arrived: Slot<MessageArrivedCallback>,
+    /// What the current stream, if any, installed.
+    stream: StreamSlots,
 }
 
 /////////////////////////////////////////////////////////////////////////////
@@ -1218,6 +1244,7 @@ impl AsyncClient {
     /// it returns.
     pub fn remove_callbacks(&self) {
         let mut cbctx = self.inner.callback_context.lock().unwrap();
+        cbctx.stream = StreamSlots::default();
         cbctx.on_connected.clear();
         cbctx.on_connection_lost.clear();
         cbctx.on_disconnected.clear();
@@ -1231,7 +1258,7 @@ impl AsyncClient {
     pub fn start_consuming(&self) -> SyncReceiver<Option<Message>> {
         let (tx, rx) = sync_channel::unbounded();
 
-        self.set_message_callback(move |_, optmsg| {
+        self.set_stream_message_callback(move |_, optmsg| {
             log_channel_err(tx.try_send(optmsg));
         });
 
@@ -1258,14 +1285,14 @@ impl AsyncClient {
             None => sync_channel::unbounded(),
         };
 
-        self.set_connected_callback({
+        self.set_stream_connected_callback({
             let tx = tx.clone();
             move |_cli, rsp| {
                 log_channel_err(tx.try_send(Event::Connected(rsp.clone())));
             }
         });
 
-        self.set_message_callback({
+        self.set_stream_message_callback({
             let tx = tx.clone();
             move |_cli, msg| {
                 if let Some(msg) = msg {
@@ -1274,14 +1301,14 @@ impl AsyncClient {
             }
         });
 
-        self.set_connection_lost_callback({
+        self.set_stream_connection_lost_callback({
             let tx = tx.clone();
             move |_cli| {
                 log_channel_err(tx.try_send(Event::ConnectionLost));
             }
         });
 
-        self.set_disconnected_callback({
+        self.set_stream_disconnected_callback({
             let tx = tx.clone();
             move |_cli, props, reason_code| {
                 log_channel_err(tx.try_send(Event::Disconnected { props, reason_code }));
@@ -1289,6 +1316,43 @@ impl AsyncClient {
         });
 
         rx
+    }
+
+    // ---- Callback installation on behalf of a stream ----
+    //
+    // Each of these registers a sender-holding callback and records which
+    // callback the stream owns, so `stop_stream` can take back exactly those.
+
+    fn set_stream_connected_callback<F>(&self, cb: F)
+    where
+        F: FnMut(&AsyncClient, &crate::ConnectResponse) + Send + 'static,
+    {
+        let mut cbctx = self.inner.callback_context.lock().unwrap();
+        cbctx.stream.connected = Some(cbctx.on_connected.set(Box::new(cb)));
+    }
+
+    fn set_stream_connection_lost_callback<F>(&self, cb: F)
+    where
+        F: FnMut(&AsyncClient) + Send + 'static,
+    {
+        let mut cbctx = self.inner.callback_context.lock().unwrap();
+        cbctx.stream.connection_lost = Some(cbctx.on_connection_lost.set(Box::new(cb)));
+    }
+
+    fn set_stream_disconnected_callback<F>(&self, cb: F)
+    where
+        F: FnMut(&AsyncClient, Properties, ReasonCode) + Send + 'static,
+    {
+        let mut cbctx = self.inner.callback_context.lock().unwrap();
+        cbctx.stream.disconnected = Some(cbctx.on_disconnected.set(Box::new(cb)));
+    }
+
+    fn set_stream_message_callback<F>(&self, cb: F)
+    where
+        F: FnMut(&AsyncClient, Option<Message>) + Send + 'static,
+    {
+        let mut cbctx = self.inner.callback_context.lock().unwrap();
+        cbctx.stream.message = Some(cbctx.on_message_arrived.set(Box::new(cb)));
     }
 
     /// Creates an async message stream.
@@ -1304,7 +1368,7 @@ impl AsyncClient {
             None => async_channel::unbounded(),
         };
 
-        self.set_message_callback(move |_, msg| {
+        self.set_stream_message_callback(move |_, msg| {
             log_stream_err(tx.try_send(msg));
         });
 
@@ -1324,14 +1388,14 @@ impl AsyncClient {
             None => async_channel::unbounded(),
         };
 
-        self.set_connected_callback({
+        self.set_stream_connected_callback({
             let tx = tx.clone();
             move |_cli, rsp| {
                 log_stream_err(tx.try_send(Event::Connected(rsp.clone())));
             }
         });
 
-        self.set_message_callback({
+        self.set_stream_message_callback({
             let tx = tx.clone();
             move |_cli, msg| {
                 if let Some(msg) = msg {
@@ -1340,14 +1404,14 @@ impl AsyncClient {
             }
         });
 
-        self.set_connection_lost_callback({
+        self.set_stream_connection_lost_callback({
             let tx = tx.clone();
             move |_cli| {
                 log_stream_err(tx.try_send(Event::ConnectionLost));
             }
         });
 
-        self.set_disconnected_callback({
+        self.set_stream_disconnected_callback({
             let tx = tx.clone();
             move |_cli, props, reason_code| {
                 log_stream_err(tx.try_send(Event::Disconnected { props, reason_code }));
@@ -1357,17 +1421,40 @@ impl AsyncClient {
         rx
     }
 
-    /// Stops the event stream created by [`get_event_stream`] or
-    /// [`start_consuming_events`], closing the channel.
+    /// Stops the stream created by [`get_stream`], [`get_event_stream`],
+    /// [`start_consuming`] or [`start_consuming_events`], closing its channel.
     ///
-    /// Removes all registered callbacks atomically, dropping the last
-    /// channel-sender clones and allowing the receiver to observe channel
-    /// closure.
+    /// Removes the callbacks that stream installed, dropping the last
+    /// channel-sender clones so the receiver observes the channel closing. A
+    /// message stream holds one callback and an event stream four, so this
+    /// removes one or four accordingly.
     ///
+    /// Callbacks the application registered itself are left alone, as is a
+    /// callback the application has replaced since the stream started — the
+    /// stream no longer owns that slot. Use [`remove_callbacks`] to clear
+    /// everything.
+    ///
+    /// [`get_stream`]: AsyncClient::get_stream
     /// [`get_event_stream`]: AsyncClient::get_event_stream
+    /// [`start_consuming`]: AsyncClient::start_consuming
     /// [`start_consuming_events`]: AsyncClient::start_consuming_events
+    /// [`remove_callbacks`]: AsyncClient::remove_callbacks
     pub fn stop_stream(&self) {
-        self.remove_callbacks();
+        let mut cbctx = self.inner.callback_context.lock().unwrap();
+        let stream = std::mem::take(&mut cbctx.stream);
+
+        if let Some(generation) = stream.connected {
+            cbctx.on_connected.clear_if(generation);
+        }
+        if let Some(generation) = stream.connection_lost {
+            cbctx.on_connection_lost.clear_if(generation);
+        }
+        if let Some(generation) = stream.disconnected {
+            cbctx.on_disconnected.clear_if(generation);
+        }
+        if let Some(generation) = stream.message {
+            cbctx.on_message_arrived.clear_if(generation);
+        }
     }
 
     /// Returns the client ID used for the client instance.
@@ -2019,5 +2106,130 @@ mod tests {
     fn test_publish_error_displays_the_cause() {
         let err = Error::Publish(Box::new(Error::Disconnected), Box::new(marked_message()));
         assert_eq!(err.to_string(), Error::Disconnected.to_string());
+    }
+
+    // ----------------------------------------------------------------------
+    // stop_stream removes the stream's callbacks, and only those
+    // ----------------------------------------------------------------------
+
+    /// Registers one counting callback in each of the four slots and returns
+    /// the counters, in the order connected, lost, disconnected, message.
+    fn count_all_callbacks(cli: &AsyncClient) -> [Arc<Mutex<u32>>; 4] {
+        let counts: [Arc<Mutex<u32>>; 4] = [counter(), counter(), counter(), counter()];
+
+        let c = counts[0].clone();
+        cli.set_connected_callback(move |_, _| *c.lock().unwrap() += 1);
+        let c = counts[1].clone();
+        cli.set_connection_lost_callback(move |_| *c.lock().unwrap() += 1);
+        let c = counts[2].clone();
+        cli.set_disconnected_callback(move |_, _, _| *c.lock().unwrap() += 1);
+        let c = counts[3].clone();
+        cli.set_message_callback(move |_, _| *c.lock().unwrap() += 1);
+        counts
+    }
+
+    /// Dispatches one of each event the callbacks answer. Note that a lost
+    /// connection calls the message callback too, with `None`, so a message
+    /// callback that is still registered sees two calls in all.
+    fn dispatch_one_of_each(cli: &AsyncClient) {
+        use crate::runtime::Event as Ev;
+        cli.dispatch_event(Ev::Connected(crate::ConnectResponse::default()));
+        cli.dispatch_event(Ev::Disconnected {
+            reason_code: ReasonCode::NormalDisconnection,
+            props: Properties::new(),
+        });
+        cli.dispatch_event(Ev::MessageArrived(Message::new("t", "p", crate::QOS_0)));
+        // Last: it clears the connected flag and calls two callbacks.
+        cli.dispatch_event(Ev::ConnectionLost(Error::Disconnected));
+    }
+
+    /// A message stream owns one callback, so stopping it must not take the
+    /// application's connection handlers with it. `stop_stream` used to call
+    /// `remove_callbacks()`, which removed all four.
+    #[test]
+    fn test_stop_stream_keeps_the_applications_callbacks() {
+        let mut cli = test_client();
+        let counts = count_all_callbacks(&cli);
+        let _rx = cli.get_stream(10);
+
+        cli.stop_stream();
+        dispatch_one_of_each(&cli);
+
+        assert_eq!(*counts[0].lock().unwrap(), 1, "connected");
+        assert_eq!(*counts[1].lock().unwrap(), 1, "connection lost");
+        assert_eq!(*counts[2].lock().unwrap(), 1, "disconnected");
+        assert_eq!(
+            *counts[3].lock().unwrap(),
+            0,
+            "the stream replaced the message callback and then removed it"
+        );
+    }
+
+    /// An event stream owns all four, so stopping it drops every sender and
+    /// the receiver sees the channel close.
+    #[test]
+    fn test_stop_stream_closes_an_event_stream() {
+        let cli = test_client();
+        let rx = cli.get_event_stream(10);
+        assert!(!rx.is_closed());
+
+        cli.stop_stream();
+        assert!(rx.is_closed(), "senders still held in the callback slots");
+
+        dispatch_one_of_each(&cli);
+        assert!(rx.try_recv().is_err(), "the stream is still fed");
+    }
+
+    /// A callback the application installed *after* starting a stream is not
+    /// the stream's to remove.
+    #[test]
+    fn test_stop_stream_leaves_a_replaced_callback_alone() {
+        let mut cli = test_client();
+        let _rx = cli.get_stream(10);
+
+        let calls = counter();
+        let c = calls.clone();
+        cli.set_message_callback(move |_, _| *c.lock().unwrap() += 1);
+
+        cli.stop_stream();
+        cli.dispatch_event(crate::runtime::Event::MessageArrived(Message::new(
+            "t",
+            "p",
+            crate::QOS_0,
+        )));
+        assert_eq!(*calls.lock().unwrap(), 1, "the replacement was removed");
+    }
+
+    /// With no stream at all there is nothing to remove.
+    #[test]
+    fn test_stop_stream_without_a_stream_removes_nothing() {
+        let cli = test_client();
+        let counts = count_all_callbacks(&cli);
+
+        cli.stop_stream();
+        dispatch_one_of_each(&cli);
+
+        assert_eq!(*counts[0].lock().unwrap(), 1, "connected");
+        assert_eq!(*counts[1].lock().unwrap(), 1, "connection lost");
+        assert_eq!(*counts[2].lock().unwrap(), 1, "disconnected");
+        // Twice: the arriving message, and the `None` that a lost connection
+        // sends to mark the end of the message stream.
+        assert_eq!(*counts[3].lock().unwrap(), 2, "message");
+    }
+
+    /// `remove_callbacks` still clears everything, stream or not.
+    #[test]
+    fn test_remove_callbacks_clears_a_stream_too() {
+        let cli = test_client();
+        let counts = count_all_callbacks(&cli);
+        let rx = cli.get_event_stream(10);
+
+        cli.remove_callbacks();
+        assert!(rx.is_closed());
+        dispatch_one_of_each(&cli);
+
+        for (i, count) in counts.iter().enumerate() {
+            assert_eq!(*count.lock().unwrap(), 0, "callback {i}");
+        }
     }
 }

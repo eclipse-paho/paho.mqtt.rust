@@ -495,7 +495,10 @@ impl Client {
         self.cli.remove_callbacks();
     }
 
-    /// Stops the event stream, closing the channel.
+    /// Stops a message or event stream, closing its channel.
+    ///
+    /// Removes only the callbacks that stream installed; the application's own
+    /// handlers keep firing. See [`AsyncClient::stop_stream`].
     pub fn stop_stream(&self) {
         self.cli.stop_stream();
     }
