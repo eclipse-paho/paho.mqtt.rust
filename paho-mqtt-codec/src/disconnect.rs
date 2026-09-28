@@ -211,6 +211,43 @@ mod tests {
         );
     }
 
+    // ---- the shorthand form's invalid cousins ----
+
+    /// An empty DISCONNECT body, and a one-byte body, are the shorthands. A
+    /// body that goes on must then be consistent: a property length longer
+    /// than what follows it, a truncated or non-minimal length, or a byte past
+    /// the properties are each rejected.
+    #[test]
+    fn test_disconnect_v5_decode_rejects_bad_property_length() {
+        let cases: [(&[u8], Error); 4] = [
+            // Property length claims 5 bytes with nothing after it.
+            (&[0x00, 0x05], Error::PacketTooShort),
+            // The length is a continuation byte with no successor.
+            (&[0x00, 0x80], Error::PacketTooShort),
+            // Non-minimal encoding of zero.
+            (&[0x00, 0x80, 0x00], Error::MalformedVarLen),
+            // Honest length of zero, then a byte that cannot be there.
+            (&[0x00, 0x00, 0xFF], Error::MalformedPacket),
+        ];
+        for (payload, err) in cases {
+            assert_eq!(
+                Disconnect::decode(Bytes::copy_from_slice(payload), v5()),
+                Err(err),
+                "{payload:02X?}"
+            );
+        }
+    }
+
+    /// An explicit property length of zero is the long spelling of the
+    /// one-byte shorthand and yields the same packet.
+    #[test]
+    fn test_disconnect_v5_decode_explicit_empty_properties_matches_shorthand() {
+        let short = Disconnect::decode(Bytes::from_static(&[0x00]), v5()).unwrap();
+        let long = Disconnect::decode(Bytes::from_static(&[0x00, 0x00]), v5()).unwrap();
+        assert_eq!(short, long);
+        assert_eq!(short, Disconnect::new());
+    }
+
     // ---- v3.1.1 ----
 
     #[test]

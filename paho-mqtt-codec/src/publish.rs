@@ -1162,6 +1162,58 @@ mod tests {
         );
     }
 
+    // ---- the shorthand forms' invalid cousins ----
+
+    /// The v5 shorthands end the packet early; a body that *starts* one but
+    /// then disagrees with itself must be rejected. A property length longer
+    /// than what follows, a truncated or non-minimal length, a stray byte past
+    /// the end, and a property truncated inside an honest length are each an
+    /// error, and each the error the specification's classification implies.
+    #[test]
+    fn test_puback_v5_decode_rejects_bad_property_length() {
+        let cases: [(&[u8], Error); 5] = [
+            // Property length claims 5 bytes with nothing after it.
+            (&[0x00, 0x01, 0x10, 0x05], Error::PacketTooShort),
+            // The length is a continuation byte with no successor.
+            (&[0x00, 0x01, 0x10, 0x80], Error::PacketTooShort),
+            // Non-minimal encoding of zero.
+            (&[0x00, 0x01, 0x10, 0x80, 0x00], Error::MalformedVarLen),
+            // Honest length of zero, then a byte that cannot be there.
+            (&[0x00, 0x01, 0x10, 0x00, 0xFF], Error::MalformedPacket),
+            // Honest length of 2, but the ReasonString inside needs more.
+            (&[0x00, 0x01, 0x10, 0x02, 0x1F, 0x00], Error::PacketTooShort),
+        ];
+        for (payload, err) in cases {
+            assert_eq!(
+                PubAck::decode(Bytes::copy_from_slice(payload), v5()),
+                Err(err),
+                "{payload:02X?}"
+            );
+        }
+    }
+
+    /// An explicit property length of zero is the long spelling of the
+    /// three-byte shorthand and yields the same packet.
+    #[test]
+    fn test_puback_v5_decode_explicit_empty_properties_matches_shorthand() {
+        let short = PubAck::decode(Bytes::from_static(&[0x00, 0x01, 0x10]), v5()).unwrap();
+        let long = PubAck::decode(Bytes::from_static(&[0x00, 0x01, 0x10, 0x00]), v5()).unwrap();
+        assert_eq!(short, long);
+    }
+
+    /// v3 has neither a reason code nor properties, so anything past the
+    /// packet identifier is malformed however legal it would be on v5.
+    #[test]
+    fn test_puback_v3_decode_rejects_anything_past_the_packet_id() {
+        for payload in [&[0x00, 0x01, 0x10][..], &[0x00, 0x01, 0x10, 0x00][..]] {
+            assert_eq!(
+                PubAck::decode(Bytes::copy_from_slice(payload), v311()),
+                Err(Error::MalformedPacket),
+                "{payload:02X?}"
+            );
+        }
+    }
+
     // ---- v3 acknowledgements cannot carry properties ----
 
     #[test]

@@ -1131,6 +1131,60 @@ mod tests {
         );
     }
 
+    // ---- shorthand acks: the invalid cousins, framed ----
+
+    /// Off the wire the property length is checked against the frame, not
+    /// against the rest of the buffer: a remaining length that stops early
+    /// while the property length says there is more must be rejected for every
+    /// packet that has, or is near, a v5 shorthand form. Whether the packet
+    /// has a shorthand only decides *where* the body may legally end.
+    #[test]
+    fn test_from_raw_rejects_property_length_past_the_frame() {
+        use PacketType as T;
+        // Each body's last byte is a property length of 5 with nothing after.
+        let cases: [(PacketType, &[u8]); 7] = [
+            (T::PubAck, &[0x00, 0x01, 0x00, 0x05]),
+            (T::PubRec, &[0x00, 0x01, 0x00, 0x05]),
+            (T::PubRel, &[0x00, 0x01, 0x00, 0x05]),
+            (T::PubComp, &[0x00, 0x01, 0x00, 0x05]),
+            (T::Disconnect, &[0x00, 0x05]),
+            (T::SubAck, &[0x00, 0x01, 0x05]),
+            (T::UnsubAck, &[0x00, 0x01, 0x05]),
+        ];
+        for (ty, body) in cases {
+            assert_eq!(
+                parse(ty.header_byte(), body, v5()),
+                Err(Error::PacketTooShort),
+                "{ty:?}"
+            );
+        }
+        // AUTH, which has no shorthand at all, fails the same way.
+        assert_eq!(
+            parse(T::Auth.header_byte(), &[0x18, 0x05], v5()),
+            Err(Error::PacketTooShort)
+        );
+    }
+
+    /// A frame one byte longer than the properties it declares: the trailing
+    /// byte is inside the remaining length, so only the packet parser can
+    /// catch it.
+    #[test]
+    fn test_from_raw_rejects_a_byte_past_the_properties() {
+        use PacketType as T;
+        let cases: [(PacketType, &[u8]); 3] = [
+            (T::PubAck, &[0x00, 0x01, 0x00, 0x00, 0xFF]),
+            (T::Disconnect, &[0x00, 0x00, 0xFF]),
+            (T::PubRel, &[0x00, 0x01, 0x00, 0x00, 0xFF]),
+        ];
+        for (ty, body) in cases {
+            assert_eq!(
+                parse(ty.header_byte(), body, v5()),
+                Err(Error::MalformedPacket),
+                "{ty:?}"
+            );
+        }
+    }
+
     #[test]
     fn test_encode_packet_id_zero_is_protocol_error_in_every_packet() {
         let mut publish = Publish::new("a", "x");

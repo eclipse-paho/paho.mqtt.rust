@@ -197,6 +197,33 @@ mod tests {
         );
     }
 
+    /// The property length must agree with what follows it: one claiming more
+    /// bytes than the body holds, a truncated or non-minimal length, and a
+    /// byte past the properties are each rejected.
+    #[test]
+    fn test_auth_decode_rejects_bad_property_length() {
+        let cases: [(&[u8], Error); 4] = [
+            // Property length claims 5 bytes with nothing after it.
+            (&[0x18, 0x05], Error::PacketTooShort),
+            // The length is a continuation byte with no successor.
+            (&[0x18, 0x80], Error::PacketTooShort),
+            // Non-minimal encoding of zero.
+            (&[0x18, 0x80, 0x00], Error::MalformedVarLen),
+            // The method is complete, then a byte that cannot be there.
+            (
+                &[0x18, 0x04, 0x15, 0x00, 0x01, b'x', 0xFF],
+                Error::MalformedPacket,
+            ),
+        ];
+        for (payload, err) in cases {
+            assert_eq!(
+                Auth::decode(Bytes::copy_from_slice(payload)),
+                Err(err),
+                "{payload:02X?}"
+            );
+        }
+    }
+
     #[test]
     fn test_auth_decode_unknown_reason_code_errors() {
         assert_eq!(

@@ -540,6 +540,32 @@ mod tests {
         );
     }
 
+    // ---- no shorthand on v5: the property length is mandatory ----
+
+    /// UNSUBACK has no shorthand form on v5: the property length is always
+    /// present, so a body of just the packet identifier is too short, and a
+    /// length that disagrees with what follows is rejected as elsewhere.
+    #[test]
+    fn test_unsuback_v5_decode_rejects_bad_property_length() {
+        let cases: [(&[u8], Error); 4] = [
+            // Packet identifier alone: the property length is missing.
+            (&[0x00, 0x01], Error::PacketTooShort),
+            // Property length claims 5 bytes with nothing after it.
+            (&[0x00, 0x01, 0x05], Error::PacketTooShort),
+            // The length is a continuation byte with no successor.
+            (&[0x00, 0x01, 0x80], Error::PacketTooShort),
+            // Non-minimal encoding of zero.
+            (&[0x00, 0x01, 0x80, 0x00, 0x00], Error::MalformedVarLen),
+        ];
+        for (payload, err) in cases {
+            assert_eq!(
+                UnsubAck::decode(Bytes::copy_from_slice(payload), v5()),
+                Err(err),
+                "{payload:02X?}"
+            );
+        }
+    }
+
     // ---- Empty lists are rejected on encode as they are on decode ----
 
     #[test]
