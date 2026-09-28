@@ -3,7 +3,7 @@
 // This file is part of the Eclipse Paho MQTT Rust Client library.
 
 /*******************************************************************************
- * Copyright (c) 2024-2026 Frank Pagliughi <fpagliughi@mindspring.com>
+ * Copyright (c) 2026 Frank Pagliughi <fpagliughi@mindspring.com>
  *
  * All rights reserved. This program and the accompanying materials
  * are made available under the terms of the Eclipse Public License v2.0
@@ -22,8 +22,8 @@
 //!
 //! Provides transport implementations of the shared [`Connection`] trait:
 //! `TcpConnection`, `UnixConnection`, `TlsConnection` (`tls`),
-//! `OpenSslConnection` (`openssl`), and `WsConnection` (`websocket`). The TLS and WebSocket
-//! configuration helpers they use live in `super::tls_config` and
+//! `OpenSslConnection` (`openssl`), and `WsConnection` (`websocket`). The TLS
+//! and WebSocket configuration helpers they use live in `super::tls_config` and
 //! `super::ws_util`.
 
 use std::{
