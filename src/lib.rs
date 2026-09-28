@@ -112,7 +112,7 @@
 //! | `smol` | Smol-based internal runtime |
 //! | `smol-tls` | TLS via rustls; implies `smol` |
 //! | `smol-websocket` | WebSocket transport; implies `smol` |
-//! | `serde` | `Serialize`/`Deserialize` for message and property types |
+//! | `serde` | `Serialize`/`Deserialize` for [`Message`], the response and options types, and the codec's data types |
 //!
 //! With both `tokio` and `smol` enabled, tokio wins. OpenSSL is tokio-only.
 //!

@@ -30,6 +30,8 @@ use crate::{
     auth::{AuthChallenge, AuthHandler},
 };
 use paho_mqtt_codec::types::*;
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, time::Duration};
 
 /// The default keep alive interval for MQTT (TCP) & MQTTS (TLS) connections.
@@ -42,6 +44,8 @@ const DEFAULT_KEEP_ALIVE_INTERVAL_WS: Duration = Duration::from_secs(45);
 // ConnectOptions
 
 /// The options for connecting to an MQTT broker.
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(default))]
 #[derive(Debug, Clone)]
 pub struct ConnectOptions {
     /// The maximum time that should pass without communications between
@@ -76,6 +80,12 @@ pub struct ConnectOptions {
     /// Handler for an MQTT v5 enhanced-authentication exchange. Required
     /// when [`props`](Self::props) names an `AuthenticationMethod`, and
     /// meaningless without one.
+    ///
+    /// Skipped by `serde`: a handler is code, not configuration. Options
+    /// that name an authentication method therefore fail
+    /// [`check`](Self::check) after a round trip until the handler is set
+    /// again, which is the mistake being reported, not a new one.
+    #[cfg_attr(feature = "serde", serde(skip))]
     pub auth_handler: Option<AuthHandler>,
     /// HTTP headers for websocket connections
     pub http_headers: HashMap<String, String>,
@@ -645,6 +655,8 @@ impl ConnectOptionsBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "serde")]
+    use crate::PropertyId;
     use crate::QOS_1;
 
     const NAME: &str = "some-random-name";
@@ -742,5 +754,76 @@ mod tests {
             .tls_options(None)
             .finalize();
         assert!(opts.tls.is_none());
+    }
+
+    /// Everything that is configuration survives a round trip. The
+    /// authentication handler does not, being code.
+    #[cfg(feature = "serde")]
+    #[test]
+    fn test_serde_round_trip() {
+        let msg = Message::new("lwt", "gone", QOS_1);
+        let opts = ConnectOptionsBuilder::new()
+            .keep_alive_interval(Duration::from_secs(45))
+            .clean_start(false)
+            .max_inflight(7)
+            .will_message(msg)
+            .tls_options(TlsOptions::default())
+            .user_name_password(NAME, PSWD)
+            .connect_timeout(Duration::from_secs(9))
+            .server_uris(&["mqtt://a:1883", "mqtt://b:1883"])
+            .automatic_reconnect(Duration::from_secs(2), Duration::from_secs(30))
+            .http_proxy("http://proxy:8080")
+            .auth_handler(|_| Ok(Vec::new()))
+            .finalize();
+        assert!(opts.auth_handler.is_some());
+
+        let back: ConnectOptions =
+            serde_json::from_str(&serde_json::to_string(&opts).unwrap()).unwrap();
+        assert_eq!(back.keep_alive_interval, Duration::from_secs(45));
+        assert!(!back.clean_start);
+        assert_eq!(back.max_inflight, 7);
+        assert_eq!(back.will.as_ref().map(|w| w.topic()), Some("lwt"));
+        assert!(back.tls.is_some());
+        assert_eq!(back.user_name.as_deref(), Some(NAME));
+        assert_eq!(back.password.as_deref(), Some(PSWD.as_bytes()));
+        assert_eq!(back.timeout, Duration::from_secs(9));
+        assert_eq!(back.server_uris.len(), 2);
+        assert!(back.auto_reconnect);
+        assert_eq!(back.min_retry_interval, Duration::from_secs(2));
+        assert_eq!(back.http_proxy, "http://proxy:8080");
+        assert_eq!(back.mqtt_version, opts.mqtt_version);
+        assert!(back.auth_handler.is_none(), "a handler cannot be read back");
+    }
+
+    /// Since the handler is dropped, options that name an authentication
+    /// method no longer pass `check` after a round trip. That is the same
+    /// mistake as configuring a method with no handler, reported the same way.
+    #[cfg(feature = "serde")]
+    #[test]
+    fn test_serde_drops_the_auth_pair() {
+        let mut props = Properties::new();
+        props.push_string(PropertyId::AuthenticationMethod, "SCRAM-SHA-1");
+        let opts = ConnectOptionsBuilder::new()
+            .properties(props)
+            .auth_handler(|_| Ok(Vec::new()))
+            .finalize();
+        opts.check().expect("a method with a handler is valid");
+
+        let back: ConnectOptions =
+            serde_json::from_str(&serde_json::to_string(&opts).unwrap()).unwrap();
+        assert!(back.check().is_err(), "the method now has no handler");
+    }
+
+    /// An empty object is the default options, so a configuration file need
+    /// only name what it changes.
+    #[cfg(feature = "serde")]
+    #[test]
+    fn test_serde_partial_input_uses_defaults() {
+        let opts: ConnectOptions = serde_json::from_str(r#"{"max_inflight":3}"#).unwrap();
+        let dflt = ConnectOptions::default();
+        assert_eq!(opts.max_inflight, 3);
+        assert_eq!(opts.keep_alive_interval, dflt.keep_alive_interval);
+        assert_eq!(opts.mqtt_version, dflt.mqtt_version);
+        assert_eq!(opts.clean_start, dflt.clean_start);
     }
 }

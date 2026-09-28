@@ -22,6 +22,8 @@
 use crate::{QoS, properties::Properties};
 use bytes::Bytes;
 use paho_mqtt_codec::Publish as PublishPacket;
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
 use std::{borrow::Cow, fmt};
 
 /// An MQTT Message.
@@ -29,7 +31,16 @@ use std::{borrow::Cow, fmt};
 /// This represents the information passed in an MQTT PUBLISH packet.
 /// It is the primary data transfer mechanism for the protocol, used for
 /// both outbound publications and inbound deliveries.
+///
+/// With the `serde` feature the whole message serializes, including the
+/// duplicate flag and packet identifier that [`dup`](Self::dup) and
+/// [`msgid`](Self::msgid) report — both written by the protocol rather than
+/// by the application. Every field is optional on the way in, taking a
+/// default message's value when absent, so a message named in a
+/// configuration file need only give the parts that matter.
 #[derive(Debug, Default, Clone)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(default))]
 pub struct Message {
     /// The message topic
     pub topic: String,
@@ -255,6 +266,70 @@ mod tests {
     const TOPIC: &str = "test";
     const PAYLOAD: &[u8] = b"Hello world";
     const QOS: QoS = QoS::ExactlyOnce;
+
+    /// Everything the accessors report survives a serde round trip,
+    /// including the two protocol fields the application does not set.
+    #[cfg(feature = "serde")]
+    #[test]
+    fn test_serde_round_trip() {
+        let mut props = Properties::new();
+        props.push_user("k", "v");
+        let msg = MessageBuilder::new()
+            .topic(TOPIC)
+            .payload(PAYLOAD)
+            .qos(QOS)
+            .retain(true)
+            .properties(props)
+            .finalize();
+
+        let json = serde_json::to_string(&msg).unwrap();
+        let back: Message = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(back.topic(), msg.topic());
+        assert_eq!(back.payload(), msg.payload());
+        assert_eq!(back.qos(), msg.qos());
+        assert_eq!(back.retain(), msg.retain());
+        assert_eq!(back.properties().get_user("k"), Some("v"));
+        assert_eq!(back.dup(), msg.dup());
+        assert_eq!(back.msgid(), msg.msgid());
+    }
+
+    /// The QoS is written in the codec's own spelling, and read back from
+    /// either that or the v0.14 word form.
+    #[cfg(feature = "serde")]
+    #[test]
+    fn test_serde_qos_spelling() {
+        let msg = Message::new(TOPIC, PAYLOAD, QoS::AtLeastOnce);
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains(r#""qos":"QoS1""#), "{json}");
+
+        let back: Message = serde_json::from_str(
+            r#"{"topic":"t","payload":[],"qos":"AtLeastOnce","retain":false,"props":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(back.qos(), QoS::QoS1);
+    }
+
+    /// `dup` and `msgid` belong to the protocol, not the application, so a
+    /// representation without them is still a message — as is one that names
+    /// only the parts a configuration file would.
+    #[cfg(feature = "serde")]
+    #[test]
+    fn test_serde_without_the_protocol_fields() {
+        let json = r#"{"topic":"t","payload":[104,105],"qos":"QoS0","retain":false,"props":[]}"#;
+        let msg: Message = serde_json::from_str(json).unwrap();
+        assert_eq!(msg.topic(), "t");
+        assert_eq!(msg.payload(), b"hi");
+        assert!(!msg.dup());
+        assert_eq!(msg.msgid(), None);
+
+        let msg: Message = serde_json::from_str(r#"{"topic":"lwt"}"#).unwrap();
+        assert_eq!(msg.topic(), "lwt");
+        assert!(msg.payload().is_empty());
+        assert_eq!(msg.qos(), QoS::default());
+        assert!(!msg.retain());
+        assert!(msg.properties().is_empty());
+    }
 
     // Determine that a message can be sent across threads.
     #[test]

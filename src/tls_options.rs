@@ -26,8 +26,11 @@ use std::{
 };
 
 use crate::{AsyncClient, TlsErrorCallback};
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
 
 /// The TLS versions that can be requested.
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum TlsVersion {
     /// The default library TLS version
@@ -50,6 +53,8 @@ pub enum TlsVersion {
 /// [`TlsOptions::default()`](Self::default) verifies the broker: both
 /// [`enable_server_cert_auth`](Self::enable_server_cert_auth) and
 /// [`verify`](Self::verify) start `true`, as they did in the v1.x client.
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(default))]
 #[derive(Clone)]
 pub struct TlsOptions {
     /// File name of the trust store.
@@ -84,6 +89,10 @@ pub struct TlsOptions {
     /// The path to the CA certificates, if specified.
     pub ca_path: PathBuf,
     /// The TLS error callback.
+    ///
+    /// Skipped by `serde`: a callback is code, not configuration, so it is
+    /// absent from a deserialized value and must be set again.
+    #[cfg_attr(feature = "serde", serde(skip))]
     pub on_tls_error: Option<Arc<TlsErrorCallback>>,
 
     /// Don't load the default TLS CA certificates.
@@ -371,5 +380,48 @@ mod tests {
         assert!(opts.on_tls_error.is_none());
         assert!(!opts.disable_default_trust_store);
         assert!(opts.protos.is_empty());
+    }
+
+    /// Options round-trip, and the callback field is left behind because a
+    /// callback is code rather than configuration.
+    #[cfg(feature = "serde")]
+    #[test]
+    fn test_serde_round_trip() {
+        let opts = TlsOptionsBuilder::new()
+            .trust_store("/ca.crt")
+            .key_store("/client.pem")
+            .enable_server_cert_auth(true)
+            .verify(false)
+            .alpn_protos(&["mqtt"])
+            .error_callback(|_, _| {})
+            .finalize();
+        assert!(opts.on_tls_error.is_some());
+
+        let back: TlsOptions =
+            serde_json::from_str(&serde_json::to_string(&opts).unwrap()).unwrap();
+        assert_eq!(back.trust_store, PathBuf::from("/ca.crt"));
+        assert_eq!(back.key_store, PathBuf::from("/client.pem"));
+        assert!(back.enable_server_cert_auth);
+        assert!(!back.verify);
+        assert_eq!(back.protos, vec!["mqtt".to_string()]);
+        assert!(
+            back.on_tls_error.is_none(),
+            "a callback cannot be read back"
+        );
+    }
+
+    /// A configuration file that names only a trust store still verifies:
+    /// the fields it leaves out come from the secure `Default`.
+    #[cfg(feature = "serde")]
+    #[test]
+    fn test_serde_partial_input_keeps_verification_on() {
+        let opts: TlsOptions = serde_json::from_str(r#"{"trust_store":"/ca.crt"}"#).unwrap();
+        assert_eq!(opts.trust_store, PathBuf::from("/ca.crt"));
+        assert!(opts.enable_server_cert_auth);
+        assert!(opts.verify);
+
+        let empty: TlsOptions = serde_json::from_str("{}").unwrap();
+        assert!(empty.enable_server_cert_auth);
+        assert!(empty.verify);
     }
 }

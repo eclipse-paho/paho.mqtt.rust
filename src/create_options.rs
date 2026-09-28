@@ -24,6 +24,8 @@ use crate::{
     AsyncClient, Client, ClientPersistence, MqttVersion, PersistenceType, Result, UserData,
     UserPersistence,
 };
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
 use std::cmp;
 
 /////////////////////////////////////////////////////////////////////////////
@@ -66,6 +68,7 @@ use std::cmp;
 /// [`Shared`]: RuntimeMode::Shared
 /// [`Shared(n)`]: RuntimeMode::Shared
 /// [`ApplicationRuntime`]: RuntimeMode::ApplicationRuntime
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Debug, Clone, Default)]
 pub enum RuntimeMode {
     /// Automatically select the runtime (default).
@@ -162,6 +165,8 @@ pub enum RuntimeMode {
 /// The options for creating an MQTT client.
 /// This can be constructed using a
 /// [CreateOptionsBuilder](struct.CreateOptionsBuilder.html).
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(default))]
 #[derive(Debug)]
 pub struct CreateOptions {
     /// The URI of the remote MQTT broker.
@@ -217,6 +222,10 @@ pub struct CreateOptions {
     /// The type of persistence used by the client.
     pub persistence: PersistenceType,
     /// User-defined data to store in the client, if any
+    ///
+    /// Skipped by `serde`: this is a `Box<dyn Any>`, which has no
+    /// representation to write or read back.
+    #[cfg_attr(feature = "serde", serde(skip))]
     pub user_data: Option<UserData>,
     /// Which Tokio runtime the client's event loop runs on.
     /// See [`RuntimeMode`] for the available options and guidance on choosing.
@@ -588,5 +597,53 @@ mod tests {
         assert_eq!(ID, &opts.client_id);
         assert!(opts.send_while_disconnected);
         assert_eq!(MAX_BUF_MSGS, opts.max_buffered_msgs);
+    }
+
+    /// The configuration round-trips; the user data does not, being a
+    /// `Box<dyn Any>`.
+    #[cfg(feature = "serde")]
+    #[test]
+    fn test_serde_round_trip() {
+        let opts = CreateOptionsBuilder::new()
+            .server_uri("mqtt://localhost:1883")
+            .client_id("cli-1")
+            .send_while_disconnected(true)
+            .max_buffered_messages(50)
+            .delete_oldest_messages(true)
+            .persist_qos0(false)
+            .mqtt_version(MqttVersion::V3_1_1)
+            .persistence(PersistenceType::FilePath("/var/mqtt".into()))
+            .shared_runtime(2)
+            .user_data(Box::new(42u32))
+            .finalize();
+        assert!(opts.user_data.is_some());
+
+        let back: CreateOptions =
+            serde_json::from_str(&serde_json::to_string(&opts).unwrap()).unwrap();
+        assert_eq!(back.server_uri, "mqtt://localhost:1883");
+        assert_eq!(back.client_id, "cli-1");
+        assert!(back.send_while_disconnected);
+        assert_eq!(back.max_buffered_msgs, 50);
+        assert!(back.delete_oldest);
+        assert!(!back.persist_qos0);
+        assert_eq!(back.mqtt_version, MqttVersion::V3_1_1);
+        assert!(
+            matches!(back.persistence, PersistenceType::FilePath(ref p) if p.as_os_str() == "/var/mqtt")
+        );
+        assert!(matches!(back.runtime_mode, RuntimeMode::Shared(2)));
+        assert!(back.user_data.is_none(), "`dyn Any` cannot be read back");
+    }
+
+    /// A configuration file need only name what it changes.
+    #[cfg(feature = "serde")]
+    #[test]
+    fn test_serde_partial_input_uses_defaults() {
+        let opts: CreateOptions =
+            serde_json::from_str(r#"{"server_uri":"mqtt://host:1883"}"#).unwrap();
+        let dflt = CreateOptions::default();
+        assert_eq!(opts.server_uri, "mqtt://host:1883");
+        assert_eq!(opts.max_buffered_msgs, dflt.max_buffered_msgs);
+        assert_eq!(opts.mqtt_version, dflt.mqtt_version);
+        assert!(matches!(opts.runtime_mode, RuntimeMode::Auto));
     }
 }

@@ -25,9 +25,13 @@
 //! the MQTT broker/server.
 
 use crate::{Properties, ReasonCode};
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
 /// The collection of options for disconnecting from the client.
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(default))]
 #[derive(Debug, Default, Clone)]
 pub struct DisconnectOptions {
     /// A delay to disconnect to allow any in-flight messages to complete.
@@ -183,5 +187,22 @@ mod tests {
         );
 
         assert_eq!(props.get(PropertyId::ContentType), None);
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn test_serde_round_trip() {
+        let opts = DisconnectOptionsBuilder::new()
+            .timeout(Duration::from_millis(1500))
+            .reason_code(ReasonCode::DisconnectWithWillMessage)
+            .finalize();
+        let back: DisconnectOptions =
+            serde_json::from_str(&serde_json::to_string(&opts).unwrap()).unwrap();
+        assert_eq!(back.timeout, Duration::from_millis(1500));
+        assert_eq!(back.reason_code, ReasonCode::DisconnectWithWillMessage);
+
+        // Missing fields come from the default.
+        let empty: DisconnectOptions = serde_json::from_str("{}").unwrap();
+        assert_eq!(empty.reason_code, DisconnectOptions::default().reason_code);
     }
 }

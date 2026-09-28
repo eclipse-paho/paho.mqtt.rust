@@ -30,3 +30,52 @@ pub use paho_mqtt_codec::{Properties, Property, PropertyId, PropertyType, Proper
 
 /// Backward-compatible alias for [`PropertyId`].
 pub type PropertyCode = PropertyId;
+
+/////////////////////////////////////////////////////////////////////////////
+//                              Unit Tests
+/////////////////////////////////////////////////////////////////////////////
+
+#[cfg(all(test, feature = "serde"))]
+mod tests {
+    use super::*;
+    use crate::{QoS, ReasonCode};
+
+    /// The crate's `serde` feature must reach the codec, where these types
+    /// are defined. It once enabled only the `serde` dependency, so the
+    /// re-exported types had no derives and nothing here compiled.
+    #[test]
+    fn test_property_types_round_trip() {
+        let mut props = Properties::new();
+        props.push_u32(PropertyId::SessionExpiryInterval, 3600);
+        props.push_user("k", "v");
+
+        let json = serde_json::to_string(&props).unwrap();
+        let back: Properties = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.get_u32(PropertyId::SessionExpiryInterval), Some(3600));
+        assert_eq!(back.get_user("k"), Some("v"));
+    }
+
+    /// A single property, its identifier and its value serialize too.
+    #[test]
+    fn test_property_round_trip() {
+        let prop = Property::new(PropertyId::ContentType, PropertyValue::String("t/p".into()));
+        let back: Property = serde_json::from_str(&serde_json::to_string(&prop).unwrap()).unwrap();
+        assert_eq!(back, prop);
+
+        let id: PropertyId =
+            serde_json::from_str(&serde_json::to_string(&PropertyId::TopicAlias).unwrap()).unwrap();
+        assert_eq!(id, PropertyId::TopicAlias);
+    }
+
+    /// The other re-exported codec types the API hands back.
+    #[test]
+    fn test_reason_code_and_qos_round_trip() {
+        let rc: ReasonCode =
+            serde_json::from_str(&serde_json::to_string(&ReasonCode::NotAuthorized).unwrap())
+                .unwrap();
+        assert_eq!(rc, ReasonCode::NotAuthorized);
+
+        let qos: QoS = serde_json::from_str(&serde_json::to_string(&QoS::QoS2).unwrap()).unwrap();
+        assert_eq!(qos, QoS::QoS2);
+    }
+}

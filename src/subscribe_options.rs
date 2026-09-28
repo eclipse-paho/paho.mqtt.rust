@@ -25,6 +25,8 @@
 //! The defaults use the behavior that was present in MQTT v3.1.1.
 
 use crate::{Error, Result};
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
 use std::{convert::TryFrom, fmt};
 
 /// Receive our own publications when subscribed to the same topics.
@@ -42,6 +44,7 @@ pub const RETAIN_AS_PUBLISHED: bool = true;
 
 /// The options for subscription retain handling.
 #[repr(u8)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum RetainHandling {
     /// Send retained messages at the time of the subscribe
@@ -84,6 +87,8 @@ impl TryFrom<i32> for RetainHandling {
 /// The MQTT v5 subscribe options.
 ///
 /// Defaults for each of these keep the original v3 behavior.
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(default))]
 #[derive(Debug, Default, Copy, Clone)]
 pub struct SubscribeOptions {
     /// Whether the client should receive its own published messages.
@@ -298,5 +303,19 @@ mod tests {
         assert!(!opts.no_local);
         assert!(!opts.retain_as_published);
         assert_eq!(opts.retain_handling, RetainHandling::DontSendRetained);
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn test_serde_round_trip() {
+        let opts = SubscribeOptions::new(true, true, RetainHandling::DontSendRetained);
+        let back: SubscribeOptions =
+            serde_json::from_str(&serde_json::to_string(&opts).unwrap()).unwrap();
+        assert!(back.no_local);
+        assert!(back.retain_as_published);
+        assert_eq!(back.retain_handling, RetainHandling::DontSendRetained);
+
+        let empty: SubscribeOptions = serde_json::from_str("{}").unwrap();
+        assert!(!empty.no_local);
     }
 }

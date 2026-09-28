@@ -119,7 +119,7 @@ Default: `tokio`.
 | `openssl` | TLS via the system OpenSSL; implies `tokio` |
 | `openssl-vendored` | As `openssl`, but builds OpenSSL from source; implies `openssl` |
 | `websocket` | WebSocket transport; implies `tokio` |
-| `serde` | `Serialize`/`Deserialize` for message and property types |
+| `serde` | `Serialize`/`Deserialize` for `Message`, the response types, the options types, and the codec's data types (properties, reason codes, QoS, versions) |
 
 ### Smol backend
 

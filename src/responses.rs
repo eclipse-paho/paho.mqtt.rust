@@ -26,8 +26,11 @@
 use std::time::Duration;
 
 use crate::{Properties, PropertyId, PropertyValue, QoS, ReasonCode};
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
 
 /// Response data from a CONNECT → CONNACK exchange.
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Clone, Default, Debug)]
 pub struct ConnectResponse {
     /// The URI of the server.
@@ -162,6 +165,7 @@ impl ConnectResponse {
 /// [`Error::ReasonCode`](crate::Error::ReasonCode) carrying that code and the
 /// acknowledgement's properties, so `reason_code` here is always a success
 /// code (`Success` or `NoMatchingSubscribers`).
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Clone, Default, Debug)]
 pub struct PublishResponse {
     /// Reason code from PUBACK or PUBCOMP (MQTT v5 only). `Success` on v3.
@@ -190,6 +194,7 @@ impl PublishResponse {
 /// may succeed for some filters and fail for others, so it always resolves
 /// `Ok` and `reason_codes` must be inspected per filter — check each code
 /// with `ReasonCode::is_err()`.
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Clone, Default, Debug)]
 pub struct SubscribeResponse {
     /// Per-topic reason codes from the SUBACK.
@@ -218,6 +223,7 @@ impl SubscribeResponse {
 /// [`unsubscribe_many`](crate::AsyncClient::unsubscribe_many) always
 /// resolves `Ok` with the per-filter codes. On v3 there are no codes, so an
 /// unsubscribe never fails once acknowledged.
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Clone, Default, Debug)]
 pub struct UnsubscribeResponse {
     /// Per-topic reason codes from the UNSUBACK (MQTT v5 only). Empty on v3.
@@ -298,5 +304,54 @@ mod tests {
         assert!(!rsp.shared_subscriptions_available());
         // Untouched flags keep their defaults.
         assert!(rsp.wildcard_subscriptions_available());
+    }
+
+    /// Every response type is plain data and survives a serde round trip.
+    #[cfg(feature = "serde")]
+    #[test]
+    fn test_serde_round_trip() {
+        let conn = ConnectResponse {
+            server_uri: "mqtt://localhost:1883".into(),
+            mqtt_version: 5,
+            session_present: true,
+            reason_code: ReasonCode::Success,
+            properties: [Property::new(
+                PropertyId::AssignedClientIdentifier,
+                PropertyValue::String("auto-42".into()),
+            )]
+            .into_iter()
+            .collect(),
+        };
+        let back: ConnectResponse =
+            serde_json::from_str(&serde_json::to_string(&conn).unwrap()).unwrap();
+        assert_eq!(back.server_uri, conn.server_uri);
+        assert_eq!(back.mqtt_version, 5);
+        assert!(back.session_present);
+        assert_eq!(back.reason_code, ReasonCode::Success);
+        assert_eq!(back.assigned_client_id(), Some("auto-42"));
+
+        let pub_resp = PublishResponse {
+            reason_code: ReasonCode::NoMatchingSubscribers,
+            properties: Properties::new(),
+        };
+        let back: PublishResponse =
+            serde_json::from_str(&serde_json::to_string(&pub_resp).unwrap()).unwrap();
+        assert_eq!(back.reason_code, ReasonCode::NoMatchingSubscribers);
+
+        let sub = SubscribeResponse {
+            reason_codes: vec![ReasonCode::GrantedQos1, ReasonCode::NotAuthorized],
+            properties: Properties::new(),
+        };
+        let back: SubscribeResponse =
+            serde_json::from_str(&serde_json::to_string(&sub).unwrap()).unwrap();
+        assert_eq!(back.reason_codes, sub.reason_codes);
+
+        let unsub = UnsubscribeResponse {
+            reason_codes: vec![ReasonCode::Success],
+            properties: Properties::new(),
+        };
+        let back: UnsubscribeResponse =
+            serde_json::from_str(&serde_json::to_string(&unsub).unwrap()).unwrap();
+        assert_eq!(back.reason_codes, unsub.reason_codes);
     }
 }

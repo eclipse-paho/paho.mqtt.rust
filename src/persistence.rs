@@ -25,6 +25,8 @@
 //! can be recovered in the event of an application crash or restart.
 
 use crate::error::{Error, Result};
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     fmt,
@@ -58,6 +60,7 @@ pub type ClientPersistenceBox = Box<dyn ClientPersistence>;
 ///
 /// The persistence type can be created from any string or path to indicate
 /// file persistence to that directory.
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Default)]
 pub enum PersistenceType {
     /// Messages are persisted to files in a local directory (default).
@@ -68,6 +71,12 @@ pub enum PersistenceType {
     #[default]
     None,
     /// A user-defined persistence provided by the application.
+    ///
+    /// Skipped by `serde`: the store is a trait object supplied in code, so
+    /// it cannot be written out or read back. Serializing a value of this
+    /// variant is an error rather than a silent downgrade to
+    /// [`None`](Self::None); the other three round-trip.
+    #[cfg_attr(feature = "serde", serde(skip))]
     User(UserPersistence),
 }
 
@@ -490,5 +499,31 @@ mod tests {
     fn test_mem_persistence_is_a_persistence_type() {
         let pt: PersistenceType = MemPersistence::new().into();
         assert!(matches!(pt, PersistenceType::User(_)));
+    }
+
+    /// The three configurable persistence choices round-trip.
+    #[cfg(feature = "serde")]
+    #[test]
+    fn test_serde_round_trip() {
+        for ty in [
+            PersistenceType::None,
+            PersistenceType::File,
+            PersistenceType::FilePath(PathBuf::from("/var/mqtt")),
+        ] {
+            let json = serde_json::to_string(&ty).unwrap();
+            let back: PersistenceType = serde_json::from_str(&json).unwrap();
+            assert_eq!(format!("{back:?}"), format!("{ty:?}"), "{json}");
+        }
+    }
+
+    /// A user-supplied store is a trait object, so it cannot be written out.
+    /// Serializing says so rather than quietly becoming `None`, which would
+    /// turn "persist through my own store" into "do not persist".
+    #[cfg(feature = "serde")]
+    #[test]
+    fn test_serde_user_persistence_cannot_be_written() {
+        let ty = PersistenceType::from(MemPersistence::new());
+        let err = serde_json::to_string(&ty).expect_err("a trait object has no representation");
+        assert!(err.to_string().contains("cannot be serialized"), "{err}");
     }
 }
