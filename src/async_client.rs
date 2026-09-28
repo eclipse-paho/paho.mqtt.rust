@@ -133,12 +133,67 @@ pub type MessageArrivedCallback = dyn FnMut(&AsyncClient, Option<Message>) + Sen
 /// User callback type for a TLS error
 pub type TlsErrorCallback = dyn Fn(&AsyncClient, &str) + Send + Sync + 'static;
 
+/// One callback slot, and the bookkeeping that lets it be removed from
+/// inside itself.
+///
+/// A callback is taken out of its slot to run, so that the application can
+/// call back into the client — including registering or removing callbacks —
+/// without meeting the lock it is already under. Putting it back afterwards
+/// must not undo what the application did in the meantime, and an empty slot
+/// alone cannot say: a slot is equally empty when nobody touched it and when
+/// the callback removed itself. Every `set` and `clear` therefore bumps a
+/// counter, and the callback is put back only if the count is where it was.
+struct Slot<F: ?Sized> {
+    cb: Option<Box<F>>,
+    /// Bumped by every `set` and `clear`, never by `take`, which the
+    /// application cannot observe.
+    generation: u64,
+}
+
+// Derived `Default` would demand `F: Default`, which a `dyn FnMut` is not.
+impl<F: ?Sized> Default for Slot<F> {
+    fn default() -> Self {
+        Self {
+            cb: None,
+            generation: 0,
+        }
+    }
+}
+
+impl<F: ?Sized> Slot<F> {
+    /// Registers `cb`, replacing whatever was there.
+    fn set(&mut self, cb: Box<F>) {
+        self.cb = Some(cb);
+        self.generation = self.generation.wrapping_add(1);
+    }
+
+    /// Removes the callback, if any.
+    fn clear(&mut self) {
+        self.cb = None;
+        self.generation = self.generation.wrapping_add(1);
+    }
+
+    /// Takes the callback out to be run, with the generation to hand back to
+    /// [`restore`](Self::restore).
+    fn take(&mut self) -> Option<(Box<F>, u64)> {
+        self.cb.take().map(|cb| (cb, self.generation))
+    }
+
+    /// Puts a taken callback back, unless the application has since changed
+    /// this slot — set another callback, or removed this one from inside it.
+    fn restore(&mut self, cb: Box<F>, generation: u64) {
+        if self.generation == generation && self.cb.is_none() {
+            self.cb = Some(cb);
+        }
+    }
+}
+
 #[derive(Default)]
 struct CallbackContext {
-    on_connected: Option<Box<ConnectedCallback>>,
-    on_connection_lost: Option<Box<ConnectionLostCallback>>,
-    on_disconnected: Option<Box<DisconnectedCallback>>,
-    on_message_arrived: Option<Box<MessageArrivedCallback>>,
+    on_connected: Slot<ConnectedCallback>,
+    on_connection_lost: Slot<ConnectionLostCallback>,
+    on_disconnected: Slot<DisconnectedCallback>,
+    on_message_arrived: Slot<MessageArrivedCallback>,
 }
 
 /////////////////////////////////////////////////////////////////////////////
@@ -378,14 +433,24 @@ impl AsyncClient {
             return Token::<()>::from_err(Error::Disconnected);
         }
 
-        if let Some(ref mut cb) = self
+        // Signal the end of the message stream. The callback runs outside
+        // the lock, so it may call back into the client — including removing
+        // itself.
+        let taken = self
             .inner
             .callback_context
             .lock()
             .unwrap()
             .on_message_arrived
-        {
+            .take();
+        if let Some((mut cb, generation)) = taken {
             cb(self, None);
+            self.inner
+                .callback_context
+                .lock()
+                .unwrap()
+                .on_message_arrived
+                .restore(cb, generation);
         }
 
         tok
@@ -806,21 +871,23 @@ impl AsyncClient {
             Ev::Connected(response) => {
                 // Take the callback out before invoking so we don't hold the
                 // lock across the call — a callback that calls set_*_callback
-                // or remove_callbacks would otherwise deadlock.
-                let cb = self
+                // or remove_callbacks would otherwise deadlock. `restore`
+                // then leaves the slot alone if it did either.
+                let taken = self
                     .inner
                     .callback_context
                     .lock()
                     .unwrap()
                     .on_connected
                     .take();
-                if let Some(mut cb) = cb {
+                if let Some((mut cb, generation)) = taken {
                     cb(self, &response);
-                    // Restore only if nothing replaced it while we were running.
-                    let mut cbctx = self.inner.callback_context.lock().unwrap();
-                    if cbctx.on_connected.is_none() {
-                        cbctx.on_connected = Some(cb);
-                    }
+                    self.inner
+                        .callback_context
+                        .lock()
+                        .unwrap()
+                        .on_connected
+                        .restore(cb, generation);
                 }
             }
             Ev::ConnectionLost(_err) => {
@@ -832,52 +899,60 @@ impl AsyncClient {
                         cbctx.on_connection_lost.take(),
                     )
                 };
-                if let Some(mut cb) = msg_cb {
+                if let Some((mut cb, generation)) = msg_cb {
                     cb(self, None);
-                    let mut cbctx = self.inner.callback_context.lock().unwrap();
-                    if cbctx.on_message_arrived.is_none() {
-                        cbctx.on_message_arrived = Some(cb);
-                    }
+                    self.inner
+                        .callback_context
+                        .lock()
+                        .unwrap()
+                        .on_message_arrived
+                        .restore(cb, generation);
                 }
-                if let Some(mut cb) = lost_cb {
+                if let Some((mut cb, generation)) = lost_cb {
                     cb(self);
-                    let mut cbctx = self.inner.callback_context.lock().unwrap();
-                    if cbctx.on_connection_lost.is_none() {
-                        cbctx.on_connection_lost = Some(cb);
-                    }
+                    self.inner
+                        .callback_context
+                        .lock()
+                        .unwrap()
+                        .on_connection_lost
+                        .restore(cb, generation);
                 }
             }
             Ev::Disconnected { reason_code, props } => {
                 self.inner.connected.store(false, Ordering::SeqCst);
-                let cb = self
+                let taken = self
                     .inner
                     .callback_context
                     .lock()
                     .unwrap()
                     .on_disconnected
                     .take();
-                if let Some(mut cb) = cb {
+                if let Some((mut cb, generation)) = taken {
                     cb(self, props, reason_code);
-                    let mut cbctx = self.inner.callback_context.lock().unwrap();
-                    if cbctx.on_disconnected.is_none() {
-                        cbctx.on_disconnected = Some(cb);
-                    }
+                    self.inner
+                        .callback_context
+                        .lock()
+                        .unwrap()
+                        .on_disconnected
+                        .restore(cb, generation);
                 }
             }
             Ev::MessageArrived(msg) => {
-                let cb = self
+                let taken = self
                     .inner
                     .callback_context
                     .lock()
                     .unwrap()
                     .on_message_arrived
                     .take();
-                if let Some(mut cb) = cb {
+                if let Some((mut cb, generation)) = taken {
                     cb(self, Some(msg));
-                    let mut cbctx = self.inner.callback_context.lock().unwrap();
-                    if cbctx.on_message_arrived.is_none() {
-                        cbctx.on_message_arrived = Some(cb);
-                    }
+                    self.inner
+                        .callback_context
+                        .lock()
+                        .unwrap()
+                        .on_message_arrived
+                        .restore(cb, generation);
                 }
             }
             Ev::TlsError(msg) => {
@@ -963,16 +1038,30 @@ impl AsyncClient {
     ///
     /// * `cb` The callback to register with the library. This can be a
     ///   function or a closure.
+    ///
+    /// The callback runs outside the lock on its slot, so it may call back
+    /// into the client — including registering a different callback, or
+    /// removing itself. Either sticks.
     pub fn set_connected_callback<F>(&self, cb: F)
     where
         F: FnMut(&AsyncClient, &crate::ConnectResponse) + Send + 'static,
     {
-        self.inner.callback_context.lock().unwrap().on_connected = Some(Box::new(cb));
+        self.inner
+            .callback_context
+            .lock()
+            .unwrap()
+            .on_connected
+            .set(Box::new(cb));
     }
 
     /// Removes the callback for when the connection is established.
     pub fn remove_connected_callback(&self) {
-        self.inner.callback_context.lock().unwrap().on_connected = None;
+        self.inner
+            .callback_context
+            .lock()
+            .unwrap()
+            .on_connected
+            .clear();
     }
 
     /// Sets the callback for when the connection is lost with the broker.
@@ -981,6 +1070,10 @@ impl AsyncClient {
     ///
     /// * `cb` The callback to register with the library. This can be a
     ///   function or a closure.
+    ///
+    /// The callback runs outside the lock on its slot, so it may call back
+    /// into the client — including registering a different callback, or
+    /// removing itself. Either sticks.
     pub fn set_connection_lost_callback<F>(&self, cb: F)
     where
         F: FnMut(&AsyncClient) + Send + 'static,
@@ -989,7 +1082,8 @@ impl AsyncClient {
             .callback_context
             .lock()
             .unwrap()
-            .on_connection_lost = Some(Box::new(cb));
+            .on_connection_lost
+            .set(Box::new(cb));
     }
 
     /// Removes the callback for when the connection is lost.
@@ -998,7 +1092,8 @@ impl AsyncClient {
             .callback_context
             .lock()
             .unwrap()
-            .on_connection_lost = None;
+            .on_connection_lost
+            .clear();
     }
 
     /// Sets the callback for when a disconnect message arrives from the broker.
@@ -1007,16 +1102,30 @@ impl AsyncClient {
     ///
     /// * `cb` The callback to register with the library. This can be a
     ///   function or a closure.
+    ///
+    /// The callback runs outside the lock on its slot, so it may call back
+    /// into the client — including registering a different callback, or
+    /// removing itself. Either sticks.
     pub fn set_disconnected_callback<F>(&self, cb: F)
     where
         F: FnMut(&AsyncClient, Properties, ReasonCode) + Send + 'static,
     {
-        self.inner.callback_context.lock().unwrap().on_disconnected = Some(Box::new(cb));
+        self.inner
+            .callback_context
+            .lock()
+            .unwrap()
+            .on_disconnected
+            .set(Box::new(cb));
     }
 
     /// Removes the callback for when a disconnect message is received.
     pub fn remove_disconnected_callback(&self) {
-        self.inner.callback_context.lock().unwrap().on_disconnected = None;
+        self.inner
+            .callback_context
+            .lock()
+            .unwrap()
+            .on_disconnected
+            .clear();
     }
 
     /// Sets the callback for when a message arrives from the broker.
@@ -1026,6 +1135,9 @@ impl AsyncClient {
     /// * `cb` The callback to register with the library. This can be a
     ///   function or a closure.
     ///
+    /// The callback runs outside the lock on its slot, so it may call back
+    /// into the client — including registering a different callback, or
+    /// removing itself. Either sticks.
     pub fn set_message_callback<F>(&self, cb: F)
     where
         F: FnMut(&AsyncClient, Option<Message>) + Send + 'static,
@@ -1034,7 +1146,8 @@ impl AsyncClient {
             .callback_context
             .lock()
             .unwrap()
-            .on_message_arrived = Some(Box::new(cb));
+            .on_message_arrived
+            .set(Box::new(cb));
     }
 
     /// Removes the callback for when a message arrives from the broker.
@@ -1043,13 +1156,20 @@ impl AsyncClient {
             .callback_context
             .lock()
             .unwrap()
-            .on_message_arrived = None;
+            .on_message_arrived
+            .clear();
     }
 
     /// Removes all registered callbacks atomically under a single lock.
+    ///
+    /// A callback may call this from inside itself; it is not reinstated when
+    /// it returns.
     pub fn remove_callbacks(&self) {
         let mut cbctx = self.inner.callback_context.lock().unwrap();
-        *cbctx = CallbackContext::default();
+        cbctx.on_connected.clear();
+        cbctx.on_connection_lost.clear();
+        cbctx.on_disconnected.clear();
+        cbctx.on_message_arrived.clear();
     }
 
     /// Starts the client consuming messages for a blocking (non-async) app.
@@ -1590,5 +1710,175 @@ mod tests {
             parse_server_uri("unix:/tmp/mqtt.sock").unwrap(),
             ServerAddr::Unix { path } if path == "/tmp/mqtt.sock"
         ));
+    }
+
+    // ----------------------------------------------------------------------
+    // A callback runs outside the lock on its own slot, so it may call back
+    // into the client. What it does there must stick.
+    // ----------------------------------------------------------------------
+
+    /// A client that talks to nothing. `dispatch_event` is driven directly,
+    /// so no broker, socket or event loop is involved.
+    fn test_client() -> AsyncClient {
+        AsyncClient::new("tcp://localhost:1883").unwrap()
+    }
+
+    fn counter() -> Arc<Mutex<u32>> {
+        Arc::new(Mutex::new(0))
+    }
+
+    /// A callback that removes itself stays removed. The dispatcher takes the
+    /// callback out of its slot to run it, and used to put it back whenever
+    /// the slot was empty afterwards — which is exactly the state a
+    /// self-removal leaves behind, so the removal was undone.
+    #[test]
+    fn test_connected_callback_can_remove_itself() {
+        let cli = test_client();
+        let calls = counter();
+
+        let c = calls.clone();
+        cli.set_connected_callback(move |cli, _| {
+            *c.lock().unwrap() += 1;
+            cli.remove_connected_callback();
+        });
+
+        let resp = crate::ConnectResponse::default();
+        cli.dispatch_event(crate::runtime::Event::Connected(resp.clone()));
+        cli.dispatch_event(crate::runtime::Event::Connected(resp));
+
+        assert_eq!(*calls.lock().unwrap(), 1, "the callback was reinstated");
+        assert!(
+            cli.inner
+                .callback_context
+                .lock()
+                .unwrap()
+                .on_connected
+                .cb
+                .is_none()
+        );
+    }
+
+    /// The same for the message callback, which has the same shape.
+    #[test]
+    fn test_message_callback_can_remove_itself() {
+        let cli = test_client();
+        let calls = counter();
+
+        let c = calls.clone();
+        cli.set_message_callback(move |cli, _| {
+            *c.lock().unwrap() += 1;
+            cli.remove_message_callback();
+        });
+
+        let msg = Message::new("t", "p", crate::QOS_0);
+        cli.dispatch_event(crate::runtime::Event::MessageArrived(msg.clone()));
+        cli.dispatch_event(crate::runtime::Event::MessageArrived(msg));
+
+        assert_eq!(*calls.lock().unwrap(), 1);
+    }
+
+    /// `remove_callbacks()` from inside a callback removes that one too.
+    #[test]
+    fn test_callback_can_remove_all_callbacks() {
+        let cli = test_client();
+        let calls = counter();
+
+        let c = calls.clone();
+        cli.set_disconnected_callback(move |cli, _, _| {
+            *c.lock().unwrap() += 1;
+            cli.remove_callbacks();
+        });
+
+        for _ in 0..2 {
+            cli.dispatch_event(crate::runtime::Event::Disconnected {
+                reason_code: ReasonCode::NormalDisconnection,
+                props: Properties::new(),
+            });
+        }
+        assert_eq!(*calls.lock().unwrap(), 1);
+    }
+
+    /// A callback that replaces itself hands over to the new one, which is
+    /// not then overwritten by the one that just ran.
+    #[test]
+    fn test_callback_can_replace_itself() {
+        let cli = test_client();
+        let first = counter();
+        let second = counter();
+
+        let f = first.clone();
+        let s = second.clone();
+        cli.set_connected_callback(move |cli, _| {
+            *f.lock().unwrap() += 1;
+            let s = s.clone();
+            cli.set_connected_callback(move |_, _| {
+                *s.lock().unwrap() += 1;
+            });
+        });
+
+        let resp = crate::ConnectResponse::default();
+        cli.dispatch_event(crate::runtime::Event::Connected(resp.clone()));
+        cli.dispatch_event(crate::runtime::Event::Connected(resp.clone()));
+        cli.dispatch_event(crate::runtime::Event::Connected(resp));
+
+        assert_eq!(*first.lock().unwrap(), 1, "the first callback ran again");
+        assert_eq!(*second.lock().unwrap(), 2);
+    }
+
+    /// A callback that touches a *different* slot keeps its own place.
+    #[test]
+    fn test_callback_setting_another_slot_keeps_its_own() {
+        let cli = test_client();
+        let calls = counter();
+
+        let c = calls.clone();
+        cli.set_connected_callback(move |cli, _| {
+            *c.lock().unwrap() += 1;
+            cli.set_message_callback(|_, _| {});
+            cli.remove_disconnected_callback();
+        });
+
+        let resp = crate::ConnectResponse::default();
+        cli.dispatch_event(crate::runtime::Event::Connected(resp.clone()));
+        cli.dispatch_event(crate::runtime::Event::Connected(resp));
+
+        assert_eq!(*calls.lock().unwrap(), 2, "it removed itself by accident");
+    }
+
+    /// A callback that does nothing to its slot is still there next time.
+    #[test]
+    fn test_untouched_callback_is_restored() {
+        let cli = test_client();
+        let calls = counter();
+
+        let c = calls.clone();
+        cli.set_connected_callback(move |_, _| {
+            *c.lock().unwrap() += 1;
+        });
+
+        let resp = crate::ConnectResponse::default();
+        for _ in 0..3 {
+            cli.dispatch_event(crate::runtime::Event::Connected(resp.clone()));
+        }
+        assert_eq!(*calls.lock().unwrap(), 3);
+    }
+
+    /// `disconnect()` ends the message stream by calling the message callback
+    /// with `None`. That call used to happen while holding the callback lock,
+    /// so a callback touching any slot deadlocked; it now runs outside it.
+    #[test]
+    fn test_message_callback_may_touch_the_client_during_disconnect() {
+        let cli = test_client();
+        let calls = counter();
+
+        let c = calls.clone();
+        cli.set_message_callback(move |cli, msg| {
+            *c.lock().unwrap() += 1;
+            assert!(msg.is_none(), "disconnect signals the end of the stream");
+            cli.remove_message_callback();
+        });
+
+        let _tok = cli.disconnect(None);
+        assert_eq!(*calls.lock().unwrap(), 1);
     }
 }

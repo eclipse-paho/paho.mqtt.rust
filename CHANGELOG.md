@@ -70,6 +70,9 @@ Version 2.0 is a rewrite of the library in pure Rust. It no longer depends on th
 
 ### API
 
+- **A callback can now remove or replace itself.** Each callback is held in a slot with a generation counter that every set and removal bumps. The dispatcher takes the callback out to run it outside the lock — so it may call back into the client — and puts it back only if the slot is untouched. It previously restored the callback whenever the slot was empty afterwards, which is exactly what a self-removal leaves behind, so `remove_*_callback()` and `remove_callbacks()` called from inside a callback were silently undone.
+- `disconnect()` signals the end of the message stream by calling the message callback with `None`. That call no longer happens while holding the callback lock, where a callback that registered or removed anything deadlocked.
+
 - **[Breaking]** `QOS_0`, `QOS_1`, `QOS_2` are `QoS` values and `MQTT_VERSION_*` are `MqttVersion` values, rather than `i32` / `u8`. Code that passes the named constants is unaffected (`Message::new(topic, payload, QOS_1)` still works). Code that passed integer literals or variables must convert: `QoS::try_from(n)?`, `MqttVersion::try_from(n)?`. The lossy `From<i32>` for `QoS` and `From<u8>` for `MqttVersion` — which mapped invalid values to a default — are removed.
 - **[Breaking]** `subscribe_many_same_qos` takes `impl Into<QoS>` instead of `i32`.
 - **[Breaking]** `Error::Publish` holds a `Box<Message>`.
