@@ -1231,6 +1231,184 @@ impl Properties {
     }
 }
 
+/////////////////////////////////////////////////////////////////////////////
+//                      Per-property typed accessors
+/////////////////////////////////////////////////////////////////////////////
+
+/// Writes one `push_*` / `get_*` pair per property identifier.
+///
+/// The table below is the point of this macro: it states every identifier's
+/// wire type once, in one place, so that a caller never has to remember which
+/// `push_*` goes with which identifier — and so that a `push_x` cannot
+/// disagree with its `get_x`, both being generated from the same row.
+///
+/// Each row is: the identifier, the name shared by the pair, the generic
+/// accessor underneath, the type the setter takes, the type the getter
+/// returns, and what the property means.
+macro_rules! typed_property_accessors {
+    ($(
+        $id:ident, $name:ident, $push_name:ident, $get_name:ident,
+            $push_fn:ident, $get_fn:ident, $push_ty:ty, $get_ty:ty,
+            $what:expr;
+    )+) => {
+        impl Properties {
+            $(
+                #[doc = concat!("Adds ", $what, ".")]
+                ///
+                #[doc = concat!(
+                    "Shorthand for [`", stringify!($push_fn), "`](Self::", stringify!($push_fn),
+                    ") with [`PropertyId::", stringify!($id), "`](PropertyId::", stringify!($id),
+                    "), whose wire type it knows."
+                )]
+                pub fn $push_name(&mut self, val: $push_ty) {
+                    self.$push_fn(PropertyId::$id, val)
+                }
+
+                #[doc = concat!("Returns ", $what, ", or `None` if it is absent.")]
+                ///
+                #[doc = concat!(
+                    "Shorthand for [`", stringify!($get_fn), "`](Self::", stringify!($get_fn),
+                    ") with [`PropertyId::", stringify!($id), "`](PropertyId::", stringify!($id),
+                    ")."
+                )]
+                pub fn $get_name(&self) -> Option<$get_ty> {
+                    self.$get_fn(PropertyId::$id)
+                }
+            )+
+        }
+    };
+}
+
+// `UserProperty` is deliberately absent: it is the one property an
+// application defines for itself, it may repeat, and it already has
+// `push_user`, `get_user` and `user_iter`, which serve it better than a pair
+// generated here would.
+typed_property_accessors! {
+    PayloadFormatIndicator, payload_format_indicator, push_payload_format_indicator, get_payload_format_indicator,
+        push_byte, get_byte, u8, u8,
+        r"the payload format indicator \[MQTT-3.3.2.3.2\]: 0 for unspecified bytes, 1 for UTF-8 text";
+    MaximumQoS, maximum_qos, push_maximum_qos, get_maximum_qos,
+        push_byte, get_byte, u8, u8,
+        r"the highest QoS the server accepts, 0 or 1 \[MQTT-3.2.2.3.4\]";
+    ServerKeepAlive, server_keep_alive, push_server_keep_alive, get_server_keep_alive,
+        push_u16, get_u16, u16, u16,
+        r"the keep-alive the server imposes, in seconds \[MQTT-3.2.2.3.14\]";
+    ReceiveMaximum, receive_maximum, push_receive_maximum, get_receive_maximum,
+        push_u16, get_u16, u16, u16,
+        r"how many QoS 1 and 2 publications the sender will handle at once \[MQTT-3.1.2.11.3\]";
+    TopicAliasMaximum, topic_alias_maximum, push_topic_alias_maximum, get_topic_alias_maximum,
+        push_u16, get_u16, u16, u16,
+        r"the highest topic alias the sender will accept \[MQTT-3.1.2.11.5\]";
+    TopicAlias, topic_alias, push_topic_alias, get_topic_alias,
+        push_u16, get_u16, u16, u16,
+        r"the topic alias standing in for a PUBLISH's topic name \[MQTT-3.3.2.3.4\]";
+    MessageExpiryInterval, message_expiry_interval, push_message_expiry_interval, get_message_expiry_interval,
+        push_u32, get_u32, u32, u32,
+        r"how long the server may hold this message for a subscriber, in seconds \[MQTT-3.3.2.3.3\]";
+    SessionExpiryInterval, session_expiry_interval, push_session_expiry_interval, get_session_expiry_interval,
+        push_u32, get_u32, u32, u32,
+        r"how long the session outlives the connection, in seconds \[MQTT-3.1.2.11.2\]";
+    WillDelayInterval, will_delay_interval, push_will_delay_interval, get_will_delay_interval,
+        push_u32, get_u32, u32, u32,
+        r"how long the server waits before publishing the Will, in seconds \[MQTT-3.1.3.2.2\]";
+    MaximumPacketSize, maximum_packet_size, push_maximum_packet_size, get_maximum_packet_size,
+        push_u32, get_u32, u32, u32,
+        r"the largest packet the sender will accept, in bytes \[MQTT-3.1.2.11.4\]";
+    SubscriptionIdentifier, subscription_identifier, push_subscription_identifier, get_subscription_identifier,
+        push_var_int, get_var_int, impl Into<u32>, u32,
+        r"the subscription identifier \[MQTT-3.8.2.1.2\], which a PUBLISH may carry more than once";
+    CorrelationData, correlation_data, push_correlation_data, get_correlation_data,
+        push_binary, get_binary, impl Into<Bytes>, Bytes,
+        r"the correlation data a requester uses to match a response to its request \[MQTT-3.3.2.3.6\]";
+    AuthenticationData, authentication_data, push_authentication_data, get_authentication_data,
+        push_binary, get_binary, impl Into<Bytes>, Bytes,
+        r"the data for this step of an enhanced authentication exchange \[MQTT-3.1.2.11.10\]";
+    ContentType, content_type, push_content_type, get_content_type,
+        push_string, get_string, impl Into<String>, String,
+        r"the content type of the payload, a MIME type by convention \[MQTT-3.3.2.3.9\]";
+    ResponseTopic, response_topic, push_response_topic, get_response_topic,
+        push_string, get_string, impl Into<String>, String,
+        r"the topic a response to this request should be published to \[MQTT-3.3.2.3.5\]";
+    AssignedClientIdentifier, assigned_client_identifier, push_assigned_client_identifier, get_assigned_client_identifier,
+        push_string, get_string, impl Into<String>, String,
+        r"the client identifier the server assigned, the client having sent an empty one \[MQTT-3.2.2.3.7\]";
+    AuthenticationMethod, authentication_method, push_authentication_method, get_authentication_method,
+        push_string, get_string, impl Into<String>, String,
+        r"the name of the enhanced authentication method \[MQTT-3.1.2.11.9\]";
+    ResponseInformation, response_information, push_response_information, get_response_information,
+        push_string, get_string, impl Into<String>, String,
+        r"the base of a response topic the server suggests \[MQTT-3.2.2.3.15\]";
+    ServerReference, server_reference, push_server_reference, get_server_reference,
+        push_string, get_string, impl Into<String>, String,
+        r"another server the client should use instead \[MQTT-3.2.2.3.16\]";
+    ReasonString, reason_string, push_reason_string, get_reason_string,
+        push_string, get_string, impl Into<String>, String,
+        r"the human-readable reason accompanying a reason code \[MQTT-3.2.2.3.2\]";
+}
+
+/// Writes the pair for a property the specification restricts to 0 or 1 and
+/// whose meaning is a yes/no, so that the pair can speak in `bool`.
+///
+/// Same table shape as [`typed_property_accessors`], minus the types: a
+/// setter takes `bool` and a getter returns `Option<bool>`, converting at the
+/// boundary. Every value the collection can hold is 0 or 1, since `push` and
+/// `decode` both reject anything else for these identifiers, so the getter's
+/// conversion cannot lose information.
+macro_rules! flag_property_accessors {
+    ($(
+        $id:ident, $push_name:ident, $get_name:ident, $what:expr;
+    )+) => {
+        impl Properties {
+            $(
+                #[doc = concat!("Sets ", $what, ".")]
+                ///
+                /// The property itself is a one-byte value restricted to 0 or
+                /// 1, which this writes as `0` for `false` and `1` for
+                /// `true`; [`push_byte`](Self::push_byte) takes it as the
+                #[doc = concat!(
+                    "`u8` it is on the wire, under [`PropertyId::",
+                    stringify!($id), "`](PropertyId::", stringify!($id), ")."
+                )]
+                pub fn $push_name(&mut self, val: bool) {
+                    self.push_byte(PropertyId::$id, u8::from(val))
+                }
+
+                #[doc = concat!("Returns ", $what, ", or `None` if it is absent.")]
+                ///
+                /// Reads the one-byte property as a flag: `0` is `false` and
+                /// `1` is `true`, and nothing else can be stored, since both
+                /// `push` and `decode` refuse it. Use
+                #[doc = concat!(
+                    "[`get_byte`](Self::get_byte) with [`PropertyId::",
+                    stringify!($id), "`](PropertyId::", stringify!($id),
+                    ") for the raw byte."
+                )]
+                pub fn $get_name(&self) -> Option<bool> {
+                    self.get_byte(PropertyId::$id).map(|v| v != 0)
+                }
+            )+
+        }
+    };
+}
+
+// `PayloadFormatIndicator` and `MaximumQoS` are 0-or-1 too, but neither is a
+// yes/no: the first says which of two payload formats is meant, the second is
+// a QoS level. Both keep their `u8` pair above.
+flag_property_accessors! {
+    RequestProblemInformation, push_request_problem_information, get_request_problem_information,
+        r"whether the sender wants a reason string or user properties on a failure \[MQTT-3.1.2.11.7\]";
+    RequestResponseInformation, push_request_response_information, get_request_response_information,
+        r"whether the client asks the server for response information \[MQTT-3.1.2.11.6\]";
+    RetainAvailable, push_retain_available, get_retain_available,
+        r"whether the server supports retained messages \[MQTT-3.2.2.3.5\]";
+    WildcardSubscriptionAvailable, push_wildcard_subscription_available, get_wildcard_subscription_available,
+        r"whether the server supports wildcard subscriptions \[MQTT-3.2.2.3.11\]";
+    SubscriptionIdentifierAvailable, push_subscription_identifier_available, get_subscription_identifier_available,
+        r"whether the server supports subscription identifiers \[MQTT-3.2.2.3.12\]";
+    SharedSubscriptionAvailable, push_shared_subscription_available, get_shared_subscription_available,
+        r"whether the server supports shared subscriptions \[MQTT-3.2.2.3.13\]";
+}
+
 impl From<Vec<Property>> for Properties {
     fn from(props: Vec<Property>) -> Self {
         let mut out = Self {
@@ -2594,5 +2772,187 @@ mod tests {
         let mut set = alloc::collections::BTreeSet::new();
         assert!(set.insert(PropertyType::U32));
         assert!(!set.insert(PropertyType::U32));
+    }
+
+    // ---- per-property typed accessors ----
+
+    /// Every identifier's pair, pushed and read back. A row whose type did
+    /// not match its identifier would fail here — or, if the types happened
+    /// to agree, in the encode test below.
+    #[test]
+    fn test_typed_accessors_round_trip() {
+        let mut p = Properties::new();
+
+        // Byte: the two that are values rather than flags.
+        p.push_payload_format_indicator(1);
+        p.push_maximum_qos(1);
+        assert_eq!(p.get_payload_format_indicator(), Some(1));
+        assert_eq!(p.get_maximum_qos(), Some(1));
+
+        // Byte: the six whose byte is a yes/no.
+        p.push_request_problem_information(true);
+        p.push_request_response_information(false);
+        p.push_retain_available(true);
+        p.push_wildcard_subscription_available(false);
+        p.push_subscription_identifier_available(true);
+        p.push_shared_subscription_available(false);
+        assert_eq!(p.get_request_problem_information(), Some(true));
+        assert_eq!(p.get_request_response_information(), Some(false));
+        assert_eq!(p.get_retain_available(), Some(true));
+        assert_eq!(p.get_wildcard_subscription_available(), Some(false));
+        assert_eq!(p.get_subscription_identifier_available(), Some(true));
+        assert_eq!(p.get_shared_subscription_available(), Some(false));
+
+        // Two-byte integers.
+        p.push_server_keep_alive(30);
+        p.push_receive_maximum(20);
+        p.push_topic_alias_maximum(10);
+        p.push_topic_alias(7);
+        assert_eq!(p.get_server_keep_alive(), Some(30));
+        assert_eq!(p.get_receive_maximum(), Some(20));
+        assert_eq!(p.get_topic_alias_maximum(), Some(10));
+        assert_eq!(p.get_topic_alias(), Some(7));
+
+        // Four-byte integers.
+        p.push_message_expiry_interval(3600);
+        p.push_session_expiry_interval(300);
+        p.push_will_delay_interval(60);
+        p.push_maximum_packet_size(65_536);
+        assert_eq!(p.get_message_expiry_interval(), Some(3600));
+        assert_eq!(p.get_session_expiry_interval(), Some(300));
+        assert_eq!(p.get_will_delay_interval(), Some(60));
+        assert_eq!(p.get_maximum_packet_size(), Some(65_536));
+
+        // Variable-byte integer.
+        p.push_subscription_identifier(4444u32);
+        assert_eq!(p.get_subscription_identifier(), Some(4444));
+
+        // Binary.
+        p.push_correlation_data(Bytes::from_static(b"corr"));
+        p.push_authentication_data(Bytes::from_static(b"auth"));
+        assert_eq!(p.get_correlation_data().as_deref(), Some(&b"corr"[..]));
+        assert_eq!(p.get_authentication_data().as_deref(), Some(&b"auth"[..]));
+
+        // Strings.
+        p.push_content_type("application/json");
+        p.push_response_topic("reply/here");
+        p.push_assigned_client_identifier("auto-42");
+        p.push_authentication_method("SCRAM-SHA-1");
+        p.push_response_information("reply");
+        p.push_server_reference("mqtt://other:1883");
+        p.push_reason_string("because");
+        assert_eq!(p.get_content_type().as_deref(), Some("application/json"));
+        assert_eq!(p.get_response_topic().as_deref(), Some("reply/here"));
+        assert_eq!(
+            p.get_assigned_client_identifier().as_deref(),
+            Some("auto-42")
+        );
+        assert_eq!(
+            p.get_authentication_method().as_deref(),
+            Some("SCRAM-SHA-1")
+        );
+        assert_eq!(p.get_response_information().as_deref(), Some("reply"));
+        assert_eq!(
+            p.get_server_reference().as_deref(),
+            Some("mqtt://other:1883")
+        );
+        assert_eq!(p.get_reason_string().as_deref(), Some("because"));
+
+        // One per identifier, `UserProperty` aside.
+        assert_eq!(p.len(), 26);
+    }
+
+    /// A property whose value type does not match its identifier fails
+    /// [`Property::validate`], which marks the collection invalid and makes
+    /// `encode` refuse it. That every one of these encodes is the check that
+    /// the table's types are the specification's.
+    #[test]
+    fn test_typed_accessors_use_the_specified_wire_types() {
+        let mut p = Properties::new();
+        p.push_payload_format_indicator(1);
+        p.push_topic_alias(7);
+        p.push_message_expiry_interval(3600);
+        p.push_subscription_identifier(4444u32);
+        p.push_correlation_data(Bytes::from_static(b"corr"));
+        p.push_content_type("application/json");
+
+        let mut dst = BytesMut::new();
+        p.encode(&mut dst, MQTT_VERSION_5).unwrap();
+
+        let mut src = dst.freeze();
+        let back = Properties::decode(&mut src, MQTT_VERSION_5).unwrap();
+        assert_eq!(back, p, "the wire form did not carry the same values");
+        assert_eq!(back.get_content_type().as_deref(), Some("application/json"));
+        assert_eq!(back.get_subscription_identifier(), Some(4444));
+    }
+
+    /// The shorthand is the generic call, nothing more.
+    #[test]
+    fn test_typed_accessors_match_the_generic_form() {
+        let mut short = Properties::new();
+        short.push_content_type("text/plain");
+        short.push_topic_alias(3);
+
+        let mut generic = Properties::new();
+        generic.push_string(PropertyId::ContentType, "text/plain");
+        generic.push_u16(PropertyId::TopicAlias, 3);
+
+        assert_eq!(short, generic);
+        assert_eq!(
+            short.get_content_type(),
+            generic.get_string(PropertyId::ContentType)
+        );
+    }
+
+    /// An absent property reads as `None`, not as a default.
+    #[test]
+    fn test_typed_accessors_absent_is_none() {
+        let p = Properties::new();
+        assert_eq!(p.get_payload_format_indicator(), None);
+        assert_eq!(p.get_topic_alias(), None);
+        assert_eq!(p.get_content_type(), None);
+        assert_eq!(p.get_correlation_data(), None);
+        assert_eq!(p.get_subscription_identifier(), None);
+    }
+
+    /// A flag property is a byte on the wire, and the two views agree.
+    #[test]
+    fn test_flag_accessors_are_a_byte_underneath() {
+        let mut p = Properties::new();
+        p.push_retain_available(true);
+        p.push_shared_subscription_available(false);
+
+        // The flag setter writes what `push_byte` would.
+        assert_eq!(p.get_byte(PropertyId::RetainAvailable), Some(1));
+        assert_eq!(p.get_byte(PropertyId::SharedSubscriptionAvailable), Some(0));
+
+        // And the flag getter reads what `push_byte` writes.
+        let mut raw = Properties::new();
+        raw.push_byte(PropertyId::RetainAvailable, 1);
+        raw.push_byte(PropertyId::SharedSubscriptionAvailable, 0);
+        assert_eq!(raw.get_retain_available(), Some(true));
+        assert_eq!(raw.get_shared_subscription_available(), Some(false));
+        assert_eq!(raw, p);
+
+        // `false` is a value, not an absence.
+        assert_eq!(
+            Properties::new().get_shared_subscription_available(),
+            None,
+            "an absent flag must not read as false"
+        );
+    }
+
+    /// A byte outside 0/1 cannot reach a flag property, so the getter's
+    /// conversion never has to guess: `push` marks the collection invalid and
+    /// `encode` refuses it.
+    #[test]
+    fn test_flag_property_rejects_other_bytes() {
+        let mut p = Properties::new();
+        p.push_byte(PropertyId::RetainAvailable, 2);
+        let mut dst = BytesMut::new();
+        assert_eq!(
+            p.encode(&mut dst, MQTT_VERSION_5),
+            Err(Error::ProtocolError)
+        );
     }
 }
