@@ -703,6 +703,13 @@ impl Properties {
         Self::default()
     }
 
+    /// Starts building a collection a property at a time.
+    ///
+    /// Shorthand for [`PropertiesBuilder::new`].
+    pub fn builder() -> PropertiesBuilder {
+        PropertiesBuilder::new()
+    }
+
     /// Returns `true` if there are no properties.
     pub fn is_empty(&self) -> bool {
         self.props.is_empty()
@@ -1232,6 +1239,98 @@ impl Properties {
 }
 
 /////////////////////////////////////////////////////////////////////////////
+//                            PropertiesBuilder
+/////////////////////////////////////////////////////////////////////////////
+
+/// Builds a [`Properties`] collection a property at a time.
+///
+/// Each setter is named for its property, without the `push_` prefix the
+/// collection's own methods carry, and takes the Rust type that property's
+/// wire type calls for — so `content_type("application/json")` takes a
+/// string, `topic_alias(7)` a `u16`, and `retain_available(true)` a `bool`.
+/// The setters and the collection's `push_*` methods are generated from one
+/// table, so the two can never disagree.
+///
+/// Each setter consumes the builder and returns it, and
+/// [`finalize`](Self::finalize) yields the collection.
+/// [`Properties::builder`] is a shorthand for [`new`](Self::new).
+///
+/// ```
+/// use paho_mqtt_codec::Properties;
+///
+/// let props = Properties::builder()
+///     .message_expiry_interval(3600)
+///     .content_type("application/json")
+///     .response_topic("reply/here")
+///     .user("trace-id", "abc123")
+///     .finalize();
+///
+/// assert_eq!(props.get_content_type().as_deref(), Some("application/json"));
+/// assert_eq!(props.get_message_expiry_interval(), Some(3600));
+/// ```
+///
+/// The builder does not validate, as nothing in this crate does before
+/// encoding: a property whose value is out of range, or which repeats where
+/// the specification forbids it, marks the collection invalid and is refused
+/// when the packet carrying it is encoded.
+#[derive(Debug, Default, Clone)]
+pub struct PropertiesBuilder(Properties);
+
+impl PropertiesBuilder {
+    /// Creates a builder for an empty collection.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Adds a user property, the one property an application defines for
+    /// itself and the only one that may repeat freely.
+    ///
+    /// The builder's form of [`Properties::push_user`].
+    pub fn user<K, V>(mut self, key: K, val: V) -> Self
+    where
+        K: Into<String>,
+        V: Into<String>,
+    {
+        self.0.push_user(key, val);
+        self
+    }
+
+    /// Adds an already-built property, for an identifier held in a variable
+    /// rather than named in the source.
+    ///
+    /// The builder's form of [`Properties::push`].
+    pub fn property(mut self, prop: Property) -> Self {
+        self.0.push(prop);
+        self
+    }
+
+    /// Finalizes the builder into the collection.
+    pub fn finalize(self) -> Properties {
+        self.0
+    }
+}
+
+impl From<PropertiesBuilder> for Properties {
+    fn from(builder: PropertiesBuilder) -> Self {
+        builder.finalize()
+    }
+}
+
+/// Lets a builder stand in for the optional properties that the
+/// acknowledgement and AUTH constructors take, so that a caller writing
+/// `PubAck::with_properties(id, rc, Properties::builder().reason_string("no"))`
+/// need not finalize it first.
+///
+/// The standard library's `From<T> for Option<T>` covers a finished
+/// [`Properties`]; this covers the builder, which is a different type and so
+/// does not overlap it.
+impl From<PropertiesBuilder> for Option<Properties> {
+    fn from(builder: PropertiesBuilder) -> Self {
+        Some(builder.finalize())
+    }
+}
+
+/////////////////////////////////////////////////////////////////////////////
 //                      Per-property typed accessors
 /////////////////////////////////////////////////////////////////////////////
 
@@ -1273,6 +1372,21 @@ macro_rules! typed_property_accessors {
                 )]
                 pub fn $get_name(&self) -> Option<$get_ty> {
                     self.$get_fn(PropertyId::$id)
+                }
+            )+
+        }
+
+        impl PropertiesBuilder {
+            $(
+                #[doc = concat!("Sets ", $what, ".")]
+                ///
+                #[doc = concat!(
+                    "The builder's form of [`Properties::", stringify!($push_name),
+                    "`](Properties::", stringify!($push_name), ")."
+                )]
+                pub fn $name(mut self, val: $push_ty) -> Self {
+                    self.0.$push_name(val);
+                    self
                 }
             )+
         }
@@ -1356,7 +1470,7 @@ typed_property_accessors! {
 /// conversion cannot lose information.
 macro_rules! flag_property_accessors {
     ($(
-        $id:ident, $push_name:ident, $get_name:ident, $what:expr;
+        $id:ident, $name:ident, $push_name:ident, $get_name:ident, $what:expr;
     )+) => {
         impl Properties {
             $(
@@ -1388,6 +1502,22 @@ macro_rules! flag_property_accessors {
                 }
             )+
         }
+
+        impl PropertiesBuilder {
+            $(
+                #[doc = concat!("Sets ", $what, ".")]
+                ///
+                /// The property is a one-byte 0 or 1 on the wire; see
+                #[doc = concat!(
+                    "[`Properties::", stringify!($push_name), "`](Properties::",
+                    stringify!($push_name), ")."
+                )]
+                pub fn $name(mut self, val: bool) -> Self {
+                    self.0.$push_name(val);
+                    self
+                }
+            )+
+        }
     };
 }
 
@@ -1395,17 +1525,23 @@ macro_rules! flag_property_accessors {
 // yes/no: the first says which of two payload formats is meant, the second is
 // a QoS level. Both keep their `u8` pair above.
 flag_property_accessors! {
-    RequestProblemInformation, push_request_problem_information, get_request_problem_information,
+    RequestProblemInformation, request_problem_information,
+        push_request_problem_information, get_request_problem_information,
         r"whether the sender wants a reason string or user properties on a failure \[MQTT-3.1.2.11.7\]";
-    RequestResponseInformation, push_request_response_information, get_request_response_information,
+    RequestResponseInformation, request_response_information,
+        push_request_response_information, get_request_response_information,
         r"whether the client asks the server for response information \[MQTT-3.1.2.11.6\]";
-    RetainAvailable, push_retain_available, get_retain_available,
+    RetainAvailable, retain_available,
+        push_retain_available, get_retain_available,
         r"whether the server supports retained messages \[MQTT-3.2.2.3.5\]";
-    WildcardSubscriptionAvailable, push_wildcard_subscription_available, get_wildcard_subscription_available,
+    WildcardSubscriptionAvailable, wildcard_subscription_available,
+        push_wildcard_subscription_available, get_wildcard_subscription_available,
         r"whether the server supports wildcard subscriptions \[MQTT-3.2.2.3.11\]";
-    SubscriptionIdentifierAvailable, push_subscription_identifier_available, get_subscription_identifier_available,
+    SubscriptionIdentifierAvailable, subscription_identifier_available,
+        push_subscription_identifier_available, get_subscription_identifier_available,
         r"whether the server supports subscription identifiers \[MQTT-3.2.2.3.12\]";
-    SharedSubscriptionAvailable, push_shared_subscription_available, get_shared_subscription_available,
+    SharedSubscriptionAvailable, shared_subscription_available,
+        push_shared_subscription_available, get_shared_subscription_available,
         r"whether the server supports shared subscriptions \[MQTT-3.2.2.3.13\]";
 }
 
@@ -1417,6 +1553,58 @@ impl From<Vec<Property>> for Properties {
         };
         out.extend(props);
         out
+    }
+}
+
+/// Builds a collection from a borrowed slice, cloning each property.
+///
+/// Useful where the properties are held elsewhere — a table of defaults, a
+/// set read from configuration — and the collection is built from them
+/// repeatedly. Where the caller owns the properties,
+/// [`From<Vec<Property>>`](Properties::from) takes them without cloning.
+///
+/// Each property goes through [`push`](Self::push), so the size cache and the
+/// seen-identifier set are built as they would be one at a time, and an
+/// invalid property marks the collection invalid rather than being refused
+/// here.
+///
+/// An array converts too, borrowed or owned — see the two impls below.
+impl From<&[Property]> for Properties {
+    fn from(props: &[Property]) -> Self {
+        let mut out = Self {
+            props: Vec::with_capacity(props.len()),
+            ..Self::default()
+        };
+        out.extend(props.iter().cloned());
+        out
+    }
+}
+
+/// Builds a collection from an array, taking the properties as they are.
+///
+/// This is the one for an array written in place — `[Property::new_u32(..),
+/// Property::new_string(..)].into()` — which the slice impl would reach only
+/// through a reference, and only by cloning.
+impl<const N: usize> From<[Property; N]> for Properties {
+    fn from(props: [Property; N]) -> Self {
+        let mut out = Self {
+            props: Vec::with_capacity(N),
+            ..Self::default()
+        };
+        out.extend(props);
+        out
+    }
+}
+
+/// Builds a collection from a borrowed array, cloning each property.
+///
+/// The same as the slice impl, which an array reference cannot reach through
+/// `into`: trait resolution does not see through the unsizing coercion from
+/// `&[Property; N]` to `&[Property]`. With this, `(&arr).into()` and
+/// `arr[..].into()` both work.
+impl<const N: usize> From<&[Property; N]> for Properties {
+    fn from(props: &[Property; N]) -> Self {
+        Self::from(&props[..])
     }
 }
 
@@ -2952,6 +3140,263 @@ mod tests {
         let mut dst = BytesMut::new();
         assert_eq!(
             p.encode(&mut dst, MQTT_VERSION_5),
+            Err(Error::ProtocolError)
+        );
+    }
+
+    // ---- PropertiesBuilder ----
+
+    /// The builder reaches every property the collection does, and produces
+    /// the same collection. Both surfaces come from one table, so this is
+    /// the test that the table is complete in both directions.
+    #[test]
+    fn test_builder_matches_the_push_methods() {
+        let built = Properties::builder()
+            // Byte values that are not flags.
+            .payload_format_indicator(1)
+            .maximum_qos(1)
+            // Flags.
+            .request_problem_information(true)
+            .request_response_information(false)
+            .retain_available(true)
+            .wildcard_subscription_available(false)
+            .subscription_identifier_available(true)
+            .shared_subscription_available(false)
+            // Two-byte integers.
+            .server_keep_alive(30)
+            .receive_maximum(20)
+            .topic_alias_maximum(10)
+            .topic_alias(7)
+            // Four-byte integers.
+            .message_expiry_interval(3600)
+            .session_expiry_interval(300)
+            .will_delay_interval(60)
+            .maximum_packet_size(65_536)
+            // Variable-byte integer.
+            .subscription_identifier(4444u32)
+            // Binary.
+            .correlation_data(Bytes::from_static(b"corr"))
+            .authentication_data(Bytes::from_static(b"auth"))
+            // Strings.
+            .content_type("application/json")
+            .response_topic("reply/here")
+            .assigned_client_identifier("auto-42")
+            .authentication_method("SCRAM-SHA-1")
+            .response_information("reply")
+            .server_reference("mqtt://other:1883")
+            .reason_string("because")
+            // The two that are not generated.
+            .user("trace-id", "abc123")
+            .property(Property::new(
+                PropertyId::PayloadFormatIndicator,
+                PropertyValue::Byte(1),
+            ))
+            .finalize();
+
+        let mut pushed = Properties::new();
+        pushed.push_payload_format_indicator(1);
+        pushed.push_maximum_qos(1);
+        pushed.push_request_problem_information(true);
+        pushed.push_request_response_information(false);
+        pushed.push_retain_available(true);
+        pushed.push_wildcard_subscription_available(false);
+        pushed.push_subscription_identifier_available(true);
+        pushed.push_shared_subscription_available(false);
+        pushed.push_server_keep_alive(30);
+        pushed.push_receive_maximum(20);
+        pushed.push_topic_alias_maximum(10);
+        pushed.push_topic_alias(7);
+        pushed.push_message_expiry_interval(3600);
+        pushed.push_session_expiry_interval(300);
+        pushed.push_will_delay_interval(60);
+        pushed.push_maximum_packet_size(65_536);
+        pushed.push_subscription_identifier(4444u32);
+        pushed.push_correlation_data(Bytes::from_static(b"corr"));
+        pushed.push_authentication_data(Bytes::from_static(b"auth"));
+        pushed.push_content_type("application/json");
+        pushed.push_response_topic("reply/here");
+        pushed.push_assigned_client_identifier("auto-42");
+        pushed.push_authentication_method("SCRAM-SHA-1");
+        pushed.push_response_information("reply");
+        pushed.push_server_reference("mqtt://other:1883");
+        pushed.push_reason_string("because");
+        pushed.push_user("trace-id", "abc123");
+        pushed.push(Property::new(
+            PropertyId::PayloadFormatIndicator,
+            PropertyValue::Byte(1),
+        ));
+
+        assert_eq!(built, pushed);
+        assert_eq!(
+            built.len(),
+            28,
+            "26 generated, plus a user property and a raw push"
+        );
+    }
+
+    /// The empty builder is the empty collection, and `new` agrees with the
+    /// shortcut on the collection.
+    #[test]
+    fn test_builder_empty_and_shortcut() {
+        assert_eq!(PropertiesBuilder::new().finalize(), Properties::new());
+        assert!(Properties::builder().finalize().is_empty());
+        assert_eq!(
+            Properties::builder().topic_alias(3).finalize(),
+            PropertiesBuilder::new().topic_alias(3).finalize()
+        );
+    }
+
+    /// A builder converts into the collection it built, and into the
+    /// `Option<Properties>` that the acknowledgement constructors take.
+    #[test]
+    fn test_builder_into_properties() {
+        let props: Properties = Properties::builder().reason_string("nope").into();
+        assert_eq!(props.get_reason_string().as_deref(), Some("nope"));
+
+        let opt: Option<Properties> = Properties::builder().reason_string("nope").into();
+        assert_eq!(opt, Some(props));
+
+        // `None` and a finished collection still convert as they did.
+        let none: Option<Properties> = None;
+        assert_eq!(none, None);
+        let from_finished: Option<Properties> = Properties::new().into();
+        assert_eq!(from_finished, Some(Properties::new()));
+    }
+
+    /// The constructors that take `Into<Option<Properties>>` now accept a
+    /// builder directly, without `finalize`.
+    #[test]
+    fn test_builder_passes_to_a_constructor_unfinalized() {
+        use crate::{PubAck, ReasonCode};
+
+        let ack = PubAck::with_properties(
+            1,
+            ReasonCode::UnspecifiedError,
+            Properties::builder().reason_string("no room"),
+        );
+        assert_eq!(
+            ack.properties.get_reason_string().as_deref(),
+            Some("no room")
+        );
+        assert_eq!(
+            ack,
+            PubAck::with_properties(
+                1,
+                ReasonCode::UnspecifiedError,
+                Properties::builder().reason_string("no room").finalize(),
+            )
+        );
+    }
+
+    /// The builder validates nothing, as documented: an out-of-range value
+    /// is refused where everything else is, on encode.
+    #[test]
+    fn test_builder_defers_validation_to_encode() {
+        let props = Properties::builder().topic_alias(0).finalize();
+        let mut dst = BytesMut::new();
+        assert_eq!(
+            props.encode(&mut dst, MQTT_VERSION_5),
+            Err(Error::ProtocolError),
+            "a topic alias of 0 is invalid"
+        );
+    }
+
+    /// A slice builds the same collection the owned `Vec` does, without
+    /// giving up the properties.
+    #[test]
+    fn test_from_property_slice() {
+        let owned = vec![
+            Property::new_u32(PropertyId::MessageExpiryInterval, 3600),
+            Property::new_string(PropertyId::ContentType, "text/plain"),
+            Property::new_string_pair(PropertyId::UserProperty, "k", "v"),
+        ];
+
+        let from_slice = Properties::from(&owned[..]);
+        let from_vec = Properties::from(owned.clone());
+        assert_eq!(from_slice, from_vec);
+
+        // The source is still usable, which is the point of the impl.
+        assert_eq!(owned.len(), 3);
+        assert_eq!(from_slice.len(), 3);
+        assert_eq!(from_slice.get_message_expiry_interval(), Some(3600));
+        assert_eq!(from_slice.get_content_type().as_deref(), Some("text/plain"));
+        assert_eq!(from_slice.get_user("k"), Some("v"));
+    }
+
+    /// The caches are built as `push` would build them, so the collection
+    /// encodes to what the same properties pushed one at a time encode to.
+    #[test]
+    fn test_from_property_slice_builds_the_caches() {
+        let props = [
+            Property::new_byte(PropertyId::PayloadFormatIndicator, 1),
+            Property::new_u16(PropertyId::TopicAlias, 7),
+        ];
+        let from_slice = Properties::from(&props[..]);
+
+        let mut pushed = Properties::new();
+        pushed.push_payload_format_indicator(1);
+        pushed.push_topic_alias(7);
+
+        assert_eq!(from_slice, pushed);
+        assert_eq!(
+            from_slice.encoded_size(MQTT_VERSION_5),
+            pushed.encoded_size(MQTT_VERSION_5)
+        );
+
+        let mut a = BytesMut::new();
+        let mut b = BytesMut::new();
+        from_slice.encode(&mut a, MQTT_VERSION_5).unwrap();
+        pushed.encode(&mut b, MQTT_VERSION_5).unwrap();
+        assert_eq!(a, b);
+    }
+
+    /// An empty slice is an empty collection, not an error.
+    #[test]
+    fn test_from_empty_property_slice() {
+        let none: [Property; 0] = [];
+        assert_eq!(Properties::from(&none[..]), Properties::new());
+        assert_eq!(Properties::from(none), Properties::new());
+    }
+
+    /// An array converts whether it is owned or borrowed, and `into` works
+    /// on both — an array reference cannot reach the slice impl through
+    /// `into`, which is why the borrowed form exists.
+    #[test]
+    fn test_from_property_array() {
+        let make = || {
+            [
+                Property::new_u32(PropertyId::MessageExpiryInterval, 3600),
+                Property::new_string(PropertyId::ContentType, "text/plain"),
+            ]
+        };
+
+        // Owned, written in place: no clone, no reference.
+        let owned: Properties = make().into();
+        assert_eq!(owned.get_message_expiry_interval(), Some(3600));
+        assert_eq!(owned.get_content_type().as_deref(), Some("text/plain"));
+
+        // Borrowed, by `into` and by `from`, leaving the array in place.
+        let arr = make();
+        let by_into: Properties = (&arr).into();
+        let by_from = Properties::from(&arr);
+        assert_eq!(arr.len(), 2);
+
+        // And all four routes agree, including through the slice.
+        let by_slice: Properties = arr[..].into();
+        assert_eq!(owned, by_into);
+        assert_eq!(owned, by_from);
+        assert_eq!(owned, by_slice);
+    }
+
+    /// A property the specification refuses still marks the collection
+    /// invalid, exactly as pushing it would; the conversion does not filter.
+    #[test]
+    fn test_from_property_slice_keeps_invalidity() {
+        let bad = [Property::new_u16(PropertyId::TopicAlias, 0)];
+        let props = Properties::from(&bad[..]);
+        let mut dst = BytesMut::new();
+        assert_eq!(
+            props.encode(&mut dst, MQTT_VERSION_5),
             Err(Error::ProtocolError)
         );
     }

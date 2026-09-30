@@ -26,7 +26,9 @@
 //!
 //! On v3.1.1 connections properties are always empty.
 
-pub use paho_mqtt_codec::{Properties, Property, PropertyId, PropertyType, PropertyValue};
+pub use paho_mqtt_codec::{
+    Properties, PropertiesBuilder, Property, PropertyId, PropertyType, PropertyValue,
+};
 
 /// Backward-compatible alias for [`PropertyId`].
 pub type PropertyCode = PropertyId;

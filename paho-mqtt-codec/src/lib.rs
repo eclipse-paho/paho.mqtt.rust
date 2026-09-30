@@ -129,7 +129,8 @@ pub use disconnect::Disconnect;
 pub use error::{Error, Result};
 pub use packet::{DecodeOptions, MAX_PACKET_SIZE, Packet, PacketType, RawPacket};
 pub use properties::{
-    Properties, Property, PropertyContext, PropertyId, PropertyType, PropertyValue,
+    Properties, PropertiesBuilder, Property, PropertyContext, PropertyId, PropertyType,
+    PropertyValue,
 };
 pub use publish::{PubAck, PubComp, PubRec, PubRel, Publish, PublishBuilder};
 pub use reason_code::ReasonCode;
