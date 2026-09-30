@@ -41,7 +41,7 @@ use serde::{Deserialize, Serialize};
 /////////////////////////////////////////////////////////////////////////////
 
 /// The wire encoding type of an MQTT v5 property value.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum PropertyType {
     /// Single byte.
@@ -67,7 +67,7 @@ pub enum PropertyType {
 /// Each identifier has a fixed associated wire type (see [`PropertyId::value_type`]).
 /// The numeric discriminants match the values on the wire.
 #[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum PropertyId {
     /// Payload is unspecified bytes (0) or UTF-8 text (1). PUBLISH, Will.
@@ -2551,5 +2551,48 @@ mod tests {
         let mut dst = BytesMut::new();
         props.encode(&mut dst, v5()).unwrap();
         assert_eq!(props.get_u16(PropertyId::ReceiveMaximum), Some(30));
+    }
+
+    // ---- orderings (a property id is a number, and sorts like one) ----
+
+    /// Identifiers sort by their wire value, so they can key a `BTreeMap` or
+    /// be sorted for a canonical order.
+    #[test]
+    fn test_property_id_orders_by_wire_value() {
+        let mut ids = vec![
+            PropertyId::UserProperty,
+            PropertyId::PayloadFormatIndicator,
+            PropertyId::TopicAlias,
+        ];
+        ids.sort();
+        assert_eq!(
+            ids,
+            vec![
+                PropertyId::PayloadFormatIndicator,
+                PropertyId::TopicAlias,
+                PropertyId::UserProperty,
+            ]
+        );
+        assert!(PropertyId::PayloadFormatIndicator < PropertyId::UserProperty);
+
+        let mut by_id = alloc::collections::BTreeMap::new();
+        by_id.insert(PropertyId::TopicAlias, 1u8);
+        by_id.insert(PropertyId::PayloadFormatIndicator, 2);
+        assert_eq!(
+            by_id.keys().copied().collect::<Vec<_>>(),
+            vec![PropertyId::PayloadFormatIndicator, PropertyId::TopicAlias]
+        );
+    }
+
+    /// A value type is hashable and ordered too, for the same reasons.
+    #[test]
+    fn test_property_type_is_hashable_and_ordered() {
+        let mut types = vec![PropertyType::StringPair, PropertyType::Byte];
+        types.sort();
+        assert_eq!(types, vec![PropertyType::Byte, PropertyType::StringPair]);
+
+        let mut set = alloc::collections::BTreeSet::new();
+        assert!(set.insert(PropertyType::U32));
+        assert!(!set.insert(PropertyType::U32));
     }
 }

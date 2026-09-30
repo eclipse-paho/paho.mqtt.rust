@@ -185,6 +185,21 @@ compile_error!(
 #[macro_use]
 extern crate log;
 
+/// Re-export `bytes`, which appears in this crate's API: a [`Message`]
+/// payload is a [`Bytes`](bytes::Bytes), and the payload arguments take
+/// anything convertible into one. Naming the type through this re-export
+/// keeps an application on the same version the client uses.
+///
+/// ```
+/// use paho_mqtt as mqtt;
+/// use mqtt::bytes::Bytes;
+///
+/// let payload = Bytes::from_static(b"reused without copying");
+/// let msg = mqtt::Message::new("data", payload.clone(), mqtt::QOS_1);
+/// assert_eq!(msg.payload(), &payload[..]);
+/// ```
+pub use bytes;
+
 /// Re-export async_channel
 pub use async_channel::{self, Receiver as AsyncReceiver};
 

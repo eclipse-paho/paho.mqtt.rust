@@ -26,8 +26,13 @@ use std::{io, result, str};
 use thiserror::Error;
 
 /// The errors from an MQTT operation.
+///
+/// `#[non_exhaustive]`: a `match` on this from outside the crate needs a
+/// wildcard arm, so that a variant added in a later release is a change an
+/// application can absorb rather than a compilation failure.
 #[derive(Error, Debug)]
 #[allow(missing_docs)]
+#[non_exhaustive]
 pub enum Error {
     /// A generic error code indicating the failure of an MQTT client operation.
     #[error("General failure")]

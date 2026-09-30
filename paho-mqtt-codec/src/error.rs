@@ -37,7 +37,16 @@ use crate::ReasonCode;
 use thiserror::Error;
 
 /// MQTT encoding and protocol errors.
+///
+/// `#[non_exhaustive]`: a `match` on this from another crate needs a wildcard
+/// arm. The specification's two classes of bad input are fixed, but the
+/// variants that name *which* rule was broken are not — every one added so
+/// far came from reading the specification more closely — so a consumer
+/// should be able to take a new one without a build failure. Where the
+/// classification is all that matters, match on
+/// [`reason_code`](Self::reason_code) instead of on the variant.
 #[derive(Error, Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Error {
     /// An invalid QoS byte value was encountered.
     #[error("invalid QoS value")]
