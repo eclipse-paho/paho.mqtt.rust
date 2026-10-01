@@ -42,7 +42,7 @@ use crate::{
     wire::{get_binary, get_utf8, put_binary, put_utf8},
 };
 use bytes::{Buf, BufMut, Bytes};
-use strum_macros::{EnumCount, EnumDiscriminants, FromRepr, VariantArray};
+use strum_macros::{EnumDiscriminants, FromRepr};
 
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
@@ -344,7 +344,7 @@ impl PropertyValue {
 #[derive(Debug, Clone, PartialEq, Eq, EnumDiscriminants)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[strum_discriminants(name(PropertyId), vis(pub))]
-#[strum_discriminants(derive(Hash, PartialOrd, Ord, FromRepr, EnumCount, VariantArray))]
+#[strum_discriminants(derive(Hash, PartialOrd, Ord, FromRepr))]
 #[strum_discriminants(cfg_attr(feature = "serde", derive(Serialize, Deserialize)))]
 #[strum_discriminants(doc = "MQTT v5 property identifiers (§2.2.2.2, Table 2-4).")]
 #[strum_discriminants(doc = "")]
@@ -1654,9 +1654,6 @@ mod tests {
     use crate::types::MQTT_VERSION_5;
     use alloc::{string::ToString, vec};
     use bytes::BytesMut;
-    // The traits behind `PropertyId::COUNT` and `::VARIANTS`, which the
-    // `EnumCount` and `VariantArray` derives implement.
-    use strum::{EnumCount as _, VariantArray as _};
 
     fn v5() -> MqttVersion {
         MQTT_VERSION_5
@@ -2207,12 +2204,13 @@ mod tests {
 
     #[test]
     fn test_property_id_try_from_known() {
-        // Every identifier, taken from the enum itself: this also covers the
-        // byte-to-identifier table that `FromRepr` writes.
-        for id in PropertyId::VARIANTS {
-            assert_eq!(PropertyId::try_from(*id as u8), Ok(*id), "{id:?}");
+        // Every identifier, by way of the fixture that holds one of each
+        // variant: this also covers the byte-to-identifier table that
+        // `FromRepr` writes.
+        for p in every_property() {
+            let id = p.property_id();
+            assert_eq!(PropertyId::try_from(id as u8), Ok(id), "{id:?}");
         }
-        assert_eq!(PropertyId::VARIANTS.len(), PropertyId::COUNT);
         // Spot-checks that the discriminants are the specification's bytes.
         assert_eq!(
             PropertyId::try_from(0x01),
@@ -3331,14 +3329,10 @@ mod tests {
     fn test_property_id_matches_the_variant() {
         let all = every_property();
 
-        // The fixture must cover the enum, which `PropertyId::VARIANTS` now
-        // states rather than a literal count someone has to remember to
-        // raise.
-        let covered: Vec<PropertyId> = all.iter().map(Property::property_id).collect();
-        for id in PropertyId::VARIANTS {
-            assert!(covered.contains(id), "{id:?} is missing from the fixture");
-        }
-        assert_eq!(all.len(), PropertyId::COUNT, "a duplicate in the fixture");
+        // `expected_id` below matches exhaustively, so the compiler already
+        // guarantees every *variant* is accounted for there; this count is
+        // what guarantees the fixture lists them all. Raise it with the enum.
+        assert_eq!(all.len(), 27, "a variant is missing from the fixture");
 
         for p in &all {
             assert_eq!(p.property_id(), expected_id(p), "{p:?}");
