@@ -657,7 +657,7 @@ impl ConnAck {
 mod tests {
     use super::*;
     use crate::{
-        Property, PropertyId, PropertyValue,
+        Property, PropertyId,
         types::{MQTT_VERSION_3_1_1, MQTT_VERSION_5},
     };
     use bytes::{BufMut, BytesMut};
@@ -930,10 +930,7 @@ mod tests {
     /// A Receive Maximum, as a server stating its window would send.
     fn recv_max_props(n: u16) -> Properties {
         let mut props = Properties::new();
-        props.push(Property::new(
-            PropertyId::ReceiveMaximum,
-            PropertyValue::U16(n),
-        ));
+        props.push(Property::ReceiveMaximum(n));
         props
     }
 
@@ -944,7 +941,7 @@ mod tests {
         assert_eq!(ack.reason_code, ReasonCode::Success);
         assert_eq!(
             ack.properties.get(PropertyId::ReceiveMaximum),
-            Some(&PropertyValue::U16(20))
+            Some(&Property::ReceiveMaximum(20))
         );
     }
 
@@ -978,30 +975,12 @@ mod tests {
     #[test]
     fn test_connack_with_properties_multiple_round_trip_v5() {
         let mut props = recv_max_props(20);
-        props.push(Property::new(
-            PropertyId::AssignedClientIdentifier,
-            PropertyValue::String("auto-42".into()),
-        ));
-        props.push(Property::new(
-            PropertyId::ServerKeepAlive,
-            PropertyValue::U16(30),
-        ));
-        props.push(Property::new(
-            PropertyId::MaximumPacketSize,
-            PropertyValue::U32(65536),
-        ));
-        props.push(Property::new(
-            PropertyId::RetainAvailable,
-            PropertyValue::Byte(0),
-        ));
-        props.push(Property::new(
-            PropertyId::UserProperty,
-            PropertyValue::StringPair("a".into(), "1".into()),
-        ));
-        props.push(Property::new(
-            PropertyId::UserProperty,
-            PropertyValue::StringPair("b".into(), "2".into()),
-        ));
+        props.push(Property::AssignedClientIdentifier("auto-42".into()));
+        props.push(Property::ServerKeepAlive(30));
+        props.push(Property::MaximumPacketSize(65536));
+        props.push(Property::RetainAvailable(0));
+        props.push(Property::UserProperty("a".into(), "1".into()));
+        props.push(Property::UserProperty("b".into(), "2".into()));
         let ack = ConnAck::with_properties(true, ReasonCode::Success, props);
 
         let mut dst = BytesMut::new();
@@ -1020,10 +999,7 @@ mod tests {
     #[test]
     fn test_connack_with_properties_on_a_refused_connection() {
         let mut props = Properties::new();
-        props.push(Property::new(
-            PropertyId::ReasonString,
-            PropertyValue::String("bad credentials".into()),
-        ));
+        props.push(Property::ReasonString("bad credentials".into()));
         let ack = ConnAck::with_properties(true, ReasonCode::NotAuthorized, props);
 
         let mut dst = BytesMut::new();
@@ -1033,7 +1009,7 @@ mod tests {
         assert_eq!(decoded.reason_code, ReasonCode::NotAuthorized);
         assert_eq!(
             decoded.properties.get(PropertyId::ReasonString),
-            Some(&PropertyValue::String("bad credentials".into()))
+            Some(&Property::ReasonString("bad credentials".into()))
         );
         assert!(
             !decoded.session_present,
@@ -1066,11 +1042,7 @@ mod tests {
     #[test]
     fn test_connack_with_properties_rejects_a_property_not_allowed_here() {
         let mut props = Properties::new();
-        props.push(Property::new(
-            // A PUBLISH property; meaningless in a CONNACK.
-            PropertyId::ContentType,
-            PropertyValue::String("text/plain".into()),
-        ));
+        props.push(Property::ContentType("text/plain".into()));
         let ack = ConnAck::with_properties(false, ReasonCode::Success, props);
         let mut dst = BytesMut::new();
         assert_eq!(ack.encode(&mut dst, v5()), Err(Error::ProtocolError));
@@ -1528,10 +1500,7 @@ mod tests {
     #[test]
     fn test_connect_rejects_connack_only_property() {
         let mut c = Connect::new(v5(), true, "c");
-        c.properties.push(Property::new(
-            PropertyId::MaximumQoS,
-            PropertyValue::Byte(1),
-        ));
+        c.properties.push(Property::MaximumQoS(1));
         let mut dst = BytesMut::new();
         assert_eq!(c.encode(&mut dst), Err(Error::ProtocolError));
     }
@@ -1541,18 +1510,14 @@ mod tests {
         let mut c = Connect::new(v5(), true, "c");
         let mut will = Will::new("w", Bytes::new(), QoS::QoS0, false);
         // TopicAlias is a PUBLISH property, never a Will property.
-        will.properties
-            .push(Property::new(PropertyId::TopicAlias, PropertyValue::U16(1)));
+        will.properties.push(Property::TopicAlias(1));
         c.will = Some(will);
         let mut dst = BytesMut::new();
         assert_eq!(c.encode(&mut dst), Err(Error::ProtocolError));
         // ... while WillDelayInterval belongs there and round-trips.
         let mut c = Connect::new(v5(), true, "c");
         let mut will = Will::new("w", Bytes::new(), QoS::QoS0, false);
-        will.properties.push(Property::new(
-            PropertyId::WillDelayInterval,
-            PropertyValue::U32(5),
-        ));
+        will.properties.push(Property::WillDelayInterval(5));
         c.will = Some(will);
         round_trip_connect(c);
     }
@@ -1562,11 +1527,7 @@ mod tests {
         // A valid v5 CONNECT, then splice MaximumQoS (0x24 0x01) into its
         // property block by re-encoding with the context check bypassed.
         let mut c = Connect::new(v5(), true, "c");
-        c.properties = alloc::vec![Property::new(
-            PropertyId::MaximumQoS,
-            PropertyValue::Byte(1)
-        )]
-        .into();
+        c.properties = alloc::vec![Property::MaximumQoS(1)].into();
         let mut dst = BytesMut::new();
         // Bypass Connect::encode's context check by writing the pieces by hand.
         dst.put_u16(4);
@@ -1622,14 +1583,8 @@ mod tests {
 
     fn will_props() -> Properties {
         let mut props = Properties::new();
-        props.push(Property::new(
-            PropertyId::WillDelayInterval,
-            PropertyValue::U32(30),
-        ));
-        props.push(Property::new(
-            PropertyId::ContentType,
-            PropertyValue::String("text/plain".into()),
-        ));
+        props.push(Property::WillDelayInterval(30));
+        props.push(Property::ContentType("text/plain".into()));
         props
     }
 
@@ -1648,7 +1603,7 @@ mod tests {
         assert!(will.retain);
         assert_eq!(
             will.properties.get(PropertyId::WillDelayInterval),
-            Some(&PropertyValue::U32(30))
+            Some(&Property::WillDelayInterval(30))
         );
     }
 
@@ -1692,10 +1647,7 @@ mod tests {
     #[test]
     fn test_will_with_properties_rejects_a_property_not_allowed_here() {
         let mut props = Properties::new();
-        props.push(Property::new(
-            PropertyId::SessionExpiryInterval,
-            PropertyValue::U32(60),
-        ));
+        props.push(Property::SessionExpiryInterval(60));
         let mut c = Connect::new(v5(), true, "c");
         c.will = Some(Will::with_properties(
             "w",
@@ -1764,7 +1716,7 @@ mod tests {
     #[test]
     fn test_will_from_publish_defers_context_validation_to_encode() {
         let mut props = Properties::new();
-        props.push(Property::new(PropertyId::TopicAlias, PropertyValue::U16(1)));
+        props.push(Property::TopicAlias(1));
         let p = Publish::builder()
             .topic("w")
             .payload("bye")
@@ -1774,7 +1726,7 @@ mod tests {
         let will = Will::from(p);
         assert_eq!(
             will.properties.get(PropertyId::TopicAlias),
-            Some(&PropertyValue::U16(1))
+            Some(&Property::TopicAlias(1))
         );
 
         let mut c = Connect::new(v5(), true, "cli");
@@ -1787,14 +1739,8 @@ mod tests {
 
     fn connect_props() -> Properties {
         let mut props = Properties::new();
-        props.push(Property::new(
-            PropertyId::SessionExpiryInterval,
-            PropertyValue::U32(300),
-        ));
-        props.push(Property::new(
-            PropertyId::ReceiveMaximum,
-            PropertyValue::U16(20),
-        ));
+        props.push(Property::SessionExpiryInterval(300));
+        props.push(Property::ReceiveMaximum(20));
         props
     }
 
@@ -1827,10 +1773,7 @@ mod tests {
     #[test]
     fn test_connect_with_properties_rejects_a_property_not_allowed_here() {
         let mut props = Properties::new();
-        props.push(Property::new(
-            PropertyId::WillDelayInterval,
-            PropertyValue::U32(5),
-        ));
+        props.push(Property::WillDelayInterval(5));
         let c = Connect::builder()
             .version(v5())
             .client_id("c")
@@ -1891,7 +1834,7 @@ mod tests {
         assert_eq!(c.will, Some(will));
         assert_eq!(
             c.properties.get(PropertyId::SessionExpiryInterval),
-            Some(&PropertyValue::U32(300))
+            Some(&Property::SessionExpiryInterval(300))
         );
     }
 

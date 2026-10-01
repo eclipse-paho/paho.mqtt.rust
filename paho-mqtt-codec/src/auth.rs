@@ -145,20 +145,14 @@ impl Auth {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        Error,
-        properties::{Property, PropertyId, PropertyValue},
-    };
+    use crate::{Error, properties::Property};
     use alloc::string::ToString;
     use bytes::BytesMut;
 
     /// Properties naming an authentication method, which every AUTH needs.
     fn method_props(name: &str) -> Properties {
         let mut props = Properties::new();
-        props.push(Property::new(
-            PropertyId::AuthenticationMethod,
-            PropertyValue::String(name.to_string()),
-        ));
+        props.push(Property::AuthenticationMethod(name.to_string()));
         props
     }
 
@@ -286,24 +280,17 @@ mod tests {
     #[test]
     fn test_auth_with_method_property_round_trip() {
         let mut props = Properties::new();
-        props.push(Property::new(
-            PropertyId::AuthenticationMethod,
-            PropertyValue::String("SCRAM-SHA-256".to_string()),
-        ));
+        props.push(Property::AuthenticationMethod("SCRAM-SHA-256".to_string()));
         round_trip(Auth::new(ReasonCode::ContinueAuthentication, props));
     }
 
     #[test]
     fn test_auth_with_method_and_data_round_trip() {
         let mut props = Properties::new();
-        props.push(Property::new(
-            PropertyId::AuthenticationMethod,
-            PropertyValue::String("GSSAPI".to_string()),
-        ));
-        props.push(Property::new(
-            PropertyId::AuthenticationData,
-            PropertyValue::Binary(bytes::Bytes::from_static(b"\x01\x02\x03\x04")),
-        ));
+        props.push(Property::AuthenticationMethod("GSSAPI".to_string()));
+        props.push(Property::AuthenticationData(bytes::Bytes::from_static(
+            b"\x01\x02\x03\x04",
+        )));
         round_trip(Auth::new(ReasonCode::ContinueAuthentication, props));
     }
 
@@ -320,10 +307,7 @@ mod tests {
     #[test]
     fn test_encoded_size_matches_encode_with_props() {
         let mut props = Properties::new();
-        props.push(Property::new(
-            PropertyId::AuthenticationMethod,
-            PropertyValue::String("plain".to_string()),
-        ));
+        props.push(Property::AuthenticationMethod("plain".to_string()));
         let a = Auth {
             reason_code: ReasonCode::Success,
             properties: props,
@@ -340,10 +324,7 @@ mod tests {
     #[test]
     fn test_auth_rejects_data_without_method() {
         let mut props = Properties::new();
-        props.push(Property::new(
-            PropertyId::AuthenticationData,
-            PropertyValue::Binary(Bytes::from_static(b"tok")),
-        ));
+        props.push(Property::AuthenticationData(Bytes::from_static(b"tok")));
         let a = Auth::new(ReasonCode::ContinueAuthentication, props);
         let mut dst = BytesMut::new();
         assert_eq!(a.encode(&mut dst), Err(Error::ProtocolError));
@@ -352,10 +333,7 @@ mod tests {
     #[test]
     fn test_auth_accepts_data_with_method() {
         let mut props = method_props("SCRAM-SHA-1");
-        props.push(Property::new(
-            PropertyId::AuthenticationData,
-            PropertyValue::Binary(Bytes::from_static(b"tok")),
-        ));
+        props.push(Property::AuthenticationData(Bytes::from_static(b"tok")));
         round_trip(Auth::new(ReasonCode::ContinueAuthentication, props));
     }
 }

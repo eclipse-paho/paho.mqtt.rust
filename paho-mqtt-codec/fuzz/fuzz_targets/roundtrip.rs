@@ -221,7 +221,9 @@ fn property(u: &mut Unstructured, id: PropertyId) -> AResult<Property> {
         }),
         PropertyType::StringPair => PropertyValue::StringPair(utf8(u, 128)?, utf8(u, 128)?),
     };
-    Ok(Property::new(id, value))
+    // The identifier and the value are chosen separately here, so build
+    // through the fallible pairing; by construction the two always agree.
+    Property::from_value(id, value).map_err(|_| arbitrary::Error::IncorrectFormat)
 }
 
 /// A property list valid for `ctx`: only identifiers the specification

@@ -35,9 +35,9 @@
 use bytes::{Bytes, BytesMut};
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use paho_mqtt_codec::{
-    Auth, ConnAck, Connect, Disconnect, MqttVersion, Packet, Properties, Property, PropertyId,
-    PropertyValue, PubAck, Publish, QoS, RawPacket, ReasonCode, RetainHandling, SubAck, Subscribe,
-    Subscription, UnsubAck, Unsubscribe, Will,
+    Auth, ConnAck, Connect, Disconnect, MqttVersion, Packet, Properties, Property, PubAck, Publish,
+    QoS, RawPacket, ReasonCode, RetainHandling, SubAck, Subscribe, Subscription, UnsubAck,
+    Unsubscribe, Will,
 };
 use std::hint::black_box;
 
@@ -61,22 +61,10 @@ fn packets_for(ver: MqttVersion) -> Vec<(&'static str, Packet)> {
 /// A representative v5 property set: two user properties and a few scalars.
 fn props() -> Properties {
     let mut p = Properties::new();
-    p.push(Property::new(
-        PropertyId::SessionExpiryInterval,
-        PropertyValue::U32(3600),
-    ));
-    p.push(Property::new(
-        PropertyId::ReceiveMaximum,
-        PropertyValue::U16(20),
-    ));
-    p.push(Property::new(
-        PropertyId::UserProperty,
-        PropertyValue::StringPair("client".into(), "bench".into()),
-    ));
-    p.push(Property::new(
-        PropertyId::UserProperty,
-        PropertyValue::StringPair("region".into(), "us-east-1".into()),
-    ));
+    p.push(Property::SessionExpiryInterval(3600));
+    p.push(Property::ReceiveMaximum(20));
+    p.push(Property::UserProperty("client".into(), "bench".into()));
+    p.push(Property::UserProperty("region".into(), "us-east-1".into()));
     p
 }
 
@@ -96,14 +84,9 @@ fn publish(ver: MqttVersion, payload_len: usize) -> Packet {
     p.qos = QoS::AtLeastOnce;
     p.packet_id = Some(1234);
     if ver == MqttVersion::V5 {
-        p.properties.push(Property::new(
-            PropertyId::MessageExpiryInterval,
-            PropertyValue::U32(60),
-        ));
-        p.properties.push(Property::new(
-            PropertyId::ContentType,
-            PropertyValue::String("application/json".into()),
-        ));
+        p.properties.push(Property::MessageExpiryInterval(60));
+        p.properties
+            .push(Property::ContentType("application/json".into()));
     }
     Packet::Publish(p)
 }
@@ -138,10 +121,9 @@ fn packets(ver: MqttVersion) -> Vec<(&'static str, Packet)> {
     if ver == MqttVersion::V5 {
         subscribe.subscriptions[0].no_local = true;
         subscribe.subscriptions[1].retain_handling = RetainHandling::DoNotSend;
-        subscribe.properties.push(Property::new(
-            PropertyId::SubscriptionIdentifier,
-            PropertyValue::VarInt(5),
-        ));
+        subscribe
+            .properties
+            .push(Property::SubscriptionIdentifier(5));
     }
 
     let suback = SubAck {
@@ -171,22 +153,18 @@ fn packets(ver: MqttVersion) -> Vec<(&'static str, Packet)> {
 
     let mut disconnect_rc = Disconnect::with_properties(ReasonCode::SessionTakenOver, None);
     if ver == MqttVersion::V5 {
-        disconnect_rc.properties.push(Property::new(
-            PropertyId::SessionExpiryInterval,
-            PropertyValue::U32(0),
-        ));
-        disconnect_rc.properties.push(Property::new(
-            PropertyId::ReasonString,
-            PropertyValue::String("session taken over".into()),
-        ));
-        disconnect_rc.properties.push(Property::new(
-            PropertyId::UserProperty,
-            PropertyValue::StringPair("client".into(), "bench".into()),
-        ));
-        disconnect_rc.properties.push(Property::new(
-            PropertyId::UserProperty,
-            PropertyValue::StringPair("region".into(), "us-east-1".into()),
-        ));
+        disconnect_rc
+            .properties
+            .push(Property::SessionExpiryInterval(0));
+        disconnect_rc
+            .properties
+            .push(Property::ReasonString("session taken over".into()));
+        disconnect_rc
+            .properties
+            .push(Property::UserProperty("client".into(), "bench".into()));
+        disconnect_rc
+            .properties
+            .push(Property::UserProperty("region".into(), "us-east-1".into()));
     }
 
     let mut pkts = vec![
@@ -214,14 +192,8 @@ fn packets(ver: MqttVersion) -> Vec<(&'static str, Packet)> {
         pkts.push(("puback_reason", Packet::PubAck(puback_rc)));
         pkts.push(("disconnect_reason", Packet::Disconnect(disconnect_rc)));
         let mut auth_props = Properties::new();
-        auth_props.push(Property::new(
-            PropertyId::AuthenticationMethod,
-            PropertyValue::String("SCRAM-SHA-256".into()),
-        ));
-        auth_props.push(Property::new(
-            PropertyId::AuthenticationData,
-            PropertyValue::Binary(Bytes::from_static(&[0u8; 32])),
-        ));
+        auth_props.push(Property::AuthenticationMethod("SCRAM-SHA-256".into()));
+        auth_props.push(Property::AuthenticationData(Bytes::from_static(&[0u8; 32])));
         let auth = Auth::new(ReasonCode::ContinueAuthentication, auth_props);
         pkts.push(("auth", Packet::Auth(auth)));
     }

@@ -174,7 +174,7 @@ impl Disconnect {
 mod tests {
     use super::*;
     use crate::{
-        Error, Property, PropertyId, PropertyValue,
+        Error, Property, PropertyId,
         types::{MQTT_VERSION_3_1_1, MQTT_VERSION_5},
     };
     use bytes::BytesMut;
@@ -428,10 +428,7 @@ mod tests {
     /// A ReasonString, as a server explaining itself would send.
     fn reason_props(text: &str) -> Properties {
         let mut props = Properties::new();
-        props.push(Property::new(
-            PropertyId::ReasonString,
-            PropertyValue::String(text.into()),
-        ));
+        props.push(Property::ReasonString(text.into()));
         props
     }
 
@@ -441,7 +438,7 @@ mod tests {
         assert_eq!(d.reason_code, ReasonCode::ServerBusy);
         assert_eq!(
             d.properties.get(PropertyId::ReasonString),
-            Some(&PropertyValue::String("try later".into()))
+            Some(&Property::ReasonString("try later".into()))
         );
     }
 
@@ -484,18 +481,9 @@ mod tests {
     #[test]
     fn test_with_properties_multiple_round_trip_v5() {
         let mut props = reason_props("going away");
-        props.push(Property::new(
-            PropertyId::SessionExpiryInterval,
-            PropertyValue::U32(120),
-        ));
-        props.push(Property::new(
-            PropertyId::UserProperty,
-            PropertyValue::StringPair("a".into(), "1".into()),
-        ));
-        props.push(Property::new(
-            PropertyId::UserProperty,
-            PropertyValue::StringPair("b".into(), "2".into()),
-        ));
+        props.push(Property::SessionExpiryInterval(120));
+        props.push(Property::UserProperty("a".into(), "1".into()));
+        props.push(Property::UserProperty("b".into(), "2".into()));
         let d = Disconnect::with_properties(ReasonCode::NormalDisconnection, props);
 
         let mut dst = BytesMut::new();
@@ -544,11 +532,7 @@ mod tests {
     #[test]
     fn test_with_properties_rejects_a_property_not_allowed_here() {
         let mut props = Properties::new();
-        props.push(Property::new(
-            // A PUBLISH property; meaningless in a DISCONNECT.
-            PropertyId::ContentType,
-            PropertyValue::String("text/plain".into()),
-        ));
+        props.push(Property::ContentType("text/plain".into()));
         let d = Disconnect::with_properties(ReasonCode::NormalDisconnection, props);
         let mut dst = BytesMut::new();
         assert_eq!(d.encode(&mut dst, v5()), Err(Error::ProtocolError));

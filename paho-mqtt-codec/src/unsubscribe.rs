@@ -262,7 +262,7 @@ impl UnsubAck {
 mod tests {
     use super::*;
     use crate::{
-        Property, PropertyId, PropertyValue,
+        Property, PropertyId,
         types::{MQTT_VERSION_3_1_1, MQTT_VERSION_5},
     };
     use alloc::{string::ToString, vec};
@@ -594,10 +594,7 @@ mod tests {
 
     fn user_props(k: &str, v: &str) -> Properties {
         let mut props = Properties::new();
-        props.push(Property::new(
-            PropertyId::UserProperty,
-            PropertyValue::StringPair(k.into(), v.into()),
-        ));
+        props.push(Property::UserProperty(k.into(), v.into()));
         props
     }
 
@@ -609,7 +606,7 @@ mod tests {
         assert_eq!(unsub.topic_filters, filters);
         assert_eq!(
             unsub.properties.get(PropertyId::UserProperty),
-            Some(&PropertyValue::StringPair("why".into(), "done".into()))
+            Some(&Property::UserProperty("why".into(), "done".into()))
         );
     }
 
@@ -625,10 +622,7 @@ mod tests {
     #[test]
     fn test_unsubscribe_with_properties_round_trip_v5() {
         let mut props = user_props("a", "1");
-        props.push(Property::new(
-            PropertyId::UserProperty,
-            PropertyValue::StringPair("b".into(), "2".into()),
-        ));
+        props.push(Property::UserProperty("b".into(), "2".into()));
         let unsub =
             Unsubscribe::with_properties(11, vec!["a/+".to_string(), "b/#".to_string()], props);
 
@@ -650,10 +644,7 @@ mod tests {
     #[test]
     fn test_unsubscribe_with_properties_rejects_a_property_not_allowed_here() {
         let mut props = Properties::new();
-        props.push(Property::new(
-            PropertyId::ReasonString,
-            PropertyValue::String("why".into()),
-        ));
+        props.push(Property::ReasonString("why".into()));
         let unsub = Unsubscribe::with_properties(1, vec!["a".to_string()], props);
         let mut dst = BytesMut::new();
         assert_eq!(unsub.encode(&mut dst, v5()), Err(Error::ProtocolError));
@@ -718,14 +709,8 @@ mod tests {
     #[test]
     fn test_unsuback_with_properties_round_trip_v5() {
         let mut props = Properties::new();
-        props.push(Property::new(
-            PropertyId::ReasonString,
-            PropertyValue::String("one was not subscribed".into()),
-        ));
-        props.push(Property::new(
-            PropertyId::UserProperty,
-            PropertyValue::StringPair("a".into(), "1".into()),
-        ));
+        props.push(Property::ReasonString("one was not subscribed".into()));
+        props.push(Property::UserProperty("a".into(), "1".into()));
         let ack = UnsubAck::with_properties(
             12,
             vec![ReasonCode::Success, ReasonCode::NoSubscriptionFound],
@@ -750,10 +735,7 @@ mod tests {
     #[test]
     fn test_unsuback_with_properties_rejects_a_property_not_allowed_here() {
         let mut props = Properties::new();
-        props.push(Property::new(
-            PropertyId::SubscriptionIdentifier,
-            PropertyValue::VarInt(1),
-        ));
+        props.push(Property::SubscriptionIdentifier(1));
         let ack = UnsubAck::with_properties(1, vec![ReasonCode::Success], props);
         let mut dst = BytesMut::new();
         assert_eq!(ack.encode(&mut dst, v5()), Err(Error::ProtocolError));

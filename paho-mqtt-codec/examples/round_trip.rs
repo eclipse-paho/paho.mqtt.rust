@@ -22,20 +22,14 @@
 //! again — the same two steps a client performs on each side of a socket.
 
 use bytes::{Bytes, BytesMut};
-use paho_mqtt_codec::{
-    MqttVersion, Packet, Properties, Property, PropertyId, PropertyValue, Publish, QoS, RawPacket,
-    Result,
-};
+use paho_mqtt_codec::{MqttVersion, Packet, Properties, Property, Publish, QoS, RawPacket, Result};
 
 fn main() -> Result<()> {
     let ver = MqttVersion::V5;
 
     // Build a QoS 1 PUBLISH carrying an MQTT v5 property.
     let mut props = Properties::new();
-    props.push(Property::new(
-        PropertyId::MessageExpiryInterval,
-        PropertyValue::U32(60),
-    ));
+    props.push(Property::MessageExpiryInterval(60));
     let publish = Publish::builder()
         .topic("sensors/temp")
         .payload(Bytes::from_static(b"21.5"))

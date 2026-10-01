@@ -21,9 +21,17 @@
 //! MQTT v5 properties.
 //!
 //! Properties are key/value pairs carried by MQTT v5 packets. Each property
-//! has a fixed wire type determined by its identifier. The [`Properties`]
-//! collection encodes and decodes the length-prefixed property list that
-//! appears in the variable header of every v5 packet type that supports them.
+//! has a fixed wire type determined by its identifier, so [`Property`] is one
+//! enum with a variant per identifier, carrying the value that identifier
+//! calls for: `Property::TopicAlias(7)`, `Property::ContentType(s)`. A value
+//! of the wrong type for its identifier therefore does not compile, where the
+//! earlier identifier-plus-value struct could build one and leave it to be
+//! caught at encode time. [`Property::from_value`] remains for code that has
+//! an identifier and a value separately, and is fallible for that reason.
+//!
+//! The [`Properties`] collection encodes and decodes the length-prefixed
+//! property list that appears in the variable header of every v5 packet type
+//! that supports them.
 //!
 //! Properties exist only in v5. On a v3 connection nothing is read from the
 //! wire and an empty list writes nothing; encoding a non-empty list for v3
@@ -422,7 +430,8 @@ impl PropertyValue {
         }
     }
 
-    /// Number of bytes this value occupies on the wire (excluding the property-ID byte).
+    /// Number of bytes this value occupies on the wire, excluding the
+    /// identifier byte.
     pub fn encoded_size(&self) -> usize {
         match self {
             PropertyValue::Byte(_) => 1,
@@ -434,165 +443,240 @@ impl PropertyValue {
             PropertyValue::StringPair(k, v) => 2 + k.len() + 2 + v.len(),
         }
     }
-
-    fn encode<B: BufMut>(&self, dst: &mut B) -> Result<()> {
-        match self {
-            PropertyValue::Byte(b) => dst.put_u8(*b),
-            PropertyValue::U16(n) => dst.put_u16(*n),
-            PropertyValue::U32(n) => dst.put_u32(*n),
-            PropertyValue::VarInt(n) => varlen::encode(*n, dst)?,
-            PropertyValue::Binary(b) => put_binary(b, dst)?,
-            PropertyValue::String(s) => put_utf8(s, dst)?,
-            PropertyValue::StringPair(k, v) => {
-                put_utf8(k, dst)?;
-                put_utf8(v, dst)?;
-            }
-        }
-        Ok(())
-    }
-
-    fn decode_typed<B: Buf>(typ: PropertyType, src: &mut B) -> Result<Self> {
-        match typ {
-            PropertyType::Byte => {
-                if src.remaining() < 1 {
-                    return Err(Error::PacketTooShort);
-                }
-                Ok(PropertyValue::Byte(src.get_u8()))
-            }
-            PropertyType::U16 => {
-                if src.remaining() < 2 {
-                    return Err(Error::PacketTooShort);
-                }
-                Ok(PropertyValue::U16(src.get_u16()))
-            }
-            PropertyType::U32 => {
-                if src.remaining() < 4 {
-                    return Err(Error::PacketTooShort);
-                }
-                Ok(PropertyValue::U32(src.get_u32()))
-            }
-            PropertyType::VarInt => {
-                let n = varlen::decode(src)?.ok_or(Error::PacketTooShort)?;
-                Ok(PropertyValue::VarInt(n))
-            }
-            PropertyType::Binary => Ok(PropertyValue::Binary(get_binary(src)?)),
-            PropertyType::String => Ok(PropertyValue::String(get_utf8(src)?)),
-            PropertyType::StringPair => {
-                let k = get_utf8(src)?;
-                let v = get_utf8(src)?;
-                Ok(PropertyValue::StringPair(k, v))
-            }
-        }
-    }
 }
 
 /////////////////////////////////////////////////////////////////////////////
 
-/// A single MQTT v5 property: an identifier paired with its typed value.
+/// An MQTT v5 property: its identifier and the value that identifier's wire
+/// type calls for.
+///
+/// The discriminants are the identifier bytes from the specification's
+/// Table 2-4, so a variant carries its own identifier; see
+/// [`property_id`](Self::property_id).
+#[repr(u8)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-pub struct Property {
-    /// The property identifier.
-    pub id: PropertyId,
-    /// The property value, typed according to `id`.
-    pub value: PropertyValue,
+pub enum Property {
+    /// 0 for unspecified bytes, 1 for UTF-8 text \[MQTT-3.3.2.3.2\].
+    PayloadFormatIndicator(u8) = 0x01,
+    /// How long the server may hold the message for a subscriber, in seconds.
+    MessageExpiryInterval(u32) = 0x02,
+    /// The content type of the payload, a MIME type by convention.
+    ContentType(String) = 0x03,
+    /// The topic a response to this request should be published to.
+    ResponseTopic(String) = 0x08,
+    /// Data a requester uses to match a response to its request.
+    CorrelationData(Bytes) = 0x09,
+    /// A subscription identifier; encoded as a variable-byte integer.
+    SubscriptionIdentifier(u32) = 0x0B,
+    /// How long the session outlives the connection, in seconds.
+    SessionExpiryInterval(u32) = 0x11,
+    /// The client identifier the server assigned.
+    AssignedClientIdentifier(String) = 0x12,
+    /// The keep-alive the server imposes, in seconds.
+    ServerKeepAlive(u16) = 0x13,
+    /// The name of the enhanced authentication method.
+    AuthenticationMethod(String) = 0x15,
+    /// Data for this step of an enhanced authentication exchange.
+    AuthenticationData(Bytes) = 0x16,
+    /// Whether the sender wants a reason string or user properties on failure.
+    RequestProblemInformation(u8) = 0x17,
+    /// How long the server waits before publishing the Will, in seconds.
+    WillDelayInterval(u32) = 0x18,
+    /// Whether the client asks the server for response information.
+    RequestResponseInformation(u8) = 0x19,
+    /// The base of a response topic the server suggests.
+    ResponseInformation(String) = 0x1A,
+    /// Another server the client should use instead.
+    ServerReference(String) = 0x1C,
+    /// The human-readable reason accompanying a reason code.
+    ReasonString(String) = 0x1F,
+    /// How many QoS 1 and 2 publications the sender will handle at once.
+    ReceiveMaximum(u16) = 0x21,
+    /// The highest topic alias the sender will accept.
+    TopicAliasMaximum(u16) = 0x22,
+    /// The alias standing in for a PUBLISH's topic name.
+    TopicAlias(u16) = 0x23,
+    /// The highest QoS the server accepts, 0 or 1.
+    MaximumQoS(u8) = 0x24,
+    /// Whether the server supports retained messages.
+    RetainAvailable(u8) = 0x25,
+    /// A key/value pair an application defines for itself; may repeat.
+    UserProperty(String, String) = 0x26,
+    /// The largest packet the sender will accept, in bytes.
+    MaximumPacketSize(u32) = 0x27,
+    /// Whether the server supports wildcard subscriptions.
+    WildcardSubscriptionAvailable(u8) = 0x28,
+    /// Whether the server supports subscription identifiers.
+    SubscriptionIdentifierAvailable(u8) = 0x29,
+    /// Whether the server supports shared subscriptions.
+    SharedSubscriptionAvailable(u8) = 0x2A,
 }
 
 impl Property {
-    /// Creates a new property.
-    pub fn new(id: PropertyId, value: PropertyValue) -> Self {
-        Self { id, value }
-    }
-
-    /// Create a new byte (u8) property.
-    pub fn new_byte(code: PropertyId, val: u8) -> Self {
-        Self::new(code, PropertyValue::Byte(val))
-    }
-
-    /// Create a new u16 property.
-    pub fn new_u16(code: PropertyId, val: u16) -> Self {
-        Self::new(code, PropertyValue::U16(val))
-    }
-
-    /// Create a new u32 property.
-    pub fn new_u32(code: PropertyId, val: u32) -> Self {
-        Self::new(code, PropertyValue::U32(val))
-    }
-
-    /// Create a new VarInt property.
-    pub fn new_var_int<I>(code: PropertyId, val: I) -> Self
-    where
-        I: Into<u32>,
-    {
-        Self::new(code, PropertyValue::VarInt(val.into()))
-    }
-
-    /// Create a new binary property.
-    pub fn new_binary<B>(code: PropertyId, val: B) -> Self
-    where
-        B: Into<Bytes>,
-    {
-        Self::new(code, PropertyValue::Binary(val.into()))
-    }
-
-    /// Create a new string property.
-    pub fn new_string<S>(code: PropertyId, s: S) -> Self
-    where
-        S: Into<String>,
-    {
-        Self::new(code, PropertyValue::String(s.into()))
-    }
-
-    /// Create a new string property.
-    pub fn new_string_pair<K, V>(code: PropertyId, key: K, val: V) -> Self
-    where
-        K: Into<String>,
-        V: Into<String>,
-    {
-        Self::new(code, PropertyValue::StringPair(key.into(), val.into()))
-    }
-
-    /// Wire size: 1 byte for the property ID plus the encoded value size.
-    pub fn encoded_size(&self) -> usize {
-        1 + self.value.encoded_size()
-    }
-
-    /// Checks that the value has the wire type the identifier requires and
-    /// is within the range the specification allows for that property.
+    /// The identifier of this property.
     ///
-    /// Several properties restrict the value beyond its type: the one-byte
-    /// flags must be 0 or 1; `ReceiveMaximum`, `MaximumPacketSize`,
-    /// `TopicAlias`, and `SubscriptionIdentifier` must be non-zero; and a
-    /// `ResponseTopic` may not contain wildcards. Returns
-    /// [`Error::ProtocolError`] on any violation.
-    pub fn validate(&self) -> Result<()> {
-        if self.value.property_type() != self.id.value_type() {
-            return Err(Error::ProtocolError);
+    /// Reads the enum's own discriminant rather than matching all
+    /// twenty-seven variants. Rust has no safe way to read the discriminant
+    /// of an enum whose variants carry fields — `as` rejects it and
+    /// [`core::mem::discriminant`] returns an opaque handle — so this reads
+    /// the tag directly, which `#[repr(u8)]` places first and sizes as one
+    /// byte. The unsafety is confined to this method.
+    pub fn property_id(&self) -> PropertyId {
+        // SAFETY: `Self` is `#[repr(u8)]`, so its layout is a tagged union
+        // whose tag is a `u8` at offset 0, and `self` is a valid reference to
+        // one. The read is aligned (a `u8` always is) and copies a byte out
+        // without touching the payload.
+        let tag = unsafe { *(self as *const Self as *const u8) };
+
+        // Every variant's discriminant above is one of the specification's
+        // identifier bytes, which is what `PropertyId` enumerates, so this
+        // cannot fail. `test_property_id_matches_the_variant` proves it for
+        // every variant rather than taking the invariant on trust.
+        match PropertyId::try_from(tag) {
+            Ok(id) => id,
+            Err(_) => unreachable!("a variant's discriminant is a property identifier"),
         }
-        self.check_range()
     }
 
-    /// The value-range half of [`validate`](Self::validate), for values whose
-    /// type is already known to match (i.e. just decoded from the wire).
-    #[inline]
-    fn check_range(&self) -> Result<()> {
-        use PropertyId::*;
-        use PropertyValue::*;
-        let ok = match self.id {
-            PayloadFormatIndicator
-            | RequestProblemInformation
-            | RequestResponseInformation
-            | MaximumQoS
-            | RetainAvailable
-            | WildcardSubscriptionAvailable
-            | SubscriptionIdentifierAvailable
-            | SharedSubscriptionAvailable => matches!(self.value, Byte(0 | 1)),
-            ReceiveMaximum | TopicAlias => matches!(self.value, U16(1..)),
-            MaximumPacketSize => matches!(self.value, U32(1..)),
-            SubscriptionIdentifier => matches!(self.value, VarInt(1..)),
-            ResponseTopic => {
-                matches!(&self.value, String(s) if !s.bytes().any(|b| b == b'+' || b == b'#'))
+    /// The wire type of this property's value.
+    pub fn value_type(&self) -> PropertyType {
+        self.property_id().value_type()
+    }
+
+    /// This property's value, as the type-tagged view that the generic
+    /// accessors speak in.
+    ///
+    /// The variant already carries the value; this copies it out for callers
+    /// that work by identifier rather than by variant, so it allocates for
+    /// the string and binary properties. Matching the variant avoids that.
+    pub fn value(&self) -> PropertyValue {
+        use Property::*;
+        match self {
+            PayloadFormatIndicator(v)
+            | RequestProblemInformation(v)
+            | RequestResponseInformation(v)
+            | MaximumQoS(v)
+            | RetainAvailable(v)
+            | WildcardSubscriptionAvailable(v)
+            | SubscriptionIdentifierAvailable(v)
+            | SharedSubscriptionAvailable(v) => PropertyValue::Byte(*v),
+            ServerKeepAlive(n) | ReceiveMaximum(n) | TopicAliasMaximum(n) | TopicAlias(n) => {
+                PropertyValue::U16(*n)
             }
+            MessageExpiryInterval(n)
+            | SessionExpiryInterval(n)
+            | WillDelayInterval(n)
+            | MaximumPacketSize(n) => PropertyValue::U32(*n),
+            SubscriptionIdentifier(n) => PropertyValue::VarInt(*n),
+            CorrelationData(b) | AuthenticationData(b) => PropertyValue::Binary(b.clone()),
+            ContentType(s)
+            | ResponseTopic(s)
+            | AssignedClientIdentifier(s)
+            | AuthenticationMethod(s)
+            | ResponseInformation(s)
+            | ServerReference(s)
+            | ReasonString(s) => PropertyValue::String(s.clone()),
+            UserProperty(k, v) => PropertyValue::StringPair(k.clone(), v.clone()),
+        }
+    }
+
+    /// Builds a property from an identifier and a loose value.
+    ///
+    /// The inverse of [`value`](Self::value), for code that works by
+    /// identifier — a decoder for another format, a generic tool, a fuzzer —
+    /// rather than naming a variant. Returns
+    /// [`ProtocolError`](Error::ProtocolError) when the value is not of the
+    /// type the identifier calls for, which naming a variant makes
+    /// impossible and which this cannot.
+    pub fn from_value(id: PropertyId, value: PropertyValue) -> Result<Self> {
+        use PropertyId as Id;
+        use PropertyValue as Val;
+        Ok(match (id, value) {
+            (Id::PayloadFormatIndicator, Val::Byte(x)) => Self::PayloadFormatIndicator(x),
+            (Id::MessageExpiryInterval, Val::U32(x)) => Self::MessageExpiryInterval(x),
+            (Id::ContentType, Val::String(x)) => Self::ContentType(x),
+            (Id::ResponseTopic, Val::String(x)) => Self::ResponseTopic(x),
+            (Id::CorrelationData, Val::Binary(x)) => Self::CorrelationData(x),
+            (Id::SubscriptionIdentifier, Val::VarInt(x)) => Self::SubscriptionIdentifier(x),
+            (Id::SessionExpiryInterval, Val::U32(x)) => Self::SessionExpiryInterval(x),
+            (Id::AssignedClientIdentifier, Val::String(x)) => Self::AssignedClientIdentifier(x),
+            (Id::ServerKeepAlive, Val::U16(x)) => Self::ServerKeepAlive(x),
+            (Id::AuthenticationMethod, Val::String(x)) => Self::AuthenticationMethod(x),
+            (Id::AuthenticationData, Val::Binary(x)) => Self::AuthenticationData(x),
+            (Id::RequestProblemInformation, Val::Byte(x)) => Self::RequestProblemInformation(x),
+            (Id::WillDelayInterval, Val::U32(x)) => Self::WillDelayInterval(x),
+            (Id::RequestResponseInformation, Val::Byte(x)) => Self::RequestResponseInformation(x),
+            (Id::ResponseInformation, Val::String(x)) => Self::ResponseInformation(x),
+            (Id::ServerReference, Val::String(x)) => Self::ServerReference(x),
+            (Id::ReasonString, Val::String(x)) => Self::ReasonString(x),
+            (Id::ReceiveMaximum, Val::U16(x)) => Self::ReceiveMaximum(x),
+            (Id::TopicAliasMaximum, Val::U16(x)) => Self::TopicAliasMaximum(x),
+            (Id::TopicAlias, Val::U16(x)) => Self::TopicAlias(x),
+            (Id::MaximumQoS, Val::Byte(x)) => Self::MaximumQoS(x),
+            (Id::RetainAvailable, Val::Byte(x)) => Self::RetainAvailable(x),
+            (Id::UserProperty, Val::StringPair(k, x)) => Self::UserProperty(k, x),
+            (Id::MaximumPacketSize, Val::U32(x)) => Self::MaximumPacketSize(x),
+            (Id::WildcardSubscriptionAvailable, Val::Byte(x)) => {
+                Self::WildcardSubscriptionAvailable(x)
+            }
+            (Id::SubscriptionIdentifierAvailable, Val::Byte(x)) => {
+                Self::SubscriptionIdentifierAvailable(x)
+            }
+            (Id::SharedSubscriptionAvailable, Val::Byte(x)) => Self::SharedSubscriptionAvailable(x),
+            _ => return Err(Error::ProtocolError),
+        })
+    }
+
+    /// Number of bytes this property occupies on the wire, identifier byte
+    /// included.
+    pub fn encoded_size(&self) -> usize {
+        use Property::*;
+        let value = match self {
+            PayloadFormatIndicator(_)
+            | RequestProblemInformation(_)
+            | RequestResponseInformation(_)
+            | MaximumQoS(_)
+            | RetainAvailable(_)
+            | WildcardSubscriptionAvailable(_)
+            | SubscriptionIdentifierAvailable(_)
+            | SharedSubscriptionAvailable(_) => 1,
+            ServerKeepAlive(_) | ReceiveMaximum(_) | TopicAliasMaximum(_) | TopicAlias(_) => 2,
+            MessageExpiryInterval(_)
+            | SessionExpiryInterval(_)
+            | WillDelayInterval(_)
+            | MaximumPacketSize(_) => 4,
+            SubscriptionIdentifier(n) => varlen::encoded_size(*n),
+            CorrelationData(b) | AuthenticationData(b) => 2 + b.len(),
+            ContentType(s)
+            | ResponseTopic(s)
+            | AssignedClientIdentifier(s)
+            | AuthenticationMethod(s)
+            | ResponseInformation(s)
+            | ServerReference(s)
+            | ReasonString(s) => 2 + s.len(),
+            UserProperty(k, v) => 2 + k.len() + 2 + v.len(),
+        };
+        1 + value
+    }
+
+    /// Checks the value against the range the specification allows for this
+    /// identifier, the only validation a variant cannot express in its type.
+    pub fn validate(&self) -> Result<()> {
+        use Property::*;
+        let ok = match self {
+            PayloadFormatIndicator(v)
+            | RequestProblemInformation(v)
+            | RequestResponseInformation(v)
+            | MaximumQoS(v)
+            | RetainAvailable(v)
+            | WildcardSubscriptionAvailable(v)
+            | SubscriptionIdentifierAvailable(v)
+            | SharedSubscriptionAvailable(v) => matches!(v, 0 | 1),
+            ReceiveMaximum(n) | TopicAlias(n) => *n > 0,
+            MaximumPacketSize(n) => *n > 0,
+            SubscriptionIdentifier(n) => *n > 0,
+            ResponseTopic(t) => !t.bytes().any(|b| b == b'+' || b == b'#'),
             _ => true,
         };
         if ok {
@@ -602,21 +686,117 @@ impl Property {
         }
     }
 
-    fn encode<B: BufMut>(&self, dst: &mut B) -> Result<()> {
-        dst.put_u8(self.id as u8);
-        self.value.encode(dst)
+    /// Writes the property, identifier byte first.
+    pub fn encode<B: BufMut>(&self, dst: &mut B) -> Result<()> {
+        use Property::*;
+        dst.put_u8(self.property_id() as u8);
+        match self {
+            PayloadFormatIndicator(v)
+            | RequestProblemInformation(v)
+            | RequestResponseInformation(v)
+            | MaximumQoS(v)
+            | RetainAvailable(v)
+            | WildcardSubscriptionAvailable(v)
+            | SubscriptionIdentifierAvailable(v)
+            | SharedSubscriptionAvailable(v) => dst.put_u8(*v),
+            ServerKeepAlive(n) | ReceiveMaximum(n) | TopicAliasMaximum(n) | TopicAlias(n) => {
+                dst.put_u16(*n)
+            }
+            MessageExpiryInterval(n)
+            | SessionExpiryInterval(n)
+            | WillDelayInterval(n)
+            | MaximumPacketSize(n) => dst.put_u32(*n),
+            SubscriptionIdentifier(n) => varlen::encode(*n, dst)?,
+            CorrelationData(b) | AuthenticationData(b) => put_binary(b, dst)?,
+            ContentType(s)
+            | ResponseTopic(s)
+            | AssignedClientIdentifier(s)
+            | AuthenticationMethod(s)
+            | ResponseInformation(s)
+            | ServerReference(s)
+            | ReasonString(s) => put_utf8(s, dst)?,
+            UserProperty(k, v) => {
+                put_utf8(k, dst)?;
+                put_utf8(v, dst)?;
+            }
+        }
+        Ok(())
     }
 
-    fn decode<B: Buf>(src: &mut B) -> Result<Self> {
-        if src.remaining() < 1 {
+    /// Reads one property, identifier byte first.
+    ///
+    /// The identifier decides the variant, so the value's type is right by
+    /// construction and only its range needs checking.
+    pub fn decode<B: Buf>(src: &mut B) -> Result<Self> {
+        if !src.has_remaining() {
             return Err(Error::PacketTooShort);
         }
         let id = PropertyId::try_from(src.get_u8())?;
-        let value = PropertyValue::decode_typed(id.value_type(), src)?;
-        let prop = Self { id, value };
-        // The type is right by construction; only the range needs checking.
-        prop.check_range()?;
+        let prop = Self::decode_value(id, src)?;
+        prop.validate()?;
         Ok(prop)
+    }
+
+    /// Reads the value for an identifier already taken from the wire.
+    fn decode_value<B: Buf>(id: PropertyId, src: &mut B) -> Result<Self> {
+        use PropertyId as Id;
+
+        fn byte<B: Buf>(src: &mut B) -> Result<u8> {
+            if src.remaining() < 1 {
+                return Err(Error::PacketTooShort);
+            }
+            Ok(src.get_u8())
+        }
+        fn u16_<B: Buf>(src: &mut B) -> Result<u16> {
+            if src.remaining() < 2 {
+                return Err(Error::PacketTooShort);
+            }
+            Ok(src.get_u16())
+        }
+        fn u32_<B: Buf>(src: &mut B) -> Result<u32> {
+            if src.remaining() < 4 {
+                return Err(Error::PacketTooShort);
+            }
+            Ok(src.get_u32())
+        }
+
+        Ok(match id {
+            Id::PayloadFormatIndicator => Self::PayloadFormatIndicator(byte(src)?),
+            Id::MessageExpiryInterval => Self::MessageExpiryInterval(u32_(src)?),
+            Id::ContentType => Self::ContentType(get_utf8(src)?),
+            Id::ResponseTopic => Self::ResponseTopic(get_utf8(src)?),
+            Id::CorrelationData => Self::CorrelationData(get_binary(src)?),
+            Id::SubscriptionIdentifier => {
+                Self::SubscriptionIdentifier(varlen::decode(src)?.ok_or(Error::PacketTooShort)?)
+            }
+            Id::SessionExpiryInterval => Self::SessionExpiryInterval(u32_(src)?),
+            Id::AssignedClientIdentifier => Self::AssignedClientIdentifier(get_utf8(src)?),
+            Id::ServerKeepAlive => Self::ServerKeepAlive(u16_(src)?),
+            Id::AuthenticationMethod => Self::AuthenticationMethod(get_utf8(src)?),
+            Id::AuthenticationData => Self::AuthenticationData(get_binary(src)?),
+            Id::RequestProblemInformation => Self::RequestProblemInformation(byte(src)?),
+            Id::WillDelayInterval => Self::WillDelayInterval(u32_(src)?),
+            Id::RequestResponseInformation => Self::RequestResponseInformation(byte(src)?),
+            Id::ResponseInformation => Self::ResponseInformation(get_utf8(src)?),
+            Id::ServerReference => Self::ServerReference(get_utf8(src)?),
+            Id::ReasonString => Self::ReasonString(get_utf8(src)?),
+            Id::ReceiveMaximum => Self::ReceiveMaximum(u16_(src)?),
+            Id::TopicAliasMaximum => Self::TopicAliasMaximum(u16_(src)?),
+            Id::TopicAlias => Self::TopicAlias(u16_(src)?),
+            Id::MaximumQoS => Self::MaximumQoS(byte(src)?),
+            Id::RetainAvailable => Self::RetainAvailable(byte(src)?),
+            Id::UserProperty => {
+                let k = get_utf8(src)?;
+                let x = get_utf8(src)?;
+                Self::UserProperty(k, x)
+            }
+            Id::MaximumPacketSize => Self::MaximumPacketSize(u32_(src)?),
+            Id::WildcardSubscriptionAvailable => Self::WildcardSubscriptionAvailable(byte(src)?),
+            Id::SubscriptionIdentifierAvailable => {
+                Self::SubscriptionIdentifierAvailable(byte(src)?)
+            }
+            Id::SharedSubscriptionAvailable => Self::SharedSubscriptionAvailable(byte(src)?),
+        })
     }
 }
 
@@ -727,71 +907,25 @@ impl Properties {
     /// or it repeats a non-repeatable identifier, the list is marked invalid
     /// and [`encode`](Self::encode) will return [`Error::ProtocolError`].
     pub fn push(&mut self, prop: Property) {
-        if prop.validate().is_err() || self.seen.note(prop.id).is_err() {
+        if prop.validate().is_err() || self.seen.note(prop.property_id()).is_err() {
             self.seen.mark_invalid();
         }
         self.payload_size += prop.encoded_size();
         self.props.push(prop);
     }
 
-    /// Adds an single-byte property to the collection.
-    pub fn push_byte(&mut self, code: PropertyId, val: u8) {
-        self.push(Property::new_byte(code, val))
-    }
-
-    /// Adds an two-byte integer property to the collection.
-    pub fn push_u16(&mut self, code: PropertyId, val: u16) {
-        self.push(Property::new_u16(code, val))
-    }
-
-    /// Adds a four-byte integer property to the collection.
-    pub fn push_u32(&mut self, code: PropertyId, val: u32) {
-        self.push(Property::new_u32(code, val))
-    }
-
-    /// Adds a variable-byte integer property to the collection.
-    ///
-    /// `SubscriptionIdentifier` is the only one, and it is encoded in one to
-    /// four bytes depending on its value rather than always four.
-    pub fn push_var_int<I>(&mut self, code: PropertyId, val: I)
-    where
-        I: Into<u32>,
-    {
-        self.push(Property::new_var_int(code, val))
-    }
-
-    /// Adds a binary property to the collection
-    pub fn push_binary<V>(&mut self, code: PropertyId, bin: V)
-    where
-        V: Into<Bytes>,
-    {
-        self.push(Property::new_binary(code, bin))
-    }
-
-    /// Adds a string property to the collection
-    pub fn push_string<S>(&mut self, code: PropertyId, s: S)
-    where
-        S: Into<String>,
-    {
-        self.push(Property::new_string(code, s))
-    }
-
-    /// Adds a string pair property to the collection
-    pub fn push_string_pair<K, V>(&mut self, code: PropertyId, key: K, val: V)
-    where
-        K: Into<String>,
-        V: Into<String>,
-    {
-        self.push(Property::new_string_pair(code, key, val))
-    }
+    // The generic setters that took an identifier and a loose value are gone:
+    // with the identifier in the variant there is nothing for
+    // `push_byte(PropertyId::ContentType, 1)` to build. Use the per-property
+    // setters below, `push_user`, or `push(Property::ContentType(..))`.
 
     /// Returns the value of the first property with the given `id`, or `None`.
     ///
     /// This is the borrowing accessor. The typed `get_*` methods below return
     /// the value already unwrapped, at the cost of a clone for the owned
     /// types.
-    pub fn get(&self, id: PropertyId) -> Option<&PropertyValue> {
-        self.props.iter().find(|p| p.id == id).map(|p| &p.value)
+    pub fn get(&self, id: PropertyId) -> Option<&Property> {
+        self.props.iter().find(|p| p.property_id() == id)
     }
 
     /// Returns the value of the `idx`-th property with the given `id`, or
@@ -799,12 +933,8 @@ impl Properties {
     ///
     /// Only `UserProperty`, and `SubscriptionIdentifier` in a PUBLISH, may
     /// appear more than once, so `idx` is 0 for every other identifier.
-    pub fn get_at(&self, id: PropertyId, idx: usize) -> Option<&PropertyValue> {
-        self.props
-            .iter()
-            .filter(|p| p.id == id)
-            .nth(idx)
-            .map(|p| &p.value)
+    pub fn get_at(&self, id: PropertyId, idx: usize) -> Option<&Property> {
+        self.props.iter().filter(|p| p.property_id() == id).nth(idx)
     }
 
     /// Returns the value of the first property with the given `id` as a byte,
@@ -815,8 +945,8 @@ impl Properties {
 
     /// Returns the `idx`-th `id` property's value as a byte.
     pub fn get_byte_at(&self, id: PropertyId, idx: usize) -> Option<u8> {
-        match self.get_at(id, idx) {
-            Some(PropertyValue::Byte(v)) => Some(*v),
+        match self.get_at(id, idx).map(Property::value) {
+            Some(PropertyValue::Byte(v)) => Some(v),
             _ => None,
         }
     }
@@ -829,8 +959,8 @@ impl Properties {
 
     /// Returns the `idx`-th `id` property's value as a two-byte integer.
     pub fn get_u16_at(&self, id: PropertyId, idx: usize) -> Option<u16> {
-        match self.get_at(id, idx) {
-            Some(PropertyValue::U16(v)) => Some(*v),
+        match self.get_at(id, idx).map(Property::value) {
+            Some(PropertyValue::U16(v)) => Some(v),
             _ => None,
         }
     }
@@ -848,8 +978,8 @@ impl Properties {
     /// Returns the `idx`-th `id` property's value as a 32-bit integer, from
     /// either a `U32` or a variable-byte integer.
     pub fn get_u32_at(&self, id: PropertyId, idx: usize) -> Option<u32> {
-        match self.get_at(id, idx) {
-            Some(PropertyValue::U32(v) | PropertyValue::VarInt(v)) => Some(*v),
+        match self.get_at(id, idx).map(Property::value) {
+            Some(PropertyValue::U32(v) | PropertyValue::VarInt(v)) => Some(v),
             _ => None,
         }
     }
@@ -869,8 +999,8 @@ impl Properties {
     /// A PUBLISH may carry several `SubscriptionIdentifier`s, one per matching
     /// subscription (§3.3.2.3.8), which is what `idx` is for.
     pub fn get_var_int_at(&self, id: PropertyId, idx: usize) -> Option<u32> {
-        match self.get_at(id, idx) {
-            Some(PropertyValue::VarInt(v)) => Some(*v),
+        match self.get_at(id, idx).map(Property::value) {
+            Some(PropertyValue::VarInt(v)) => Some(v),
             _ => None,
         }
     }
@@ -885,8 +1015,8 @@ impl Properties {
 
     /// Returns the `idx`-th `id` property's value as binary data.
     pub fn get_binary_at(&self, id: PropertyId, idx: usize) -> Option<Bytes> {
-        match self.get_at(id, idx) {
-            Some(PropertyValue::Binary(v)) => Some(v.clone()),
+        match self.get_at(id, idx).map(Property::value) {
+            Some(PropertyValue::Binary(v)) => Some(v),
             _ => None,
         }
     }
@@ -901,8 +1031,8 @@ impl Properties {
 
     /// Returns the `idx`-th `id` property's value as a string.
     pub fn get_string_at(&self, id: PropertyId, idx: usize) -> Option<String> {
-        match self.get_at(id, idx) {
-            Some(PropertyValue::String(v)) => Some(v.clone()),
+        match self.get_at(id, idx).map(Property::value) {
+            Some(PropertyValue::String(v)) => Some(v),
             _ => None,
         }
     }
@@ -919,8 +1049,8 @@ impl Properties {
 
     /// Returns the `idx`-th `id` property's value as a key/value pair.
     pub fn get_string_pair_at(&self, id: PropertyId, idx: usize) -> Option<(String, String)> {
-        match self.get_at(id, idx) {
-            Some(PropertyValue::StringPair(k, v)) => Some((k.clone(), v.clone())),
+        match self.get_at(id, idx).map(Property::value) {
+            Some(PropertyValue::StringPair(k, v)) => Some((k, v)),
             _ => None,
         }
     }
@@ -931,24 +1061,18 @@ impl Properties {
     /// Only `UserProperty`, and `SubscriptionIdentifier` in a PUBLISH, can
     /// yield more than one. This is v0.14's `iter(code)`; the name differs
     /// because [`iter`](Self::iter) here walks the whole collection.
-    pub fn get_all(&self, id: PropertyId) -> impl Iterator<Item = &PropertyValue> {
-        self.props
-            .iter()
-            .filter(move |p| p.id == id)
-            .map(|p| &p.value)
+    pub fn get_all(&self, id: PropertyId) -> impl Iterator<Item = &Property> {
+        self.props.iter().filter(move |p| p.property_id() == id)
     }
 
-    /// Adds a user property.
-    ///
-    /// Shorthand for [`push_string_pair`](Self::push_string_pair) with
-    /// `UserProperty`, the only string-pair property and the only one an
-    /// application defines for itself.
+    /// Adds a user property, the only string-pair property and the only one
+    /// an application defines for itself.
     pub fn push_user<K, V>(&mut self, key: K, val: V)
     where
         K: Into<String>,
         V: Into<String>,
     {
-        self.push_string_pair(PropertyId::UserProperty, key, val)
+        self.push(Property::UserProperty(key.into(), val.into()))
     }
 
     /// Iterates over the user properties as key/value pairs, in order.
@@ -960,10 +1084,8 @@ impl Properties {
     /// Unlike v0.14 this borrows rather than allocating a `String` per item;
     /// `.map(|(k, v)| (k.to_string(), v.to_string()))` recovers the owned form.
     pub fn user_iter(&self) -> impl Iterator<Item = (&str, &str)> {
-        self.props.iter().filter_map(|p| match (&p.id, &p.value) {
-            (PropertyId::UserProperty, PropertyValue::StringPair(k, v)) => {
-                Some((k.as_str(), v.as_str()))
-            }
+        self.props.iter().filter_map(|p| match p {
+            Property::UserProperty(k, v) => Some((k.as_str(), v.as_str())),
             _ => None,
         })
     }
@@ -1013,7 +1135,7 @@ impl Properties {
     /// removed.
     pub fn remove(&mut self, id: PropertyId) -> usize {
         let before = self.props.len();
-        self.retain(|p| p.id != id);
+        self.retain(|p| p.property_id() != id);
         before - self.props.len()
     }
 
@@ -1021,12 +1143,7 @@ impl Properties {
     /// were removed.
     pub fn remove_user(&mut self, key: &str) -> usize {
         let before = self.props.len();
-        self.retain(|p| {
-            !matches!(
-                (&p.id, &p.value),
-                (PropertyId::UserProperty, PropertyValue::StringPair(k, _)) if k == key
-            )
-        });
+        self.retain(|p| !matches!(p, Property::UserProperty(k, _) if k == key));
         before - self.props.len()
     }
 
@@ -1049,7 +1166,7 @@ impl Properties {
         self.payload_size = self.props.iter().map(Property::encoded_size).sum();
         let mut seen = SeenIds::default();
         for prop in &self.props {
-            if prop.validate().is_err() || seen.note(prop.id).is_err() {
+            if prop.validate().is_err() || seen.note(prop.property_id()).is_err() {
                 seen.mark_invalid();
             }
         }
@@ -1149,10 +1266,10 @@ impl Properties {
         let allowed = ctx.allowed_ids();
         let mut sub_ids = 0usize;
         for p in &self.props {
-            if allowed & (1 << (p.id as u8)) == 0 {
+            if allowed & (1 << (p.property_id() as u8)) == 0 {
                 return Err(Error::ProtocolError);
             }
-            if p.id == PropertyId::SubscriptionIdentifier {
+            if p.property_id() == PropertyId::SubscriptionIdentifier {
                 sub_ids += 1;
             }
         }
@@ -1214,11 +1331,11 @@ impl Properties {
         let mut saw_sub_id = false;
         while payload.has_remaining() {
             let prop = Property::decode(&mut payload)?; // validated
-            if allowed & (1 << (prop.id as u8)) == 0 {
+            if allowed & (1 << (prop.property_id() as u8)) == 0 {
                 return Err(Error::ProtocolError);
             }
-            seen.note(prop.id)?;
-            if prop.id == PropertyId::SubscriptionIdentifier {
+            seen.note(prop.property_id())?;
+            if prop.property_id() == PropertyId::SubscriptionIdentifier {
                 if saw_sub_id && !sub_id_repeats {
                     return Err(Error::ProtocolError);
                 }
@@ -1347,7 +1464,7 @@ impl From<PropertiesBuilder> for Option<Properties> {
 macro_rules! typed_property_accessors {
     ($(
         $id:ident, $name:ident, $push_name:ident, $get_name:ident,
-            $push_fn:ident, $get_fn:ident, $push_ty:ty, $get_ty:ty,
+            $get_fn:ident, $push_ty:ty, $get_ty:ty,
             $what:expr;
     )+) => {
         impl Properties {
@@ -1355,12 +1472,12 @@ macro_rules! typed_property_accessors {
                 #[doc = concat!("Adds ", $what, ".")]
                 ///
                 #[doc = concat!(
-                    "Shorthand for [`", stringify!($push_fn), "`](Self::", stringify!($push_fn),
-                    ") with [`PropertyId::", stringify!($id), "`](PropertyId::", stringify!($id),
-                    "), whose wire type it knows."
+                    "Shorthand for [`push`](Self::push) with [`Property::",
+                    stringify!($id), "`](Property::", stringify!($id),
+                    "), whose payload type it takes."
                 )]
                 pub fn $push_name(&mut self, val: $push_ty) {
-                    self.$push_fn(PropertyId::$id, val)
+                    self.push(Property::$id(val.into()))
                 }
 
                 #[doc = concat!("Returns ", $what, ", or `None` if it is absent.")]
@@ -1399,64 +1516,64 @@ macro_rules! typed_property_accessors {
 // generated here would.
 typed_property_accessors! {
     PayloadFormatIndicator, payload_format_indicator, push_payload_format_indicator, get_payload_format_indicator,
-        push_byte, get_byte, u8, u8,
+        get_byte, u8, u8,
         r"the payload format indicator \[MQTT-3.3.2.3.2\]: 0 for unspecified bytes, 1 for UTF-8 text";
     MaximumQoS, maximum_qos, push_maximum_qos, get_maximum_qos,
-        push_byte, get_byte, u8, u8,
+        get_byte, u8, u8,
         r"the highest QoS the server accepts, 0 or 1 \[MQTT-3.2.2.3.4\]";
     ServerKeepAlive, server_keep_alive, push_server_keep_alive, get_server_keep_alive,
-        push_u16, get_u16, u16, u16,
+        get_u16, u16, u16,
         r"the keep-alive the server imposes, in seconds \[MQTT-3.2.2.3.14\]";
     ReceiveMaximum, receive_maximum, push_receive_maximum, get_receive_maximum,
-        push_u16, get_u16, u16, u16,
+        get_u16, u16, u16,
         r"how many QoS 1 and 2 publications the sender will handle at once \[MQTT-3.1.2.11.3\]";
     TopicAliasMaximum, topic_alias_maximum, push_topic_alias_maximum, get_topic_alias_maximum,
-        push_u16, get_u16, u16, u16,
+        get_u16, u16, u16,
         r"the highest topic alias the sender will accept \[MQTT-3.1.2.11.5\]";
     TopicAlias, topic_alias, push_topic_alias, get_topic_alias,
-        push_u16, get_u16, u16, u16,
+        get_u16, u16, u16,
         r"the topic alias standing in for a PUBLISH's topic name \[MQTT-3.3.2.3.4\]";
     MessageExpiryInterval, message_expiry_interval, push_message_expiry_interval, get_message_expiry_interval,
-        push_u32, get_u32, u32, u32,
+        get_u32, u32, u32,
         r"how long the server may hold this message for a subscriber, in seconds \[MQTT-3.3.2.3.3\]";
     SessionExpiryInterval, session_expiry_interval, push_session_expiry_interval, get_session_expiry_interval,
-        push_u32, get_u32, u32, u32,
+        get_u32, u32, u32,
         r"how long the session outlives the connection, in seconds \[MQTT-3.1.2.11.2\]";
     WillDelayInterval, will_delay_interval, push_will_delay_interval, get_will_delay_interval,
-        push_u32, get_u32, u32, u32,
+        get_u32, u32, u32,
         r"how long the server waits before publishing the Will, in seconds \[MQTT-3.1.3.2.2\]";
     MaximumPacketSize, maximum_packet_size, push_maximum_packet_size, get_maximum_packet_size,
-        push_u32, get_u32, u32, u32,
+        get_u32, u32, u32,
         r"the largest packet the sender will accept, in bytes \[MQTT-3.1.2.11.4\]";
     SubscriptionIdentifier, subscription_identifier, push_subscription_identifier, get_subscription_identifier,
-        push_var_int, get_var_int, impl Into<u32>, u32,
+        get_var_int, impl Into<u32>, u32,
         r"the subscription identifier \[MQTT-3.8.2.1.2\], which a PUBLISH may carry more than once";
     CorrelationData, correlation_data, push_correlation_data, get_correlation_data,
-        push_binary, get_binary, impl Into<Bytes>, Bytes,
+        get_binary, impl Into<Bytes>, Bytes,
         r"the correlation data a requester uses to match a response to its request \[MQTT-3.3.2.3.6\]";
     AuthenticationData, authentication_data, push_authentication_data, get_authentication_data,
-        push_binary, get_binary, impl Into<Bytes>, Bytes,
+        get_binary, impl Into<Bytes>, Bytes,
         r"the data for this step of an enhanced authentication exchange \[MQTT-3.1.2.11.10\]";
     ContentType, content_type, push_content_type, get_content_type,
-        push_string, get_string, impl Into<String>, String,
+        get_string, impl Into<String>, String,
         r"the content type of the payload, a MIME type by convention \[MQTT-3.3.2.3.9\]";
     ResponseTopic, response_topic, push_response_topic, get_response_topic,
-        push_string, get_string, impl Into<String>, String,
+        get_string, impl Into<String>, String,
         r"the topic a response to this request should be published to \[MQTT-3.3.2.3.5\]";
     AssignedClientIdentifier, assigned_client_identifier, push_assigned_client_identifier, get_assigned_client_identifier,
-        push_string, get_string, impl Into<String>, String,
+        get_string, impl Into<String>, String,
         r"the client identifier the server assigned, the client having sent an empty one \[MQTT-3.2.2.3.7\]";
     AuthenticationMethod, authentication_method, push_authentication_method, get_authentication_method,
-        push_string, get_string, impl Into<String>, String,
+        get_string, impl Into<String>, String,
         r"the name of the enhanced authentication method \[MQTT-3.1.2.11.9\]";
     ResponseInformation, response_information, push_response_information, get_response_information,
-        push_string, get_string, impl Into<String>, String,
+        get_string, impl Into<String>, String,
         r"the base of a response topic the server suggests \[MQTT-3.2.2.3.15\]";
     ServerReference, server_reference, push_server_reference, get_server_reference,
-        push_string, get_string, impl Into<String>, String,
+        get_string, impl Into<String>, String,
         r"another server the client should use instead \[MQTT-3.2.2.3.16\]";
     ReasonString, reason_string, push_reason_string, get_reason_string,
-        push_string, get_string, impl Into<String>, String,
+        get_string, impl Into<String>, String,
         r"the human-readable reason accompanying a reason code \[MQTT-3.2.2.3.2\]";
 }
 
@@ -1478,13 +1595,13 @@ macro_rules! flag_property_accessors {
                 ///
                 /// The property itself is a one-byte value restricted to 0 or
                 /// 1, which this writes as `0` for `false` and `1` for
-                /// `true`; [`push_byte`](Self::push_byte) takes it as the
+                /// `true`; the variant
                 #[doc = concat!(
-                    "`u8` it is on the wire, under [`PropertyId::",
-                    stringify!($id), "`](PropertyId::", stringify!($id), ")."
+                    "[`Property::", stringify!($id), "`](Property::",
+                    stringify!($id), ") takes it as the `u8` it is on the wire."
                 )]
                 pub fn $push_name(&mut self, val: bool) {
-                    self.push_byte(PropertyId::$id, u8::from(val))
+                    self.push(Property::$id(u8::from(val)))
                 }
 
                 #[doc = concat!("Returns ", $what, ", or `None` if it is absent.")]
@@ -1669,10 +1786,6 @@ mod tests {
         assert_eq!(&decoded, props);
     }
 
-    fn prop(id: PropertyId, value: PropertyValue) -> Property {
-        Property::new(id, value)
-    }
-
     // ---- empty ----
 
     #[test]
@@ -1706,16 +1819,13 @@ mod tests {
     #[test]
     fn test_payload_format_indicator_round_trip() {
         let mut props = Properties::new();
-        props.push(prop(
-            PropertyId::PayloadFormatIndicator,
-            PropertyValue::Byte(1),
-        ));
+        props.push(Property::PayloadFormatIndicator(1));
         round_trip(&props);
     }
 
     #[test]
     fn test_byte_encoded_size() {
-        let p = prop(PropertyId::RetainAvailable, PropertyValue::Byte(1));
+        let p = Property::RetainAvailable(1);
         assert_eq!(p.encoded_size(), 2); // 1 id + 1 byte
     }
 
@@ -1724,20 +1834,20 @@ mod tests {
     #[test]
     fn test_receive_maximum_round_trip() {
         let mut props = Properties::new();
-        props.push(prop(PropertyId::ReceiveMaximum, PropertyValue::U16(1000)));
+        props.push(Property::ReceiveMaximum(1000));
         round_trip(&props);
     }
 
     #[test]
     fn test_u16_encoded_size() {
-        let p = prop(PropertyId::TopicAlias, PropertyValue::U16(42));
+        let p = Property::TopicAlias(42);
         assert_eq!(p.encoded_size(), 3); // 1 id + 2 bytes
     }
 
     #[test]
     fn test_receive_maximum_wire_bytes() {
         let mut props = Properties::new();
-        props.push(prop(PropertyId::ReceiveMaximum, PropertyValue::U16(0x0064)));
+        props.push(Property::ReceiveMaximum(0x0064));
         let mut dst = BytesMut::new();
         props.encode(&mut dst, v5()).unwrap();
         // VBI(3), id=0x21, value=0x00 0x64
@@ -1749,19 +1859,13 @@ mod tests {
     #[test]
     fn test_session_expiry_interval_round_trip() {
         let mut props = Properties::new();
-        props.push(prop(
-            PropertyId::SessionExpiryInterval,
-            PropertyValue::U32(3600),
-        ));
+        props.push(Property::SessionExpiryInterval(3600));
         round_trip(&props);
     }
 
     #[test]
     fn test_u32_encoded_size() {
-        let p = prop(
-            PropertyId::MessageExpiryInterval,
-            PropertyValue::U32(0xDEAD_BEEF),
-        );
+        let p = Property::MessageExpiryInterval(0xDEAD_BEEF);
         assert_eq!(p.encoded_size(), 5); // 1 id + 4 bytes
     }
 
@@ -1770,20 +1874,14 @@ mod tests {
     #[test]
     fn test_subscription_identifier_single_byte() {
         let mut props = Properties::new();
-        props.push(prop(
-            PropertyId::SubscriptionIdentifier,
-            PropertyValue::VarInt(5),
-        ));
+        props.push(Property::SubscriptionIdentifier(5));
         round_trip(&props);
     }
 
     #[test]
     fn test_subscription_identifier_multibyte() {
         let mut props = Properties::new();
-        props.push(prop(
-            PropertyId::SubscriptionIdentifier,
-            PropertyValue::VarInt(300),
-        ));
+        props.push(Property::SubscriptionIdentifier(300));
         round_trip(&props);
     }
 
@@ -1792,17 +1890,16 @@ mod tests {
     #[test]
     fn test_correlation_data_round_trip() {
         let mut props = Properties::new();
-        props.push(prop(
-            PropertyId::CorrelationData,
-            PropertyValue::Binary(Bytes::from_static(b"\x01\x02\x03")),
-        ));
+        props.push(Property::CorrelationData(Bytes::from_static(
+            b"\x01\x02\x03",
+        )));
         round_trip(&props);
     }
 
     #[test]
     fn test_binary_encoded_size() {
         let data = Bytes::from_static(b"hello");
-        let p = prop(PropertyId::CorrelationData, PropertyValue::Binary(data));
+        let p = Property::CorrelationData(data);
         assert_eq!(p.encoded_size(), 1 + 2 + 5); // id + len_prefix + data
     }
 
@@ -1811,20 +1908,14 @@ mod tests {
     #[test]
     fn test_content_type_round_trip() {
         let mut props = Properties::new();
-        props.push(prop(
-            PropertyId::ContentType,
-            PropertyValue::String("application/json".to_string()),
-        ));
+        props.push(Property::ContentType("application/json".to_string()));
         round_trip(&props);
     }
 
     #[test]
     fn test_reason_string_round_trip() {
         let mut props = Properties::new();
-        props.push(prop(
-            PropertyId::ReasonString,
-            PropertyValue::String("Normal".to_string()),
-        ));
+        props.push(Property::ReasonString("Normal".to_string()));
         round_trip(&props);
     }
 
@@ -1833,9 +1924,9 @@ mod tests {
     #[test]
     fn test_user_property_round_trip() {
         let mut props = Properties::new();
-        props.push(prop(
-            PropertyId::UserProperty,
-            PropertyValue::StringPair("key".to_string(), "value".to_string()),
+        props.push(Property::UserProperty(
+            "key".to_string(),
+            "value".to_string(),
         ));
         round_trip(&props);
     }
@@ -1843,19 +1934,13 @@ mod tests {
     #[test]
     fn test_multiple_user_properties() {
         let mut props = Properties::new();
-        props.push(prop(
-            PropertyId::UserProperty,
-            PropertyValue::StringPair("a".to_string(), "1".to_string()),
-        ));
-        props.push(prop(
-            PropertyId::UserProperty,
-            PropertyValue::StringPair("b".to_string(), "2".to_string()),
-        ));
+        props.push(Property::UserProperty("a".to_string(), "1".to_string()));
+        props.push(Property::UserProperty("b".to_string(), "2".to_string()));
         round_trip(&props);
         // Both preserved in order.
         let mut count = 0;
         for p in props.iter() {
-            assert_eq!(p.id, PropertyId::UserProperty);
+            assert_eq!(p.property_id(), PropertyId::UserProperty);
             count += 1;
         }
         assert_eq!(count, 2);
@@ -1866,14 +1951,11 @@ mod tests {
     #[test]
     fn test_mixed_properties_round_trip() {
         let mut props = Properties::new();
-        props.push(prop(
-            PropertyId::SessionExpiryInterval,
-            PropertyValue::U32(120),
-        ));
-        props.push(prop(PropertyId::ReceiveMaximum, PropertyValue::U16(100)));
-        props.push(prop(
-            PropertyId::UserProperty,
-            PropertyValue::StringPair("env".to_string(), "prod".to_string()),
+        props.push(Property::SessionExpiryInterval(120));
+        props.push(Property::ReceiveMaximum(100));
+        props.push(Property::UserProperty(
+            "env".to_string(),
+            "prod".to_string(),
         ));
         round_trip(&props);
     }
@@ -1883,13 +1965,10 @@ mod tests {
     #[test]
     fn test_get_existing_property() {
         let mut props = Properties::new();
-        props.push(prop(
-            PropertyId::SessionExpiryInterval,
-            PropertyValue::U32(60),
-        ));
+        props.push(Property::SessionExpiryInterval(60));
         assert_eq!(
             props.get(PropertyId::SessionExpiryInterval),
-            Some(&PropertyValue::U32(60))
+            Some(&Property::SessionExpiryInterval(60))
         );
     }
 
@@ -1902,17 +1981,14 @@ mod tests {
     #[test]
     fn test_get_returns_first_occurrence() {
         let mut props = Properties::new();
-        props.push(prop(
-            PropertyId::UserProperty,
-            PropertyValue::StringPair("k".to_string(), "first".to_string()),
-        ));
-        props.push(prop(
-            PropertyId::UserProperty,
-            PropertyValue::StringPair("k".to_string(), "second".to_string()),
+        props.push(Property::UserProperty("k".to_string(), "first".to_string()));
+        props.push(Property::UserProperty(
+            "k".to_string(),
+            "second".to_string(),
         ));
         assert_eq!(
             props.get(PropertyId::UserProperty),
-            Some(&PropertyValue::StringPair(
+            Some(&Property::UserProperty(
                 "k".to_string(),
                 "first".to_string()
             ))
@@ -1932,11 +2008,8 @@ mod tests {
     #[test]
     fn test_encoded_size_matches_encode_multiple() {
         let mut props = Properties::new();
-        props.push(prop(
-            PropertyId::MaximumPacketSize,
-            PropertyValue::U32(65536),
-        ));
-        props.push(prop(PropertyId::TopicAliasMaximum, PropertyValue::U16(10)));
+        props.push(Property::MaximumPacketSize(65536));
+        props.push(Property::TopicAliasMaximum(10));
         let mut dst = BytesMut::new();
         props.encode(&mut dst, v5()).unwrap();
         assert_eq!(dst.len(), props.encoded_size(v5()));
@@ -1960,101 +2033,46 @@ mod tests {
 
     #[test]
     fn test_validate_flag_properties_must_be_0_or_1() {
-        for id in [
-            PropertyId::PayloadFormatIndicator,
-            PropertyId::RequestProblemInformation,
-            PropertyId::RequestResponseInformation,
-            PropertyId::MaximumQoS,
-            PropertyId::RetainAvailable,
-            PropertyId::WildcardSubscriptionAvailable,
-            PropertyId::SubscriptionIdentifierAvailable,
-            PropertyId::SharedSubscriptionAvailable,
-        ] {
-            assert!(Property::new(id, PropertyValue::Byte(0)).validate().is_ok());
-            assert!(Property::new(id, PropertyValue::Byte(1)).validate().is_ok());
-            assert_eq!(
-                Property::new(id, PropertyValue::Byte(2)).validate(),
-                Err(Error::ProtocolError),
-                "{id:?}"
-            );
+        // Each variant is a constructor function, which is what lets this
+        // iterate now that an identifier alone cannot build a property.
+        let flags: [fn(u8) -> Property; 8] = [
+            Property::PayloadFormatIndicator,
+            Property::RequestProblemInformation,
+            Property::RequestResponseInformation,
+            Property::MaximumQoS,
+            Property::RetainAvailable,
+            Property::WildcardSubscriptionAvailable,
+            Property::SubscriptionIdentifierAvailable,
+            Property::SharedSubscriptionAvailable,
+        ];
+        for make in flags {
+            let id = make(0).property_id();
+            assert!(make(0).validate().is_ok(), "{id:?}");
+            assert!(make(1).validate().is_ok(), "{id:?}");
+            assert_eq!(make(2).validate(), Err(Error::ProtocolError), "{id:?}");
             // ... and on the wire
             assert_eq!(decode_raw(&[id as u8, 0x07]), Err(Error::ProtocolError));
-            assert_eq!(
-                encode_one(Property::new(id, PropertyValue::Byte(7))),
-                Err(Error::ProtocolError)
-            );
+            assert_eq!(encode_one(make(7)), Err(Error::ProtocolError));
         }
-    }
-
-    #[test]
-    fn test_validate_non_zero_properties() {
-        assert_eq!(
-            Property::new(PropertyId::ReceiveMaximum, PropertyValue::U16(0)).validate(),
-            Err(Error::ProtocolError)
-        );
-        assert_eq!(
-            Property::new(PropertyId::TopicAlias, PropertyValue::U16(0)).validate(),
-            Err(Error::ProtocolError)
-        );
-        assert_eq!(
-            Property::new(PropertyId::MaximumPacketSize, PropertyValue::U32(0)).validate(),
-            Err(Error::ProtocolError)
-        );
-        assert_eq!(
-            Property::new(PropertyId::SubscriptionIdentifier, PropertyValue::VarInt(0)).validate(),
-            Err(Error::ProtocolError)
-        );
-        // Wire forms: ReceiveMaximum = 0, MaximumPacketSize = 0, TopicAlias = 0, SubId = 0
-        assert_eq!(decode_raw(&[0x21, 0x00, 0x00]), Err(Error::ProtocolError));
-        assert_eq!(
-            decode_raw(&[0x27, 0x00, 0x00, 0x00, 0x00]),
-            Err(Error::ProtocolError)
-        );
-        assert_eq!(decode_raw(&[0x23, 0x00, 0x00]), Err(Error::ProtocolError));
-        assert_eq!(decode_raw(&[0x0B, 0x00]), Err(Error::ProtocolError));
-        // Minimum legal values are fine.
-        assert!(decode_raw(&[0x21, 0x00, 0x01]).is_ok());
-        assert!(decode_raw(&[0x0B, 0x01]).is_ok());
-        // TopicAliasMaximum = 0 is explicitly allowed (means "no aliases").
-        assert!(decode_raw(&[0x22, 0x00, 0x00]).is_ok());
     }
 
     #[test]
     fn test_validate_response_topic_rejects_wildcards() {
         for t in ["a/#", "a/+/b", "+", "#"] {
             assert_eq!(
-                Property::new(PropertyId::ResponseTopic, PropertyValue::String(t.into()))
-                    .validate(),
+                Property::ResponseTopic(t.into()).validate(),
                 Err(Error::ProtocolError),
                 "{t}"
             );
         }
-        assert!(
-            Property::new(
-                PropertyId::ResponseTopic,
-                PropertyValue::String("a/b".into())
-            )
-            .validate()
-            .is_ok()
-        );
+        assert!(Property::ResponseTopic("a/b".into()).validate().is_ok());
     }
 
-    #[test]
-    fn test_validate_value_type_must_match_id() {
-        // A U32 where the id calls for a Byte can only be built via the API,
-        // never decoded; encode must refuse it.
-        assert_eq!(
-            Property::new(PropertyId::MaximumQoS, PropertyValue::U32(1)).validate(),
-            Err(Error::ProtocolError)
-        );
-        assert_eq!(
-            encode_one(Property::new(
-                PropertyId::ContentType,
-                PropertyValue::Binary(Bytes::from_static(b"x"))
-            )),
-            Err(Error::ProtocolError)
-        );
-    }
+    // A value whose type does not match its identifier used to be buildable
+    // (`Property::new(PropertyId::MaximumQoS, PropertyValue::U32(1))`) and was
+    // caught only by `validate`. With the identifier in the variant it cannot
+    // be written down at all, so the test that covered it is gone: the
+    // compiler covers it now.
 
     // ---- property-to-packet context (G2) ----
 
@@ -2125,7 +2143,7 @@ mod tests {
     #[test]
     fn test_check_context() {
         let mut props = Properties::new();
-        props.push(prop(PropertyId::TopicAlias, PropertyValue::U16(3)));
+        props.push(Property::TopicAlias(3));
         assert!(props.check_context(PacketType::Publish).is_ok());
         assert_eq!(
             props.check_context(PropertyContext::Will),
@@ -2166,8 +2184,8 @@ mod tests {
     #[test]
     fn test_encode_rejects_duplicate_non_repeatable_property() {
         let mut props = Properties::new();
-        props.push(prop(PropertyId::ReceiveMaximum, PropertyValue::U16(1)));
-        props.push(prop(PropertyId::ReceiveMaximum, PropertyValue::U16(2)));
+        props.push(Property::ReceiveMaximum(1));
+        props.push(Property::ReceiveMaximum(2));
         let mut dst = BytesMut::new();
         assert_eq!(props.encode(&mut dst, v5()), Err(Error::ProtocolError));
         // Rejected on v3 too — non-empty properties cannot be carried there.
@@ -2180,22 +2198,10 @@ mod tests {
     #[test]
     fn test_encode_allows_repeatable_properties() {
         let mut props = Properties::new();
-        props.push(prop(
-            PropertyId::UserProperty,
-            PropertyValue::StringPair("a".to_string(), "1".to_string()),
-        ));
-        props.push(prop(
-            PropertyId::UserProperty,
-            PropertyValue::StringPair("a".to_string(), "2".to_string()),
-        ));
-        props.push(prop(
-            PropertyId::SubscriptionIdentifier,
-            PropertyValue::VarInt(1),
-        ));
-        props.push(prop(
-            PropertyId::SubscriptionIdentifier,
-            PropertyValue::VarInt(2),
-        ));
+        props.push(Property::UserProperty("a".to_string(), "1".to_string()));
+        props.push(Property::UserProperty("a".to_string(), "2".to_string()));
+        props.push(Property::SubscriptionIdentifier(1));
+        props.push(Property::SubscriptionIdentifier(2));
         let mut dst = BytesMut::new();
         props.encode(&mut dst, v5()).unwrap();
         let back = Properties::decode(&mut dst.freeze(), v5()).unwrap();
@@ -2214,16 +2220,10 @@ mod tests {
 
     fn sample_props() -> alloc::vec::Vec<Property> {
         alloc::vec![
-            prop(PropertyId::MaximumPacketSize, PropertyValue::U32(65536)),
-            prop(PropertyId::TopicAliasMaximum, PropertyValue::U16(10)),
-            prop(
-                PropertyId::UserProperty,
-                PropertyValue::StringPair("key".to_string(), "value".to_string()),
-            ),
-            prop(
-                PropertyId::CorrelationData,
-                PropertyValue::Binary(Bytes::from_static(b"abc")),
-            ),
+            Property::MaximumPacketSize(65536),
+            Property::TopicAliasMaximum(10),
+            Property::UserProperty("key".to_string(), "value".to_string()),
+            Property::CorrelationData(Bytes::from_static(b"abc")),
         ]
     }
 
@@ -2335,10 +2335,9 @@ mod tests {
     #[test]
     fn test_encode_binary_too_long_errors() {
         let mut props = Properties::new();
-        props.push(Property::new(
-            PropertyId::CorrelationData,
-            PropertyValue::Binary(Bytes::from(alloc::vec![0u8; 65_536])),
-        ));
+        props.push(Property::CorrelationData(Bytes::from(
+            alloc::vec![0u8; 65_536],
+        )));
         let mut dst = BytesMut::new();
         assert_eq!(props.encode(&mut dst, v5()), Err(Error::BinaryTooLong));
     }
@@ -2347,10 +2346,7 @@ mod tests {
     fn test_encode_string_too_long_errors() {
         let s: String = core::iter::repeat_n('x', 65_536).collect();
         let mut props = Properties::new();
-        props.push(Property::new(
-            PropertyId::ContentType,
-            PropertyValue::String(s),
-        ));
+        props.push(Property::ContentType(s));
         let mut dst = BytesMut::new();
         assert_eq!(props.encode(&mut dst, v5()), Err(Error::StringTooLong));
     }
@@ -2359,10 +2355,7 @@ mod tests {
     fn test_encode_string_pair_value_too_long_errors() {
         let v: String = core::iter::repeat_n('x', 65_536).collect();
         let mut props = Properties::new();
-        props.push(Property::new(
-            PropertyId::UserProperty,
-            PropertyValue::StringPair("k".to_string(), v),
-        ));
+        props.push(Property::UserProperty("k".to_string(), v));
         let mut dst = BytesMut::new();
         assert_eq!(props.encode(&mut dst, v5()), Err(Error::StringTooLong));
     }
@@ -2371,14 +2364,8 @@ mod tests {
 
     fn two_sub_ids() -> Properties {
         let mut props = Properties::new();
-        props.push(Property::new(
-            PropertyId::SubscriptionIdentifier,
-            PropertyValue::VarInt(1),
-        ));
-        props.push(Property::new(
-            PropertyId::SubscriptionIdentifier,
-            PropertyValue::VarInt(2),
-        ));
+        props.push(Property::SubscriptionIdentifier(1));
+        props.push(Property::SubscriptionIdentifier(2));
         props
     }
 
@@ -2428,10 +2415,7 @@ mod tests {
     #[test]
     fn test_encode_non_empty_on_v3_is_protocol_error() {
         let mut props = Properties::new();
-        props.push(prop(
-            PropertyId::UserProperty,
-            PropertyValue::StringPair("k".into(), "v".into()),
-        ));
+        props.push(Property::UserProperty("k".into(), "v".into()));
         for ver in [MqttVersion::V3_1, MqttVersion::V3_1_1] {
             let mut dst = BytesMut::new();
             assert_eq!(
@@ -2455,17 +2439,11 @@ mod tests {
     // ---- Authentication Data requires an Authentication Method ----
 
     fn auth_method(name: &str) -> Property {
-        Property::new(
-            PropertyId::AuthenticationMethod,
-            PropertyValue::String(name.into()),
-        )
+        Property::AuthenticationMethod(name.into())
     }
 
     fn auth_data(bytes: &'static [u8]) -> Property {
-        Property::new(
-            PropertyId::AuthenticationData,
-            PropertyValue::Binary(Bytes::from_static(bytes)),
-        )
+        Property::AuthenticationData(Bytes::from_static(bytes))
     }
 
     /// Wire bytes for a property list, built with `encode` — which is
@@ -2550,13 +2528,13 @@ mod tests {
     /// One property of every type the `push_*` helpers can produce.
     fn one_of_each() -> Properties {
         let mut props = Properties::new();
-        props.push_byte(PropertyId::PayloadFormatIndicator, 1);
-        props.push_u16(PropertyId::ReceiveMaximum, 20);
-        props.push_u32(PropertyId::SessionExpiryInterval, 300);
-        props.push_var_int(PropertyId::SubscriptionIdentifier, 9u32);
-        props.push_binary(PropertyId::CorrelationData, Bytes::from_static(b"\x01\x02"));
-        props.push_string(PropertyId::ContentType, "text/plain");
-        props.push_string_pair(PropertyId::UserProperty, "k", "v");
+        props.push(Property::PayloadFormatIndicator(1));
+        props.push(Property::ReceiveMaximum(20));
+        props.push(Property::SessionExpiryInterval(300));
+        props.push(Property::SubscriptionIdentifier(9u32));
+        props.push(Property::CorrelationData(Bytes::from_static(b"\x01\x02")));
+        props.push(Property::ContentType("text/plain".into()));
+        props.push(Property::UserProperty("k".into(), "v".into()));
         props
     }
 
@@ -2616,9 +2594,9 @@ mod tests {
     #[test]
     fn test_string_pair_at_walks_repeated_user_properties() {
         let mut props = Properties::new();
-        props.push_string_pair(PropertyId::UserProperty, "a", "1");
-        props.push_string_pair(PropertyId::UserProperty, "b", "2");
-        props.push_string_pair(PropertyId::UserProperty, "c", "3");
+        props.push(Property::UserProperty("a".into(), "1".into()));
+        props.push(Property::UserProperty("b".into(), "2".into()));
+        props.push(Property::UserProperty("c".into(), "3".into()));
 
         for (i, (k, v)) in [("a", "1"), ("b", "2"), ("c", "3")].iter().enumerate() {
             assert_eq!(
@@ -2640,14 +2618,14 @@ mod tests {
     #[test]
     fn test_get_at_indexes_within_the_identifier() {
         let mut props = Properties::new();
-        props.push_string(PropertyId::ContentType, "text/plain");
-        props.push_string_pair(PropertyId::UserProperty, "a", "1");
-        props.push_u16(PropertyId::ReceiveMaximum, 7);
-        props.push_string_pair(PropertyId::UserProperty, "b", "2");
+        props.push(Property::ContentType("text/plain".into()));
+        props.push(Property::UserProperty("a".into(), "1".into()));
+        props.push(Property::ReceiveMaximum(7));
+        props.push(Property::UserProperty("b".into(), "2".into()));
 
         assert_eq!(
             props.get_at(PropertyId::UserProperty, 1),
-            Some(&PropertyValue::StringPair("b".into(), "2".into()))
+            Some(&Property::UserProperty("b".into(), "2".into()))
         );
         assert_eq!(
             props.get_at(PropertyId::ReceiveMaximum, 0),
@@ -2660,8 +2638,8 @@ mod tests {
     #[test]
     fn test_get_u32_reads_both_integer_forms() {
         let mut props = Properties::new();
-        props.push_var_int(PropertyId::SubscriptionIdentifier, 5u32);
-        props.push_u32(PropertyId::SessionExpiryInterval, 300);
+        props.push(Property::SubscriptionIdentifier(5u32));
+        props.push(Property::SessionExpiryInterval(300));
 
         assert_eq!(props.get_u32(PropertyId::SubscriptionIdentifier), Some(5));
         assert_eq!(props.get_u32(PropertyId::SessionExpiryInterval), Some(300));
@@ -2678,17 +2656,14 @@ mod tests {
     #[test]
     fn test_push_var_int_matches_the_constructor() {
         let mut a = Properties::new();
-        a.push_var_int(PropertyId::SubscriptionIdentifier, 7u32);
+        a.push(Property::SubscriptionIdentifier(7u32));
         let mut b = Properties::new();
-        b.push(Property::new_var_int(
-            PropertyId::SubscriptionIdentifier,
-            7u32,
-        ));
+        b.push(Property::SubscriptionIdentifier(7u32));
         assert_eq!(a, b);
 
         // A narrower integer converts.
         let mut c = Properties::new();
-        c.push_var_int(PropertyId::SubscriptionIdentifier, 7u16);
+        c.push(Property::SubscriptionIdentifier(7));
         assert_eq!(c, a);
     }
 
@@ -2698,7 +2673,7 @@ mod tests {
     fn test_var_int_at_walks_repeated_subscription_identifiers() {
         let mut props = Properties::new();
         for id in [1u32, 2, 3] {
-            props.push_var_int(PropertyId::SubscriptionIdentifier, id);
+            props.push(Property::SubscriptionIdentifier(id));
         }
         for (i, want) in [1u32, 2, 3].iter().enumerate() {
             assert_eq!(
@@ -2729,7 +2704,7 @@ mod tests {
     fn three_users() -> Properties {
         let mut props = Properties::new();
         props.push_user("a", "1");
-        props.push_string(PropertyId::ContentType, "text/plain");
+        props.push(Property::ContentType("text/plain".into()));
         props.push_user("b", "2");
         props.push_user("a", "3");
         props
@@ -2740,7 +2715,7 @@ mod tests {
         let mut a = Properties::new();
         a.push_user("k", "v");
         let mut b = Properties::new();
-        b.push_string_pair(PropertyId::UserProperty, "k", "v");
+        b.push(Property::UserProperty("k".into(), "v".into()));
         assert_eq!(a, b);
     }
 
@@ -2780,7 +2755,7 @@ mod tests {
         assert_eq!(props.get_all(PropertyId::UserProperty).count(), 3);
         assert_eq!(
             props.get_all(PropertyId::ContentType).collect::<Vec<_>>(),
-            vec![&PropertyValue::String("text/plain".into())]
+            vec![&Property::ContentType("text/plain".into())]
         );
         assert_eq!(props.get_all(PropertyId::ReceiveMaximum).count(), 0);
     }
@@ -2821,12 +2796,7 @@ mod tests {
     fn test_retain_keeps_only_what_the_predicate_wants() {
         let mut props = three_users();
         // Drop the user properties whose key is "a".
-        props.retain(|p| {
-            !matches!(
-                (&p.id, &p.value),
-                (PropertyId::UserProperty, PropertyValue::StringPair(k, _)) if k == "a"
-            )
-        });
+        props.retain(|p| !matches!(p, Property::UserProperty(k, _) if k == "a"));
         assert_eq!(props.user_iter().collect::<Vec<_>>(), vec![("b", "2")]);
         assert_eq!(
             props.get_string(PropertyId::ContentType).as_deref(),
@@ -2842,7 +2812,7 @@ mod tests {
         props.push_user("keep", "yes");
         props.push_user("drop", "");
         props.push_user("also", "yes");
-        props.retain(|p| !matches!(&p.value, PropertyValue::StringPair(_, v) if v.is_empty()));
+        props.retain(|p| !matches!(p, Property::UserProperty(_, v) if v.is_empty()));
         assert_eq!(
             props.user_iter().collect::<Vec<_>>(),
             vec![("keep", "yes"), ("also", "yes")]
@@ -2868,7 +2838,7 @@ mod tests {
         let mut a = three_users();
         a.remove(PropertyId::UserProperty);
         let mut b = three_users();
-        b.retain(|p| p.id != PropertyId::UserProperty);
+        b.retain(|p| p.property_id() != PropertyId::UserProperty);
         assert_eq!(a, b);
     }
 
@@ -2887,7 +2857,7 @@ mod tests {
                 p.remove(PropertyId::ContentType);
             },
             |p: &mut Properties| p.clear(),
-            |p: &mut Properties| p.retain(|prop| prop.id == PropertyId::ContentType),
+            |p: &mut Properties| p.retain(|prop| prop.property_id() == PropertyId::ContentType),
             |p: &mut Properties| p.retain(|_| false),
         ] {
             let mut props = three_users();
@@ -2906,14 +2876,14 @@ mod tests {
     #[test]
     fn test_removal_rebuilds_the_seen_set() {
         let mut props = Properties::new();
-        props.push_u16(PropertyId::ReceiveMaximum, 10);
-        props.push_u16(PropertyId::ReceiveMaximum, 20); // a repeat: invalid
+        props.push(Property::ReceiveMaximum(10));
+        props.push(Property::ReceiveMaximum(20)); // a repeat: invalid
         let mut dst = BytesMut::new();
         assert_eq!(props.encode(&mut dst, v5()), Err(Error::ProtocolError));
 
         // Dropping both and pushing one again is a valid list.
         assert_eq!(props.remove(PropertyId::ReceiveMaximum), 2);
-        props.push_u16(PropertyId::ReceiveMaximum, 30);
+        props.push(Property::ReceiveMaximum(30));
         let mut dst = BytesMut::new();
         props.encode(&mut dst, v5()).unwrap();
         assert_eq!(props.get_u16(PropertyId::ReceiveMaximum), Some(30));
@@ -3082,8 +3052,8 @@ mod tests {
         short.push_topic_alias(3);
 
         let mut generic = Properties::new();
-        generic.push_string(PropertyId::ContentType, "text/plain");
-        generic.push_u16(PropertyId::TopicAlias, 3);
+        generic.push(Property::ContentType("text/plain".into()));
+        generic.push(Property::TopicAlias(3));
 
         assert_eq!(short, generic);
         assert_eq!(
@@ -3116,8 +3086,8 @@ mod tests {
 
         // And the flag getter reads what `push_byte` writes.
         let mut raw = Properties::new();
-        raw.push_byte(PropertyId::RetainAvailable, 1);
-        raw.push_byte(PropertyId::SharedSubscriptionAvailable, 0);
+        raw.push(Property::RetainAvailable(1));
+        raw.push(Property::SharedSubscriptionAvailable(0));
         assert_eq!(raw.get_retain_available(), Some(true));
         assert_eq!(raw.get_shared_subscription_available(), Some(false));
         assert_eq!(raw, p);
@@ -3136,7 +3106,7 @@ mod tests {
     #[test]
     fn test_flag_property_rejects_other_bytes() {
         let mut p = Properties::new();
-        p.push_byte(PropertyId::RetainAvailable, 2);
+        p.push(Property::RetainAvailable(2));
         let mut dst = BytesMut::new();
         assert_eq!(
             p.encode(&mut dst, MQTT_VERSION_5),
@@ -3187,10 +3157,7 @@ mod tests {
             .reason_string("because")
             // The two that are not generated.
             .user("trace-id", "abc123")
-            .property(Property::new(
-                PropertyId::PayloadFormatIndicator,
-                PropertyValue::Byte(1),
-            ))
+            .property(Property::PayloadFormatIndicator(1))
             .finalize();
 
         let mut pushed = Properties::new();
@@ -3221,10 +3188,7 @@ mod tests {
         pushed.push_server_reference("mqtt://other:1883");
         pushed.push_reason_string("because");
         pushed.push_user("trace-id", "abc123");
-        pushed.push(Property::new(
-            PropertyId::PayloadFormatIndicator,
-            PropertyValue::Byte(1),
-        ));
+        pushed.push(Property::PayloadFormatIndicator(1));
 
         assert_eq!(built, pushed);
         assert_eq!(
@@ -3306,9 +3270,9 @@ mod tests {
     #[test]
     fn test_from_property_slice() {
         let owned = vec![
-            Property::new_u32(PropertyId::MessageExpiryInterval, 3600),
-            Property::new_string(PropertyId::ContentType, "text/plain"),
-            Property::new_string_pair(PropertyId::UserProperty, "k", "v"),
+            Property::MessageExpiryInterval(3600),
+            Property::ContentType("text/plain".into()),
+            Property::UserProperty("k".into(), "v".into()),
         ];
 
         let from_slice = Properties::from(&owned[..]);
@@ -3327,10 +3291,7 @@ mod tests {
     /// encodes to what the same properties pushed one at a time encode to.
     #[test]
     fn test_from_property_slice_builds_the_caches() {
-        let props = [
-            Property::new_byte(PropertyId::PayloadFormatIndicator, 1),
-            Property::new_u16(PropertyId::TopicAlias, 7),
-        ];
+        let props = [Property::PayloadFormatIndicator(1), Property::TopicAlias(7)];
         let from_slice = Properties::from(&props[..]);
 
         let mut pushed = Properties::new();
@@ -3365,8 +3326,8 @@ mod tests {
     fn test_from_property_array() {
         let make = || {
             [
-                Property::new_u32(PropertyId::MessageExpiryInterval, 3600),
-                Property::new_string(PropertyId::ContentType, "text/plain"),
+                Property::MessageExpiryInterval(3600),
+                Property::ContentType("text/plain".into()),
             ]
         };
 
@@ -3392,12 +3353,201 @@ mod tests {
     /// invalid, exactly as pushing it would; the conversion does not filter.
     #[test]
     fn test_from_property_slice_keeps_invalidity() {
-        let bad = [Property::new_u16(PropertyId::TopicAlias, 0)];
+        let bad = [Property::TopicAlias(0)];
         let props = Properties::from(&bad[..]);
         let mut dst = BytesMut::new();
         assert_eq!(
             props.encode(&mut dst, MQTT_VERSION_5),
             Err(Error::ProtocolError)
         );
+    }
+
+    // ---- Property as an enum: the discriminant, and the wire form ----
+
+    /// One of every variant, so that a test can walk the whole set.
+    fn every_property() -> Vec<Property> {
+        vec![
+            Property::PayloadFormatIndicator(1),
+            Property::MessageExpiryInterval(3600),
+            Property::ContentType("text/plain".to_string()),
+            Property::ResponseTopic("reply/here".to_string()),
+            Property::CorrelationData(Bytes::from_static(b"corr")),
+            Property::SubscriptionIdentifier(4444),
+            Property::SessionExpiryInterval(300),
+            Property::AssignedClientIdentifier("auto-42".to_string()),
+            Property::ServerKeepAlive(30),
+            Property::AuthenticationMethod("SCRAM-SHA-1".to_string()),
+            Property::AuthenticationData(Bytes::from_static(b"auth")),
+            Property::RequestProblemInformation(1),
+            Property::WillDelayInterval(60),
+            Property::RequestResponseInformation(0),
+            Property::ResponseInformation("reply".to_string()),
+            Property::ServerReference("mqtt://other:1883".to_string()),
+            Property::ReasonString("because".to_string()),
+            Property::ReceiveMaximum(20),
+            Property::TopicAliasMaximum(10),
+            Property::TopicAlias(7),
+            Property::MaximumQoS(1),
+            Property::RetainAvailable(1),
+            Property::UserProperty("k".to_string(), "v".to_string()),
+            Property::MaximumPacketSize(65_536),
+            Property::WildcardSubscriptionAvailable(0),
+            Property::SubscriptionIdentifierAvailable(1),
+            Property::SharedSubscriptionAvailable(0),
+        ]
+    }
+
+    /// What the identifier would be if it were written out by hand, for every
+    /// variant. This is the oracle the discriminant read is checked against.
+    fn expected_id(p: &Property) -> PropertyId {
+        use Property as P;
+        use PropertyId as Id;
+        match p {
+            P::PayloadFormatIndicator(_) => Id::PayloadFormatIndicator,
+            P::MessageExpiryInterval(_) => Id::MessageExpiryInterval,
+            P::ContentType(_) => Id::ContentType,
+            P::ResponseTopic(_) => Id::ResponseTopic,
+            P::CorrelationData(_) => Id::CorrelationData,
+            P::SubscriptionIdentifier(_) => Id::SubscriptionIdentifier,
+            P::SessionExpiryInterval(_) => Id::SessionExpiryInterval,
+            P::AssignedClientIdentifier(_) => Id::AssignedClientIdentifier,
+            P::ServerKeepAlive(_) => Id::ServerKeepAlive,
+            P::AuthenticationMethod(_) => Id::AuthenticationMethod,
+            P::AuthenticationData(_) => Id::AuthenticationData,
+            P::RequestProblemInformation(_) => Id::RequestProblemInformation,
+            P::WillDelayInterval(_) => Id::WillDelayInterval,
+            P::RequestResponseInformation(_) => Id::RequestResponseInformation,
+            P::ResponseInformation(_) => Id::ResponseInformation,
+            P::ServerReference(_) => Id::ServerReference,
+            P::ReasonString(_) => Id::ReasonString,
+            P::ReceiveMaximum(_) => Id::ReceiveMaximum,
+            P::TopicAliasMaximum(_) => Id::TopicAliasMaximum,
+            P::TopicAlias(_) => Id::TopicAlias,
+            P::MaximumQoS(_) => Id::MaximumQoS,
+            P::RetainAvailable(_) => Id::RetainAvailable,
+            P::UserProperty(..) => Id::UserProperty,
+            P::MaximumPacketSize(_) => Id::MaximumPacketSize,
+            P::WildcardSubscriptionAvailable(_) => Id::WildcardSubscriptionAvailable,
+            P::SubscriptionIdentifierAvailable(_) => Id::SubscriptionIdentifierAvailable,
+            P::SharedSubscriptionAvailable(_) => Id::SharedSubscriptionAvailable,
+        }
+    }
+
+    /// The whole point of the unsafe read: the tag it produces is the
+    /// identifier an exhaustive match would name, for every variant. A
+    /// discriminant typed wrongly in the enum above fails here.
+    #[test]
+    fn test_property_id_matches_the_variant() {
+        let all = every_property();
+        assert_eq!(all.len(), 27, "a variant is missing from the fixture");
+
+        for p in &all {
+            assert_eq!(p.property_id(), expected_id(p), "{p:?}");
+        }
+    }
+
+    /// And the tag is the specification's identifier byte, not merely
+    /// self-consistent.
+    #[test]
+    fn test_property_id_is_the_wire_byte() {
+        for p in &every_property() {
+            let mut dst = BytesMut::new();
+            p.encode(&mut dst).unwrap();
+            assert_eq!(dst[0], p.property_id() as u8, "{p:?}");
+        }
+    }
+
+    /// Every variant round-trips through the wire unchanged.
+    #[test]
+    fn test_round_trip_every_variant() {
+        for p in every_property() {
+            let mut dst = BytesMut::new();
+            p.encode(&mut dst).unwrap();
+            assert_eq!(dst.len(), p.encoded_size(), "{p:?}");
+
+            let mut src = dst.freeze();
+            let back = Property::decode(&mut src).unwrap();
+            assert_eq!(back, p);
+            assert!(!src.has_remaining(), "{p:?} left bytes behind");
+        }
+    }
+
+    /// The value type follows from the identifier, as the specification's
+    /// table says, and matches what the shipped `PropertyId` reports.
+    #[test]
+    fn test_value_type_follows_the_identifier() {
+        for p in &every_property() {
+            assert_eq!(p.value_type(), p.property_id().value_type(), "{p:?}");
+        }
+    }
+
+    /// Ranges are still checked, since a type cannot express "0 or 1".
+    #[test]
+    fn test_validate_checks_ranges() {
+        assert_eq!(
+            Property::MaximumQoS(2).validate(),
+            Err(Error::ProtocolError)
+        );
+        assert_eq!(
+            Property::TopicAlias(0).validate(),
+            Err(Error::ProtocolError)
+        );
+        assert_eq!(
+            Property::SubscriptionIdentifier(0).validate(),
+            Err(Error::ProtocolError)
+        );
+        assert_eq!(
+            Property::ResponseTopic("a/+/b".to_string()).validate(),
+            Err(Error::ProtocolError)
+        );
+        assert!(Property::MaximumQoS(1).validate().is_ok());
+        assert!(Property::TopicAlias(1).validate().is_ok());
+    }
+
+    /// A range violation is refused on the way in as well as the way out.
+    #[test]
+    fn test_decode_rejects_a_bad_range() {
+        let mut src = Bytes::from_static(&[0x24, 0x02]); // MaximumQoS = 2
+        assert_eq!(Property::decode(&mut src), Err(Error::ProtocolError));
+    }
+
+    /// `from_value` pairs an identifier with a loose value, and refuses a
+    /// pairing the specification does not define.
+    #[test]
+    fn test_from_value_pairs_or_refuses() {
+        // Every variant survives the round trip through the loose form.
+        for p in every_property() {
+            let id = p.property_id();
+            assert_eq!(Property::from_value(id, p.value()), Ok(p.clone()), "{p:?}");
+        }
+
+        // A value of the wrong type for the identifier is refused, where
+        // naming the variant would not have compiled.
+        assert_eq!(
+            Property::from_value(PropertyId::MaximumQoS, PropertyValue::U32(1)),
+            Err(Error::ProtocolError)
+        );
+        assert_eq!(
+            Property::from_value(
+                PropertyId::ContentType,
+                PropertyValue::Binary(Bytes::from_static(b"x"))
+            ),
+            Err(Error::ProtocolError)
+        );
+        assert_eq!(
+            Property::from_value(
+                PropertyId::UserProperty,
+                PropertyValue::String("no pair".into())
+            ),
+            Err(Error::ProtocolError)
+        );
+    }
+
+    /// The range rules still apply to a property built this way, once it is
+    /// pushed or encoded.
+    #[test]
+    fn test_from_value_still_range_checks() {
+        let bad = Property::from_value(PropertyId::TopicAlias, PropertyValue::U16(0)).unwrap();
+        assert_eq!(bad.validate(), Err(Error::ProtocolError));
     }
 }

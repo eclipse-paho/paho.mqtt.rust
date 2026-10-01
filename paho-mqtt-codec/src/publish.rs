@@ -446,7 +446,7 @@ impl PubAck {
 mod tests {
     use super::*;
     use crate::{
-        properties::{Property, PropertyId, PropertyValue},
+        properties::{Property, PropertyId},
         types::{MQTT_VERSION_3_1_1, MQTT_VERSION_5},
     };
     use bytes::BytesMut;
@@ -782,10 +782,7 @@ mod tests {
     #[test]
     fn test_builder_sets_every_field() {
         let mut props = Properties::new();
-        props.push(Property::new(
-            PropertyId::ContentType,
-            PropertyValue::String("text/plain".into()),
-        ));
+        props.push(Property::ContentType("text/plain".into()));
         let p = PublishBuilder::new()
             .topic("a/b")
             .payload("hi")
@@ -804,7 +801,7 @@ mod tests {
         assert!(p.dup);
         assert_eq!(
             p.properties.get(PropertyId::ContentType),
-            Some(&PropertyValue::String("text/plain".into()))
+            Some(&Property::ContentType("text/plain".into()))
         );
     }
 
@@ -909,14 +906,8 @@ mod tests {
 
     fn publish_props() -> Properties {
         let mut props = Properties::new();
-        props.push(Property::new(
-            PropertyId::ContentType,
-            PropertyValue::String("application/json".into()),
-        ));
-        props.push(Property::new(
-            PropertyId::MessageExpiryInterval,
-            PropertyValue::U32(60),
-        ));
+        props.push(Property::ContentType("application/json".into()));
+        props.push(Property::MessageExpiryInterval(60));
         props
     }
 
@@ -929,7 +920,7 @@ mod tests {
         assert_eq!(&p.payload[..], b"hi");
         assert_eq!(
             p.properties.get(PropertyId::ContentType),
-            Some(&PropertyValue::String("application/json".into()))
+            Some(&Property::ContentType("application/json".into()))
         );
         assert_eq!(p.qos, QoS::QoS0);
         assert!(!p.dup);
@@ -980,10 +971,7 @@ mod tests {
     #[test]
     fn test_publish_with_properties_rejects_a_property_not_allowed_here() {
         let mut props = Properties::new();
-        props.push(Property::new(
-            PropertyId::WillDelayInterval,
-            PropertyValue::U32(5),
-        ));
+        props.push(Property::WillDelayInterval(5));
         let p = PublishBuilder::new()
             .topic("a")
             .payload("x")
@@ -1069,10 +1057,7 @@ mod tests {
     #[test]
     fn test_puback_v5_full_form_with_properties_encode() {
         let mut props = Properties::new();
-        props.push(Property::new(
-            PropertyId::ReasonString,
-            PropertyValue::String("no".into()),
-        ));
+        props.push(Property::ReasonString("no".into()));
         let ack = PubAck::with_properties(3, ReasonCode::NotAuthorized, props);
         let mut dst = BytesMut::new();
         ack.encode(&mut dst, v5()).unwrap();
@@ -1219,10 +1204,7 @@ mod tests {
     #[test]
     fn test_puback_encode_props_on_v3_is_protocol_error() {
         let mut ack = PubAck::new(1);
-        ack.properties.push(Property::new(
-            PropertyId::ReasonString,
-            PropertyValue::String("x".into()),
-        ));
+        ack.properties.push(Property::ReasonString("x".into()));
         let mut dst = BytesMut::new();
         assert_eq!(ack.encode(&mut dst, v311()), Err(Error::ProtocolError));
         // Same packet is fine on v5.
@@ -1234,10 +1216,7 @@ mod tests {
 
     fn reason_props(text: &str) -> Properties {
         let mut props = Properties::new();
-        props.push(Property::new(
-            PropertyId::ReasonString,
-            PropertyValue::String(text.into()),
-        ));
+        props.push(Property::ReasonString(text.into()));
         props
     }
 
@@ -1252,7 +1231,7 @@ mod tests {
         assert_eq!(ack.reason_code, ReasonCode::NoMatchingSubscribers);
         assert_eq!(
             ack.properties.get(PropertyId::ReasonString),
-            Some(&PropertyValue::String("nobody listening".into()))
+            Some(&Property::ReasonString("nobody listening".into()))
         );
     }
 
@@ -1327,10 +1306,7 @@ mod tests {
     #[test]
     fn test_puback_with_properties_rejects_a_property_not_allowed_here() {
         let mut props = Properties::new();
-        props.push(Property::new(
-            PropertyId::SubscriptionIdentifier,
-            PropertyValue::VarInt(1),
-        ));
+        props.push(Property::SubscriptionIdentifier(1));
         let ack = PubAck::with_properties(1, ReasonCode::Success, props);
         let mut dst = BytesMut::new();
         assert_eq!(ack.encode(&mut dst, v5()), Err(Error::ProtocolError));

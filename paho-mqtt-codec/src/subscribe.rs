@@ -371,7 +371,7 @@ impl SubAck {
 mod tests {
     use super::*;
     use crate::{
-        Property, PropertyId, PropertyValue,
+        Property, PropertyId,
         types::{MQTT_VERSION_3_1_1, MQTT_VERSION_5},
     };
     use alloc::vec;
@@ -781,16 +781,10 @@ mod tests {
     fn test_subscribe_encode_rejects_second_subscription_identifier() {
         // A PUBLISH may carry several; a SUBSCRIBE only one (§3.8.2.1.2).
         let mut sub = Subscribe::new(1, vec![Subscription::new("a", QoS::QoS0)]);
-        sub.properties.push(Property::new(
-            PropertyId::SubscriptionIdentifier,
-            PropertyValue::VarInt(1),
-        ));
+        sub.properties.push(Property::SubscriptionIdentifier(1));
         let mut dst = BytesMut::new();
         assert!(sub.encode(&mut dst, v5()).is_ok(), "one is fine");
-        sub.properties.push(Property::new(
-            PropertyId::SubscriptionIdentifier,
-            PropertyValue::VarInt(2),
-        ));
+        sub.properties.push(Property::SubscriptionIdentifier(2));
         let mut dst = BytesMut::new();
         assert_eq!(sub.encode(&mut dst, v5()), Err(Error::ProtocolError));
     }
@@ -851,18 +845,12 @@ mod tests {
     // ---- with_properties ----
 
     fn user_prop(k: &str, v: &str) -> Property {
-        Property::new(
-            PropertyId::UserProperty,
-            PropertyValue::StringPair(k.into(), v.into()),
-        )
+        Property::UserProperty(k.into(), v.into())
     }
 
     fn sub_id_props(id: u32) -> Properties {
         let mut props = Properties::new();
-        props.push(Property::new(
-            PropertyId::SubscriptionIdentifier,
-            PropertyValue::VarInt(id),
-        ));
+        props.push(Property::SubscriptionIdentifier(id));
         props
     }
 
@@ -874,7 +862,7 @@ mod tests {
         assert_eq!(sub.subscriptions, subs);
         assert_eq!(
             sub.properties.get(PropertyId::SubscriptionIdentifier),
-            Some(&PropertyValue::VarInt(5))
+            Some(&Property::SubscriptionIdentifier(5))
         );
     }
 
@@ -923,10 +911,7 @@ mod tests {
     #[test]
     fn test_subscribe_with_properties_rejects_repeated_subscription_identifier() {
         let mut props = sub_id_props(1);
-        props.push(Property::new(
-            PropertyId::SubscriptionIdentifier,
-            PropertyValue::VarInt(2),
-        ));
+        props.push(Property::SubscriptionIdentifier(2));
         let sub =
             Subscribe::with_properties(1, vec![Subscription::new("a", QoS::AtMostOnce)], props);
         let mut dst = BytesMut::new();
@@ -936,10 +921,7 @@ mod tests {
     #[test]
     fn test_subscribe_with_properties_rejects_a_property_not_allowed_here() {
         let mut props = Properties::new();
-        props.push(Property::new(
-            PropertyId::ReasonString,
-            PropertyValue::String("why".into()),
-        ));
+        props.push(Property::ReasonString("why".into()));
         let sub =
             Subscribe::with_properties(1, vec![Subscription::new("a", QoS::AtMostOnce)], props);
         let mut dst = BytesMut::new();
@@ -948,10 +930,7 @@ mod tests {
 
     fn reason_props(text: &str) -> Properties {
         let mut props = Properties::new();
-        props.push(Property::new(
-            PropertyId::ReasonString,
-            PropertyValue::String(text.into()),
-        ));
+        props.push(Property::ReasonString(text.into()));
         props
     }
 
@@ -963,7 +942,7 @@ mod tests {
         assert_eq!(ack.reason_codes, codes);
         assert_eq!(
             ack.properties.get(PropertyId::ReasonString),
-            Some(&PropertyValue::String("partly denied".into()))
+            Some(&Property::ReasonString("partly denied".into()))
         );
     }
 
@@ -1002,10 +981,7 @@ mod tests {
     #[test]
     fn test_suback_with_properties_rejects_a_property_not_allowed_here() {
         let mut props = Properties::new();
-        props.push(Property::new(
-            PropertyId::SubscriptionIdentifier,
-            PropertyValue::VarInt(1),
-        ));
+        props.push(Property::SubscriptionIdentifier(1));
         let ack = SubAck::with_properties(1, vec![ReasonCode::GrantedQos0], props);
         let mut dst = BytesMut::new();
         assert_eq!(ack.encode(&mut dst, v5()), Err(Error::ProtocolError));
