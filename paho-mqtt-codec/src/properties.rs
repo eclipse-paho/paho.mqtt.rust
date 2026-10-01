@@ -49,26 +49,6 @@ use serde::{Deserialize, Serialize};
 
 /////////////////////////////////////////////////////////////////////////////
 
-/// The wire encoding type of an MQTT v5 property value.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-pub enum PropertyType {
-    /// Single byte.
-    Byte,
-    /// Two-byte big-endian unsigned integer.
-    U16,
-    /// Four-byte big-endian unsigned integer.
-    U32,
-    /// Variable-byte integer (1–4 bytes).
-    VarInt,
-    /// Two-byte length-prefixed binary blob.
-    Binary,
-    /// Two-byte length-prefixed UTF-8 string.
-    String,
-    /// Two UTF-8 strings (key then value), each length-prefixed.
-    StringPair,
-}
-
 ///////////////////////////////////////////////////////////////////
 
 impl PropertyId {
@@ -301,37 +281,40 @@ impl TryFrom<u8> for PropertyId {
 /////////////////////////////////////////////////////////////////////////////
 
 /// The typed value of an MQTT v5 property.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, EnumDiscriminants)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[strum_discriminants(name(PropertyType), vis(pub))]
+#[strum_discriminants(derive(Hash, PartialOrd, Ord))]
+#[strum_discriminants(cfg_attr(feature = "serde", derive(Serialize, Deserialize)))]
+#[strum_discriminants(doc = "The wire encoding type of an MQTT v5 property value.")]
+#[strum_discriminants(doc = "")]
+#[strum_discriminants(doc = "Generated from [`PropertyValue`], whose variants are these")]
+#[strum_discriminants(doc = "types carrying a value, so the two cannot drift apart.")]
 pub enum PropertyValue {
-    /// Single-byte value.
+    /// Single byte.
     Byte(u8),
-    /// Two-byte unsigned integer.
+    /// Two-byte big-endian unsigned integer.
     U16(u16),
-    /// Four-byte unsigned integer.
+    /// Four-byte big-endian unsigned integer.
     U32(u32),
-    /// Variable-byte integer.
+    /// Variable-byte integer (1–4 bytes).
     VarInt(u32),
-    /// Length-prefixed binary data.
+    /// Two-byte length-prefixed binary blob.
     Binary(Bytes),
-    /// Length-prefixed UTF-8 string.
+    /// Two-byte length-prefixed UTF-8 string.
     String(String),
-    /// Two length-prefixed UTF-8 strings (key, value).
+    /// Two UTF-8 strings (key then value), each length-prefixed.
     StringPair(String, String),
 }
 
 impl PropertyValue {
     /// Returns the wire encoding type of this value.
+    ///
+    /// The variant itself, as mapped by the `EnumDiscriminants` derive:
+    /// [`PropertyType`] is generated from this enum, so the two lists are
+    /// one list.
     pub fn property_type(&self) -> PropertyType {
-        match self {
-            PropertyValue::Byte(_) => PropertyType::Byte,
-            PropertyValue::U16(_) => PropertyType::U16,
-            PropertyValue::U32(_) => PropertyType::U32,
-            PropertyValue::VarInt(_) => PropertyType::VarInt,
-            PropertyValue::Binary(_) => PropertyType::Binary,
-            PropertyValue::String(_) => PropertyType::String,
-            PropertyValue::StringPair(..) => PropertyType::StringPair,
-        }
+        PropertyType::from(self)
     }
 
     /// Number of bytes this value occupies on the wire, excluding the
