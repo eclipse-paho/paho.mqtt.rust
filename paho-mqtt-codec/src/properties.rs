@@ -42,6 +42,7 @@ use crate::{
     wire::{get_binary, get_utf8, put_binary, put_utf8},
 };
 use bytes::{Buf, BufMut, Bytes};
+use strum_macros::{EnumDiscriminants, FromRepr};
 
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
@@ -69,77 +70,6 @@ pub enum PropertyType {
 }
 
 ///////////////////////////////////////////////////////////////////
-
-/// MQTT v5 property identifiers.
-///
-/// Each identifier has a fixed associated wire type (see [`PropertyId::value_type`]).
-/// The numeric discriminants match the values on the wire.
-#[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-pub enum PropertyId {
-    /// Payload is unspecified bytes (0) or UTF-8 text (1). PUBLISH, Will.
-    PayloadFormatIndicator = 0x01,
-    /// Message lifetime in seconds. PUBLISH, Will.
-    MessageExpiryInterval = 0x02,
-    /// Description of the payload content, e.g. a MIME type. PUBLISH, Will.
-    ContentType = 0x03,
-    /// Topic for a response in a request/response exchange. PUBLISH, Will.
-    ResponseTopic = 0x08,
-    /// Opaque data correlating a response with its request. PUBLISH, Will.
-    CorrelationData = 0x09,
-    /// Identifier tying a delivered PUBLISH to the subscription that matched
-    /// it. SUBSCRIBE (once), PUBLISH (may repeat).
-    SubscriptionIdentifier = 0x0B,
-    /// How long the session survives after disconnect, in seconds.
-    /// CONNECT, CONNACK, DISCONNECT.
-    SessionExpiryInterval = 0x11,
-    /// Client identifier the server assigned when the client sent none.
-    /// CONNACK.
-    AssignedClientIdentifier = 0x12,
-    /// Keep-alive the server requires, overriding the client's. CONNACK.
-    ServerKeepAlive = 0x13,
-    /// Name of the extended authentication method. CONNECT, CONNACK, AUTH.
-    AuthenticationMethod = 0x15,
-    /// Method-specific authentication data. CONNECT, CONNACK, AUTH.
-    AuthenticationData = 0x16,
-    /// Whether the server may send Reason Strings and User Properties on
-    /// failures other than PUBLISH, CONNACK, and DISCONNECT. CONNECT.
-    RequestProblemInformation = 0x17,
-    /// Delay before the server publishes the Will, in seconds. Will.
-    WillDelayInterval = 0x18,
-    /// Whether the client wants Response Information in CONNACK. CONNECT.
-    RequestResponseInformation = 0x19,
-    /// Basis for building response topics. CONNACK.
-    ResponseInformation = 0x1A,
-    /// Another server the client should use. CONNACK, DISCONNECT.
-    ServerReference = 0x1C,
-    /// Human-readable explanation of a reason code. Any acknowledgement,
-    /// DISCONNECT, AUTH.
-    ReasonString = 0x1F,
-    /// Most QoS 1 and 2 PUBLISH packets the sender will accept in flight.
-    /// CONNECT, CONNACK.
-    ReceiveMaximum = 0x21,
-    /// Highest topic alias the sender will accept. CONNECT, CONNACK.
-    TopicAliasMaximum = 0x22,
-    /// Integer standing in for the topic name. PUBLISH.
-    TopicAlias = 0x23,
-    /// Highest QoS the server supports (0 or 1). CONNACK.
-    MaximumQoS = 0x24,
-    /// Whether the server supports retained messages. CONNACK.
-    RetainAvailable = 0x25,
-    /// Application-defined name/value pair. Every packet except PINGREQ
-    /// and PINGRESP; may repeat.
-    UserProperty = 0x26,
-    /// Largest packet the sender will accept. CONNECT, CONNACK.
-    MaximumPacketSize = 0x27,
-    /// Whether the server supports wildcard subscriptions. CONNACK.
-    WildcardSubscriptionAvailable = 0x28,
-    /// Whether the server supports subscription identifiers. CONNACK.
-    SubscriptionIdentifierAvailable = 0x29,
-    /// Whether the server supports shared subscriptions. CONNACK.
-    SharedSubscriptionAvailable = 0x2A,
-}
 
 impl PropertyId {
     /// Returns the wire encoding type for the value of this property.
@@ -359,38 +289,12 @@ impl TryFrom<u8> for PropertyId {
     /// is a `ProtocolError`: the identifier is part of the packet's format,
     /// whereas a reason code is a correctly-typed field whose value is merely
     /// out of range.
+    ///
+    /// The byte-to-identifier table comes from `from_repr`, which the
+    /// `FromRepr` derive writes from the discriminants on [`Property`], so
+    /// the identifier bytes still appear exactly once in this crate.
     fn try_from(b: u8) -> Result<Self> {
-        use PropertyId::*;
-        match b {
-            0x01 => Ok(PayloadFormatIndicator),
-            0x02 => Ok(MessageExpiryInterval),
-            0x03 => Ok(ContentType),
-            0x08 => Ok(ResponseTopic),
-            0x09 => Ok(CorrelationData),
-            0x0B => Ok(SubscriptionIdentifier),
-            0x11 => Ok(SessionExpiryInterval),
-            0x12 => Ok(AssignedClientIdentifier),
-            0x13 => Ok(ServerKeepAlive),
-            0x15 => Ok(AuthenticationMethod),
-            0x16 => Ok(AuthenticationData),
-            0x17 => Ok(RequestProblemInformation),
-            0x18 => Ok(WillDelayInterval),
-            0x19 => Ok(RequestResponseInformation),
-            0x1A => Ok(ResponseInformation),
-            0x1C => Ok(ServerReference),
-            0x1F => Ok(ReasonString),
-            0x21 => Ok(ReceiveMaximum),
-            0x22 => Ok(TopicAliasMaximum),
-            0x23 => Ok(TopicAlias),
-            0x24 => Ok(MaximumQoS),
-            0x25 => Ok(RetainAvailable),
-            0x26 => Ok(UserProperty),
-            0x27 => Ok(MaximumPacketSize),
-            0x28 => Ok(WildcardSubscriptionAvailable),
-            0x29 => Ok(SubscriptionIdentifierAvailable),
-            0x2A => Ok(SharedSubscriptionAvailable),
-            _ => Err(Error::MalformedPacket),
-        }
+        Self::from_repr(b).ok_or(Error::MalformedPacket)
     }
 }
 
@@ -454,8 +358,17 @@ impl PropertyValue {
 /// Table 2-4, so a variant carries its own identifier; see
 /// [`property_id`](Self::property_id).
 #[repr(u8)]
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, EnumDiscriminants)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[strum_discriminants(name(PropertyId), vis(pub))]
+#[strum_discriminants(derive(Hash, PartialOrd, Ord, FromRepr))]
+#[strum_discriminants(cfg_attr(feature = "serde", derive(Serialize, Deserialize)))]
+#[strum_discriminants(doc = "MQTT v5 property identifiers (§2.2.2.2, Table 2-4).")]
+#[strum_discriminants(doc = "")]
+#[strum_discriminants(doc = "Generated from [`Property`], whose variants carry these")]
+#[strum_discriminants(doc = "bytes as their discriminants, so the identifier table is")]
+#[strum_discriminants(doc = "written once. Each identifier has a fixed associated wire")]
+#[strum_discriminants(doc = "type; see [`value_type`](Self::value_type).")]
 pub enum Property {
     /// 0 for unspecified bytes, 1 for UTF-8 text \[MQTT-3.3.2.3.2\].
     PayloadFormatIndicator(u8) = 0x01,
@@ -516,27 +429,12 @@ pub enum Property {
 impl Property {
     /// The identifier of this property.
     ///
-    /// Reads the enum's own discriminant rather than matching all
-    /// twenty-seven variants. Rust has no safe way to read the discriminant
-    /// of an enum whose variants carry fields — `as` rejects it and
-    /// [`core::mem::discriminant`] returns an opaque handle — so this reads
-    /// the tag directly, which `#[repr(u8)]` places first and sizes as one
-    /// byte. The unsafety is confined to this method.
+    /// The variant's own discriminant, as mapped by the `EnumDiscriminants`
+    /// derive above: [`PropertyId`] is generated from this enum, so the
+    /// identifier bytes are written once and this mapping needs neither a
+    /// match of its own nor a read of the tag.
     pub fn property_id(&self) -> PropertyId {
-        // SAFETY: `Self` is `#[repr(u8)]`, so its layout is a tagged union
-        // whose tag is a `u8` at offset 0, and `self` is a valid reference to
-        // one. The read is aligned (a `u8` always is) and copies a byte out
-        // without touching the payload.
-        let tag = unsafe { *(self as *const Self as *const u8) };
-
-        // Every variant's discriminant above is one of the specification's
-        // identifier bytes, which is what `PropertyId` enumerates, so this
-        // cannot fail. `test_property_id_matches_the_variant` proves it for
-        // every variant rather than taking the invariant on trust.
-        match PropertyId::try_from(tag) {
-            Ok(id) => id,
-            Err(_) => unreachable!("a variant's discriminant is a property identifier"),
-        }
+        PropertyId::from(self)
     }
 
     /// The wire type of this property's value.
@@ -3433,9 +3331,9 @@ mod tests {
         }
     }
 
-    /// The whole point of the unsafe read: the tag it produces is the
-    /// identifier an exhaustive match would name, for every variant. A
-    /// discriminant typed wrongly in the enum above fails here.
+    /// The identifier the derive produces is the one an exhaustive match
+    /// would name, for every variant — so a discriminant typed wrongly in
+    /// the enum, or a variant the derive mapped differently, fails here.
     #[test]
     fn test_property_id_matches_the_variant() {
         let all = every_property();
