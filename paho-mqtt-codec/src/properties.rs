@@ -26,8 +26,14 @@
 //! calls for: `Property::TopicAlias(7)`, `Property::ContentType(s)`. A value
 //! of the wrong type for its identifier therefore does not compile, where the
 //! earlier identifier-plus-value struct could build one and leave it to be
-//! caught at encode time. [`Property::from_value`] remains for code that has
-//! an identifier and a value separately, and is fallible for that reason.
+//! caught at encode time.
+//!
+//! Values are read back through the accessors on [`Properties`]: the typed
+//! ones ([`get_u16`](Properties::get_u16), [`get_str`](Properties::get_str))
+//! when the identifier is known, [`get`](Properties::get) for the property
+//! itself. The type-tagged `PropertyValue` the earlier struct stored is now
+//! internal, since nothing outside the crate needs a value separated from the
+//! identifier that gives it meaning.
 //!
 //! The [`Properties`] collection encodes and decodes the length-prefixed
 //! property list that appears in the variable header of every v5 packet type
@@ -280,7 +286,15 @@ impl TryFrom<u8> for PropertyId {
 
 /////////////////////////////////////////////////////////////////////////////
 
-/// The typed value of an MQTT v5 property.
+/// The typed value of an MQTT v5 property, independent of which property
+/// carries it.
+///
+/// Internal: [`Property`] carries its value in the variant, so this is not
+/// how a value is stored or encoded. It remains as the vocabulary for the two
+/// places that handle a value whose type is known only at run time —
+/// `Property::value` and `Property::from_value` — and as the source
+/// [`PropertyType`] is generated from. Callers reach values through the typed
+/// accessors on [`Properties`] instead.
 #[derive(Debug, Clone, PartialEq, Eq, EnumDiscriminants)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[strum_discriminants(name(PropertyType), vis(pub))]
@@ -290,7 +304,7 @@ impl TryFrom<u8> for PropertyId {
 #[strum_discriminants(doc = "")]
 #[strum_discriminants(doc = "Generated from [`PropertyValue`], whose variants are these")]
 #[strum_discriminants(doc = "types carrying a value, so the two cannot drift apart.")]
-pub enum PropertyValue {
+pub(crate) enum PropertyValue {
     /// Single byte.
     Byte(u8),
     /// Two-byte big-endian unsigned integer.
@@ -305,31 +319,6 @@ pub enum PropertyValue {
     String(String),
     /// Two UTF-8 strings (key then value), each length-prefixed.
     StringPair(String, String),
-}
-
-impl PropertyValue {
-    /// Returns the wire encoding type of this value.
-    ///
-    /// The variant itself, as mapped by the `EnumDiscriminants` derive:
-    /// [`PropertyType`] is generated from this enum, so the two lists are
-    /// one list.
-    pub fn property_type(&self) -> PropertyType {
-        PropertyType::from(self)
-    }
-
-    /// Number of bytes this value occupies on the wire, excluding the
-    /// identifier byte.
-    pub fn encoded_size(&self) -> usize {
-        match self {
-            PropertyValue::Byte(_) => 1,
-            PropertyValue::U16(_) => 2,
-            PropertyValue::U32(_) => 4,
-            PropertyValue::VarInt(n) => varlen::encoded_size(*n),
-            PropertyValue::Binary(b) => 2 + b.len(),
-            PropertyValue::String(s) => 2 + s.len(),
-            PropertyValue::StringPair(k, v) => 2 + k.len() + 2 + v.len(),
-        }
-    }
 }
 
 /////////////////////////////////////////////////////////////////////////////
@@ -425,13 +414,19 @@ impl Property {
         self.property_id().value_type()
     }
 
-    /// This property's value, as the type-tagged view that the generic
-    /// accessors speak in.
+    /// This property's value, as a type-tagged [`PropertyValue`].
+    ///
+    /// Internal, and currently exercised only by the tests that prove it and
+    /// [`from_value`](Self::from_value) are inverses: the accessors on
+    /// [`Properties`] read values straight out of the variant, so nothing in
+    /// the crate needs the tagged form. Kept because it is the only way to
+    /// speak about a value whose type is known at run time.
     ///
     /// The variant already carries the value; this copies it out for callers
     /// that work by identifier rather than by variant, so it allocates for
     /// the string and binary properties. Matching the variant avoids that.
-    pub fn value(&self) -> PropertyValue {
+    #[allow(dead_code)]
+    pub(crate) fn value(&self) -> PropertyValue {
         use Property::*;
         match self {
             PayloadFormatIndicator(v)
@@ -470,7 +465,8 @@ impl Property {
     /// [`ProtocolError`](Error::ProtocolError) when the value is not of the
     /// type the identifier calls for, which naming a variant makes
     /// impossible and which this cannot.
-    pub fn from_value(id: PropertyId, value: PropertyValue) -> Result<Self> {
+    #[allow(dead_code)]
+    pub(crate) fn from_value(id: PropertyId, value: PropertyValue) -> Result<Self> {
         use PropertyId as Id;
         use PropertyValue as Val;
         Ok(match (id, value) {
@@ -826,8 +822,16 @@ impl Properties {
 
     /// Returns the `idx`-th `id` property's value as a byte.
     pub fn get_byte_at(&self, id: PropertyId, idx: usize) -> Option<u8> {
-        match self.get_at(id, idx).map(Property::value) {
-            Some(PropertyValue::Byte(v)) => Some(v),
+        use Property::*;
+        match self.get_at(id, idx)? {
+            PayloadFormatIndicator(v)
+            | RequestProblemInformation(v)
+            | RequestResponseInformation(v)
+            | MaximumQoS(v)
+            | RetainAvailable(v)
+            | WildcardSubscriptionAvailable(v)
+            | SubscriptionIdentifierAvailable(v)
+            | SharedSubscriptionAvailable(v) => Some(*v),
             _ => None,
         }
     }
@@ -840,8 +844,11 @@ impl Properties {
 
     /// Returns the `idx`-th `id` property's value as a two-byte integer.
     pub fn get_u16_at(&self, id: PropertyId, idx: usize) -> Option<u16> {
-        match self.get_at(id, idx).map(Property::value) {
-            Some(PropertyValue::U16(v)) => Some(v),
+        use Property::*;
+        match self.get_at(id, idx)? {
+            ServerKeepAlive(v) | ReceiveMaximum(v) | TopicAliasMaximum(v) | TopicAlias(v) => {
+                Some(*v)
+            }
             _ => None,
         }
     }
@@ -859,8 +866,13 @@ impl Properties {
     /// Returns the `idx`-th `id` property's value as a 32-bit integer, from
     /// either a `U32` or a variable-byte integer.
     pub fn get_u32_at(&self, id: PropertyId, idx: usize) -> Option<u32> {
-        match self.get_at(id, idx).map(Property::value) {
-            Some(PropertyValue::U32(v) | PropertyValue::VarInt(v)) => Some(v),
+        use Property::*;
+        match self.get_at(id, idx)? {
+            MessageExpiryInterval(v)
+            | SessionExpiryInterval(v)
+            | WillDelayInterval(v)
+            | MaximumPacketSize(v)
+            | SubscriptionIdentifier(v) => Some(*v),
             _ => None,
         }
     }
@@ -880,8 +892,8 @@ impl Properties {
     /// A PUBLISH may carry several `SubscriptionIdentifier`s, one per matching
     /// subscription (§3.3.2.3.8), which is what `idx` is for.
     pub fn get_var_int_at(&self, id: PropertyId, idx: usize) -> Option<u32> {
-        match self.get_at(id, idx).map(Property::value) {
-            Some(PropertyValue::VarInt(v)) => Some(v),
+        match self.get_at(id, idx)? {
+            Property::SubscriptionIdentifier(v) => Some(*v),
             _ => None,
         }
     }
@@ -896,8 +908,9 @@ impl Properties {
 
     /// Returns the `idx`-th `id` property's value as binary data.
     pub fn get_binary_at(&self, id: PropertyId, idx: usize) -> Option<Bytes> {
-        match self.get_at(id, idx).map(Property::value) {
-            Some(PropertyValue::Binary(v)) => Some(v),
+        use Property::*;
+        match self.get_at(id, idx)? {
+            CorrelationData(v) | AuthenticationData(v) => Some(v.clone()),
             _ => None,
         }
     }
@@ -958,8 +971,15 @@ impl Properties {
 
     /// Returns the `idx`-th `id` property's value as a string.
     pub fn get_string_at(&self, id: PropertyId, idx: usize) -> Option<String> {
-        match self.get_at(id, idx).map(Property::value) {
-            Some(PropertyValue::String(v)) => Some(v),
+        use Property::*;
+        match self.get_at(id, idx)? {
+            ContentType(v)
+            | ResponseTopic(v)
+            | AssignedClientIdentifier(v)
+            | AuthenticationMethod(v)
+            | ResponseInformation(v)
+            | ServerReference(v)
+            | ReasonString(v) => Some(v.clone()),
             _ => None,
         }
     }
@@ -976,8 +996,8 @@ impl Properties {
 
     /// Returns the `idx`-th `id` property's value as a key/value pair.
     pub fn get_string_pair_at(&self, id: PropertyId, idx: usize) -> Option<(String, String)> {
-        match self.get_at(id, idx).map(Property::value) {
-            Some(PropertyValue::StringPair(k, v)) => Some((k, v)),
+        match self.get_at(id, idx)? {
+            Property::UserProperty(k, v) => Some((k.clone(), v.clone())),
             _ => None,
         }
     }

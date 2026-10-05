@@ -242,10 +242,7 @@ pub use crate::{
         ClientPersistence, ClientPersistenceBox, FilePersistence, MemPersistence,
         PERSISTENCE_ERROR, PERSISTENCE_SUCCESS, PersistenceType, UserPersistence,
     },
-    properties::{
-        Properties, PropertiesBuilder, Property, PropertyCode, PropertyId, PropertyType,
-        PropertyValue,
-    },
+    properties::{Properties, PropertiesBuilder, Property, PropertyCode, PropertyId, PropertyType},
     responses::{ConnectResponse, PublishResponse, SubscribeResponse, UnsubscribeResponse},
     subscribe_options::{
         NO_RETAIN_AS_PUBLISHED, RETAIN_AS_PUBLISHED, RetainHandling, SUBSCRIBE_LOCAL,

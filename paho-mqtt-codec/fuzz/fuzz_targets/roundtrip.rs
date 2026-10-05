@@ -42,7 +42,7 @@ use bytes::{Bytes, BytesMut};
 use libfuzzer_sys::fuzz_target;
 use paho_mqtt_codec::{
     Auth, ConnAck, Connect, Disconnect, MqttVersion, Packet, PacketType, Properties,
-    Property, PropertyContext, PropertyId, PropertyType, PropertyValue, PubAck, Publish,
+    Property, PropertyContext, PropertyId, PubAck, Publish,
     QoS, RawPacket, ReasonCode, RetainHandling, SubAck, Subscribe, Subscription, UnsubAck,
     Unsubscribe, Will, topic,
 };
@@ -189,41 +189,63 @@ const ALL_IDS: [PropertyId; 27] = [
 ];
 
 /// A property whose value is valid for its identifier.
+///
+/// One arm per identifier: the variant decides the payload type, so the
+/// generator cannot produce a property whose value contradicts its
+/// identifier — it could not be written down. The ranges are the
+/// specification's, so what comes out of here is a property the encoder will
+/// accept, which is what makes a round-trip failure meaningful.
 fn property(u: &mut Unstructured, id: PropertyId) -> AResult<Property> {
-    use PropertyId::*;
-    let value = match id.value_type() {
-        PropertyType::Byte => PropertyValue::Byte(match id {
-            PayloadFormatIndicator
-            | RequestProblemInformation
-            | RequestResponseInformation
-            | MaximumQoS
-            | RetainAvailable
-            | WildcardSubscriptionAvailable
-            | SubscriptionIdentifierAvailable
-            | SharedSubscriptionAvailable => u.int_in_range(0..=1)?,
-            _ => u.arbitrary()?,
-        }),
-        PropertyType::U16 => PropertyValue::U16(match id {
-            ReceiveMaximum | TopicAlias => u.int_in_range(1..=u16::MAX)?,
-            _ => u.arbitrary()?,
-        }),
-        PropertyType::U32 => PropertyValue::U32(match id {
-            MaximumPacketSize => u.int_in_range(1..=u32::MAX)?,
-            _ => u.arbitrary()?,
-        }),
-        PropertyType::VarInt => {
-            PropertyValue::VarInt(u.int_in_range(1..=paho_mqtt_codec::varlen::MAX_VARLEN)?)
+    use PropertyId as Id;
+
+    // The eight one-byte properties the specification restricts to 0 or 1.
+    let flag = |u: &mut Unstructured| u.int_in_range(0..=1u8);
+
+    Ok(match id {
+        Id::PayloadFormatIndicator => Property::PayloadFormatIndicator(flag(u)?),
+        Id::RequestProblemInformation => Property::RequestProblemInformation(flag(u)?),
+        Id::RequestResponseInformation => Property::RequestResponseInformation(flag(u)?),
+        Id::MaximumQoS => Property::MaximumQoS(flag(u)?),
+        Id::RetainAvailable => Property::RetainAvailable(flag(u)?),
+        Id::WildcardSubscriptionAvailable => Property::WildcardSubscriptionAvailable(flag(u)?),
+        Id::SubscriptionIdentifierAvailable => {
+            Property::SubscriptionIdentifierAvailable(flag(u)?)
         }
-        PropertyType::Binary => PropertyValue::Binary(blob(u, 512)?),
-        PropertyType::String => PropertyValue::String(match id {
-            ResponseTopic => topic_name(u)?,
-            _ => utf8(u, 512)?,
-        }),
-        PropertyType::StringPair => PropertyValue::StringPair(utf8(u, 128)?, utf8(u, 128)?),
-    };
-    // The identifier and the value are chosen separately here, so build
-    // through the fallible pairing; by construction the two always agree.
-    Property::from_value(id, value).map_err(|_| arbitrary::Error::IncorrectFormat)
+        Id::SharedSubscriptionAvailable => Property::SharedSubscriptionAvailable(flag(u)?),
+
+        // Two-byte integers; two of them may not be zero.
+        Id::ServerKeepAlive => Property::ServerKeepAlive(u.arbitrary()?),
+        Id::TopicAliasMaximum => Property::TopicAliasMaximum(u.arbitrary()?),
+        Id::ReceiveMaximum => Property::ReceiveMaximum(u.int_in_range(1..=u16::MAX)?),
+        Id::TopicAlias => Property::TopicAlias(u.int_in_range(1..=u16::MAX)?),
+
+        // Four-byte integers; the packet size may not be zero.
+        Id::MessageExpiryInterval => Property::MessageExpiryInterval(u.arbitrary()?),
+        Id::SessionExpiryInterval => Property::SessionExpiryInterval(u.arbitrary()?),
+        Id::WillDelayInterval => Property::WillDelayInterval(u.arbitrary()?),
+        Id::MaximumPacketSize => Property::MaximumPacketSize(u.int_in_range(1..=u32::MAX)?),
+
+        // A variable-byte integer, which may not be zero either.
+        Id::SubscriptionIdentifier => Property::SubscriptionIdentifier(
+            u.int_in_range(1..=paho_mqtt_codec::varlen::MAX_VARLEN)?,
+        ),
+
+        // Binary data.
+        Id::CorrelationData => Property::CorrelationData(blob(u, 512)?),
+        Id::AuthenticationData => Property::AuthenticationData(blob(u, 512)?),
+
+        // Strings; a response topic is a topic *name*, so no wildcards.
+        Id::ResponseTopic => Property::ResponseTopic(topic_name(u)?),
+        Id::ContentType => Property::ContentType(utf8(u, 512)?),
+        Id::AssignedClientIdentifier => Property::AssignedClientIdentifier(utf8(u, 512)?),
+        Id::AuthenticationMethod => Property::AuthenticationMethod(utf8(u, 512)?),
+        Id::ResponseInformation => Property::ResponseInformation(utf8(u, 512)?),
+        Id::ServerReference => Property::ServerReference(utf8(u, 512)?),
+        Id::ReasonString => Property::ReasonString(utf8(u, 512)?),
+
+        // The one pair.
+        Id::UserProperty => Property::UserProperty(utf8(u, 128)?, utf8(u, 128)?),
+    })
 }
 
 /// A property list valid for `ctx`: only identifiers the specification

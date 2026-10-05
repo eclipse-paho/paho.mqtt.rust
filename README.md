@@ -233,7 +233,7 @@ Most application code needs little or no change. The client types, builders, tok
 **API changes**
 
 - `QOS_0`/`QOS_1`/`QOS_2` are `QoS` values and `MQTT_VERSION_*` are `MqttVersion` values, rather than integers. Code passing the named constants is unaffected; code passing integers needs `QoS::try_from(n)?` or `MqttVersion::try_from(n)?`. The old lossy conversions, which turned an invalid number into a default, are gone.
-- `Properties`, `Property`, `PropertyId`, `PropertyValue`, `ReasonCode`, `QoS`, and `MqttVersion` are re-exported from `paho-mqtt-codec` and documented there.
+- `Properties`, `Property`, `PropertyId`, `PropertyType`, `ReasonCode`, `QoS`, and `MqttVersion` are re-exported from `paho-mqtt-codec` and documented there.
 - Per-operation success/failure callbacks are removed. Await the token, or use the connection-state callbacks and the event stream.
 - An acknowledgement carrying an error reason code now fails the operation's token with `Error::ReasonCode`, for `publish`, `subscribe`, and `unsubscribe`. The `*_many` calls still return `Ok` with one code per topic, since they can succeed partially.
 - `client_id()` returns `String` rather than `&str`, so it can report a broker-assigned identifier.

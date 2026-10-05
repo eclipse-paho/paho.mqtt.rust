@@ -22,13 +22,11 @@
 //!
 //! Properties are key/value pairs carried in MQTT v5 packets. The
 //! [`Properties`] collection holds any number of [`Property`] values, each
-//! identified by a [`PropertyId`] and typed as a [`PropertyValue`].
+//! carrying the value its [`PropertyId`] calls for.
 //!
 //! On v3.1.1 connections properties are always empty.
 
-pub use paho_mqtt_codec::{
-    Properties, PropertiesBuilder, Property, PropertyId, PropertyType, PropertyValue,
-};
+pub use paho_mqtt_codec::{Properties, PropertiesBuilder, Property, PropertyId, PropertyType};
 
 /// Backward-compatible alias for [`PropertyId`].
 pub type PropertyCode = PropertyId;
