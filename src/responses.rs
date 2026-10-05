@@ -25,7 +25,7 @@
 
 use std::time::Duration;
 
-use crate::{Properties, Property, PropertyId, QoS, ReasonCode};
+use crate::{Properties, PropertyId, QoS, ReasonCode};
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
@@ -53,10 +53,8 @@ impl ConnectResponse {
     /// reports it, so this is only needed to tell an assigned identifier
     /// from a configured one.
     pub fn assigned_client_id(&self) -> Option<&str> {
-        match self.properties.get(PropertyId::AssignedClientIdentifier) {
-            Some(Property::AssignedClientIdentifier(s)) => Some(s),
-            _ => None,
-        }
+        self.properties
+            .get_str(PropertyId::AssignedClientIdentifier)
     }
 
     /// The keep-alive the server imposed, if it overrode the requested one
@@ -78,10 +76,7 @@ impl ConnectResponse {
     /// `None` means no limit beyond the protocol maximum. A publish that
     /// would exceed it fails locally rather than being sent.
     pub fn maximum_packet_size(&self) -> Option<u32> {
-        match self.properties.get(PropertyId::MaximumPacketSize) {
-            Some(Property::MaximumPacketSize(n)) => Some(*n),
-            _ => None,
-        }
+        self.properties.get_u32(PropertyId::MaximumPacketSize)
     }
 
     /// The highest topic alias the server accepts (v5 `TopicAliasMaximum`).
@@ -93,10 +88,10 @@ impl ConnectResponse {
     /// The highest QoS the server supports (v5 `MaximumQoS`, default
     /// [`QoS::ExactlyOnce`]). Publishing above it is refused by the server.
     pub fn maximum_qos(&self) -> QoS {
-        match self.properties.get(PropertyId::MaximumQoS) {
-            Some(Property::MaximumQoS(b)) => QoS::try_from(*b).unwrap_or(QoS::ExactlyOnce),
-            _ => QoS::ExactlyOnce,
-        }
+        self.properties
+            .get_byte(PropertyId::MaximumQoS)
+            .and_then(|b| QoS::try_from(b).ok())
+            .unwrap_or(QoS::ExactlyOnce)
     }
 
     /// Whether the server supports retained messages (v5 `RetainAvailable`,
@@ -126,19 +121,13 @@ impl ConnectResponse {
     /// Another server the client should use instead (v5 `ServerReference`),
     /// typically alongside a `UseAnotherServer` or `ServerMoved` reason code.
     pub fn server_reference(&self) -> Option<&str> {
-        match self.properties.get(PropertyId::ServerReference) {
-            Some(Property::ServerReference(s)) => Some(s),
-            _ => None,
-        }
+        self.properties.get_str(PropertyId::ServerReference)
     }
 
     /// A human-readable note from the server about the outcome (v5
     /// `ReasonString`). Diagnostic only — never for programmatic decisions.
     pub fn reason_string(&self) -> Option<&str> {
-        match self.properties.get(PropertyId::ReasonString) {
-            Some(Property::ReasonString(s)) => Some(s),
-            _ => None,
-        }
+        self.properties.get_str(PropertyId::ReasonString)
     }
 
     /// A one-byte "available" flag, which defaults to true when absent.

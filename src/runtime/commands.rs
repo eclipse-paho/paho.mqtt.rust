@@ -37,8 +37,8 @@ use paho_mqtt_codec::{
 };
 
 use crate::{
-    ClientPersistence, ConnectResponse, Error, Message, Property, PublishResponse,
-    SubscribeOptions, SubscribeResponse, UnsubscribeResponse, token::Completer,
+    ClientPersistence, ConnectResponse, Error, Message, PublishResponse, SubscribeOptions,
+    SubscribeResponse, UnsubscribeResponse, token::Completer,
 };
 
 /////////////////////////////////////////////////////////////////////////////
@@ -192,10 +192,10 @@ impl ConnectParams {
     /// exceed an advertised limit, so anything larger is rejected at the
     /// framing layer before its body is buffered.
     pub fn max_packet_size(&self) -> u32 {
-        match self.props.get(PropertyId::MaximumPacketSize) {
-            Some(Property::MaximumPacketSize(n)) if *n > 0 => *n,
-            _ => MAX_PACKET_SIZE,
-        }
+        self.props
+            .get_u32(PropertyId::MaximumPacketSize)
+            .filter(|n| *n > 0)
+            .unwrap_or(MAX_PACKET_SIZE)
     }
 }
 
@@ -276,10 +276,11 @@ pub(crate) fn negotiated_keep_alive(params: &ConnectParams, connack: &ConnAck) -
 /// The client identifier the server assigned, when the client sent an empty
 /// one (MQTT v5 §3.2.2.3.7).
 pub(crate) fn assigned_client_id(connack: &ConnAck) -> Option<String> {
-    match connack.properties.get(PropertyId::AssignedClientIdentifier) {
-        Some(Property::AssignedClientIdentifier(s)) if !s.is_empty() => Some(s.clone()),
-        _ => None,
-    }
+    connack
+        .properties
+        .get_str(PropertyId::AssignedClientIdentifier)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
 }
 
 /// The largest packet the server will accept, from its CONNACK's v5
@@ -290,10 +291,10 @@ pub(crate) fn assigned_client_id(connack: &ConnAck) -> Option<String> {
 /// server that receives one disconnects with `PacketTooLarge`, so the
 /// session refuses such a packet locally instead.
 pub(crate) fn server_max_packet_size(connack: &ConnAck) -> Option<u32> {
-    match connack.properties.get(PropertyId::MaximumPacketSize) {
-        Some(Property::MaximumPacketSize(n)) if *n > 0 => Some(*n),
-        _ => None,
-    }
+    connack
+        .properties
+        .get_u32(PropertyId::MaximumPacketSize)
+        .filter(|n| *n > 0)
 }
 
 /////////////////////////////////////////////////////////////////////////////

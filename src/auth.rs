@@ -29,7 +29,7 @@
 
 use std::{fmt, sync::Arc};
 
-use crate::{Properties, Property, PropertyId, Result};
+use crate::{Properties, PropertyId, Result};
 
 /// One step of an authentication exchange, as sent by the broker.
 ///
@@ -115,16 +115,12 @@ where
 
 /// The `AuthenticationMethod` named in a set of CONNECT properties, if any.
 pub(crate) fn auth_method(props: &Properties) -> Option<&str> {
-    match props.get(PropertyId::AuthenticationMethod) {
-        Some(Property::AuthenticationMethod(s)) => Some(s),
-        _ => None,
-    }
+    props.get_str(PropertyId::AuthenticationMethod)
 }
 
 /// The `AuthenticationData` in a set of properties, if any.
 pub(crate) fn auth_data(props: &Properties) -> &[u8] {
-    match props.get(PropertyId::AuthenticationData) {
-        Some(Property::AuthenticationData(b)) => b,
-        _ => &[],
-    }
+    props
+        .get_bytes(PropertyId::AuthenticationData)
+        .unwrap_or(&[])
 }

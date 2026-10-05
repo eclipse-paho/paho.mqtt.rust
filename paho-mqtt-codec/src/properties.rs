@@ -902,6 +902,52 @@ impl Properties {
         }
     }
 
+    /// Returns the first property with the given `id` as a borrowed string,
+    /// or `None` if it is absent or does not carry a single string.
+    ///
+    /// The borrowing counterpart of [`get_string`](Self::get_string), for the
+    /// common case of reading a string out of a received packet without
+    /// copying it. `UserProperty` carries a *pair* and so is not a single
+    /// string: use [`get_user`](Self::get_user) or
+    /// [`user_iter`](Self::user_iter) for those.
+    ///
+    /// ```
+    /// use paho_mqtt_codec::{Properties, Property, PropertyId};
+    ///
+    /// let mut props = Properties::new();
+    /// props.push(Property::ContentType("application/json".into()));
+    /// assert_eq!(props.get_str(PropertyId::ContentType), Some("application/json"));
+    /// assert_eq!(props.get_str(PropertyId::ReasonString), None);
+    /// ```
+    pub fn get_str(&self, id: PropertyId) -> Option<&str> {
+        use Property::*;
+        match self.get(id)? {
+            ContentType(s)
+            | ResponseTopic(s)
+            | AssignedClientIdentifier(s)
+            | AuthenticationMethod(s)
+            | ResponseInformation(s)
+            | ServerReference(s)
+            | ReasonString(s) => Some(s.as_str()),
+            _ => None,
+        }
+    }
+
+    /// Returns the first property with the given `id` as borrowed bytes, or
+    /// `None` if it is absent or not a binary property.
+    ///
+    /// The borrowing counterpart of [`get_binary`](Self::get_binary). Cloning
+    /// a [`Bytes`] is cheap, but a caller that only needs to look at the
+    /// bytes — comparing authentication data, hashing correlation data —
+    /// needs neither the clone nor the refcount traffic.
+    pub fn get_bytes(&self, id: PropertyId) -> Option<&[u8]> {
+        use Property::*;
+        match self.get(id)? {
+            CorrelationData(b) | AuthenticationData(b) => Some(&b[..]),
+            _ => None,
+        }
+    }
+
     /// Returns the value of the first property with the given `id` as a
     /// string, or `None` if it is absent or not a string property.
     ///
@@ -3442,5 +3488,82 @@ mod tests {
     fn test_from_value_still_range_checks() {
         let bad = Property::from_value(PropertyId::TopicAlias, PropertyValue::U16(0)).unwrap();
         assert_eq!(bad.validate(), Err(Error::ProtocolError));
+    }
+
+    // ---- borrowing reads ----
+
+    /// `get_str` reads every single-string property, and nothing else.
+    #[test]
+    fn test_get_str_reads_string_properties() {
+        let mut p = Properties::new();
+        p.push(Property::ContentType("application/json".into()));
+        p.push(Property::ResponseTopic("reply/here".into()));
+        p.push(Property::AssignedClientIdentifier("auto-42".into()));
+        p.push(Property::AuthenticationMethod("SCRAM-SHA-1".into()));
+        p.push(Property::ResponseInformation("reply".into()));
+        p.push(Property::ServerReference("mqtt://other:1883".into()));
+        p.push(Property::ReasonString("because".into()));
+
+        assert_eq!(p.get_str(PropertyId::ContentType), Some("application/json"));
+        assert_eq!(p.get_str(PropertyId::ResponseTopic), Some("reply/here"));
+        assert_eq!(
+            p.get_str(PropertyId::AssignedClientIdentifier),
+            Some("auto-42")
+        );
+        assert_eq!(
+            p.get_str(PropertyId::AuthenticationMethod),
+            Some("SCRAM-SHA-1")
+        );
+        assert_eq!(p.get_str(PropertyId::ResponseInformation), Some("reply"));
+        assert_eq!(
+            p.get_str(PropertyId::ServerReference),
+            Some("mqtt://other:1883")
+        );
+        assert_eq!(p.get_str(PropertyId::ReasonString), Some("because"));
+
+        // It agrees with the owning form, without the allocation.
+        assert_eq!(
+            p.get_str(PropertyId::ContentType).map(String::from),
+            p.get_string(PropertyId::ContentType)
+        );
+    }
+
+    /// Absent, and present-but-not-a-string, both read `None`.
+    #[test]
+    fn test_get_str_on_other_properties() {
+        let mut p = Properties::new();
+        p.push(Property::TopicAlias(7));
+        p.push(Property::CorrelationData(Bytes::from_static(b"corr")));
+        p.push_user("k", "v");
+
+        assert_eq!(p.get_str(PropertyId::ContentType), None, "absent");
+        assert_eq!(p.get_str(PropertyId::TopicAlias), None, "not a string");
+        assert_eq!(p.get_str(PropertyId::CorrelationData), None, "binary");
+        // A user property is a pair, not a single string.
+        assert_eq!(p.get_str(PropertyId::UserProperty), None);
+        assert_eq!(p.get_user("k"), Some("v"), "which is what get_user is for");
+    }
+
+    /// `get_bytes` reads the two binary properties, and nothing else.
+    #[test]
+    fn test_get_bytes_reads_binary_properties() {
+        let mut p = Properties::new();
+        p.push(Property::CorrelationData(Bytes::from_static(b"corr")));
+        p.push(Property::AuthenticationData(Bytes::from_static(b"auth")));
+        p.push(Property::ContentType("text/plain".into()));
+
+        assert_eq!(p.get_bytes(PropertyId::CorrelationData), Some(&b"corr"[..]));
+        assert_eq!(
+            p.get_bytes(PropertyId::AuthenticationData),
+            Some(&b"auth"[..])
+        );
+        assert_eq!(p.get_bytes(PropertyId::ContentType), None, "not binary");
+        assert_eq!(p.get_bytes(PropertyId::ResponseTopic), None, "absent");
+
+        assert_eq!(
+            p.get_bytes(PropertyId::CorrelationData)
+                .map(Bytes::copy_from_slice),
+            p.get_binary(PropertyId::CorrelationData)
+        );
     }
 }

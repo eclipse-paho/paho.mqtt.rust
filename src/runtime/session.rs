@@ -736,9 +736,8 @@ impl<B: Backend> Session<B> {
     /// a name for is a protocol error, reported as `TopicAliasInvalid` so
     /// the DISCONNECT carries the code the specification asks for.
     fn resolve_topic_alias(&mut self, pub_pkt: &mut paho_mqtt_codec::Publish) -> Result<()> {
-        let alias = match pub_pkt.properties.get(PropertyId::TopicAlias) {
-            Some(Property::TopicAlias(n)) => *n,
-            _ => return Ok(()),
+        let Some(alias) = pub_pkt.properties.get_u16(PropertyId::TopicAlias) else {
+            return Ok(());
         };
         let invalid = || Error::ReasonCode(ReasonCode::TopicAliasInvalid, Properties::new());
 
@@ -1086,8 +1085,8 @@ impl<B: Backend> Session<B> {
                 // The server states the highest alias it will accept (0, the
                 // default, means none at all); sending a larger one earns a
                 // DISCONNECT, so fail this publish instead (§3.2.2.3.8).
-                if let Some(Property::TopicAlias(alias)) = props.get(PropertyId::TopicAlias)
-                    && (*alias == 0 || *alias > self.limits.server_topic_alias_max)
+                if let Some(alias) = props.get_u16(PropertyId::TopicAlias)
+                    && (alias == 0 || alias > self.limits.server_topic_alias_max)
                 {
                     tx.complete(Err(Error::ReasonCode(
                         ReasonCode::TopicAliasInvalid,
