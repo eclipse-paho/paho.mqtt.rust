@@ -487,7 +487,7 @@ fn test_lwt() {
 /// with the user property the will was given.
 #[test]
 fn test_lwt_v5_properties() {
-    use mqtt::{Property, PropertyId, PropertyValue};
+    use mqtt::{Property, PropertyId};
     let lwt_topic = topic!("lwt-v5");
 
     let sub = mqtt::AsyncClient::new(HOST).unwrap();
@@ -501,14 +501,9 @@ fn test_lwt_v5_properties() {
 
     {
         let mut will = mqtt::Message::new(lwt_topic, "gone", mqtt::QOS_1);
-        will.props.push(Property::new(
-            PropertyId::UserProperty,
-            PropertyValue::StringPair("cause".into(), "test".into()),
-        ));
-        will.props.push(Property::new(
-            PropertyId::ContentType,
-            PropertyValue::String("text/plain".into()),
-        ));
+        will.props
+            .push(Property::UserProperty("cause".into(), "test".into()));
+        will.props.push(Property::ContentType("text/plain".into()));
         let conn_opts = mqtt::ConnectOptionsBuilder::new_v5()
             .will_message(will)
             .finalize();
@@ -527,12 +522,12 @@ fn test_lwt_v5_properties() {
     assert_eq!(msg.topic(), lwt_topic);
     assert_eq!(
         msg.properties().get(PropertyId::ContentType),
-        Some(&PropertyValue::String("text/plain".into())),
+        Some(&Property::ContentType("text/plain".into())),
         "will properties were not forwarded"
     );
     assert_eq!(
         msg.properties().get(PropertyId::UserProperty),
-        Some(&PropertyValue::StringPair("cause".into(), "test".into()))
+        Some(&Property::UserProperty("cause".into(), "test".into()))
     );
     sub.disconnect(None).wait().ok();
 }
@@ -540,12 +535,9 @@ fn test_lwt_v5_properties() {
 /// Will properties on a v3 connection are rejected up front.
 #[test]
 fn test_lwt_props_need_v5() {
-    use mqtt::{Property, PropertyId, PropertyValue};
+    use mqtt::Property;
     let mut will = mqtt::Message::new(topic!("lwt-v3"), "gone", mqtt::QOS_0);
-    will.props.push(Property::new(
-        PropertyId::ContentType,
-        PropertyValue::String("text/plain".into()),
-    ));
+    will.props.push(Property::ContentType("text/plain".into()));
     let conn_opts = mqtt::ConnectOptionsBuilder::new_v3()
         .will_message(will)
         .finalize();
@@ -1021,15 +1013,12 @@ fn test_v5_connack_capabilities() {
 /// client pings on the broker's schedule, not its own.
 #[test]
 fn test_v5_server_keep_alive_overrides() {
-    use mqtt::paho_mqtt_codec::{ConnAck, Packet, Property, PropertyId, PropertyValue, ReasonCode};
+    use mqtt::paho_mqtt_codec::{ConnAck, Packet, Property, ReasonCode};
 
     let broker = common::spawn_broker(|pkt| match pkt {
         Packet::Connect(_) => {
             let mut ack = ConnAck::new(false, ReasonCode::Success);
-            ack.properties.push(Property::new(
-                PropertyId::ServerKeepAlive,
-                PropertyValue::U16(1),
-            ));
+            ack.properties.push(Property::ServerKeepAlive(1));
             vec![Packet::ConnAck(ack)]
         }
         Packet::PingReq => vec![Packet::PingResp],
@@ -1056,16 +1045,13 @@ fn test_v5_server_keep_alive_overrides() {
 /// client asked for an unlimited one.
 #[test]
 fn test_v5_receive_maximum_caps_inflight() {
-    use mqtt::paho_mqtt_codec::{ConnAck, Packet, Property, PropertyId, PropertyValue, ReasonCode};
+    use mqtt::paho_mqtt_codec::{ConnAck, Packet, Property, ReasonCode};
 
     // Advertise room for exactly one unacknowledged publish, and never ack.
     let broker = common::spawn_broker(|pkt| match pkt {
         Packet::Connect(_) => {
             let mut ack = ConnAck::new(false, ReasonCode::Success);
-            ack.properties.push(Property::new(
-                PropertyId::ReceiveMaximum,
-                PropertyValue::U16(1),
-            ));
+            ack.properties.push(Property::ReceiveMaximum(1));
             vec![Packet::ConnAck(ack)]
         }
         _ => vec![],
@@ -1107,12 +1093,9 @@ fn test_v5_receive_maximum_caps_inflight() {
 /// Connect properties advertising the largest packet we will accept.
 #[cfg(test)]
 fn max_packet_props(max: u32) -> mqtt::Properties {
-    use mqtt::{Property, PropertyId, PropertyValue};
+    use mqtt::Property;
     let mut props = mqtt::Properties::new();
-    props.push(Property::new(
-        PropertyId::MaximumPacketSize,
-        PropertyValue::U32(max),
-    ));
+    props.push(Property::MaximumPacketSize(max));
     props
 }
 
@@ -1120,15 +1103,12 @@ fn max_packet_props(max: u32) -> mqtt::Properties {
 /// than being sent and earning a DISCONNECT.
 #[test]
 fn test_outbound_packet_over_server_maximum_is_refused() {
-    use mqtt::paho_mqtt_codec::{ConnAck, Packet, Property, PropertyId, PropertyValue, ReasonCode};
+    use mqtt::paho_mqtt_codec::{ConnAck, Packet, Property, ReasonCode};
 
     let broker = common::spawn_broker(|pkt| match pkt {
         Packet::Connect(_) => {
             let mut ack = ConnAck::new(false, ReasonCode::Success);
-            ack.properties.push(Property::new(
-                PropertyId::MaximumPacketSize,
-                PropertyValue::U32(128),
-            ));
+            ack.properties.push(Property::MaximumPacketSize(128));
             vec![Packet::ConnAck(ack)]
         }
         _ => vec![],
@@ -1222,7 +1202,7 @@ fn test_inbound_packet_over_our_maximum_is_rejected() {
 /// client with several overlapping filters tells them apart.
 #[test]
 fn test_v5_subscription_identifier() {
-    use mqtt::{Property, PropertyId, PropertyValue};
+    use mqtt::{Property, PropertyId};
 
     let cli = mqtt::AsyncClient::new(HOST).unwrap();
     let rsp = cli
@@ -1238,10 +1218,7 @@ fn test_v5_subscription_identifier() {
     let rx = cli.start_consuming();
 
     let mut props = mqtt::Properties::new();
-    props.push(Property::new(
-        PropertyId::SubscriptionIdentifier,
-        PropertyValue::VarInt(42),
-    ));
+    props.push(Property::SubscriptionIdentifier(42));
     cli.subscribe_with_options(topic!("subid"), mqtt::QOS_1, None, props)
         .wait()
         .expect("subscribe failed");
@@ -1257,7 +1234,7 @@ fn test_v5_subscription_identifier() {
     assert_eq!(msg.payload_str(), "tagged");
     assert_eq!(
         msg.properties().get(PropertyId::SubscriptionIdentifier),
-        Some(&PropertyValue::VarInt(42)),
+        Some(&Property::SubscriptionIdentifier(42)),
         "the broker should tag the message with our subscription identifier"
     );
 
@@ -1271,12 +1248,9 @@ fn test_v5_subscription_identifier() {
 /// Connect properties advertising a topic-alias maximum to the broker.
 #[cfg(test)]
 fn alias_max_props(max: u16) -> mqtt::Properties {
-    use mqtt::{Property, PropertyId, PropertyValue};
+    use mqtt::Property;
     let mut props = mqtt::Properties::new();
-    props.push(Property::new(
-        PropertyId::TopicAliasMaximum,
-        PropertyValue::U16(max),
-    ));
+    props.push(Property::TopicAliasMaximum(max));
     props
 }
 
@@ -1284,15 +1258,12 @@ fn alias_max_props(max: u16) -> mqtt::Properties {
 /// token, rather than being sent and earning a DISCONNECT.
 #[test]
 fn test_v5_outbound_topic_alias_limits() {
-    use mqtt::paho_mqtt_codec::{ConnAck, Packet, Property, PropertyId, PropertyValue, ReasonCode};
+    use mqtt::paho_mqtt_codec::{ConnAck, Packet, Property, ReasonCode};
 
     let broker = common::spawn_broker(|pkt| match pkt {
         Packet::Connect(_) => {
             let mut ack = ConnAck::new(false, ReasonCode::Success);
-            ack.properties.push(Property::new(
-                PropertyId::TopicAliasMaximum,
-                PropertyValue::U16(2),
-            ));
+            ack.properties.push(Property::TopicAliasMaximum(2));
             vec![Packet::ConnAck(ack)]
         }
         _ => vec![],
@@ -1305,10 +1276,7 @@ fn test_v5_outbound_topic_alias_limits() {
 
     let publish_with_alias = |alias: u16| {
         let mut msg = mqtt::Message::new(topic!("alias"), "x", mqtt::QOS_0);
-        msg.props.push(Property::new(
-            PropertyId::TopicAlias,
-            PropertyValue::U16(alias),
-        ));
+        msg.props.push(Property::TopicAlias(alias));
         cli.publish(msg).wait()
     };
 
@@ -1341,16 +1309,11 @@ fn test_v5_outbound_topic_alias_limits() {
 /// name the alias was established with.
 #[test]
 fn test_v5_inbound_topic_alias_resolved() {
-    use mqtt::paho_mqtt_codec::{
-        ConnAck, Packet, Property, PropertyId, PropertyValue, Publish, ReasonCode, SubAck,
-    };
+    use mqtt::paho_mqtt_codec::{ConnAck, Packet, Property, Publish, ReasonCode, SubAck};
 
     let aliased = |topic: &str, alias: u16, payload: &'static str| {
         let mut p = Publish::new(topic.to_string(), payload);
-        p.properties.push(Property::new(
-            PropertyId::TopicAlias,
-            PropertyValue::U16(alias),
-        ));
+        p.properties.push(Property::TopicAlias(alias));
         Packet::Publish(p)
     };
 
@@ -1396,17 +1359,14 @@ fn test_v5_inbound_topic_alias_resolved() {
 /// client closes the connection and tells the broker why (§3.3.2.3.4, §4.13).
 #[test]
 fn test_v5_inbound_topic_alias_out_of_range_disconnects() {
-    use mqtt::paho_mqtt_codec::{
-        ConnAck, Packet, Property, PropertyId, PropertyValue, Publish, ReasonCode, SubAck,
-    };
+    use mqtt::paho_mqtt_codec::{ConnAck, Packet, Property, Publish, ReasonCode, SubAck};
 
     let broker = common::spawn_broker(move |pkt| match pkt {
         Packet::Connect(_) => vec![Packet::ConnAck(ConnAck::new(false, ReasonCode::Success))],
         Packet::Subscribe(s) => {
             let mut p = Publish::new(topic!("bad-alias").to_string(), "x");
             // We advertised a maximum of 2.
-            p.properties
-                .push(Property::new(PropertyId::TopicAlias, PropertyValue::U16(7)));
+            p.properties.push(Property::TopicAlias(7));
             vec![
                 Packet::SubAck(SubAck::new(s.packet_id, vec![ReasonCode::GrantedQos0])),
                 Packet::Publish(p),
@@ -1443,33 +1403,22 @@ fn test_v5_inbound_topic_alias_out_of_range_disconnects() {
 /// Connect properties naming an authentication method.
 #[cfg(test)]
 fn auth_method_props(method: &str) -> mqtt::Properties {
-    use mqtt::{Property, PropertyId, PropertyValue};
+    use mqtt::Property;
     let mut props = mqtt::Properties::new();
-    props.push(Property::new(
-        PropertyId::AuthenticationMethod,
-        PropertyValue::String(method.into()),
-    ));
+    props.push(Property::AuthenticationMethod(method.into()));
     props
 }
 
 /// A two-step challenge/response exchange between CONNECT and CONNACK.
 #[test]
 fn test_v5_auth_exchange() {
-    use mqtt::paho_mqtt_codec::{
-        Auth, ConnAck, Packet, Property, PropertyId, PropertyValue, ReasonCode,
-    };
+    use mqtt::paho_mqtt_codec::{Auth, ConnAck, Packet, Property, PropertyId, ReasonCode};
     use std::sync::{Arc, Mutex};
 
     let challenge = |data: &'static str| {
         let mut props = mqtt::Properties::new();
-        props.push(Property::new(
-            PropertyId::AuthenticationMethod,
-            PropertyValue::String("SCRAM-TEST".into()),
-        ));
-        props.push(Property::new(
-            PropertyId::AuthenticationData,
-            PropertyValue::Binary(data.into()),
-        ));
+        props.push(Property::AuthenticationMethod("SCRAM-TEST".into()));
+        props.push(Property::AuthenticationData(data.into()));
         Packet::Auth(Auth::new(ReasonCode::ContinueAuthentication, props))
     };
 
@@ -1525,7 +1474,7 @@ fn test_v5_auth_exchange() {
         assert_eq!(a.reason_code, ReasonCode::ContinueAuthentication);
         assert!(matches!(
             a.properties.get(PropertyId::AuthenticationMethod),
-            Some(PropertyValue::String(m)) if m == "SCRAM-TEST"
+            Some(Property::AuthenticationMethod(m)) if m == "SCRAM-TEST"
         ));
     }
 
@@ -1536,15 +1485,12 @@ fn test_v5_auth_exchange() {
 /// A handler that refuses abandons the connection attempt with its error.
 #[test]
 fn test_v5_auth_handler_failure_fails_connect() {
-    use mqtt::paho_mqtt_codec::{Auth, Packet, Property, PropertyId, PropertyValue, ReasonCode};
+    use mqtt::paho_mqtt_codec::{Auth, Packet, Property, ReasonCode};
 
     let broker = common::spawn_broker(move |pkt| match pkt {
         Packet::Connect(_) => {
             let mut props = mqtt::Properties::new();
-            props.push(Property::new(
-                PropertyId::AuthenticationMethod,
-                PropertyValue::String("SCRAM-TEST".into()),
-            ));
+            props.push(Property::AuthenticationMethod("SCRAM-TEST".into()));
             vec![Packet::Auth(Auth::new(
                 ReasonCode::ContinueAuthentication,
                 props,
@@ -2260,7 +2206,7 @@ fn test_v5_publish_subscribe() {
 // Verify user properties are preserved end-to-end through the broker.
 #[test]
 fn test_v5_user_properties() {
-    use mqtt::{Properties, Property, PropertyId, PropertyValue};
+    use mqtt::{Properties, Property, PropertyId};
 
     let topic = topic!("v5/user_props");
 
@@ -2280,10 +2226,7 @@ fn test_v5_user_properties() {
         .expect("v5 connect failed");
 
     let mut props = Properties::new();
-    props.push(Property::new(
-        PropertyId::UserProperty,
-        PropertyValue::StringPair("env".into(), "test".into()),
-    ));
+    props.push(Property::UserProperty("env".into(), "test".into()));
     let msg = mqtt::MessageBuilder::new()
         .topic(topic)
         .payload("with-props")
@@ -2304,12 +2247,12 @@ fn test_v5_user_properties() {
     let user_prop = received
         .properties()
         .iter()
-        .find(|p| p.id == PropertyId::UserProperty);
+        .find(|p| p.property_id() == PropertyId::UserProperty);
     assert!(
         user_prop.is_some(),
         "user property not present on received message"
     );
-    if let Some(PropertyValue::StringPair(k, v)) = user_prop.map(|p| &p.value) {
+    if let Some(Property::UserProperty(k, v)) = user_prop {
         assert_eq!(k, "env");
         assert_eq!(v, "test");
     } else {
@@ -2325,7 +2268,7 @@ fn test_v5_user_properties() {
 // passes it through unchanged on MQTT v5 connections).
 #[test]
 fn test_v5_message_expiry_interval() {
-    use mqtt::{Properties, Property, PropertyId, PropertyValue};
+    use mqtt::{Properties, Property, PropertyId};
 
     let topic = topic!("v5/expiry");
 
@@ -2345,10 +2288,7 @@ fn test_v5_message_expiry_interval() {
         .expect("connect failed");
 
     let mut props = Properties::new();
-    props.push(Property::new(
-        PropertyId::MessageExpiryInterval,
-        PropertyValue::U32(60),
-    ));
+    props.push(Property::MessageExpiryInterval(60));
     let msg = mqtt::MessageBuilder::new()
         .topic(topic)
         .payload("expiry-payload")
@@ -2575,15 +2515,13 @@ fn test_session_persistence_v3() {
 // causes the broker to discard the session immediately on disconnect.
 #[test]
 fn test_session_persistence_v5() {
-    use mqtt::{Properties, Property, PropertyId, PropertyValue};
+    use mqtt::{Properties, Property};
 
     const CLIENT_ID: &str = "paho-rust-v2-session-v5";
 
     let mut props = Properties::new();
-    props.push(Property::new(
-        PropertyId::SessionExpiryInterval,
-        PropertyValue::U32(300), // 5-minute session lifetime
-    ));
+    // 5-minute session lifetime
+    props.push(Property::SessionExpiryInterval(300));
     let opts_persist = mqtt::ConnectOptionsBuilder::new_v5()
         .clean_start(false)
         .properties(props.clone())

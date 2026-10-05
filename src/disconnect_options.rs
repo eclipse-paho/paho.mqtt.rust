@@ -134,7 +134,7 @@ impl DisconnectOptionsBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Properties, Property, ReasonCode};
+    use crate::{Properties, ReasonCode};
 
     #[test]
     fn test_reason_code() {
@@ -154,7 +154,7 @@ mod tests {
 
     #[test]
     fn test_properties() {
-        use crate::{PropertyId, PropertyValue};
+        use crate::{Property, PropertyId};
 
         let opts = DisconnectOptions::new();
         assert!(opts.properties().is_empty());
@@ -163,14 +163,8 @@ mod tests {
         assert!(opts.properties().is_empty());
 
         let mut props = Properties::new();
-        props.push(Property::new(
-            PropertyId::SessionExpiryInterval,
-            PropertyValue::U32(1000),
-        ));
-        props.push(Property::new(
-            PropertyId::ReasonString,
-            PropertyValue::String("causeIwanna".into()),
-        ));
+        props.push(Property::SessionExpiryInterval(1000));
+        props.push(Property::ReasonString("causeIwanna".into()));
 
         let opts = DisconnectOptionsBuilder::new().properties(props).finalize();
         let props = opts.properties();
@@ -179,11 +173,11 @@ mod tests {
 
         assert_eq!(
             props.get(PropertyId::SessionExpiryInterval),
-            Some(&PropertyValue::U32(1000))
+            Some(&Property::SessionExpiryInterval(1000))
         );
         assert_eq!(
             props.get(PropertyId::ReasonString),
-            Some(&PropertyValue::String("causeIwanna".into()))
+            Some(&Property::ReasonString("causeIwanna".into()))
         );
 
         assert_eq!(props.get(PropertyId::ContentType), None);

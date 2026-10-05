@@ -244,13 +244,11 @@ impl ConnectOptions {
     ///
     /// ```no_run
     /// use paho_mqtt as mqtt;
-    /// use mqtt::{Property, PropertyId, PropertyValue};
+    /// use mqtt::Property;
     ///
     /// let mut props = mqtt::Properties::new();
-    /// props.push(Property::new(
-    ///     PropertyId::SessionExpiryInterval,
-    ///     PropertyValue::U32(3600), // keep my session for an hour
-    /// ));
+    /// // keep my session for an hour
+    /// props.push(Property::SessionExpiryInterval(3600));
     ///
     /// let opts = mqtt::ConnectOptionsBuilder::new_v5()
     ///     .clean_start(false)
@@ -686,7 +684,7 @@ impl ConnectOptionsBuilder {
 mod tests {
     use super::*;
     #[cfg(feature = "serde")]
-    use crate::PropertyId;
+    use crate::Property;
     use crate::QOS_1;
 
     const NAME: &str = "some-random-name";
@@ -832,7 +830,7 @@ mod tests {
     #[test]
     fn test_serde_drops_the_auth_pair() {
         let mut props = Properties::new();
-        props.push_string(PropertyId::AuthenticationMethod, "SCRAM-SHA-1");
+        props.push(Property::AuthenticationMethod("SCRAM-SHA-1".into()));
         let opts = ConnectOptionsBuilder::new()
             .properties(props)
             .auth_handler(|_| Ok(Vec::new()))

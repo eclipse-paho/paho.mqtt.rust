@@ -2075,8 +2075,7 @@ mod tests {
         .unwrap();
 
         let mut msg = marked_message();
-        msg.props
-            .push_u32(crate::PropertyId::MessageExpiryInterval, 30);
+        msg.props.push(crate::Property::MessageExpiryInterval(30));
 
         match cli.try_publish(msg.clone()) {
             Err(Error::Publish(cause, back)) => {

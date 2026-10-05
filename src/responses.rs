@@ -25,7 +25,7 @@
 
 use std::time::Duration;
 
-use crate::{Properties, PropertyId, PropertyValue, QoS, ReasonCode};
+use crate::{Properties, Property, PropertyId, QoS, ReasonCode};
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
@@ -54,7 +54,7 @@ impl ConnectResponse {
     /// from a configured one.
     pub fn assigned_client_id(&self) -> Option<&str> {
         match self.properties.get(PropertyId::AssignedClientIdentifier) {
-            Some(PropertyValue::String(s)) => Some(s),
+            Some(Property::AssignedClientIdentifier(s)) => Some(s),
             _ => None,
         }
     }
@@ -79,7 +79,7 @@ impl ConnectResponse {
     /// would exceed it fails locally rather than being sent.
     pub fn maximum_packet_size(&self) -> Option<u32> {
         match self.properties.get(PropertyId::MaximumPacketSize) {
-            Some(PropertyValue::U32(n)) => Some(*n),
+            Some(Property::MaximumPacketSize(n)) => Some(*n),
             _ => None,
         }
     }
@@ -94,7 +94,7 @@ impl ConnectResponse {
     /// [`QoS::ExactlyOnce`]). Publishing above it is refused by the server.
     pub fn maximum_qos(&self) -> QoS {
         match self.properties.get(PropertyId::MaximumQoS) {
-            Some(PropertyValue::Byte(b)) => QoS::try_from(*b).unwrap_or(QoS::ExactlyOnce),
+            Some(Property::MaximumQoS(b)) => QoS::try_from(*b).unwrap_or(QoS::ExactlyOnce),
             _ => QoS::ExactlyOnce,
         }
     }
@@ -127,7 +127,7 @@ impl ConnectResponse {
     /// typically alongside a `UseAnotherServer` or `ServerMoved` reason code.
     pub fn server_reference(&self) -> Option<&str> {
         match self.properties.get(PropertyId::ServerReference) {
-            Some(PropertyValue::String(s)) => Some(s),
+            Some(Property::ServerReference(s)) => Some(s),
             _ => None,
         }
     }
@@ -136,21 +136,18 @@ impl ConnectResponse {
     /// `ReasonString`). Diagnostic only — never for programmatic decisions.
     pub fn reason_string(&self) -> Option<&str> {
         match self.properties.get(PropertyId::ReasonString) {
-            Some(PropertyValue::String(s)) => Some(s),
+            Some(Property::ReasonString(s)) => Some(s),
             _ => None,
         }
     }
 
     /// A one-byte "available" flag, which defaults to true when absent.
     fn flag_prop(&self, id: PropertyId) -> bool {
-        !matches!(self.properties.get(id), Some(PropertyValue::Byte(0)))
+        self.properties.get_byte(id) != Some(0)
     }
 
     fn u16_prop(&self, id: PropertyId) -> Option<u16> {
-        match self.properties.get(id) {
-            Some(PropertyValue::U16(n)) => Some(*n),
-            _ => None,
-        }
+        self.properties.get_u16(id)
     }
 }
 
@@ -279,20 +276,14 @@ mod tests {
     #[test]
     fn test_connack_capabilities_read_properties() {
         let rsp = with(vec![
-            Property::new(PropertyId::ReceiveMaximum, PropertyValue::U16(10)),
-            Property::new(PropertyId::TopicAliasMaximum, PropertyValue::U16(5)),
-            Property::new(PropertyId::MaximumQoS, PropertyValue::Byte(1)),
-            Property::new(PropertyId::RetainAvailable, PropertyValue::Byte(0)),
-            Property::new(PropertyId::MaximumPacketSize, PropertyValue::U32(4096)),
-            Property::new(PropertyId::ServerKeepAlive, PropertyValue::U16(30)),
-            Property::new(
-                PropertyId::AssignedClientIdentifier,
-                PropertyValue::String("auto-1".into()),
-            ),
-            Property::new(
-                PropertyId::SharedSubscriptionAvailable,
-                PropertyValue::Byte(0),
-            ),
+            Property::ReceiveMaximum(10),
+            Property::TopicAliasMaximum(5),
+            Property::MaximumQoS(1),
+            Property::RetainAvailable(0),
+            Property::MaximumPacketSize(4096),
+            Property::ServerKeepAlive(30),
+            Property::AssignedClientIdentifier("auto-1".into()),
+            Property::SharedSubscriptionAvailable(0),
         ]);
         assert_eq!(rsp.receive_maximum(), 10);
         assert_eq!(rsp.topic_alias_maximum(), 5);
@@ -315,12 +306,9 @@ mod tests {
             mqtt_version: 5,
             session_present: true,
             reason_code: ReasonCode::Success,
-            properties: [Property::new(
-                PropertyId::AssignedClientIdentifier,
-                PropertyValue::String("auto-42".into()),
-            )]
-            .into_iter()
-            .collect(),
+            properties: [Property::AssignedClientIdentifier("auto-42".into())]
+                .into_iter()
+                .collect(),
         };
         let back: ConnectResponse =
             serde_json::from_str(&serde_json::to_string(&conn).unwrap()).unwrap();

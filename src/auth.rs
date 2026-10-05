@@ -29,7 +29,7 @@
 
 use std::{fmt, sync::Arc};
 
-use crate::{Properties, PropertyId, PropertyValue, Result};
+use crate::{Properties, Property, PropertyId, Result};
 
 /// One step of an authentication exchange, as sent by the broker.
 ///
@@ -66,13 +66,10 @@ pub type AuthCallback = dyn Fn(&AuthChallenge<'_>) -> Result<Vec<u8>> + Send + S
 ///
 /// ```no_run
 /// use paho_mqtt as mqtt;
-/// use mqtt::{Property, PropertyId, PropertyValue};
+/// use mqtt::Property;
 ///
 /// let mut props = mqtt::Properties::new();
-/// props.push(Property::new(
-///     PropertyId::AuthenticationMethod,
-///     PropertyValue::String("SCRAM-SHA-256".into()),
-/// ));
+/// props.push(Property::AuthenticationMethod("SCRAM-SHA-256".into()));
 ///
 /// let opts = mqtt::ConnectOptionsBuilder::new_v5()
 ///     .properties(props)
@@ -119,7 +116,7 @@ where
 /// The `AuthenticationMethod` named in a set of CONNECT properties, if any.
 pub(crate) fn auth_method(props: &Properties) -> Option<&str> {
     match props.get(PropertyId::AuthenticationMethod) {
-        Some(PropertyValue::String(s)) => Some(s),
+        Some(Property::AuthenticationMethod(s)) => Some(s),
         _ => None,
     }
 }
@@ -127,7 +124,7 @@ pub(crate) fn auth_method(props: &Properties) -> Option<&str> {
 /// The `AuthenticationData` in a set of properties, if any.
 pub(crate) fn auth_data(props: &Properties) -> &[u8] {
     match props.get(PropertyId::AuthenticationData) {
-        Some(PropertyValue::Binary(b)) => b,
+        Some(Property::AuthenticationData(b)) => b,
         _ => &[],
     }
 }

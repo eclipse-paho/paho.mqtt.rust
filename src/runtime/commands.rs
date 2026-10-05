@@ -32,13 +32,13 @@ use std::{
 
 use bytes::Bytes;
 use paho_mqtt_codec::{
-    ConnAck, MAX_PACKET_SIZE, MqttVersion, Properties as CodecProperties, PropertyId,
-    PropertyValue, QoS, ReasonCode, Will,
+    ConnAck, MAX_PACKET_SIZE, MqttVersion, Properties as CodecProperties, PropertyId, QoS,
+    ReasonCode, Will,
 };
 
 use crate::{
-    ClientPersistence, ConnectResponse, Error, Message, PublishResponse, SubscribeOptions,
-    SubscribeResponse, UnsubscribeResponse, token::Completer,
+    ClientPersistence, ConnectResponse, Error, Message, Property, PublishResponse,
+    SubscribeOptions, SubscribeResponse, UnsubscribeResponse, token::Completer,
 };
 
 /////////////////////////////////////////////////////////////////////////////
@@ -193,7 +193,7 @@ impl ConnectParams {
     /// framing layer before its body is buffered.
     pub fn max_packet_size(&self) -> u32 {
         match self.props.get(PropertyId::MaximumPacketSize) {
-            Some(PropertyValue::U32(n)) if *n > 0 => *n,
+            Some(Property::MaximumPacketSize(n)) if *n > 0 => *n,
             _ => MAX_PACKET_SIZE,
         }
     }
@@ -237,10 +237,7 @@ impl SessionLimits {
 
 /// Reads a two-byte property, if present with the right type.
 fn u16_prop(props: &CodecProperties, id: PropertyId) -> Option<u16> {
-    match props.get(id) {
-        Some(PropertyValue::U16(n)) => Some(*n),
-        _ => None,
-    }
+    props.get_u16(id)
 }
 
 /// The number of QoS 1/2 publishes that may be in flight at once.
@@ -280,7 +277,7 @@ pub(crate) fn negotiated_keep_alive(params: &ConnectParams, connack: &ConnAck) -
 /// one (MQTT v5 §3.2.2.3.7).
 pub(crate) fn assigned_client_id(connack: &ConnAck) -> Option<String> {
     match connack.properties.get(PropertyId::AssignedClientIdentifier) {
-        Some(PropertyValue::String(s)) if !s.is_empty() => Some(s.clone()),
+        Some(Property::AssignedClientIdentifier(s)) if !s.is_empty() => Some(s.clone()),
         _ => None,
     }
 }
@@ -294,7 +291,7 @@ pub(crate) fn assigned_client_id(connack: &ConnAck) -> Option<String> {
 /// session refuses such a packet locally instead.
 pub(crate) fn server_max_packet_size(connack: &ConnAck) -> Option<u32> {
     match connack.properties.get(PropertyId::MaximumPacketSize) {
-        Some(PropertyValue::U32(n)) if *n > 0 => Some(*n),
+        Some(Property::MaximumPacketSize(n)) if *n > 0 => Some(*n),
         _ => None,
     }
 }
@@ -450,10 +447,7 @@ mod tests {
     #[test]
     fn test_max_packet_size_from_connect_property() {
         let mut props = CodecProperties::new();
-        props.push(Property::new(
-            PropertyId::MaximumPacketSize,
-            PropertyValue::U32(4096),
-        ));
+        props.push(Property::MaximumPacketSize(4096));
         assert_eq!(params_with(props).max_packet_size(), 4096);
     }
 
@@ -462,10 +456,7 @@ mod tests {
         use paho_mqtt_codec::ReasonCode;
         let mut ack = ConnAck::new(false, ReasonCode::Success);
         assert_eq!(server_max_packet_size(&ack), None);
-        ack.properties.push(Property::new(
-            PropertyId::MaximumPacketSize,
-            PropertyValue::U32(512),
-        ));
+        ack.properties.push(Property::MaximumPacketSize(512));
         assert_eq!(server_max_packet_size(&ack), Some(512));
     }
 
@@ -473,10 +464,7 @@ mod tests {
     fn test_max_packet_size_zero_property_falls_back() {
         // 0 is a protocol error on the wire; treat it as "not set".
         let mut props = CodecProperties::new();
-        props.push(Property::new(
-            PropertyId::MaximumPacketSize,
-            PropertyValue::U32(0),
-        ));
+        props.push(Property::MaximumPacketSize(0));
         assert_eq!(params_with(props).max_packet_size(), MAX_PACKET_SIZE);
     }
 
@@ -501,10 +489,7 @@ mod tests {
 
     #[test]
     fn test_receive_maximum_caps_configured_inflight() {
-        let ack = connack_with(vec![Property::new(
-            PropertyId::ReceiveMaximum,
-            PropertyValue::U16(5),
-        )]);
+        let ack = connack_with(vec![Property::ReceiveMaximum(5)]);
         // Unlimited locally: the server's window is the cap.
         assert_eq!(
             SessionLimits::new(&params_v(MqttVersion::V5, 0), &ack).max_inflight,
@@ -544,10 +529,7 @@ mod tests {
 
     #[test]
     fn test_server_keep_alive_overrides_request() {
-        let ack = connack_with(vec![Property::new(
-            PropertyId::ServerKeepAlive,
-            PropertyValue::U16(15),
-        )]);
+        let ack = connack_with(vec![Property::ServerKeepAlive(15)]);
         let p = params_v(MqttVersion::V5, 0);
         assert_eq!(negotiated_keep_alive(&p, &ack), Duration::from_secs(15));
 
@@ -565,10 +547,7 @@ mod tests {
 
     #[test]
     fn test_assigned_client_id() {
-        let ack = connack_with(vec![Property::new(
-            PropertyId::AssignedClientIdentifier,
-            PropertyValue::String("auto-42".into()),
-        )]);
+        let ack = connack_with(vec![Property::AssignedClientIdentifier("auto-42".into())]);
         assert_eq!(assigned_client_id(&ack), Some(String::from("auto-42")));
         assert_eq!(assigned_client_id(&connack_with(vec![])), None);
     }
@@ -577,15 +556,9 @@ mod tests {
 
     #[test]
     fn test_topic_alias_maxima_come_from_both_sides() {
-        let ack = connack_with(vec![Property::new(
-            PropertyId::TopicAliasMaximum,
-            PropertyValue::U16(8),
-        )]);
+        let ack = connack_with(vec![Property::TopicAliasMaximum(8)]);
         let mut ours = CodecProperties::new();
-        ours.push(Property::new(
-            PropertyId::TopicAliasMaximum,
-            PropertyValue::U16(3),
-        ));
+        ours.push(Property::TopicAliasMaximum(3));
         let params = ConnectParams {
             ver: MqttVersion::V5,
             props: ours,

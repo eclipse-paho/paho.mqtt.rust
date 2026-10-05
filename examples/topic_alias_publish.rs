@@ -70,11 +70,11 @@ fn main() -> mqtt::Result<()> {
     });
 
     match rsp.properties.get(mqtt::PropertyId::TopicAliasMaximum) {
-        None | Some(mqtt::PropertyValue::U16(0)) => {
+        None | Some(mqtt::Property::TopicAliasMaximum(0)) => {
             eprintln!("The server doesn't support Topic Aliases.");
             process::exit(2);
         }
-        Some(mqtt::PropertyValue::U16(n)) => {
+        Some(mqtt::Property::TopicAliasMaximum(n)) => {
             println!("The server supports up to {} aliases.", n)
         }
         _ => {}

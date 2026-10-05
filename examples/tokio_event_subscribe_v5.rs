@@ -90,9 +90,8 @@ async fn main() {
         // (3600sec) if the service disconnects or restarts.
         let conn_opts = mqtt::ConnectOptionsBuilder::with_mqtt_version(MQTT_VERSION_5)
             .clean_start(false)
-            .properties(mqtt::properties![mqtt::Property::new(
-                mqtt::PropertyId::SessionExpiryInterval,
-                mqtt::PropertyValue::U32(3600)
+            .properties(mqtt::properties![mqtt::Property::SessionExpiryInterval(
+                3600
             )])
             .will_message(lwt)
             .finalize();

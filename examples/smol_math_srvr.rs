@@ -116,12 +116,12 @@ async fn handle_request(cli: &mqtt::AsyncClient, msg: mqtt::Message) -> mqtt::Re
     // We need both a response topic and correlation data to respond.
 
     let reply_to = match msg.properties().get(mqtt::PropertyId::ResponseTopic) {
-        Some(mqtt::PropertyValue::String(s)) => s.clone(),
+        Some(mqtt::Property::ResponseTopic(s)) => s.clone(),
         _ => return Err("No response topic provided.".into()),
     };
 
     let corr_id = match msg.properties().get(mqtt::PropertyId::CorrelationData) {
-        Some(mqtt::PropertyValue::Binary(b)) => b.clone(),
+        Some(mqtt::Property::CorrelationData(b)) => b.clone(),
         _ => return Err("No correlation data provided.".into()),
     };
 
@@ -153,10 +153,7 @@ async fn handle_request(cli: &mqtt::AsyncClient, msg: mqtt::Message) -> mqtt::Re
 
         // Form a reply message, using the correlation ID
 
-        let props = mqtt::properties![mqtt::Property::new(
-            mqtt::PropertyId::CorrelationData,
-            mqtt::PropertyValue::Binary(corr_id)
-        )];
+        let props = mqtt::properties![mqtt::Property::CorrelationData(corr_id)];
 
         // Create the reply message and publish it on the response topic
 
@@ -207,10 +204,7 @@ fn main() -> mqtt::Result<()> {
         // session of 60 sec. But we set a clean start.
         let mut conn_opts = mqtt::ConnectOptionsBuilder::new_v5()
             .clean_start(true)
-            .properties(mqtt::properties![mqtt::Property::new(
-                mqtt::PropertyId::SessionExpiryInterval,
-                mqtt::PropertyValue::U32(60)
-            )])
+            .properties(mqtt::properties![mqtt::Property::SessionExpiryInterval(60)])
             .finalize();
 
         // Connect and wait for it to complete or fail

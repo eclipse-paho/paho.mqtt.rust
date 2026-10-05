@@ -180,10 +180,7 @@ Version 5 is the default protocol level. Properties travel on every packet that 
 
 ```rust
 let mut props = mqtt::Properties::new();
-props.push(mqtt::Property::new(
-    mqtt::PropertyId::SessionExpiryInterval,
-    mqtt::PropertyValue::U32(3600),
-));
+props.push(mqtt::Property::SessionExpiryInterval(3600));
 
 let conn_opts = mqtt::ConnectOptionsBuilder::new_v5()
     .clean_start(false)

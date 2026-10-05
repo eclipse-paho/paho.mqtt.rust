@@ -48,7 +48,7 @@ mod tests {
     #[test]
     fn test_property_types_round_trip() {
         let mut props = Properties::new();
-        props.push_u32(PropertyId::SessionExpiryInterval, 3600);
+        props.push(Property::SessionExpiryInterval(3600));
         props.push_user("k", "v");
 
         let json = serde_json::to_string(&props).unwrap();
@@ -60,7 +60,7 @@ mod tests {
     /// A single property, its identifier and its value serialize too.
     #[test]
     fn test_property_round_trip() {
-        let prop = Property::new(PropertyId::ContentType, PropertyValue::String("t/p".into()));
+        let prop = Property::ContentType("t/p".into());
         let back: Property = serde_json::from_str(&serde_json::to_string(&prop).unwrap()).unwrap();
         assert_eq!(back, prop);
 

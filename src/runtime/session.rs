@@ -40,9 +40,9 @@ use std::{
 use bytes::{Bytes, BytesMut};
 use futures::{FutureExt, select};
 use paho_mqtt_codec::{
-    Auth, ConnAck, Disconnect, MqttVersion, Packet, Properties, Property, PropertyId,
-    PropertyValue, PubAck, QoS, RawPacket, ReasonCode, RetainHandling as CodecRetainHandling,
-    Subscribe, Subscription, Unsubscribe,
+    Auth, ConnAck, Disconnect, MqttVersion, Packet, Properties, Property, PropertyId, PubAck, QoS,
+    RawPacket, ReasonCode, RetainHandling as CodecRetainHandling, Subscribe, Subscription,
+    Unsubscribe,
 };
 
 use super::{
@@ -152,15 +152,9 @@ fn auth_response(p: &ConnectParams, challenge_props: &Properties) -> Result<Auth
     })?;
 
     let mut props = Properties::new();
-    props.push(Property::new(
-        PropertyId::AuthenticationMethod,
-        PropertyValue::String(method.into()),
-    ));
+    props.push(Property::AuthenticationMethod(method.into()));
     if !data.is_empty() {
-        props.push(Property::new(
-            PropertyId::AuthenticationData,
-            PropertyValue::Binary(data.into()),
-        ));
+        props.push(Property::AuthenticationData(data.into()));
     }
 
     Ok(Auth::new(ReasonCode::ContinueAuthentication, props))
@@ -743,7 +737,7 @@ impl<B: Backend> Session<B> {
     /// the DISCONNECT carries the code the specification asks for.
     fn resolve_topic_alias(&mut self, pub_pkt: &mut paho_mqtt_codec::Publish) -> Result<()> {
         let alias = match pub_pkt.properties.get(PropertyId::TopicAlias) {
-            Some(PropertyValue::U16(n)) => *n,
+            Some(Property::TopicAlias(n)) => *n,
             _ => return Ok(()),
         };
         let invalid = || Error::ReasonCode(ReasonCode::TopicAliasInvalid, Properties::new());
@@ -1092,7 +1086,7 @@ impl<B: Backend> Session<B> {
                 // The server states the highest alias it will accept (0, the
                 // default, means none at all); sending a larger one earns a
                 // DISCONNECT, so fail this publish instead (§3.2.2.3.8).
-                if let Some(PropertyValue::U16(alias)) = props.get(PropertyId::TopicAlias)
+                if let Some(Property::TopicAlias(alias)) = props.get(PropertyId::TopicAlias)
                     && (*alias == 0 || *alias > self.limits.server_topic_alias_max)
                 {
                     tx.complete(Err(Error::ReasonCode(

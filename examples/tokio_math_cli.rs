@@ -92,7 +92,7 @@ async fn main() -> mqtt::Result<()> {
         .properties
         .get(mqtt::PropertyId::AssignedClientIdentifier)
     {
-        Some(mqtt::PropertyValue::String(s)) => s.clone(),
+        Some(mqtt::Property::AssignedClientIdentifier(s)) => s.clone(),
         _ => {
             eprintln!("Unable to retrieve Client ID");
             process::exit(1);
@@ -108,14 +108,8 @@ async fn main() -> mqtt::Result<()> {
     let corr_id = b"1";
 
     let props = mqtt::properties![
-        mqtt::Property::new(
-            mqtt::PropertyId::ResponseTopic,
-            mqtt::PropertyValue::String(reply_topic.clone())
-        ),
-        mqtt::Property::new(
-            mqtt::PropertyId::CorrelationData,
-            mqtt::PropertyValue::Binary(corr_id.to_vec().into())
-        ),
+        mqtt::Property::ResponseTopic(reply_topic.clone()),
+        mqtt::Property::CorrelationData(corr_id.to_vec().into()),
     ];
 
     // The request topic will be of the form:
@@ -157,7 +151,7 @@ async fn main() -> mqtt::Result<()> {
         match strm.recv().await {
             Ok(mqtt::Event::Message(msg)) => {
                 let reply_corr_id = match msg.properties().get(mqtt::PropertyId::CorrelationData) {
-                    Some(mqtt::PropertyValue::Binary(b)) => b.clone(),
+                    Some(mqtt::Property::CorrelationData(b)) => b.clone(),
                     _ => bytes::Bytes::new(),
                 };
 

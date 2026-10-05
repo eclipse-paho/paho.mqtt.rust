@@ -24,8 +24,8 @@
 
 #[cfg(any(feature = "tokio", feature = "smol"))]
 use crate::{
-    AsyncClient, Client, DeliveryToken, Message, MessageBuilder, Properties, Property, PropertyId,
-    PropertyValue, QoS, SubscribeOptions, SubscribeResponse, token::SubscribeToken,
+    AsyncClient, Client, DeliveryToken, Message, MessageBuilder, Properties, Property, QoS,
+    SubscribeOptions, SubscribeResponse, token::SubscribeToken,
 };
 use crate::{Error, Result};
 use std::fmt;
@@ -123,10 +123,7 @@ impl<'a> Topic<'a> {
 
         if self.alias != 0 {
             let mut props = Properties::new();
-            props.push(Property::new(
-                PropertyId::TopicAlias,
-                PropertyValue::U16(self.alias),
-            ));
+            props.push(Property::TopicAlias(self.alias));
             bld = bld.properties(props);
         }
 
