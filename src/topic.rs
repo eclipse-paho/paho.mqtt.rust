@@ -123,8 +123,15 @@ impl<'a> Topic<'a> {
 
         if self.alias != 0 {
             let mut props = Properties::new();
-            props.push(Property::TopicAlias(self.alias));
-            bld = bld.properties(props);
+            // The alias is the application's; `try_push` keeps a rejected one
+            // out of the message rather than leaving a list that cannot
+            // encode. A zero is already excluded above, so this cannot fail
+            // today — but a message with no alias beats one that cannot be
+            // sent, so the error is swallowed deliberately rather than
+            // ignored by construction.
+            if props.try_push(Property::TopicAlias(self.alias)).is_ok() {
+                bld = bld.properties(props);
+            }
         }
 
         bld.finalize()

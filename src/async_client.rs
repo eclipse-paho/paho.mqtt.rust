@@ -513,6 +513,13 @@ impl AsyncClient {
             return Err(Error::Publish(Box::new(cause), Box::new(msg)));
         }
 
+        // Deliberately *not* gated on `msg.props.is_valid()`. It would catch
+        // a bad property here, synchronously and with the message handed
+        // back — but the session reports the one that matters in practice, an
+        // unusable `TopicAlias`, as `ReasonCode(TopicAliasInvalid)`, the code
+        // the specification defines for it (§3.3.2.3.4). A blanket check at
+        // this boundary would shadow that with a bare `ProtocolError`.
+
         // Kept aside so that a message handed back is the message given: the
         // command carries only what goes on the wire.
         let (dup, msgid) = (msg.dup, msg.msgid);

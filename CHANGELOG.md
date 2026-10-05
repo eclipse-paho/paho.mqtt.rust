@@ -70,6 +70,8 @@ Version 2.0 is a rewrite of the library in pure Rust. It no longer depends on th
 
 ### API
 
+- `ConnectOptions::check` rejects a property set the specification does not allow — an out-of-range value, or a repeat of an identifier that may not repeat — instead of letting the connect token fail when the CONNECT is encoded. A configuration mistake is reported where the rest of them are.
+
 - **The crate builds with `--no-default-features`.** Without a runtime backend there is no client — `AsyncClient`, `Client`, `Topic`, `SyncTopic`, `CreateOptionsBuilder::create_async_client` / `create_client`, `TlsOptions::on_tls_error` and `TlsOptionsBuilder::error_callback` are gated on `any(feature = "tokio", feature = "smol")` — but everything that does not need one builds and is tested: the codec re-exports, `Message`, `Properties`, `TopicMatcher`, `TopicFilter`, `Token`, the response types, the options types and their builders, persistence, and `Error`. That is the build for a tool that handles MQTT data without connecting, or (with `serde`) a crate that reads and writes client configuration for an application that links the runtime itself. Previously this configuration failed with six errors about missing items in `crate::runtime`.
 - **[Breaking]** **Enabling both `tokio` and `smol` is now a `compile_error!`** rather than silently preferring tokio, which left an application unable to tell which runtime it was talking to. Enable exactly one; `tls`, `openssl` and `websocket` imply `tokio`, and `smol-tls` and `smol-websocket` imply `smol`. Note that `cargo doc --all-features` and `cargo test --all-features` therefore no longer work at the workspace level — name a feature set.
 

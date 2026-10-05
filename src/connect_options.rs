@@ -170,6 +170,15 @@ impl ConnectOptions {
             }
         }
 
+        // A property the specification does not allow would be refused when
+        // the CONNECT is encoded, failing the connect token; `check` is where
+        // a configuration mistake is supposed to surface.
+        if !self.props.is_valid() {
+            return Err(Error::General(
+                "the connect properties hold a value the specification does not allow",
+            ));
+        }
+
         // Enhanced authentication needs both halves: a method for the broker
         // to run and a handler to answer its challenges. Either alone is a
         // configuration mistake that would otherwise surface as a puzzling
@@ -683,9 +692,7 @@ impl ConnectOptionsBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(feature = "serde")]
-    use crate::Property;
-    use crate::QOS_1;
+    use crate::{Property, QOS_1};
 
     const NAME: &str = "some-random-name";
     const PSWD: &str = "some-random-password";
@@ -853,5 +860,25 @@ mod tests {
         assert_eq!(opts.keep_alive_interval, dflt.keep_alive_interval);
         assert_eq!(opts.mqtt_version, dflt.mqtt_version);
         assert_eq!(opts.clean_start, dflt.clean_start);
+    }
+
+    /// A property the specification does not allow is a configuration
+    /// mistake, so `check` reports it rather than letting the connect token
+    /// fail when the CONNECT is encoded.
+    #[test]
+    fn test_check_rejects_invalid_properties() {
+        let mut props = Properties::new();
+        // `push` takes it and marks the list; `try_push` would have refused.
+        props.push(Property::ReceiveMaximum(0));
+        assert!(!props.is_valid());
+
+        let opts = ConnectOptionsBuilder::new_v5().properties(props).finalize();
+        assert!(matches!(opts.check(), Err(Error::General(_))));
+
+        // A sound set still passes.
+        let mut good = Properties::new();
+        good.try_push(Property::ReceiveMaximum(20)).unwrap();
+        let opts = ConnectOptionsBuilder::new_v5().properties(good).finalize();
+        assert!(opts.check().is_ok());
     }
 }

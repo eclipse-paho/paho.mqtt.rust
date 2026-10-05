@@ -791,6 +791,65 @@ impl Properties {
         self.props.push(prop);
     }
 
+    /// Adds `prop`, reporting what [`push`](Self::push) records silently.
+    ///
+    /// Returns [`Error::ProtocolError`] and **leaves the collection
+    /// untouched** when the value is out of range for its identifier (see
+    /// [`Property::validate`]), or when the identifier is one the
+    /// specification forbids repeating and is already present. Nothing is
+    /// added and the collection stays valid, so a caller can report the
+    /// problem and carry on with what it has.
+    ///
+    /// Prefer this wherever the value came from outside the program. `push`
+    /// remains the infallible form that [`Extend`] and [`FromIterator`]
+    /// require: it adds the property and marks the collection invalid, which
+    /// [`encode`](Self::encode) refuses later — correct, but reported far
+    /// from the mistake.
+    ///
+    /// ```
+    /// use paho_mqtt_codec::{Properties, Property, PropertyId};
+    ///
+    /// let mut props = Properties::new();
+    /// props.try_push(Property::TopicAlias(7)).unwrap();
+    ///
+    /// // A topic alias of 0 is not allowed (§3.3.2.3.4).
+    /// assert!(props.try_push(Property::TopicAlias(0)).is_err());
+    /// // Nor may a second one appear.
+    /// assert!(props.try_push(Property::TopicAlias(9)).is_err());
+    ///
+    /// // Neither attempt changed anything.
+    /// assert_eq!(props.len(), 1);
+    /// assert_eq!(props.get_u16(PropertyId::TopicAlias), Some(7));
+    /// assert!(props.is_valid());
+    /// ```
+    pub fn try_push(&mut self, prop: Property) -> Result<()> {
+        prop.validate()?;
+        self.seen.note(prop.property_id())?;
+        self.payload_size += prop.encoded_size();
+        self.props.push(prop);
+        Ok(())
+    }
+
+    /// Returns `false` if the list holds a property the specification does
+    /// not allow on its own — a value out of range for its identifier, or a
+    /// repeat of an identifier that may not repeat.
+    ///
+    /// Such a list is refused by [`encode`](Self::encode), so this answers
+    /// "will this encode?" without building the packet, for a caller that
+    /// used [`push`](Self::push) and wants to know before sending. A list
+    /// that was never given a bad property is always valid, and one becomes
+    /// valid again if the offending property is taken back out with
+    /// [`retain`](Self::retain), [`remove`](Self::remove) or
+    /// [`clear`](Self::clear).
+    ///
+    /// It does not speak for the *packet*: a property may be valid here and
+    /// still not be allowed in the packet carrying it — that is
+    /// [`check_context`](Self::check_context) — and encoding any non-empty
+    /// list for a v3 connection is an error whatever this returns.
+    pub fn is_valid(&self) -> bool {
+        !self.seen.is_invalid()
+    }
+
     // The generic setters that took an identifier and a loose value are gone:
     // with the identifier in the variant there is nothing for
     // `push_byte(PropertyId::ContentType, 1)` to build. Use the per-property
@@ -3584,6 +3643,120 @@ mod tests {
             p.get_bytes(PropertyId::CorrelationData)
                 .map(Bytes::copy_from_slice),
             p.get_binary(PropertyId::CorrelationData)
+        );
+    }
+
+    // ---- try_push / is_valid ----
+
+    /// A good property goes in and the caches move with it.
+    #[test]
+    fn test_try_push_accepts_a_valid_property() {
+        let mut p = Properties::new();
+        assert!(
+            p.try_push(Property::ContentType("text/plain".into()))
+                .is_ok()
+        );
+        assert!(p.try_push(Property::TopicAlias(7)).is_ok());
+        assert_eq!(p.len(), 2);
+        assert!(p.is_valid());
+
+        // Identical to the same two pushed the infallible way.
+        let mut pushed = Properties::new();
+        pushed.push(Property::ContentType("text/plain".into()));
+        pushed.push(Property::TopicAlias(7));
+        assert_eq!(p, pushed);
+        assert_eq!(
+            p.encoded_size(MQTT_VERSION_5),
+            pushed.encoded_size(MQTT_VERSION_5)
+        );
+    }
+
+    /// An out-of-range value is refused, and refusing changes nothing: the
+    /// collection still holds what it held and still encodes.
+    #[test]
+    fn test_try_push_rejects_a_bad_value_without_changing_anything() {
+        let mut p = Properties::new();
+        p.try_push(Property::TopicAlias(7)).unwrap();
+        let before = p.clone();
+
+        assert_eq!(
+            p.try_push(Property::MaximumQoS(2)),
+            Err(Error::ProtocolError),
+            "a QoS above 1 is out of range"
+        );
+        assert_eq!(p, before, "the failed push left a trace");
+        assert!(p.is_valid());
+
+        let mut dst = BytesMut::new();
+        p.encode(&mut dst, MQTT_VERSION_5).unwrap();
+    }
+
+    /// A second non-repeatable identifier is refused the same way.
+    #[test]
+    fn test_try_push_rejects_a_repeat() {
+        let mut p = Properties::new();
+        p.try_push(Property::ContentType("text/plain".into()))
+            .unwrap();
+        assert_eq!(
+            p.try_push(Property::ContentType("application/json".into())),
+            Err(Error::ProtocolError)
+        );
+        assert_eq!(p.len(), 1);
+        assert_eq!(p.get_str(PropertyId::ContentType), Some("text/plain"));
+        assert!(p.is_valid());
+    }
+
+    /// The two identifiers that may repeat still may.
+    #[test]
+    fn test_try_push_allows_the_repeatable_identifiers() {
+        let mut p = Properties::new();
+        p.try_push(Property::UserProperty("a".into(), "1".into()))
+            .unwrap();
+        p.try_push(Property::UserProperty("b".into(), "2".into()))
+            .unwrap();
+        p.try_push(Property::SubscriptionIdentifier(1)).unwrap();
+        p.try_push(Property::SubscriptionIdentifier(2)).unwrap();
+        assert_eq!(p.len(), 4);
+        assert!(p.is_valid());
+    }
+
+    /// `is_valid` reports what `push` recorded silently, and tracks removal.
+    #[test]
+    fn test_is_valid_follows_push_and_removal() {
+        let mut p = Properties::new();
+        assert!(p.is_valid(), "an empty list is valid");
+
+        p.push(Property::ContentType("text/plain".into()));
+        assert!(p.is_valid());
+
+        // `push` takes it and marks the list instead of reporting.
+        p.push(Property::TopicAlias(0));
+        assert!(!p.is_valid());
+        let mut dst = BytesMut::new();
+        assert_eq!(
+            p.encode(&mut dst, MQTT_VERSION_5),
+            Err(Error::ProtocolError),
+            "is_valid() should predict what encode does"
+        );
+
+        // Taking the offender out makes it encodable again.
+        p.remove(PropertyId::TopicAlias);
+        assert!(p.is_valid());
+        let mut dst = BytesMut::new();
+        p.encode(&mut dst, MQTT_VERSION_5).unwrap();
+    }
+
+    /// Validity is about the properties themselves, not the packet carrying
+    /// them: a list can be valid and still be refused by its context.
+    #[test]
+    fn test_is_valid_says_nothing_about_context() {
+        let mut p = Properties::new();
+        p.try_push(Property::TopicAlias(7)).unwrap();
+        assert!(p.is_valid());
+        // A topic alias is a PUBLISH property, not a SUBSCRIBE one.
+        assert_eq!(
+            p.check_context(PacketType::Subscribe),
+            Err(Error::ProtocolError)
         );
     }
 }
