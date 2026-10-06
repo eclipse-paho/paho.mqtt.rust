@@ -416,15 +416,22 @@ impl Property {
 
     /// This property's value, as a type-tagged [`PropertyValue`].
     ///
-    /// Internal, and currently exercised only by the tests that prove it and
-    /// [`from_value`](Self::from_value) are inverses: the accessors on
-    /// [`Properties`] read values straight out of the variant, so nothing in
-    /// the crate needs the tagged form. Kept because it is the only way to
-    /// speak about a value whose type is known at run time.
+    /// The variant already carries the value; this copies it out for code
+    /// working by identifier rather than by variant, so it allocates for the
+    /// string and binary properties. Matching the variant avoids that, which
+    /// is what the accessors on [`Properties`] do.
     ///
-    /// The variant already carries the value; this copies it out for callers
-    /// that work by identifier rather than by variant, so it allocates for
-    /// the string and binary properties. Matching the variant avoids that.
+    // Unused by the library: the accessors read values out of the variant
+    // directly, so nothing here needs the tagged form, and the only callers
+    // are the tests that prove this and `from_value` are inverses. It is kept
+    // rather than deleted because the pair is the crate's single way to
+    // speak about a value whose type is known only at run time — what a
+    // decoder for another format, a generic rules engine, or a different
+    // fuzzing strategy would need — and because `PropertyValue` has to exist
+    // regardless, being what `PropertyType` is generated from. Give it a
+    // caller and the attribute comes off; find none for a release or two and
+    // delete the pair, at which point hand-writing `PropertyType` is the
+    // tidier end state.
     #[allow(dead_code)]
     pub(crate) fn value(&self) -> PropertyValue {
         use Property::*;
@@ -465,6 +472,8 @@ impl Property {
     /// [`ProtocolError`](Error::ProtocolError) when the value is not of the
     /// type the identifier calls for, which naming a variant makes
     /// impossible and which this cannot.
+    ///
+    // Unused by the library, and kept for the reasons given on `value`.
     #[allow(dead_code)]
     pub(crate) fn from_value(id: PropertyId, value: PropertyValue) -> Result<Self> {
         use PropertyId as Id;
@@ -1061,6 +1070,48 @@ impl Properties {
         }
     }
 
+    /// Whether any property with the given `id` is present.
+    ///
+    /// ```
+    /// use paho_mqtt_codec::{Properties, Property, PropertyId};
+    ///
+    /// let mut props = Properties::new();
+    /// props.push_user("trace-id", "abc123");
+    ///
+    /// assert!(props.contains(PropertyId::UserProperty));
+    /// assert!(!props.contains(PropertyId::ContentType));
+    /// ```
+    pub fn contains(&self, id: PropertyId) -> bool {
+        // A scan rather than the seen-identifier set, which records only the
+        // identifiers that may *not* repeat: it would answer `false` for a
+        // user property that is plainly there.
+        self.props.iter().any(|p| p.property_id() == id)
+    }
+
+    /// How many properties with the given `id` the list holds.
+    ///
+    /// At most one for every identifier except `UserProperty`, and
+    /// `SubscriptionIdentifier` in a PUBLISH, which the specification allows
+    /// to repeat — so this is the count to check before indexing with
+    /// [`get_at`](Self::get_at).
+    ///
+    /// ```
+    /// use paho_mqtt_codec::{Properties, Property, PropertyId};
+    ///
+    /// let mut props = Properties::new();
+    /// props.push_user("a", "1");
+    /// props.push_user("b", "2");
+    /// props.push(Property::ContentType("text/plain".into()));
+    ///
+    /// assert_eq!(props.count(PropertyId::UserProperty), 2);
+    /// assert_eq!(props.count(PropertyId::ContentType), 1);
+    /// assert_eq!(props.count(PropertyId::ReasonString), 0);
+    /// assert_eq!(props.len(), 3, "`len` counts every property");
+    /// ```
+    pub fn count(&self, id: PropertyId) -> usize {
+        self.props.iter().filter(|p| p.property_id() == id).count()
+    }
+
     /// Iterates over the values of every property with the given `id`, in
     /// order.
     ///
@@ -1094,6 +1145,27 @@ impl Properties {
             Property::UserProperty(k, v) => Some((k.as_str(), v.as_str())),
             _ => None,
         })
+    }
+
+    /// Whether a user property with the given `key` is present.
+    ///
+    /// Keys are not unique — an application may send the same one more than
+    /// once — so this answers "at least one", and
+    /// [`user_iter`](Self::user_iter) walks them all. It matches on the key
+    /// only: a value equal to `key` does not count.
+    ///
+    /// ```
+    /// use paho_mqtt_codec::Properties;
+    ///
+    /// let mut props = Properties::new();
+    /// props.push_user("trace-id", "abc123");
+    ///
+    /// assert!(props.contains_user("trace-id"));
+    /// assert!(!props.contains_user("span-id"));
+    /// assert!(!props.contains_user("abc123"), "the value is not a key");
+    /// ```
+    pub fn contains_user(&self, key: &str) -> bool {
+        self.user_iter().any(|(k, _)| k == key)
     }
 
     /// Returns the value of the first user property with the given `key`, or
@@ -3758,5 +3830,133 @@ mod tests {
             p.check_context(PacketType::Subscribe),
             Err(Error::ProtocolError)
         );
+    }
+
+    // ---- contains / count ----
+
+    /// Both agree with the accessors they are shorthand for.
+    #[test]
+    fn test_contains_and_count_agree_with_the_accessors() {
+        let mut p = Properties::new();
+        p.push(Property::ContentType("text/plain".into()));
+        p.push(Property::TopicAlias(7));
+
+        for id in [
+            PropertyId::ContentType,
+            PropertyId::TopicAlias,
+            PropertyId::ReasonString,
+        ] {
+            assert_eq!(p.contains(id), p.get(id).is_some(), "{id:?}");
+            assert_eq!(p.count(id), p.get_all(id).count(), "{id:?}");
+        }
+        assert_eq!(p.count(PropertyId::ContentType), 1);
+        assert_eq!(p.count(PropertyId::ReasonString), 0);
+        assert!(!p.contains(PropertyId::ReasonString));
+    }
+
+    /// The repeatable identifiers are the reason `count` exists: `len` is the
+    /// whole list, and `get_at` needs to know how far it may index.
+    #[test]
+    fn test_count_counts_repeats() {
+        let mut p = Properties::new();
+        p.push_user("a", "1");
+        p.push_user("b", "2");
+        p.push_user("c", "3");
+        p.push(Property::SubscriptionIdentifier(1));
+        p.push(Property::SubscriptionIdentifier(2));
+
+        assert_eq!(p.count(PropertyId::UserProperty), 3);
+        assert_eq!(p.count(PropertyId::SubscriptionIdentifier), 2);
+        assert_eq!(p.len(), 5);
+
+        // Every index below the count resolves, and the next one does not.
+        for idx in 0..p.count(PropertyId::UserProperty) {
+            assert!(p.get_at(PropertyId::UserProperty, idx).is_some(), "{idx}");
+        }
+        assert!(p.get_at(PropertyId::UserProperty, 3).is_none());
+    }
+
+    /// `contains` must not consult the seen-identifier set, which records
+    /// only the identifiers that may not repeat — it would deny a user
+    /// property that is plainly present.
+    #[test]
+    fn test_contains_sees_repeatable_identifiers() {
+        let mut p = Properties::new();
+        p.push_user("k", "v");
+        p.push(Property::SubscriptionIdentifier(4444));
+
+        assert!(p.contains(PropertyId::UserProperty));
+        assert!(p.contains(PropertyId::SubscriptionIdentifier));
+    }
+
+    /// Both follow removal.
+    #[test]
+    fn test_contains_and_count_follow_removal() {
+        let mut p = Properties::new();
+        p.push_user("a", "1");
+        p.push_user("b", "2");
+        p.push(Property::ContentType("text/plain".into()));
+
+        assert_eq!(p.remove_user("a"), 1);
+        assert_eq!(p.count(PropertyId::UserProperty), 1);
+
+        assert_eq!(p.remove(PropertyId::ContentType), 1);
+        assert!(!p.contains(PropertyId::ContentType));
+        assert_eq!(p.count(PropertyId::ContentType), 0);
+
+        p.clear();
+        assert!(!p.contains(PropertyId::UserProperty));
+        assert_eq!(p.count(PropertyId::UserProperty), 0);
+    }
+
+    /// `contains_user` keys off the key, agrees with `get_user`, and counts
+    /// a repeated key once.
+    #[test]
+    fn test_contains_user() {
+        let mut p = three_users();
+        assert!(p.contains_user("a"));
+        assert!(p.contains_user("b"));
+        assert!(!p.contains_user("nope"));
+
+        for key in ["a", "b", "nope"] {
+            assert_eq!(p.contains_user(key), p.get_user(key).is_some(), "{key}");
+        }
+
+        // A value is not a key.
+        assert_eq!(p.get_user("a"), Some("1"));
+        assert!(!p.contains_user("1"));
+
+        // The fixture already repeats "a"; one more changes nothing here.
+        assert_eq!(p.count(PropertyId::UserProperty), 3);
+        p.push_user("a", "again");
+        assert!(p.contains_user("a"));
+        assert_eq!(p.count(PropertyId::UserProperty), 4);
+
+        // And it follows removal: every "a" goes, "b" stays.
+        assert_eq!(p.remove_user("a"), 3);
+        assert!(!p.contains_user("a"));
+        assert!(p.contains_user("b"));
+    }
+
+    /// An empty key is a legal user property, and is found like any other.
+    #[test]
+    fn test_contains_user_with_an_empty_key() {
+        let mut p = Properties::new();
+        assert!(!p.contains_user(""));
+        p.push_user("", "value");
+        assert!(p.contains_user(""));
+        assert_eq!(p.get_user(""), Some("value"));
+    }
+
+    /// Only user properties are considered, not some other string property
+    /// that happens to hold the same text.
+    #[test]
+    fn test_contains_user_ignores_other_properties() {
+        let mut p = Properties::new();
+        p.push(Property::ContentType("text/plain".into()));
+        p.push(Property::ReasonString("because".into()));
+        assert!(!p.contains_user("text/plain"));
+        assert!(!p.contains_user("because"));
+        assert_eq!(p.count(PropertyId::UserProperty), 0);
     }
 }
