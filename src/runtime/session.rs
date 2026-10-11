@@ -404,6 +404,23 @@ fn single_outcome<R>(
 /// buffer to avoid the copy.
 const INLINE_PAYLOAD_MAX: usize = 16 * 1024;
 
+/// Initial capacity of the inbound byte buffer. One buffer serves a whole
+/// connection — from the CONNACK read through to the last packet — and grows
+/// to fit anything larger.
+const READ_BUF_CAPACITY: usize = 4096;
+
+/// What the CONNECT exchange settled, fixed for the life of the connection.
+///
+/// Each of these is read from the connect options and the CONNACK together —
+/// the version in force, the keep-alive after any Server Keep Alive override,
+/// and the limits the two sides agreed — so they are gathered rather than
+/// passed one by one.
+struct Negotiated {
+    ver: MqttVersion,
+    keep_alive: Duration,
+    limits: SessionLimits,
+}
+
 /// Holds all mutable state for a connected MQTT session.
 struct Session<B: Backend> {
     /// Write half of the split transport.
@@ -414,6 +431,9 @@ struct Session<B: Backend> {
     keep_alive: Duration,
     /// Reusable scratch buffer for packet encoding.
     write_buf: BytesMut,
+    /// Inbound bytes not yet parsed into packets. Starts out holding
+    /// whatever arrived with the CONNACK behind it; see [`Connected`].
+    read_buf: BytesMut,
     /// Message state carried across the connections of one session.
     state: SessionState,
     /// Pending SUBSCRIBE operations awaiting SUBACK, with the `single` flag
@@ -445,18 +465,23 @@ struct Session<B: Backend> {
 impl<B: Backend> Session<B> {
     fn new(
         writer: B::Writer,
-        ver: MqttVersion,
-        keep_alive: Duration,
+        read_buf: BytesMut,
+        negotiated: Negotiated,
         event_tx: async_channel::Sender<Event>,
         persist: Option<Arc<Mutex<Box<dyn ClientPersistence>>>>,
-        limits: SessionLimits,
         state: SessionState,
     ) -> Self {
+        let Negotiated {
+            ver,
+            keep_alive,
+            limits,
+        } = negotiated;
         Self {
             writer,
             ver,
             keep_alive,
             write_buf: BytesMut::with_capacity(256),
+            read_buf,
             state,
             pending_sub: HashMap::new(),
             pending_unsub: HashMap::new(),
@@ -755,6 +780,21 @@ impl<B: Backend> Session<B> {
         Ok(())
     }
 
+    /// Handles every complete packet now in `read_buf`.
+    ///
+    /// One read can carry any number of packets, and the first `read_buf` of
+    /// a connection can arrive already full of them, so this is driven by
+    /// what the buffer holds rather than by what a single read returned.
+    async fn handle_buffered(&mut self) -> Result<()> {
+        while let Some(raw) =
+            RawPacket::decode_max(&mut self.read_buf, self.limits.max_packet_size)?
+        {
+            let packet = Packet::from_raw(raw, self.ver)?;
+            self.handle_packet(packet).await?;
+        }
+        Ok(())
+    }
+
     /// Main event loop: read from `reader`, dispatch commands from `cmd_rx`,
     /// and service keep-alive until an error or clean disconnect.
     async fn run(
@@ -775,11 +815,14 @@ impl<B: Backend> Session<B> {
             B::Sleep::never()
         };
 
-        let mut read_buf = BytesMut::with_capacity(4096);
+        // Packets the broker pipelined behind the CONNACK are in `read_buf`
+        // already. Nothing further is owed on this connection, so waiting on
+        // a read before handling them could wait indefinitely.
+        self.handle_buffered().await?;
 
         loop {
             let ev = select! {
-                res = B::read_buf(reader, &mut read_buf).fuse() => LoopEvent::Read(res),
+                res = B::read_buf(reader, &mut self.read_buf).fuse() => LoopEvent::Read(res),
                 cmd = cmd_rx.recv().fuse() => LoopEvent::Command(cmd),
                 _ = ka_sleep => LoopEvent::KeepAlive,
             };
@@ -790,12 +833,7 @@ impl<B: Backend> Session<B> {
                     if n == 0 {
                         return Err(Error::Disconnected);
                     }
-                    while let Some(raw) =
-                        RawPacket::decode_max(&mut read_buf, self.limits.max_packet_size)?
-                    {
-                        let packet = Packet::from_raw(raw, self.ver)?;
-                        self.handle_packet(packet).await?;
-                    }
+                    self.handle_buffered().await?;
                     if ka_enabled && self.sent_packet {
                         self.sent_packet = false;
                         ka_sleep.reset(keep_alive);
@@ -812,7 +850,7 @@ impl<B: Backend> Session<B> {
                     // If requested, wait for in-flight ops to complete
                     // before sending DISCONNECT.
                     if !timeout.is_zero() && self.has_pending() {
-                        self.drain_pending(reader, &mut read_buf, timeout).await;
+                        self.drain_pending(reader, timeout).await;
                     }
                     let disc = Disconnect::with_properties(reason_code, props);
                     let _ = self.send(&Packet::Disconnect(disc)).await;
@@ -848,24 +886,19 @@ impl<B: Backend> Session<B> {
     /// (un)subscribes get their ACKs before DISCONNECT goes out.  A closed
     /// connection, read error, or undecodable packet ends the drain early;
     /// the caller sends DISCONNECT regardless.
-    async fn drain_pending(
-        &mut self,
-        reader: &mut B::Reader,
-        read_buf: &mut BytesMut,
-        timeout: Duration,
-    ) {
+    async fn drain_pending(&mut self, reader: &mut B::Reader, timeout: Duration) {
         let mut deadline = B::Sleep::new(timeout);
 
         while self.has_pending() {
             let res = select! {
-                res = B::read_buf(reader, read_buf).fuse() => res,
+                res = B::read_buf(reader, &mut self.read_buf).fuse() => res,
                 _ = deadline => return,
             };
             match res {
                 Ok(0) | Err(_) => return,
                 Ok(_) => {
                     while let Ok(Some(raw)) =
-                        RawPacket::decode_max(read_buf, self.limits.max_packet_size)
+                        RawPacket::decode_max(&mut self.read_buf, self.limits.max_packet_size)
                     {
                         match Packet::from_raw(raw, self.ver) {
                             Ok(pkt) => {
@@ -1232,8 +1265,23 @@ struct ConnectJob {
     persist: Option<Arc<Mutex<Box<dyn ClientPersistence>>>>,
 }
 
+/// A transport with the MQTT CONNECT exchange completed.
+struct Connected<B: Backend> {
+    reader: B::Reader,
+    writer: B::Writer,
+    connack: ConnAck,
+    /// Bytes that came in with the CONNACK and have not been parsed yet.
+    ///
+    /// A broker is free to pipeline packets behind the CONNACK — the queued
+    /// messages of a session it has just resumed, say — and they can arrive
+    /// in the same read. So the buffer travels on into the session instead
+    /// of being dropped here with the connect: whatever is in it is handled
+    /// before the session waits on another read.
+    read_buf: BytesMut,
+}
+
 /// Opens persistence and the transport, sends CONNECT, waits for CONNACK.
-async fn do_connect<B: Backend>(job: &ConnectJob) -> Result<(B::Reader, B::Writer, ConnAck)> {
+async fn do_connect<B: Backend>(job: &ConnectJob) -> Result<Connected<B>> {
     let p = &job.params;
     let (addr, server_uri) = &p.servers[job.server_idx];
 
@@ -1263,10 +1311,15 @@ async fn do_connect<B: Backend>(job: &ConnectJob) -> Result<(B::Reader, B::Write
     B::flush(&mut writer).await?;
 
     // ---- Wait for CONNACK ----
-    let mut read_buf = BytesMut::with_capacity(256);
+    let mut read_buf = BytesMut::with_capacity(READ_BUF_CAPACITY);
     let connack = recv_connack::<B>(&mut reader, &mut writer, &mut read_buf, p).await?;
 
-    Ok((reader, writer, connack))
+    Ok(Connected {
+        reader,
+        writer,
+        connack,
+        read_buf,
+    })
 }
 
 /// Pushes a bufferable command into the send-while-disconnected buffer.
@@ -1361,7 +1414,7 @@ fn handle_offline_command(
 /// Outcome of one connection attempt against one server.
 enum Attempt<B: Backend> {
     /// Transport up and CONNACK received (its reason code not yet examined).
-    Connected(B::Reader, B::Writer, ConnAck),
+    Connected(Connected<B>),
     /// The attempt failed or timed out.
     Failed(Error),
     /// `disconnect()` was called mid-attempt (or the API was dropped); the
@@ -1394,7 +1447,7 @@ async fn attempt_connect<B: Backend>(
         let cmd = select! {
             res = conn => {
                 return match res {
-                    Ok((r, w, ack)) => Attempt::Connected(r, w, ack),
+                    Ok(conn) => Attempt::Connected(conn),
                     Err(e) => Attempt::Failed(e),
                 };
             }
@@ -1538,11 +1591,14 @@ pub(crate) async fn run_event_loop<B: Backend>(
                     job.server_idx = idx;
                     match attempt_connect::<B>(&job, &cmd_rx, &mut buf, &buf_cfg, should_buf).await
                     {
-                        Attempt::Connected(_, _, ack) if ack.reason_code.is_err() => {
-                            last_err = Some(Error::ReasonCode(ack.reason_code, ack.properties));
+                        Attempt::Connected(c) if c.connack.reason_code.is_err() => {
+                            last_err = Some(Error::ReasonCode(
+                                c.connack.reason_code,
+                                c.connack.properties,
+                            ));
                         }
-                        Attempt::Connected(r, w, ack) => {
-                            result = Some((r, w, ack));
+                        Attempt::Connected(c) => {
+                            result = Some(c);
                             break;
                         }
                         Attempt::Failed(e) => last_err = Some(e),
@@ -1550,7 +1606,7 @@ pub(crate) async fn run_event_loop<B: Backend>(
                     }
                 }
                 match result {
-                    Some((r, w, ack)) => Attempt::Connected(r, w, ack),
+                    Some(c) => Attempt::Connected(c),
                     None => {
                         Attempt::Failed(last_err.unwrap_or(Error::General("no servers configured")))
                     }
@@ -1572,14 +1628,19 @@ pub(crate) async fn run_event_loop<B: Backend>(
                     }
                 }
                 match attempt_connect::<B>(&job, &cmd_rx, &mut buf, &buf_cfg, should_buf).await {
-                    Attempt::Connected(_, _, ack) if ack.reason_code.is_err() => {
-                        Attempt::Failed(Error::ReasonCode(ack.reason_code, ack.properties))
-                    }
+                    Attempt::Connected(c) if c.connack.reason_code.is_err() => Attempt::Failed(
+                        Error::ReasonCode(c.connack.reason_code, c.connack.properties),
+                    ),
                     other => other,
                 }
             };
 
-            let (mut reader, writer, connack) = match attempt {
+            let Connected {
+                mut reader,
+                writer,
+                connack,
+                read_buf,
+            } = match attempt {
                 Attempt::Aborted => break 'retry,
                 Attempt::Failed(err) => {
                     if matches!(err, Error::Tls(_)) {
@@ -1594,7 +1655,7 @@ pub(crate) async fn run_event_loop<B: Backend>(
                     retry_delay = (retry_delay * 2).min(job.params.max_retry_interval);
                     continue 'retry;
                 }
-                Attempt::Connected(r, w, ack) => (r, w, ack),
+                Attempt::Connected(c) => c,
             };
 
             // ---- Connected ----
@@ -1641,11 +1702,14 @@ pub(crate) async fn run_event_loop<B: Backend>(
 
             let mut session = Session::<B>::new(
                 writer,
-                job.params.ver,
-                keep_alive,
+                read_buf,
+                Negotiated {
+                    ver: job.params.ver,
+                    keep_alive,
+                    limits,
+                },
                 event_tx.clone(),
                 job.persist.clone(),
-                limits,
                 state,
             );
             let result = session.serve(&mut reader, &cmd_rx, &mut buf, resumed).await;
@@ -1680,8 +1744,172 @@ pub(crate) async fn run_event_loop<B: Backend>(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::task::Poll;
+
+    use super::{super::ServerAddr, *};
     use crate::Token;
+
+    /// A timer that never fires. `never()` reports itself terminated, so
+    /// `select!` skips its branch; `new()` would hang, which no test here
+    /// reaches because every session is built with keep-alive disabled.
+    struct MockSleep {
+        terminated: bool,
+    }
+
+    impl Future for MockSleep {
+        type Output = ();
+        fn poll(self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>) -> Poll<()> {
+            Poll::Pending
+        }
+    }
+
+    impl futures::future::FusedFuture for MockSleep {
+        fn is_terminated(&self) -> bool {
+            self.terminated
+        }
+    }
+
+    impl Sleep for MockSleep {
+        fn new(_: Duration) -> Self {
+            Self { terminated: false }
+        }
+        fn never() -> Self {
+            Self { terminated: true }
+        }
+        fn reset(&mut self, _: Duration) {}
+    }
+
+    /// A backend whose transport is already at end of file: every read
+    /// reports EOF, and writes are collected so a test can inspect them.
+    struct MockBackend;
+
+    impl Backend for MockBackend {
+        type Reader = ();
+        type Writer = Vec<u8>;
+        type Sleep = MockSleep;
+
+        async fn open(_: &ServerAddr, _: &ConnectParams) -> Result<(Self::Reader, Self::Writer)> {
+            Err(Error::General("MockBackend opens no transports"))
+        }
+
+        async fn read_buf(_: &mut Self::Reader, _: &mut BytesMut) -> io::Result<usize> {
+            Ok(0)
+        }
+
+        async fn write_all(writer: &mut Self::Writer, data: &[u8]) -> io::Result<()> {
+            writer.extend_from_slice(data);
+            Ok(())
+        }
+
+        async fn write_frame(
+            writer: &mut Self::Writer,
+            header: &[u8],
+            payload: Bytes,
+        ) -> io::Result<()> {
+            writer.extend_from_slice(header);
+            writer.extend_from_slice(&payload);
+            Ok(())
+        }
+
+        async fn flush(_: &mut Self::Writer) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn test_limits() -> SessionLimits {
+        SessionLimits {
+            max_inflight: 0,
+            max_packet_size: paho_mqtt_codec::MAX_PACKET_SIZE,
+            server_max_packet_size: None,
+            server_topic_alias_max: 0,
+            topic_alias_max: 0,
+        }
+    }
+
+    /// Builds a session over [`MockBackend`] whose inbound buffer already
+    /// holds `read_buf`, as one carried over from the CONNACK read does.
+    fn session_with_buffered(
+        read_buf: BytesMut,
+    ) -> (
+        Session<MockBackend>,
+        async_channel::Receiver<Event>,
+        async_channel::Sender<Command>,
+        async_channel::Receiver<Command>,
+    ) {
+        let (event_tx, event_rx) = async_channel::unbounded();
+        let (cmd_tx, cmd_rx) = async_channel::unbounded();
+        let session = Session::<MockBackend>::new(
+            Vec::new(),
+            read_buf,
+            Negotiated {
+                ver: MqttVersion::V5,
+                keep_alive: Duration::ZERO, // off: MockSleep::never()
+                limits: test_limits(),
+            },
+            event_tx,
+            None,
+            SessionState::default(),
+        );
+        (session, event_rx, cmd_tx, cmd_rx)
+    }
+
+    fn encoded_publish(topic: &str, qos: QoS, id: Option<u16>) -> BytesMut {
+        let mut buf = BytesMut::new();
+        let pkt = Packet::Publish(paho_mqtt_codec::Publish {
+            dup: false,
+            qos,
+            retain: false,
+            topic: topic.into(),
+            packet_id: id,
+            payload: Bytes::from_static(b"body"),
+            properties: Properties::new(),
+        });
+        pkt.encode(&mut buf, MqttVersion::V5).unwrap();
+        buf
+    }
+
+    /// A broker may pipeline packets behind the CONNACK, and they can arrive
+    /// in the same read. Those bytes are carried into the session and taken
+    /// before it waits on a read that may never come: here the transport is
+    /// at EOF, so a message left in the buffer would be lost outright.
+    #[test]
+    fn test_packets_pipelined_with_the_connack_are_delivered() {
+        let (mut session, event_rx, _cmd_tx, cmd_rx) =
+            session_with_buffered(encoded_publish("pipelined/qos0", QoS::QoS0, None));
+
+        let res = futures::executor::block_on(session.run(&mut (), &cmd_rx));
+        assert!(
+            matches!(res, Err(Error::Disconnected)),
+            "the mock transport is at EOF: {res:?}"
+        );
+
+        match event_rx.try_recv() {
+            Ok(Event::MessageArrived(msg)) => assert_eq!(msg.topic, "pipelined/qos0"),
+            other => panic!("pipelined PUBLISH was dropped: {:?}", other.is_ok()),
+        }
+    }
+
+    /// Every packet in the carried-over buffer is handled, not just the
+    /// first, and acknowledgements for them go out on the new connection.
+    #[test]
+    fn test_every_pipelined_packet_is_handled() {
+        let mut buffered = encoded_publish("pipelined/a", QoS::QoS0, None);
+        buffered.extend_from_slice(&encoded_publish("pipelined/b", QoS::QoS1, Some(7)));
+
+        let (mut session, event_rx, _cmd_tx, cmd_rx) = session_with_buffered(buffered);
+        let _ = futures::executor::block_on(session.run(&mut (), &cmd_rx));
+
+        let topics: Vec<String> = std::iter::from_fn(|| event_rx.try_recv().ok())
+            .filter_map(|ev| match ev {
+                Event::MessageArrived(msg) => Some(msg.topic),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(topics, vec!["pipelined/a", "pipelined/b"]);
+
+        // The QoS 1 message was acknowledged: PUBACK for packet ID 7.
+        assert_eq!(&session.writer[..], &[0x40, 0x02, 0x00, 0x07]);
+    }
     fn params(ver: MqttVersion, clean_start: bool) -> ConnectParams {
         ConnectParams {
             servers: Vec::new(),
