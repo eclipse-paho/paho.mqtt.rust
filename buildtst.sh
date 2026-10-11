@@ -94,8 +94,32 @@ done
 
 # ---- Docs ------------------------------------------------------------------
 
-step "Docs (all features, warnings are errors)"
-RUSTDOCFLAGS="-D warnings" run cargo doc --workspace --no-deps --all-features
+# Not --all-features: that would enable both runtime backends at once, which
+# the crate root refuses with a compile_error!. One pass per feature set, so a
+# doc link that only resolves under some features is still caught.
+for FEATURES in "${FEATURE_SETS[@]}"; do
+    step "Docs [${FEATURES}] (warnings are errors)"
+    RUSTDOCFLAGS="-D warnings" run cargo doc --workspace --no-deps --no-default-features --features "${FEATURES}"
+done
+
+# ---- No runtime backend ----------------------------------------------------
+
+# Without `tokio` or `smol` there is no client, but everything that does not
+# need one must still build: the codec re-exports, messages, properties, topic
+# matching, tokens, the response and options types, persistence.
+step "No-runtime build, tests and clippy"
+run cargo check --no-default-features --all-targets
+run cargo check --no-default-features --features serde --all-targets
+run cargo test --no-default-features --no-fail-fast
+run cargo clippy --no-deps --all-targets --no-default-features -- -D warnings
+
+# And the reverse must be refused rather than silently picking a backend.
+step "Both backends at once is a compile error"
+if cargo check --no-default-features --features tokio,smol >/dev/null 2>&1; then
+    printf "\n*** FAILED: tokio + smol should not build\n"
+    exit 1
+fi
+echo "    cargo check --no-default-features --features tokio,smol  (correctly refused)"
 
 # ---- Codec: no_std ---------------------------------------------------------
 

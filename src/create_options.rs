@@ -640,6 +640,27 @@ mod tests {
         assert!(back.user_data.is_none(), "`dyn Any` cannot be read back");
     }
 
+    /// The two client constructors differ only in the type they hand back;
+    /// the annotations below are the point of the test.
+    #[cfg(any(feature = "tokio", feature = "smol"))]
+    #[test]
+    fn test_client_constructors() {
+        let opts = || {
+            CreateOptionsBuilder::new()
+                .server_uri("tcp://localhost:1883")
+                .client_id("ctor-test")
+        };
+
+        let acli: crate::AsyncClient = opts().create_async_client().unwrap();
+        assert_eq!(acli.client_id(), "ctor-test");
+
+        let scli: crate::Client = opts().create_client().unwrap();
+        assert_eq!(scli.client_id(), "ctor-test");
+
+        let direct = crate::Client::new(opts().finalize()).unwrap();
+        assert_eq!(direct.client_id(), scli.client_id());
+    }
+
     /// A configuration file need only name what it changes.
     #[cfg(feature = "serde")]
     #[test]
