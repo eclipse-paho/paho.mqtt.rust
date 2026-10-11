@@ -68,6 +68,14 @@ Version 2.0 is a rewrite of the library in pure Rust. It no longer depends on th
 - A QoS 2 publish refused at PUBREC is removed from persistence, so it is not re-sent on the next connect.
 - `AsyncClient` no longer relies on `unsafe impl Send/Sync`; `UserPersistence` holds its store behind a `Mutex` so the types are thread-safe by construction.
 
+### Performance
+
+- **Write pipeline.** Outbound packets are queued and written by the event loop as soon as the socket accepts them, so whatever piles up during one write goes out together in the next, as a single vectored write. A packet sent on an idle connection still goes out at once, with the same syscalls as before: there is no timer and no Nagle-style delay. Pipelined QoS 0 publishing on a local connection went from about 150K to 1.4M (tokio) and 2M (smol) messages per second, and QoS 1/2 two to five times; see `bench/`.
+- A QoS 0 publish token now resolves once its bytes are written *and flushed* to the transport. Over TCP that is the same moment as before; over TLS and WebSocket it is after the record or frame has gone out, which is stricter. If the connection fails before then, the token fails with `Error::Disconnected`.
+- Several MQTT packets may share one WebSocket frame, as the MQTT specification allows (§6 in v3.1.1 and v5). Frames are capped at about 64 KiB. Note that mosquitto 2.0 handles a whole frame at once and may drop QoS 0 messages it cannot queue for slow subscribers; a sender that bursts QoS 0 over WebSocket can see more of that than before simply because it now sends faster.
+- A write blocked on a full socket no longer stops the client reading: inbound messages, acknowledgements and keep-alive carry on, and a peer that is itself blocked writing to the client can no longer deadlock the connection.
+- The final writes when a session ends — a zero-timeout `disconnect()`, the DISCONNECT sent after a protocol error, or the client being dropped — are bounded at about a second. A zero-timeout `disconnect()` used to make one unbounded write attempt.
+
 ### API
 
 - `ConnectOptions::check` rejects a property set the specification does not allow — an out-of-range value, or a repeat of an identifier that may not repeat — instead of letting the connect token fail when the CONNECT is encoded. A configuration mistake is reported where the rest of them are.
@@ -98,6 +106,7 @@ Version 2.0 is a rewrite of the library in pure Rust. It no longer depends on th
 ### Development
 
 - `paho-mqtt-codec` has Criterion benchmarks (`cargo bench -p paho-mqtt-codec`) and two `cargo-fuzz` targets; CI runs the benchmarks' compile and a short fuzz pass on every change, and builds the codec for a bare-metal `no_std` target.
+- `bench/` holds the benchmark harness: a client driver and a null broker (`bench/mqttbench`), a script that runs a configuration matrix with the builds being compared interleaved (`matrix.sh`), and a summarizer (`summarize.py`). See `bench/README.md`.
 - `buildtst.sh` mirrors the CI matrix (feature sets × stable/MSRV, clippy, docs, no_std, benches) with `--integration`, `--fuzz`, and `--bench` options.
 - Integration tests run against a local Mosquitto on both runtimes, including WebSocket, Unix sockets, and v3.1. Behaviour a stock broker will not produce — a refused subscription, an imposed keep-alive, enhanced authentication, a session it declines to resume, a TLS certificate naming the wrong host, an HTTP proxy — is tested against scripted servers built on `paho-mqtt-codec` (`tests/common/`). The TLS tests generate their own certificates, so no broker TLS configuration is needed and none of the suite is `#[ignore]`d.
 - `README.md` is rewritten for v2, and its code examples are compiled by `tests/readme.rs` so they cannot fall out of date.

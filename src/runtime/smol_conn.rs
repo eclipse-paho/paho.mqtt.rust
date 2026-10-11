@@ -82,6 +82,16 @@ macro_rules! impl_connection {
                 Pin::new(&mut self.stream).poll_write(cx, buf)
             }
 
+            // Without this the `futures-io` default would write only the
+            // first slice of every vectored write.
+            fn poll_write_vectored(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+                bufs: &[io::IoSlice<'_>],
+            ) -> Poll<io::Result<usize>> {
+                Pin::new(&mut self.stream).poll_write_vectored(cx, bufs)
+            }
+
             fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
                 Pin::new(&mut self.stream).poll_flush(cx)
             }
@@ -137,12 +147,22 @@ impl_connection!(TlsConnection);
 
 /////////////////////////////////////////////////////////////////////////////
 
+/// Bytes a WebSocket transport buffers for its next frame before a write
+/// must wait for that frame to be sent.
+#[cfg(feature = "smol-websocket")]
+const WS_WRITE_BUF_MAX: usize = 64 * 1024;
+
 /// A WebSocket transport wrapping an [`async_tungstenite::WebSocketStream`].
 ///
 /// Presents a byte-stream interface (`AsyncRead` + `AsyncWrite`) over a
-/// WebSocket connection.  Each flushed write becomes one binary WebSocket
-/// frame; reads reassemble frames back into a byte stream.  Requires the
-/// `smol-websocket` feature.
+/// WebSocket connection.  Writes accumulate, and each flush sends what has
+/// accumulated as one binary WebSocket frame, which may hold several MQTT
+/// packets (MQTT §6 allows it); reads reassemble frames back into a byte
+/// stream.  Requires the `smol-websocket` feature.
+///
+/// Once [`WS_WRITE_BUF_MAX`] bytes are waiting, or while a frame is still
+/// going out, a write drives the flush itself and accepts nothing until it
+/// completes, so the transport pushes back on a writer that outruns it.
 #[cfg(feature = "smol-websocket")]
 pub(super) struct WsConnection<S> {
     stream: async_tungstenite::WebSocketStream<S>,
@@ -154,6 +174,8 @@ pub(super) struct WsConnection<S> {
     write_buf: Vec<u8>,
     /// Non-`None` while waiting for the sink to be ready before `start_send`.
     pending_msg: Option<Vec<u8>>,
+    /// The last flush returned `Pending`: a frame is still going out.
+    flushing: bool,
 }
 
 #[cfg(feature = "smol-websocket")]
@@ -165,7 +187,43 @@ impl<S: AsyncRead + AsyncWrite + Unpin> WsConnection<S> {
             read_pos: 0,
             write_buf: Vec::new(),
             pending_msg: None,
+            flushing: false,
         }
+    }
+
+    /// Hands the accumulated bytes to the sink as one binary frame, and
+    /// flushes the sink.
+    fn poll_send_frame(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        use async_tungstenite::tungstenite::Message as WsMessage;
+        use futures::Sink;
+
+        // Move the accumulated write buffer into `pending_msg` for sending.
+        if self.pending_msg.is_none() && !self.write_buf.is_empty() {
+            self.pending_msg = Some(std::mem::take(&mut self.write_buf));
+        }
+
+        // Drive the pending message through the Sink.
+        if let Some(data) = self.pending_msg.take() {
+            match Pin::new(&mut self.stream).poll_ready(cx) {
+                Poll::Pending => {
+                    self.pending_msg = Some(data);
+                    return Poll::Pending;
+                }
+                Poll::Ready(Err(e)) => {
+                    return Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, e)));
+                }
+                Poll::Ready(Ok(())) => {
+                    if let Err(e) = Pin::new(&mut self.stream).start_send(WsMessage::Binary(data)) {
+                        return Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, e)));
+                    }
+                }
+            }
+        }
+
+        // Flush the sink to push the frame onto the wire.
+        Pin::new(&mut self.stream)
+            .poll_flush(cx)
+            .map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e))
     }
 }
 
@@ -243,46 +301,40 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for WsConnection<S> {
 impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for WsConnection<S> {
     fn poll_write(
         self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
+        cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        self.get_mut().write_buf.extend_from_slice(buf);
-        Poll::Ready(Ok(buf.len()))
+        self.poll_write_vectored(cx, &[io::IoSlice::new(buf)])
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        if this.flushing || this.write_buf.len() >= WS_WRITE_BUF_MAX {
+            std::task::ready!(Pin::new(&mut *this).poll_flush(cx))?;
+        }
+        // Take only what fits under the cap, so no frame is much larger.
+        let room = WS_WRITE_BUF_MAX - this.write_buf.len();
+        let mut n = 0;
+        for b in bufs {
+            let k = b.len().min(room - n);
+            this.write_buf.extend_from_slice(&b[..k]);
+            n += k;
+            if n == room {
+                break;
+            }
+        }
+        Poll::Ready(Ok(n))
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        use async_tungstenite::tungstenite::Message as WsMessage;
-        use futures::Sink;
-
         let this = self.get_mut();
-
-        // Move the accumulated write buffer into `pending_msg` for sending.
-        if this.pending_msg.is_none() && !this.write_buf.is_empty() {
-            this.pending_msg = Some(std::mem::take(&mut this.write_buf));
-        }
-
-        // Drive the pending message through the Sink.
-        if let Some(data) = this.pending_msg.take() {
-            match Pin::new(&mut this.stream).poll_ready(cx) {
-                Poll::Pending => {
-                    this.pending_msg = Some(data);
-                    return Poll::Pending;
-                }
-                Poll::Ready(Err(e)) => {
-                    return Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, e)));
-                }
-                Poll::Ready(Ok(())) => {
-                    if let Err(e) = Pin::new(&mut this.stream).start_send(WsMessage::Binary(data)) {
-                        return Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, e)));
-                    }
-                }
-            }
-        }
-
-        // Flush the sink to push the frame onto the wire.
-        Pin::new(&mut this.stream)
-            .poll_flush(cx)
-            .map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e))
+        let res = this.poll_send_frame(cx);
+        this.flushing = res.is_pending();
+        res
     }
 
     fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {

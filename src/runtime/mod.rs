@@ -43,6 +43,9 @@ pub(crate) mod connection;
 pub(crate) mod backend;
 
 #[cfg(any(feature = "tokio", feature = "smol"))]
+pub(crate) mod outbox;
+
+#[cfg(any(feature = "tokio", feature = "smol"))]
 pub(crate) mod session;
 
 #[cfg(any(feature = "tls", feature = "smol-tls", feature = "openssl"))]

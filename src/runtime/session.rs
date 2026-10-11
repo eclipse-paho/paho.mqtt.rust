@@ -25,10 +25,20 @@
 //! loop, and the send-while-disconnected buffer.  A backend supplies only the
 //! transport (open, read, write, flush) and a resettable timer; see
 //! `tokio_rt` and `smol_rt`.
+//!
+//! # Writing
+//!
+//! Packet handlers never touch the transport. They encode into the session's
+//! [`Outbox`] and return, which keeps them synchronous; writing is one branch
+//! of the run loop's `select!`, beside reading, commands and keep-alive. A
+//! packet queued on an idle connection goes out on the loop's next poll, at
+//! the cost of a lone write. Under load, whatever queues up while a write is
+//! in progress goes out together in the next vectored write, and a write
+//! blocked on a full socket no longer stops reads.
 
 use std::{
     collections::{HashMap, VecDeque},
-    io,
+    io::{self, IoSlice},
     pin::pin,
     sync::{
         Arc, Mutex, RwLock,
@@ -37,8 +47,8 @@ use std::{
     time::Duration,
 };
 
-use bytes::{Bytes, BytesMut};
-use futures::{FutureExt, select};
+use bytes::BytesMut;
+use futures::{FutureExt, future::pending, select, select_biased};
 use paho_mqtt_codec::{
     Auth, ConnAck, Disconnect, MqttVersion, Packet, Properties, Property, PropertyId, PubAck, QoS,
     RawPacket, ReasonCode, RetainHandling as CodecRetainHandling, Subscribe, Subscription,
@@ -51,6 +61,7 @@ use super::{
         BufConfig, Command, ConnectParams, Event, SessionLimits, assigned_client_id,
         negotiated_keep_alive,
     },
+    outbox::Outbox,
 };
 use crate::{
     Error, Message, Result,
@@ -162,6 +173,8 @@ fn auth_response(p: &ConnectParams, challenge_props: &Properties) -> Result<Auth
 
 /// What woke the session loop.
 enum LoopEvent {
+    /// The writer made progress (or failed).
+    Writer(io::Result<Step>),
     /// The transport read completed (byte count or error).
     Read(io::Result<usize>),
     /// A command arrived from the public API (or the channel closed).
@@ -399,10 +412,25 @@ fn single_outcome<R>(
     Ok(rsp)
 }
 
-/// PUBLISH payloads up to this size are copied into the header buffer and
-/// sent as one contiguous write; larger ones are written from their own
-/// buffer to avoid the copy.
-const INLINE_PAYLOAD_MAX: usize = 16 * 1024;
+/// Most bytes the run loop queues from commands it finds waiting before it
+/// lets the writer have them. Batching is opportunistic, never timed: this
+/// only bounds how long the first of them is held back.
+const BATCH_BYTES: usize = 16 * 1024;
+
+/// Most commands taken in one opportunistic batch, for commands that queue
+/// no bytes (publishes deferred by the in-flight window).
+const BATCH_CMDS: usize = 256;
+
+/// The run loop stops taking commands while this many bytes are waiting to
+/// be written; they wait in the command channel instead.
+const HIGH_WATER: usize = 512 * 1024;
+
+/// Bound on a best-effort final write: what is queued when the session ends,
+/// including a DISCONNECT.
+const CLOSE_CAP: Duration = Duration::from_secs(1);
+
+/// Most slices handed to one vectored write.
+const MAX_IOV: usize = 64;
 
 /// Initial capacity of the inbound byte buffer. One buffer serves a whole
 /// connection — from the CONNACK read through to the last packet — and grows
@@ -429,8 +457,8 @@ struct Session<B: Backend> {
     ver: MqttVersion,
     /// Keep-alive interval.
     keep_alive: Duration,
-    /// Reusable scratch buffer for packet encoding.
-    write_buf: BytesMut,
+    /// Encoded packets not yet accepted by the transport.
+    out: Outbox,
     /// Inbound bytes not yet parsed into packets. Starts out holding
     /// whatever arrived with the CONNACK behind it; see [`Connected`].
     read_buf: BytesMut,
@@ -457,9 +485,6 @@ struct Session<B: Backend> {
     /// new commands and persisted messages awaiting re-transmission alike.
     /// Drained one-for-one as PUBACK/PUBCOMP ACKs arrive.
     inflight_deferred: VecDeque<Deferred>,
-    /// Set by `send()` to indicate a packet was written since the last
-    /// keep-alive timer reset. Checked in `run()` to reset the deadline.
-    sent_packet: bool,
 }
 
 impl<B: Backend> Session<B> {
@@ -480,7 +505,7 @@ impl<B: Backend> Session<B> {
             writer,
             ver,
             keep_alive,
-            write_buf: BytesMut::with_capacity(256),
+            out: Outbox::new(),
             read_buf,
             state,
             pending_sub: HashMap::new(),
@@ -491,7 +516,6 @@ impl<B: Backend> Session<B> {
             limits,
             topic_aliases: HashMap::new(),
             inflight_deferred: VecDeque::new(),
-            sent_packet: false,
         }
     }
 
@@ -519,41 +543,50 @@ impl<B: Backend> Session<B> {
     }
 
     /// Drains deferred publishes into the session while the in-flight count
-    /// is below `max_inflight`.  A transport error propagates immediately.
-    async fn drain_deferred(&mut self) -> Result<()> {
+    /// is below `max_inflight`.  An encoding error propagates immediately.
+    fn drain_deferred(&mut self) -> Result<()> {
         while self.inflight_slot_free() {
             match self.inflight_deferred.pop_front() {
                 Some(Deferred::Command(cmd)) => {
-                    self.handle_command(cmd).await?;
+                    self.handle_command(cmd)?;
                 }
-                Some(Deferred::Retransmit(id)) => self.send_inflight(id).await?,
+                Some(Deferred::Retransmit(id)) => self.send_inflight(id)?,
                 None => break,
             }
         }
         Ok(())
     }
 
-    /// Sends (or re-sends) the in-flight message held under `id`.
+    /// Queues (or re-queues) the in-flight message held under `id`.
     ///
     /// A message still awaiting its first acknowledgement goes out as a
     /// PUBLISH with DUP set; one that has been PUBREC'd goes out as a PUBREL.
     /// Marks the record as occupying a window slot.
-    async fn send_inflight(&mut self, id: u16) -> Result<()> {
-        let packet = match self.state.inflight.get(&id) {
-            Some(rec) => match &rec.phase {
-                PublishPhase::AwaitingAck(pub_pkt) => {
-                    let mut p = (**pub_pkt).clone();
-                    p.dup = true;
-                    Packet::Publish(p)
-                }
-                PublishPhase::AwaitingPubComp => Packet::PubRel(PubAck::new(id)),
-            },
-            None => return Ok(()),
+    fn send_inflight(&mut self, id: u16) -> Result<()> {
+        let Some(rec) = self.state.inflight.get_mut(&id) else {
+            return Ok(());
         };
-        if let Some(rec) = self.state.inflight.get_mut(&id) {
-            rec.sent = true;
-        }
-        self.send(&packet).await
+        rec.sent = true;
+        let max = self.limits.server_max_packet_size;
+        let res = match std::mem::replace(&mut rec.phase, PublishPhase::AwaitingPubComp) {
+            // The record's own copy is encoded and put back, not cloned. Any
+            // later re-send is a duplicate too, so DUP stays set.
+            PublishPhase::AwaitingAck(mut pub_pkt) => {
+                pub_pkt.dup = true;
+                let packet = Packet::Publish(*pub_pkt);
+                let res = self.out.push(&packet, self.ver, max);
+                let Packet::Publish(pub_pkt) = packet else {
+                    unreachable!()
+                };
+                rec.phase = PublishPhase::AwaitingAck(Box::new(pub_pkt));
+                res
+            }
+            PublishPhase::AwaitingPubComp => {
+                self.out
+                    .push(&Packet::PubRel(PubAck::new(id)), self.ver, max)
+            }
+        };
+        res.map(|_| ())
     }
 
     /// `true` if `id` is currently in use by any outstanding operation.
@@ -595,46 +628,12 @@ impl<B: Backend> Session<B> {
         }
     }
 
-    /// Encodes and sends a packet on the wire.
-    async fn send(&mut self, packet: &Packet) -> Result<()> {
-        self.write_buf.clear();
-        let payload = packet.encode_split(&mut self.write_buf, self.ver)?;
-        self.check_outbound_size(payload.as_ref().map_or(0, Bytes::len))?;
-        self.write_frame(payload).await
-    }
-
-    /// Refuses a frame larger than the server's advertised maximum packet
-    /// size. The header is already in `write_buf`; `payload_len` is the
-    /// separately held payload, if any.
-    fn check_outbound_size(&self, payload_len: usize) -> Result<()> {
-        if let Some(max) = self.limits.server_max_packet_size
-            && self.write_buf.len() + payload_len > max as usize
-        {
-            return Err(paho_mqtt_codec::Error::PacketTooLarge.into());
-        }
-        Ok(())
-    }
-
-    /// Writes the packet header in `write_buf`, followed by `payload` if
-    /// present, as one flushed frame.
-    ///
-    /// Small payloads are appended to the header so the frame goes out in a
-    /// single write; larger ones are written from their own buffer (via a
-    /// vectored write where the transport supports it) to avoid copying.
-    async fn write_frame(&mut self, payload: Option<Bytes>) -> Result<()> {
-        match payload {
-            Some(p) if p.len() > INLINE_PAYLOAD_MAX => {
-                B::write_frame(&mut self.writer, &self.write_buf, p).await?;
-            }
-            Some(p) => {
-                self.write_buf.extend_from_slice(&p);
-                B::write_all(&mut self.writer, &self.write_buf).await?;
-            }
-            None => B::write_all(&mut self.writer, &self.write_buf).await?,
-        }
-        B::flush(&mut self.writer).await?;
-        self.sent_packet = true;
-        Ok(())
+    /// Queues `packet` for the writer and returns the offset at which its
+    /// frame ends. Nothing is written until the handler returns to the run
+    /// loop. A packet over the server's maximum packet size is refused.
+    fn queue(&mut self, packet: &Packet) -> Result<u64> {
+        self.out
+            .push(packet, self.ver, self.limits.server_max_packet_size)
     }
 
     /// Brings the carried session state into line with what the server
@@ -655,7 +654,7 @@ impl<B: Backend> Session<B> {
     ///   reported instead.
     /// * **Inbound QoS 2** state is dropped: the server will not re-send the
     ///   PUBRELs those messages are waiting for.
-    async fn resume(&mut self, resumed: bool) -> Result<()> {
+    fn resume(&mut self, resumed: bool) -> Result<()> {
         if !resumed {
             self.discard_unresumable();
         }
@@ -664,7 +663,7 @@ impl<B: Backend> Session<B> {
         // respecting the in-flight window as new publishes do.
         for id in self.state.ids_in_order() {
             if self.inflight_slot_free() {
-                self.send_inflight(id).await?;
+                self.send_inflight(id)?;
             } else {
                 if let Some(rec) = self.state.inflight.get_mut(&id) {
                     rec.sent = false;
@@ -725,15 +724,16 @@ impl<B: Backend> Session<B> {
         let res = self.serve_inner(reader, cmd_rx, buf, resumed).await;
 
         // A v5 receiver that rejects a packet must say why before closing
-        // (§4.13). Best-effort: the connection may already be gone, and the
-        // original error is what the caller hears either way.
+        // (§4.13). Best-effort, and bounded: the connection may already be
+        // gone, and the original error is what the caller hears either way.
         if let Err(e) = &res
             && self.ver.is_v5()
             && let Some(rc) = disconnect_reason(e)
+            && self
+                .queue(&Packet::Disconnect(Disconnect::with_properties(rc, None)))
+                .is_ok()
         {
-            let _ = self
-                .send(&Packet::Disconnect(Disconnect::with_properties(rc, None)))
-                .await;
+            self.drain_outbox(reader, CLOSE_CAP).await;
         }
         res
     }
@@ -745,9 +745,13 @@ impl<B: Backend> Session<B> {
         buf: &mut VecDeque<Command>,
         resumed: bool,
     ) -> Result<()> {
-        self.resume(resumed).await?;
+        // Both only queue: the run loop's first pass writes the result. A
+        // long outage can leave a lot here, well past `HIGH_WATER`; the loop
+        // then takes no new commands until it has drained.
+        self.resume(resumed)?;
         while let Some(cmd) = buf.pop_front() {
-            self.handle_command(cmd).await?;
+            // Only publishes are ever buffered.
+            self.handle_command(cmd)?;
         }
         self.run(reader, cmd_rx).await
     }
@@ -785,18 +789,26 @@ impl<B: Backend> Session<B> {
     /// One read can carry any number of packets, and the first `read_buf` of
     /// a connection can arrive already full of them, so this is driven by
     /// what the buffer holds rather than by what a single read returned.
-    async fn handle_buffered(&mut self) -> Result<()> {
+    fn handle_buffered(&mut self) -> Result<()> {
         while let Some(raw) =
             RawPacket::decode_max(&mut self.read_buf, self.limits.max_packet_size)?
         {
             let packet = Packet::from_raw(raw, self.ver)?;
-            self.handle_packet(packet).await?;
+            self.handle_packet(packet)?;
         }
         Ok(())
     }
 
-    /// Main event loop: read from `reader`, dispatch commands from `cmd_rx`,
-    /// and service keep-alive until an error or clean disconnect.
+    /// Main event loop: write what the outbox holds, read from `reader`,
+    /// take commands from `cmd_rx`, and service keep-alive, until an error
+    /// or a clean disconnect.
+    ///
+    /// The `select!` is biased, in that order. The writer goes first, so a
+    /// packet queued on the last pass goes out on this one; it cannot starve
+    /// the others, since it is enabled only while there is something to write
+    /// or flush, one vectored write normally empties the outbox, and a full
+    /// socket makes it pend. Reads come before commands, so inbound ACKs,
+    /// which free in-flight slots, are seen before more work is accepted.
     async fn run(
         &mut self,
         reader: &mut B::Reader,
@@ -807,8 +819,8 @@ impl<B: Backend> Session<B> {
         // itself terminated, so `select!` skips that branch entirely.
         let ka_enabled = !keep_alive.is_zero();
 
-        // Resettable sleep: the deadline advances on every outbound packet so
-        // that PINGREQs are only sent when the connection has been truly idle.
+        // Resettable sleep: the deadline advances on every write, so that
+        // PINGREQs are only sent when the connection has been truly idle.
         let mut ka_sleep = if ka_enabled {
             B::Sleep::new(keep_alive)
         } else {
@@ -818,60 +830,64 @@ impl<B: Backend> Session<B> {
         // Packets the broker pipelined behind the CONNACK are in `read_buf`
         // already. Nothing further is owed on this connection, so waiting on
         // a read before handling them could wait indefinitely.
-        self.handle_buffered().await?;
+        self.handle_buffered()?;
 
         loop {
-            let ev = select! {
+            self.out.prepare_write();
+            let take_cmds = self.out.len() < HIGH_WATER;
+
+            let ev = select_biased! {
+                res = writer_step::<B>(&mut self.writer, &self.out).fuse() => {
+                    LoopEvent::Writer(res)
+                }
                 res = B::read_buf(reader, &mut self.read_buf).fuse() => LoopEvent::Read(res),
-                cmd = cmd_rx.recv().fuse() => LoopEvent::Command(cmd),
+                cmd = recv_when(take_cmds, cmd_rx).fuse() => LoopEvent::Command(cmd),
                 _ = ka_sleep => LoopEvent::KeepAlive,
             };
 
             match ev {
-                LoopEvent::Read(res) => {
-                    let n = res?;
-                    if n == 0 {
-                        return Err(Error::Disconnected);
-                    }
-                    self.handle_buffered().await?;
-                    if ka_enabled && self.sent_packet {
-                        self.sent_packet = false;
+                LoopEvent::Writer(res) => {
+                    if self.writer_done(res)? && ka_enabled {
                         ka_sleep.reset(keep_alive);
                     }
                 }
-                LoopEvent::Command(Err(_)) => return Ok(()),
-                LoopEvent::Command(Ok(Command::Disconnect {
-                    timeout,
-                    reason_code,
-                    props,
-                    tx,
-                    connected_flag,
-                })) => {
-                    // If requested, wait for in-flight ops to complete
-                    // before sending DISCONNECT.
-                    if !timeout.is_zero() && self.has_pending() {
-                        self.drain_pending(reader, timeout).await;
+                LoopEvent::Read(res) => {
+                    if res? == 0 {
+                        return Err(Error::Disconnected);
                     }
-                    let disc = Disconnect::with_properties(reason_code, props);
-                    let _ = self.send(&Packet::Disconnect(disc)).await;
-                    connected_flag.store(false, Ordering::SeqCst);
-                    tx.complete(Ok(()));
+                    self.handle_buffered()?;
+                }
+                // The API was dropped: send what is already queued, then stop.
+                LoopEvent::Command(Err(_)) => {
+                    self.drain_outbox(reader, CLOSE_CAP).await;
                     return Ok(());
                 }
                 LoopEvent::Command(Ok(cmd)) => {
-                    if self.handle_command(cmd).await? {
-                        return Ok(());
+                    // Take whatever else is already waiting, so it goes out
+                    // in the same write, but only up to a bound, so the
+                    // first packet is not held back for long.
+                    let mut flow = self.handle_command(cmd)?;
+                    let mut n = 1;
+                    while matches!(flow, Flow::Continue)
+                        && n < BATCH_CMDS
+                        && self.out.len() < BATCH_BYTES
+                    {
+                        let Ok(cmd) = cmd_rx.try_recv() else {
+                            break;
+                        };
+                        flow = self.handle_command(cmd)?;
+                        n += 1;
                     }
-                    if ka_enabled && self.sent_packet {
-                        self.sent_packet = false;
-                        ka_sleep.reset(keep_alive);
+                    if let Flow::Disconnect(req) = flow {
+                        self.disconnect(req, reader).await;
+                        return Ok(());
                     }
                 }
                 LoopEvent::KeepAlive => {
                     if self.ping_outstanding {
                         return Err(Error::Timeout);
                     }
-                    self.send(&Packet::PingReq).await?;
+                    self.queue(&Packet::PingReq)?;
                     self.ping_outstanding = true;
                     ka_sleep.reset(keep_alive);
                 }
@@ -879,41 +895,117 @@ impl<B: Backend> Session<B> {
         }
     }
 
-    /// Keeps servicing inbound packets until every pending operation has been
+    /// Applies the outcome of a [`writer_step`] to the outbox. Returns `true`
+    /// if bytes went out, which is what restarts the keep-alive interval.
+    fn writer_done(&mut self, res: io::Result<Step>) -> Result<bool> {
+        match res? {
+            Step::Wrote(0) => Err(io::Error::from(io::ErrorKind::WriteZero).into()),
+            Step::Wrote(n) => {
+                self.out.advance(n);
+                Ok(true)
+            }
+            Step::Flushed => {
+                self.out.flushed();
+                Ok(false)
+            }
+        }
+    }
+
+    /// Performs an orderly disconnect, then resolves its token.
+    ///
+    /// With a timeout, in-flight operations get up to that long to be
+    /// acknowledged first. The DISCONNECT then goes out behind everything
+    /// already queued, given up to [`CLOSE_CAP`] to be written.
+    async fn disconnect(&mut self, req: DisconnectReq, reader: &mut B::Reader) {
+        if !req.timeout.is_zero() && self.has_pending() {
+            self.drain_pending(reader, req.timeout).await;
+        }
+        let disc = Disconnect::with_properties(req.reason_code, req.props);
+        if self.queue(&Packet::Disconnect(disc)).is_ok() {
+            self.drain_outbox(reader, CLOSE_CAP).await;
+        }
+        req.connected_flag.store(false, Ordering::SeqCst);
+        req.tx.complete(Ok(()));
+    }
+
+    /// Writes and flushes what the outbox holds, for up to `cap`, as the
+    /// session ends. Best effort: a write error or the deadline just stops it.
+    ///
+    /// It keeps reading, since a peer that is itself blocked writing to us
+    /// could otherwise deadlock the two of us, but discards what it reads:
+    /// anything that came of handling it would be queued behind a DISCONNECT.
+    async fn drain_outbox(&mut self, reader: &mut B::Reader, cap: Duration) {
+        let mut deadline = B::Sleep::new(cap);
+        loop {
+            self.out.prepare_write();
+            if self.out.is_empty() && !self.out.needs_flush() {
+                return;
+            }
+            let ev = select_biased! {
+                res = writer_step::<B>(&mut self.writer, &self.out).fuse() => {
+                    LoopEvent::Writer(res)
+                }
+                res = B::read_buf(reader, &mut self.read_buf).fuse() => LoopEvent::Read(res),
+                _ = deadline => return,
+            };
+            match ev {
+                LoopEvent::Writer(res) => {
+                    if self.writer_done(res).is_err() {
+                        return;
+                    }
+                }
+                LoopEvent::Read(Ok(n)) if n > 0 => self.read_buf.clear(),
+                _ => return,
+            }
+        }
+    }
+
+    /// Keeps servicing the connection until every pending operation has been
     /// acknowledged or `timeout` elapses, whichever comes first.
     ///
     /// Used by an orderly disconnect so in-flight QoS 1/2 publishes and
-    /// (un)subscribes get their ACKs before DISCONNECT goes out.  A closed
-    /// connection, read error, or undecodable packet ends the drain early;
-    /// the caller sends DISCONNECT regardless.
+    /// (un)subscribes get their ACKs before DISCONNECT goes out. It writes
+    /// too: the packets awaiting those ACKs, and what handling them queues,
+    /// may not have gone out yet. A closed connection, I/O error, or
+    /// undecodable packet ends the drain early; the caller sends DISCONNECT
+    /// regardless.
     async fn drain_pending(&mut self, reader: &mut B::Reader, timeout: Duration) {
         let mut deadline = B::Sleep::new(timeout);
 
         while self.has_pending() {
-            let res = select! {
-                res = B::read_buf(reader, &mut self.read_buf).fuse() => res,
+            self.out.prepare_write();
+            let ev = select_biased! {
+                res = writer_step::<B>(&mut self.writer, &self.out).fuse() => {
+                    LoopEvent::Writer(res)
+                }
+                res = B::read_buf(reader, &mut self.read_buf).fuse() => LoopEvent::Read(res),
                 _ = deadline => return,
             };
-            match res {
-                Ok(0) | Err(_) => return,
-                Ok(_) => {
+            match ev {
+                LoopEvent::Writer(res) => {
+                    if self.writer_done(res).is_err() {
+                        return;
+                    }
+                }
+                LoopEvent::Read(Ok(n)) if n > 0 => {
                     while let Ok(Some(raw)) =
                         RawPacket::decode_max(&mut self.read_buf, self.limits.max_packet_size)
                     {
                         match Packet::from_raw(raw, self.ver) {
                             Ok(pkt) => {
-                                let _ = self.handle_packet(pkt).await;
+                                let _ = self.handle_packet(pkt);
                             }
                             Err(_) => return,
                         }
                     }
                 }
+                _ => return,
             }
         }
     }
 
-    /// Handles one inbound packet from the broker.
-    async fn handle_packet(&mut self, packet: Packet) -> Result<()> {
+    /// Handles one inbound packet from the broker. Any reply is queued.
+    fn handle_packet(&mut self, packet: Packet) -> Result<()> {
         match packet {
             // ---- Publish acknowledgements ----
             // A publish is one operation with one outcome: an error reason
@@ -926,7 +1018,7 @@ impl<B: Backend> Session<B> {
                     rec.tx
                         .complete(publish_outcome(ack.reason_code, ack.properties));
                 }
-                self.drain_deferred().await?;
+                self.drain_deferred()?;
             }
 
             // ---- QoS 2 outbound: PUBREC → send PUBREL ----
@@ -938,7 +1030,7 @@ impl<B: Backend> Session<B> {
                             .tx
                             .complete(Err(Error::ReasonCode(rec.reason_code, rec.properties)));
                     }
-                    self.drain_deferred().await?;
+                    self.drain_deferred()?;
                     return Ok(());
                 }
 
@@ -959,7 +1051,7 @@ impl<B: Backend> Session<B> {
                 {
                     self.persist_put(&format!("s{}", rec.packet_id), vec![&enc]);
                 }
-                self.send(&Packet::PubRel(rel)).await?;
+                self.queue(&Packet::PubRel(rel))?;
             }
 
             // ---- QoS 2 outbound: PUBCOMP → resolve token ----
@@ -969,7 +1061,7 @@ impl<B: Backend> Session<B> {
                     rec.tx
                         .complete(publish_outcome(comp.reason_code, comp.properties));
                 }
-                self.drain_deferred().await?;
+                self.drain_deferred()?;
             }
 
             // ---- Subscription acknowledgement ----
@@ -1007,14 +1099,14 @@ impl<B: Backend> Session<B> {
                 match pub_pkt.qos {
                     QoS::QoS0 => {
                         let msg = Message::from(pub_pkt);
-                        let _ = self.event_tx.send(Event::MessageArrived(msg)).await;
+                        self.deliver(Event::MessageArrived(msg));
                     }
                     QoS::QoS1 => {
                         let id = pub_pkt.packet_id.unwrap_or(0);
                         let msg = Message::from(pub_pkt);
-                        let _ = self.event_tx.send(Event::MessageArrived(msg)).await;
+                        self.deliver(Event::MessageArrived(msg));
                         let ack = PubAck::new(id);
-                        self.send(&Packet::PubAck(ack)).await?;
+                        self.queue(&Packet::PubAck(ack))?;
                     }
                     QoS::QoS2 => {
                         let id = pub_pkt.packet_id.unwrap_or(0);
@@ -1031,7 +1123,7 @@ impl<B: Backend> Session<B> {
                         let msg = Message::from(pub_pkt);
                         self.state.pending_pub2_in.insert(id, msg);
                         let rec = PubAck::new(id);
-                        self.send(&Packet::PubRec(rec)).await?;
+                        self.queue(&Packet::PubRec(rec))?;
                     }
                 }
             }
@@ -1040,10 +1132,10 @@ impl<B: Backend> Session<B> {
             Packet::PubRel(rel) => {
                 if let Some(msg) = self.state.pending_pub2_in.remove(&rel.packet_id) {
                     self.persist_remove(&format!("r{}", rel.packet_id));
-                    let _ = self.event_tx.send(Event::MessageArrived(msg)).await;
+                    self.deliver(Event::MessageArrived(msg));
                 }
                 let comp = PubAck::new(rel.packet_id);
-                self.send(&Packet::PubComp(comp)).await?;
+                self.queue(&Packet::PubComp(comp))?;
             }
 
             // ---- Enhanced authentication ----
@@ -1066,13 +1158,10 @@ impl<B: Backend> Session<B> {
             // As in the C library, this also fires ConnectionLost and
             // triggers auto-reconnect once the session loop unwinds.
             Packet::Disconnect(disc) => {
-                let _ = self
-                    .event_tx
-                    .send(Event::Disconnected {
-                        reason_code: disc.reason_code,
-                        props: disc.properties,
-                    })
-                    .await;
+                self.deliver(Event::Disconnected {
+                    reason_code: disc.reason_code,
+                    props: disc.properties,
+                });
                 return Err(Error::Disconnected);
             }
 
@@ -1081,11 +1170,21 @@ impl<B: Backend> Session<B> {
         Ok(())
     }
 
-    /// Handles one command from the public API.
+    /// Hands an event to the public layer.
     ///
-    /// `Command::Disconnect` is intercepted by `run()` before this is called
-    /// and should never reach here.
-    async fn handle_command(&mut self, cmd: Command) -> Result<bool> {
+    /// The event channel is unbounded, so this fails only once the API side
+    /// has gone, when there is no one left to tell.
+    fn deliver(&self, ev: Event) {
+        let _ = self.event_tx.try_send(ev);
+    }
+
+    /// Handles one command from the public API. Any packet it produces is
+    /// queued.
+    ///
+    /// `Command::Disconnect` needs to wait on the connection, which a
+    /// synchronous handler cannot, so it is handed back to the run loop as
+    /// [`Flow::Disconnect`].
+    fn handle_command(&mut self, cmd: Command) -> Result<Flow> {
         match cmd {
             Command::Connect { tx, .. } => {
                 // Already connected; reject duplicate connect.
@@ -1112,7 +1211,7 @@ impl<B: Backend> Session<B> {
                             props,
                             tx,
                         }));
-                    return Ok(false);
+                    return Ok(Flow::Continue);
                 }
 
                 // The server states the highest alias it will accept (0, the
@@ -1125,7 +1224,7 @@ impl<B: Backend> Session<B> {
                         ReasonCode::TopicAliasInvalid,
                         Properties::new(),
                     )));
-                    return Ok(false);
+                    return Ok(Flow::Continue);
                 }
 
                 let id = match qos {
@@ -1143,53 +1242,49 @@ impl<B: Backend> Session<B> {
                     properties: props,
                 };
 
-                // Kept so the message can be re-sent with DUP if the
-                // connection drops before it is acknowledged. The payload is
-                // reference-counted, so this copies only the topic and
-                // properties.
-                let retain_copy = (qos != QoS::QoS0).then(|| Box::new(pub_pkt.clone()));
                 let packet = Packet::Publish(pub_pkt);
 
-                // Encode once: the header lands in `write_buf` and the payload
-                // is shared by reference, so persisting and sending both use
-                // the same bytes without a second encode or a copy.
-                //
                 // A publish that cannot be encoded, or that exceeds the
                 // server's maximum packet size, is this publish's failure,
                 // not the connection's: fail its token and carry on.
-                self.write_buf.clear();
-                let payload = match packet.encode_split(&mut self.write_buf, self.ver) {
-                    Ok(p) => p,
+                let end = match self.queue(&packet) {
+                    Ok(end) => end,
                     Err(e) => {
-                        tx.complete(Err(e.into()));
-                        return Ok(false);
+                        tx.complete(Err(e));
+                        return Ok(Flow::Continue);
                     }
                 };
-                if let Err(e) = self.check_outbound_size(payload.as_ref().map_or(0, Bytes::len)) {
-                    tx.complete(Err(e));
-                    return Ok(false);
-                }
 
-                // Persist QoS 1/2 PUBLISH before sending so we can
-                // re-transmit after a crash.
+                // Persist a QoS 1/2 PUBLISH, exactly as queued, so it can be
+                // re-sent after a crash. Nothing queued is written before
+                // this handler returns, so it is stored before it is sent.
                 if let Some(pid) = id {
-                    let mut parts = vec![&self.write_buf[..]];
-                    if let Some(p) = &payload {
-                        parts.push(&p[..]);
+                    let [hdr, payload] = self.out.last_frame();
+                    let mut parts = vec![hdr];
+                    if !payload.is_empty() {
+                        parts.push(payload);
                     }
                     self.persist_put(&format!("s{pid}"), parts);
                 }
 
-                self.write_frame(payload).await?;
-
-                match (id, retain_copy) {
-                    // QoS 0 is complete the moment it is written.
-                    (_, None) => tx.complete(Ok(PublishResponse::default())),
-                    (Some(id), Some(pub_pkt)) => {
-                        self.state
-                            .insert(id, tx, PublishPhase::AwaitingAck(pub_pkt), true);
+                let Packet::Publish(pub_pkt) = packet else {
+                    unreachable!()
+                };
+                match id {
+                    // QoS 0 is complete once its bytes are written and flushed.
+                    None => self.out.complete_when_flushed(end, tx),
+                    // QoS 1/2 is held, so it can be re-sent with DUP if the
+                    // connection drops before it is acknowledged. It counts
+                    // as sent: if the session ends before the bytes leave,
+                    // re-sending it is what a resumed session does anyway.
+                    Some(id) => {
+                        self.state.insert(
+                            id,
+                            tx,
+                            PublishPhase::AwaitingAck(Box::new(pub_pkt)),
+                            true,
+                        );
                     }
-                    (None, Some(_)) => unreachable!("QoS 1/2 always has a packet ID"),
                 }
             }
 
@@ -1222,7 +1317,7 @@ impl<B: Backend> Session<B> {
                     subscriptions,
                     properties: props,
                 };
-                self.send(&Packet::Subscribe(sub)).await?;
+                self.queue(&Packet::Subscribe(sub))?;
                 self.pending_sub.insert(id, (tx, single));
             }
 
@@ -1238,15 +1333,90 @@ impl<B: Backend> Session<B> {
                     topic_filters: filters,
                     properties: props,
                 };
-                self.send(&Packet::Unsubscribe(unsub)).await?;
+                self.queue(&Packet::Unsubscribe(unsub))?;
                 self.pending_unsub.insert(id, (tx, single));
             }
 
-            // Intercepted in run() before this method is called.
-            Command::Disconnect { .. } => unreachable!(),
+            Command::Disconnect {
+                timeout,
+                reason_code,
+                props,
+                tx,
+                connected_flag,
+            } => {
+                return Ok(Flow::Disconnect(DisconnectReq {
+                    timeout,
+                    reason_code,
+                    props,
+                    tx,
+                    connected_flag,
+                }));
+            }
         }
-        Ok(false)
+        Ok(Flow::Continue)
     }
+}
+
+/////////////////////////////////////////////////////////////////////////////
+// Writing
+
+/// What one [`writer_step`] did.
+enum Step {
+    /// The transport accepted this many bytes.
+    Wrote(usize),
+    /// Everything written so far has been flushed.
+    Flushed,
+}
+
+/// Makes one write of the outbox's unwritten bytes or, once they are all
+/// written, one flush; pends forever when there is nothing to do.
+///
+/// Never both: if it flushed after writing and were cancelled during the
+/// flush, the count of bytes just written would be lost. On TCP a flush is a
+/// no-op that completes at once, so it costs one more pass of the loop, with
+/// no syscall and no wakeup.
+///
+/// Takes the writer and the outbox as separate borrows rather than the whole
+/// session, so that it can be polled in the same `select!` as a read.
+async fn writer_step<B: Backend>(writer: &mut B::Writer, out: &Outbox) -> io::Result<Step> {
+    if !out.is_empty() {
+        let mut iov = [IoSlice::new(&[]); MAX_IOV];
+        let n = out.io_slices(&mut iov);
+        B::write_vectored(writer, &iov[..n]).await.map(Step::Wrote)
+    } else if out.needs_flush() {
+        B::flush(writer).await.map(|()| Step::Flushed)
+    } else {
+        pending().await
+    }
+}
+
+/// Receives the next command, or pends forever when `enabled` is false.
+async fn recv_when(
+    enabled: bool,
+    rx: &async_channel::Receiver<Command>,
+) -> std::result::Result<Command, async_channel::RecvError> {
+    if enabled {
+        rx.recv().await
+    } else {
+        pending().await
+    }
+}
+
+/// What the run loop should do after a command.
+enum Flow {
+    Continue,
+    /// `disconnect()` was called; the run loop performs it, since it has to
+    /// wait on the connection.
+    Disconnect(DisconnectReq),
+}
+
+/// The parts of a [`Command::Disconnect`].
+struct DisconnectReq {
+    timeout: Duration,
+    reason_code: ReasonCode,
+    props: Properties,
+    tx: Completer<()>,
+    connected_flag: Arc<AtomicBool>,
 }
 
 /////////////////////////////////////////////////////////////////////////////
@@ -1744,77 +1914,232 @@ pub(crate) async fn run_event_loop<B: Backend>(
 
 #[cfg(test)]
 mod tests {
-    use std::task::Poll;
+    use std::{
+        pin::Pin,
+        task::{Context, Poll},
+        time::Instant,
+    };
+
+    use bytes::Bytes;
 
     use super::{super::ServerAddr, *};
     use crate::Token;
 
-    /// A timer that never fires. `never()` reports itself terminated, so
-    /// `select!` skips its branch; `new()` would hang, which no test here
-    /// reaches because every session is built with keep-alive disabled.
+    /// A timer on the wall clock. `never()` reports itself terminated, so
+    /// `select!` skips its branch. The tests poll by hand with a no-op
+    /// waker (see [`poll_until`]), so the timer need not wake anyone: it is
+    /// simply found ready on a later poll.
     struct MockSleep {
-        terminated: bool,
+        deadline: Option<Instant>,
     }
 
     impl Future for MockSleep {
         type Output = ();
-        fn poll(self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>) -> Poll<()> {
-            Poll::Pending
+        fn poll(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<()> {
+            match self.deadline {
+                Some(d) if Instant::now() >= d => {
+                    self.deadline = None;
+                    Poll::Ready(())
+                }
+                _ => Poll::Pending,
+            }
         }
     }
 
     impl futures::future::FusedFuture for MockSleep {
         fn is_terminated(&self) -> bool {
-            self.terminated
+            self.deadline.is_none()
         }
     }
 
     impl Sleep for MockSleep {
-        fn new(_: Duration) -> Self {
-            Self { terminated: false }
+        fn new(dur: Duration) -> Self {
+            Self {
+                deadline: Some(Instant::now() + dur),
+            }
         }
         fn never() -> Self {
-            Self { terminated: true }
+            Self { deadline: None }
         }
-        fn reset(&mut self, _: Duration) {}
+        fn reset(&mut self, dur: Duration) {
+            self.deadline = Some(Instant::now() + dur);
+        }
     }
 
-    /// A backend whose transport is already at end of file: every read
-    /// reports EOF, and writes are collected so a test can inspect them.
+    /// Inbound bytes for a [`MockBackend`] session: each chunk is one read.
+    /// Once they are gone, reads report EOF, or pend forever if `hold_open`.
+    #[derive(Default)]
+    struct MockReader {
+        chunks: VecDeque<Vec<u8>>,
+        hold_open: bool,
+    }
+
+    impl MockReader {
+        fn eof() -> Self {
+            Self::default()
+        }
+
+        fn open_with(chunks: impl IntoIterator<Item = Vec<u8>>) -> Self {
+            Self {
+                chunks: chunks.into_iter().collect(),
+                hold_open: true,
+            }
+        }
+    }
+
+    /// The transport a [`MockBackend`] session writes to, and how it
+    /// behaves. Shared, so a test can change it while the session runs.
+    #[derive(Default)]
+    struct MockWire {
+        /// Everything written, in order.
+        bytes: Vec<u8>,
+        /// Start address of every slice offered to a write.
+        slice_ptrs: Vec<usize>,
+        /// Most bytes accepted per write; 0 for no limit.
+        max_per_write: usize,
+        /// Every write pends this often (every n-th call); 0 for never.
+        pending_every: usize,
+        /// Writes pend forever, as on a socket whose peer reads nothing.
+        stalled: bool,
+        /// Flushes pend.
+        hold_flush: bool,
+        /// Writes fail once this many bytes have been accepted.
+        fail_after: Option<usize>,
+        write_calls: usize,
+        flushes: usize,
+    }
+
+    #[derive(Clone, Default)]
+    struct MockWriter(Arc<Mutex<MockWire>>);
+
+    impl MockWriter {
+        fn wire(&self) -> std::sync::MutexGuard<'_, MockWire> {
+            self.0.lock().unwrap()
+        }
+    }
+
+    /// Pends once, then completes.
+    struct YieldOnce(bool);
+
+    impl Future for YieldOnce {
+        type Output = ();
+        fn poll(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<()> {
+            if self.0 {
+                Poll::Ready(())
+            } else {
+                self.0 = true;
+                Poll::Pending
+            }
+        }
+    }
+
+    /// A backend over in-memory transport halves; see [`MockReader`] and
+    /// [`MockWire`].
     struct MockBackend;
 
     impl Backend for MockBackend {
-        type Reader = ();
-        type Writer = Vec<u8>;
+        type Reader = MockReader;
+        type Writer = MockWriter;
         type Sleep = MockSleep;
 
         async fn open(_: &ServerAddr, _: &ConnectParams) -> Result<(Self::Reader, Self::Writer)> {
             Err(Error::General("MockBackend opens no transports"))
         }
 
-        async fn read_buf(_: &mut Self::Reader, _: &mut BytesMut) -> io::Result<usize> {
-            Ok(0)
+        async fn read_buf(reader: &mut Self::Reader, buf: &mut BytesMut) -> io::Result<usize> {
+            match reader.chunks.pop_front() {
+                Some(chunk) => {
+                    buf.extend_from_slice(&chunk);
+                    Ok(chunk.len())
+                }
+                None if reader.hold_open => pending().await,
+                None => Ok(0),
+            }
         }
 
         async fn write_all(writer: &mut Self::Writer, data: &[u8]) -> io::Result<()> {
-            writer.extend_from_slice(data);
+            writer.wire().bytes.extend_from_slice(data);
             Ok(())
         }
 
-        async fn write_frame(
+        async fn write_vectored(
             writer: &mut Self::Writer,
-            header: &[u8],
-            payload: Bytes,
-        ) -> io::Result<()> {
-            writer.extend_from_slice(header);
-            writer.extend_from_slice(&payload);
-            Ok(())
+            bufs: &[IoSlice<'_>],
+        ) -> io::Result<usize> {
+            let (stalled, yield_now) = {
+                let mut w = writer.wire();
+                w.write_calls += 1;
+                (
+                    w.stalled,
+                    w.pending_every > 0 && w.write_calls % w.pending_every == 0,
+                )
+            };
+            if stalled {
+                return pending().await;
+            }
+            if yield_now {
+                YieldOnce(false).await;
+            }
+
+            let mut w = writer.wire();
+            let mut room = match w.max_per_write {
+                0 => usize::MAX,
+                n => n,
+            };
+            if let Some(limit) = w.fail_after {
+                if w.bytes.len() >= limit {
+                    return Err(io::ErrorKind::BrokenPipe.into());
+                }
+                room = room.min(limit - w.bytes.len());
+            }
+            let mut n = 0;
+            for b in bufs {
+                w.slice_ptrs.push(b.as_ptr() as usize);
+                let k = b.len().min(room - n);
+                w.bytes.extend_from_slice(&b[..k]);
+                n += k;
+                if n == room {
+                    break;
+                }
+            }
+            Ok(n)
         }
 
-        async fn flush(_: &mut Self::Writer) -> io::Result<()> {
-            Ok(())
+        /// Checks `hold_flush` on every poll, as a real transport's
+        /// `poll_flush` would find its buffer drained.
+        async fn flush(writer: &mut Self::Writer) -> io::Result<()> {
+            std::future::poll_fn(|_| {
+                let mut w = writer.wire();
+                if w.hold_flush {
+                    return Poll::Pending;
+                }
+                w.flushes += 1;
+                Poll::Ready(Ok(()))
+            })
+            .await
         }
     }
+
+    /// Polls `fut` with a no-op waker until it completes or `limit` passes,
+    /// yielding the thread between polls so wall-clock timers can expire.
+    /// Every mock future is either ready or, until a test changes something,
+    /// pending for good, so the polling loses no wakeups.
+    fn poll_until<F: Future>(mut fut: Pin<&mut F>, limit: Duration) -> Option<F::Output> {
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        let end = Instant::now() + limit;
+        loop {
+            if let Poll::Ready(v) = fut.as_mut().poll(&mut cx) {
+                return Some(v);
+            }
+            if Instant::now() >= end {
+                return None;
+            }
+            std::thread::yield_now();
+        }
+    }
+
+    /// Long enough for every ready step of a mock session to run.
+    const SETTLE: Duration = Duration::from_millis(50);
 
     fn test_limits() -> SessionLimits {
         SessionLimits {
@@ -1826,31 +2151,102 @@ mod tests {
         }
     }
 
-    /// Builds a session over [`MockBackend`] whose inbound buffer already
-    /// holds `read_buf`, as one carried over from the CONNACK read does.
-    fn session_with_buffered(
-        read_buf: BytesMut,
-    ) -> (
-        Session<MockBackend>,
-        async_channel::Receiver<Event>,
-        async_channel::Sender<Command>,
-        async_channel::Receiver<Command>,
-    ) {
+    /// A session over [`MockBackend`], with the far ends of its channels.
+    struct Harness {
+        session: Session<MockBackend>,
+        wire: MockWriter,
+        event_rx: async_channel::Receiver<Event>,
+        cmd_tx: async_channel::Sender<Command>,
+        cmd_rx: async_channel::Receiver<Command>,
+    }
+
+    fn harness(read_buf: BytesMut, keep_alive: Duration, state: SessionState) -> Harness {
         let (event_tx, event_rx) = async_channel::unbounded();
         let (cmd_tx, cmd_rx) = async_channel::unbounded();
+        let wire = MockWriter::default();
         let session = Session::<MockBackend>::new(
-            Vec::new(),
+            wire.clone(),
             read_buf,
             Negotiated {
                 ver: MqttVersion::V5,
-                keep_alive: Duration::ZERO, // off: MockSleep::never()
+                keep_alive,
                 limits: test_limits(),
             },
             event_tx,
             None,
-            SessionState::default(),
+            state,
         );
-        (session, event_rx, cmd_tx, cmd_rx)
+        Harness {
+            session,
+            wire,
+            event_rx,
+            cmd_tx,
+            cmd_rx,
+        }
+    }
+
+    /// Builds a session over [`MockBackend`] whose inbound buffer already
+    /// holds `read_buf`, as one carried over from the CONNACK read does.
+    fn session_with_buffered(read_buf: BytesMut) -> Harness {
+        harness(read_buf, Duration::ZERO, SessionState::default())
+    }
+
+    fn publish_cmd(topic: &str, qos: QoS, payload: Bytes) -> (Token<PublishResponse>, Command) {
+        let (tok, tx) = Token::new();
+        let cmd = Command::Publish {
+            topic: topic.into(),
+            payload,
+            qos,
+            retain: false,
+            props: Properties::new(),
+            tx,
+        };
+        (tok, cmd)
+    }
+
+    fn subscribe_cmd(filter: &str) -> (Token<SubscribeResponse>, Command) {
+        let (tok, tx) = Token::new();
+        let cmd = Command::Subscribe {
+            single: true,
+            filters: vec![(filter.into(), QoS::QoS1, Default::default())],
+            props: Properties::new(),
+            tx,
+        };
+        (tok, cmd)
+    }
+
+    fn disconnect_cmd() -> (Token<()>, Command) {
+        let (tok, tx) = Token::new();
+        let cmd = Command::Disconnect {
+            timeout: Duration::ZERO,
+            reason_code: ReasonCode::Success,
+            props: Properties::new(),
+            tx,
+            connected_flag: Arc::new(AtomicBool::new(true)),
+        };
+        (tok, cmd)
+    }
+
+    fn wire_publish(topic: &str, qos: QoS, id: Option<u16>, payload: &Bytes) -> Vec<u8> {
+        let mut buf = BytesMut::new();
+        Packet::Publish(paho_mqtt_codec::Publish {
+            dup: false,
+            qos,
+            retain: false,
+            topic: topic.into(),
+            packet_id: id,
+            payload: payload.clone(),
+            properties: Properties::new(),
+        })
+        .encode(&mut buf, MqttVersion::V5)
+        .unwrap();
+        buf.to_vec()
+    }
+
+    fn wire_packet(pkt: Packet) -> Vec<u8> {
+        let mut buf = BytesMut::new();
+        pkt.encode(&mut buf, MqttVersion::V5).unwrap();
+        buf.to_vec()
     }
 
     fn encoded_publish(topic: &str, qos: QoS, id: Option<u16>) -> BytesMut {
@@ -1874,10 +2270,14 @@ mod tests {
     /// at EOF, so a message left in the buffer would be lost outright.
     #[test]
     fn test_packets_pipelined_with_the_connack_are_delivered() {
-        let (mut session, event_rx, _cmd_tx, cmd_rx) =
-            session_with_buffered(encoded_publish("pipelined/qos0", QoS::QoS0, None));
+        let Harness {
+            mut session,
+            event_rx,
+            cmd_rx,
+            ..
+        } = session_with_buffered(encoded_publish("pipelined/qos0", QoS::QoS0, None));
 
-        let res = futures::executor::block_on(session.run(&mut (), &cmd_rx));
+        let res = futures::executor::block_on(session.run(&mut MockReader::eof(), &cmd_rx));
         assert!(
             matches!(res, Err(Error::Disconnected)),
             "the mock transport is at EOF: {res:?}"
@@ -1896,8 +2296,14 @@ mod tests {
         let mut buffered = encoded_publish("pipelined/a", QoS::QoS0, None);
         buffered.extend_from_slice(&encoded_publish("pipelined/b", QoS::QoS1, Some(7)));
 
-        let (mut session, event_rx, _cmd_tx, cmd_rx) = session_with_buffered(buffered);
-        let _ = futures::executor::block_on(session.run(&mut (), &cmd_rx));
+        let Harness {
+            mut session,
+            wire,
+            event_rx,
+            cmd_rx,
+            ..
+        } = session_with_buffered(buffered);
+        let _ = futures::executor::block_on(session.run(&mut MockReader::eof(), &cmd_rx));
 
         let topics: Vec<String> = std::iter::from_fn(|| event_rx.try_recv().ok())
             .filter_map(|ev| match ev {
@@ -1908,7 +2314,7 @@ mod tests {
         assert_eq!(topics, vec!["pipelined/a", "pipelined/b"]);
 
         // The QoS 1 message was acknowledged: PUBACK for packet ID 7.
-        assert_eq!(&session.writer[..], &[0x40, 0x02, 0x00, 0x07]);
+        assert_eq!(&wire.wire().bytes[..], &[0x40, 0x02, 0x00, 0x07]);
     }
     fn params(ver: MqttVersion, clean_start: bool) -> ConnectParams {
         ConnectParams {
@@ -1972,5 +2378,263 @@ mod tests {
             state.insert(id, comp, PublishPhase::AwaitingPubComp, true);
         }
         assert_eq!(state.ids_in_order(), vec![9, 3, 7]);
+    }
+
+    // ---- The write pipeline ----
+
+    /// Runs a session on `chunks` of inbound bytes, with `cmds` waiting in
+    /// the command channel, until it ends (the last command is normally a
+    /// disconnect). Returns what went out on the wire.
+    fn run_to_end(h: &mut Harness, chunks: Vec<Vec<u8>>, cmds: Vec<Command>) -> Vec<u8> {
+        for cmd in cmds {
+            h.cmd_tx.try_send(cmd).unwrap();
+        }
+        let mut reader = MockReader::open_with(chunks);
+        let run = pin!(h.session.run(&mut reader, &h.cmd_rx));
+        let res = poll_until(run, Duration::from_secs(5)).expect("session did not finish");
+        assert!(res.is_ok(), "{res:?}");
+        std::mem::take(&mut h.wire.wire().bytes)
+    }
+
+    /// Packets go out in the order they were queued, whether they came from
+    /// commands or from handling inbound packets. Reads are taken before
+    /// commands, so the PUBACK owed for the inbound message goes first.
+    fn check_queue_order(configure: impl FnOnce(&mut MockWire)) {
+        let mut h = session_with_buffered(BytesMut::new());
+        configure(&mut h.wire.wire());
+
+        let body = Bytes::from_static(b"payload");
+        let inbound = wire_publish("in", QoS::QoS1, Some(7), &body);
+        let (mut t0, c0) = publish_cmd("a", QoS::QoS0, body.clone());
+        let (_t1, c1) = subscribe_cmd("s/#");
+        let (_t2, c2) = publish_cmd("b", QoS::QoS1, body.clone());
+        let (mut td, cd) = disconnect_cmd();
+
+        let wire = run_to_end(&mut h, vec![inbound], vec![c0, c1, c2, cd]);
+
+        let mut expect = wire_packet(Packet::PubAck(PubAck::new(7)));
+        expect.extend(wire_publish("a", QoS::QoS0, None, &body));
+        expect.extend(wire_packet(Packet::Subscribe(Subscribe {
+            packet_id: 1,
+            subscriptions: vec![Subscription {
+                topic_filter: "s/#".into(),
+                qos: QoS::QoS1,
+                no_local: false,
+                retain_as_published: false,
+                retain_handling: CodecRetainHandling::SendOnSubscribe,
+            }],
+            properties: Properties::new(),
+        })));
+        expect.extend(wire_publish("b", QoS::QoS1, Some(2), &body));
+        expect.extend(wire_packet(Packet::Disconnect(
+            Disconnect::with_properties(ReasonCode::Success, Properties::new()),
+        )));
+        assert_eq!(wire, expect);
+
+        assert!(matches!(t0.try_wait(), Some(Ok(_))));
+        assert!(matches!(td.try_wait(), Some(Ok(()))));
+    }
+
+    #[test]
+    fn test_packets_reach_the_wire_in_queue_order() {
+        check_queue_order(|_| {});
+    }
+
+    /// The same, through a transport that takes 7 bytes per write and pends
+    /// on every third: every frame is reassembled exactly.
+    #[test]
+    fn test_partial_and_pending_writes_reassemble() {
+        check_queue_order(|w| {
+            w.max_per_write = 7;
+            w.pending_every = 3;
+        });
+    }
+
+    /// A QoS 0 publish completes once its bytes are written *and* flushed:
+    /// TLS and WebSocket transports hold written bytes until a flush.
+    #[test]
+    fn test_qos0_completes_only_once_flushed() {
+        let mut h = session_with_buffered(BytesMut::new());
+        h.wire.wire().hold_flush = true;
+
+        let (mut tok, cmd) = publish_cmd("q0", QoS::QoS0, Bytes::from_static(b"x"));
+        h.cmd_tx.try_send(cmd).unwrap();
+
+        let mut reader = MockReader::open_with([]);
+        {
+            let mut run = pin!(h.session.run(&mut reader, &h.cmd_rx));
+            assert!(poll_until(run.as_mut(), SETTLE).is_none());
+            assert!(!h.wire.wire().bytes.is_empty(), "the bytes were written");
+            assert!(tok.try_wait().is_none(), "but not flushed");
+
+            h.wire.wire().hold_flush = false;
+            assert!(poll_until(run.as_mut(), SETTLE).is_none());
+        }
+        assert!(matches!(tok.try_wait(), Some(Ok(_))));
+        assert!(h.wire.wire().flushes >= 1);
+    }
+
+    /// A write error ends the session. QoS 0 messages still queued fail with
+    /// `Disconnected`; a QoS 1 message stays in flight and is re-sent, with
+    /// DUP set, when the session resumes.
+    #[test]
+    fn test_write_error_fails_qos0_and_keeps_qos1() {
+        let body = Bytes::from_static(b"body");
+        let first = wire_publish("a", QoS::QoS0, None, &body);
+
+        let mut h = session_with_buffered(BytesMut::new());
+        // The first message gets out; the write after it fails.
+        h.wire.wire().fail_after = Some(first.len());
+        h.wire.wire().max_per_write = first.len();
+
+        let (mut t0, c0) = publish_cmd("a", QoS::QoS0, body.clone());
+        let (mut t1, c1) = publish_cmd("b", QoS::QoS1, body.clone());
+        let (mut t2, c2) = publish_cmd("c", QoS::QoS0, body.clone());
+        for c in [c0, c1, c2] {
+            h.cmd_tx.try_send(c).unwrap();
+        }
+
+        let mut reader = MockReader::open_with([]);
+        let res = {
+            let run = pin!(h.session.run(&mut reader, &h.cmd_rx));
+            poll_until(run, Duration::from_secs(5)).expect("session did not end")
+        };
+        assert!(matches!(res, Err(Error::Io(_))), "{res:?}");
+
+        // The session is torn down; its state carries on.
+        let Harness { mut session, .. } = h;
+        let state = std::mem::take(&mut session.state);
+        drop(session);
+        // "a" was written but never flushed, so it is not known to be out.
+        assert!(matches!(t0.try_wait(), Some(Err(Error::Disconnected))));
+        assert!(matches!(t2.try_wait(), Some(Err(Error::Disconnected))));
+        assert!(t1.try_wait().is_none(), "QoS 1 is still in flight");
+
+        let mut h = harness(BytesMut::new(), Duration::ZERO, state);
+        h.session.resume(true).unwrap();
+        let (_td, cd) = disconnect_cmd();
+        let wire = run_to_end(&mut h, vec![], vec![cd]);
+
+        let mut dup = wire_publish("b", QoS::QoS1, Some(1), &body);
+        dup[0] |= 0x08;
+        assert!(wire.starts_with(&dup), "re-sent with DUP: {wire:02x?}");
+    }
+
+    /// A write that cannot complete does not stop reads.
+    #[test]
+    fn test_reads_continue_while_writer_blocked() {
+        let mut h = session_with_buffered(BytesMut::new());
+        h.wire.wire().stalled = true;
+
+        let (_tok, cmd) = publish_cmd("out", QoS::QoS0, Bytes::from_static(b"x"));
+        h.cmd_tx.try_send(cmd).unwrap();
+        let inbound = wire_publish("in", QoS::QoS0, None, &Bytes::from_static(b"y"));
+
+        let mut reader = MockReader::open_with([inbound]);
+        let run = pin!(h.session.run(&mut reader, &h.cmd_rx));
+        assert!(poll_until(run, SETTLE).is_none());
+
+        match h.event_rx.try_recv() {
+            Ok(Event::MessageArrived(msg)) => assert_eq!(msg.topic, "in"),
+            _ => panic!("the inbound message was not delivered"),
+        }
+    }
+
+    /// With a stalled writer, the loop stops taking commands once
+    /// `HIGH_WATER` bytes are queued; the rest wait in the channel.
+    #[test]
+    fn test_high_water_leaves_commands_in_channel() {
+        let mut h = session_with_buffered(BytesMut::new());
+        h.wire.wire().stalled = true;
+
+        let body = Bytes::from(vec![0u8; 16 * 1024]);
+        let n = 2 * HIGH_WATER / body.len();
+        let mut toks = Vec::new();
+        for i in 0..n {
+            let (tok, cmd) = publish_cmd(&format!("t/{i}"), QoS::QoS0, body.clone());
+            toks.push(tok);
+            h.cmd_tx.try_send(cmd).unwrap();
+        }
+
+        let mut reader = MockReader::open_with([]);
+        {
+            let run = pin!(h.session.run(&mut reader, &h.cmd_rx));
+            assert!(poll_until(run, SETTLE).is_none());
+        }
+        let queued = h.session.out.len();
+        assert!(queued >= HIGH_WATER, "{queued}");
+        assert!(
+            queued < HIGH_WATER + BATCH_BYTES + 2 * body.len(),
+            "{queued}"
+        );
+        assert!(!h.cmd_rx.is_empty(), "commands were left in the channel");
+    }
+
+    /// A disconnect writes everything queued before it, then the DISCONNECT,
+    /// before its token resolves.
+    #[test]
+    fn test_disconnect_drains_outbox_first() {
+        let mut h = session_with_buffered(BytesMut::new());
+        h.wire.wire().max_per_write = 5;
+
+        let body = Bytes::from(vec![1u8; 100]);
+        let (_t0, c0) = publish_cmd("a", QoS::QoS0, body.clone());
+        let (mut td, cd) = disconnect_cmd();
+        let wire = run_to_end(&mut h, vec![], vec![c0, cd]);
+
+        let mut expect = wire_publish("a", QoS::QoS0, None, &body);
+        expect.extend(wire_packet(Packet::Disconnect(Disconnect::new())));
+        assert_eq!(wire, expect);
+        assert!(matches!(td.try_wait(), Some(Ok(()))));
+    }
+
+    /// A transport that never takes the DISCONNECT does not hang the
+    /// disconnect: it gives up after `CLOSE_CAP`.
+    #[test]
+    fn test_disconnect_bounded_when_writer_stalls() {
+        let mut h = session_with_buffered(BytesMut::new());
+        h.wire.wire().stalled = true;
+
+        let (mut td, cd) = disconnect_cmd();
+        h.cmd_tx.try_send(cd).unwrap();
+
+        let start = Instant::now();
+        let mut reader = MockReader::open_with([]);
+        let res = {
+            let run = pin!(h.session.run(&mut reader, &h.cmd_rx));
+            poll_until(run, CLOSE_CAP * 3).expect("disconnect hung")
+        };
+        assert!(res.is_ok());
+        assert!(start.elapsed() >= CLOSE_CAP);
+        assert!(matches!(td.try_wait(), Some(Ok(()))));
+    }
+
+    /// A large payload is written from the caller's buffer, not copied.
+    #[test]
+    fn test_large_payload_written_by_reference() {
+        let mut h = session_with_buffered(BytesMut::new());
+        let body = Bytes::from(vec![5u8; crate::runtime::outbox::INLINE_PAYLOAD_MAX + 1]);
+        let (_t0, c0) = publish_cmd("big", QoS::QoS0, body.clone());
+        let (_td, cd) = disconnect_cmd();
+        run_to_end(&mut h, vec![], vec![c0, cd]);
+        assert!(h.wire.wire().slice_ptrs.contains(&(body.as_ptr() as usize)));
+    }
+
+    /// On an idle connection a PINGREQ goes out after the keep-alive
+    /// interval, and a missing PINGRESP ends the session.
+    #[test]
+    fn test_keep_alive_ping_and_timeout() {
+        let ka = Duration::from_millis(30);
+        let mut h = harness(BytesMut::new(), ka, SessionState::default());
+        let mut reader = MockReader::open_with([]);
+
+        let start = Instant::now();
+        let res = {
+            let run = pin!(h.session.run(&mut reader, &h.cmd_rx));
+            poll_until(run, Duration::from_secs(5)).expect("no keep-alive timeout")
+        };
+        assert!(matches!(res, Err(Error::Timeout)), "{res:?}");
+        assert!(start.elapsed() >= 2 * ka);
+        assert_eq!(h.wire.wire().bytes, wire_packet(Packet::PingReq));
     }
 }

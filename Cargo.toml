@@ -1,6 +1,6 @@
 [workspace]
 members = ["paho-mqtt-codec"]
-exclude = ["paho-mqtt-codec/fuzz"]
+exclude = ["paho-mqtt-codec/fuzz", "bench/mqttbench"]
 resolver = "2"
 
 [package]

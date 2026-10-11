@@ -24,13 +24,16 @@
 //! [`Backend`].  A backend is a zero-sized marker type that names the
 //! runtime's split transport halves and timer, and supplies the handful of
 //! I/O operations the session performs: open a transport for a
-//! [`ServerAddr`], read into a `BytesMut`, write a frame, flush, and sleep.
+//! [`ServerAddr`], read into a `BytesMut`, write, flush, and sleep.
 //! Every future a backend returns must be `Send` so the event loop can run
 //! on a multi-threaded executor.
 
-use std::{io, time::Duration};
+use std::{
+    io::{self, IoSlice},
+    time::Duration,
+};
 
-use bytes::{Bytes, BytesMut};
+use bytes::BytesMut;
 use futures::future::FusedFuture;
 
 use super::commands::{ConnectParams, ServerAddr};
@@ -86,19 +89,29 @@ pub(crate) trait Backend: 'static {
     ) -> impl Future<Output = io::Result<usize>> + Send;
 
     /// Writes all of `data`.
+    ///
+    /// Used only for the CONNECT exchange, before the session's run loop
+    /// takes over the writer.
     fn write_all(
         writer: &mut Self::Writer,
         data: &[u8],
     ) -> impl Future<Output = io::Result<()>> + Send;
 
-    /// Writes `header` followed by `payload` as one frame, without copying
-    /// the payload into the header buffer (vectored where the runtime allows).
-    fn write_frame(
+    /// Makes one attempt to write `bufs`, in order, and returns the number
+    /// of bytes the transport accepted, which may be fewer than offered.
+    ///
+    /// Must be cancel-safe: if the future is dropped before completion,
+    /// nothing was written. The run loop polls it as one branch of a
+    /// `select!` and drops it whenever another branch wins.
+    fn write_vectored(
         writer: &mut Self::Writer,
-        header: &[u8],
-        payload: Bytes,
-    ) -> impl Future<Output = io::Result<()>> + Send;
+        bufs: &[IoSlice<'_>],
+    ) -> impl Future<Output = io::Result<usize>> + Send;
 
-    /// Flushes any buffered output to the transport.
+    /// Flushes any output the transport has buffered internally, such as a
+    /// TLS record or a WebSocket frame.
+    ///
+    /// Must be cancel-safe: a flush dropped before completion may simply be
+    /// started again.
     fn flush(writer: &mut Self::Writer) -> impl Future<Output = io::Result<()>> + Send;
 }

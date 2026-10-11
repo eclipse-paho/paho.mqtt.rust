@@ -29,16 +29,19 @@
 
 use std::{
     future::Future,
-    io,
+    io::{self, IoSlice},
     pin::Pin,
     sync::{Arc, OnceLock},
     task::{Context, Poll},
     time::Duration,
 };
 
-use bytes::{Bytes, BytesMut};
-use futures::future::FusedFuture;
-use smol::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf, split};
+use bytes::BytesMut;
+use futures::{
+    future::FusedFuture,
+    io::{ReadHalf, WriteHalf},
+};
+use smol::io::{AsyncReadExt, AsyncWriteExt};
 #[cfg(any(feature = "smol-tls", feature = "smol-websocket"))]
 use smol::net::TcpStream;
 
@@ -334,7 +337,10 @@ impl Backend for SmolBackend {
                 ));
             }
         };
-        Ok(split(conn))
+        // Split with `futures::io` rather than `smol::io`: the latter's write
+        // half does not forward `poll_write_vectored`, so every vectored
+        // write would send only its first slice.
+        Ok(futures::io::AsyncReadExt::split(conn))
     }
 
     /// `futures::io::AsyncRead` only reads into an initialised slice, so
@@ -351,14 +357,9 @@ impl Backend for SmolBackend {
         writer.write_all(data).await
     }
 
-    /// No vectored `write_all` in `futures::io`; two writes, one flush.
-    async fn write_frame(
-        writer: &mut Self::Writer,
-        header: &[u8],
-        payload: Bytes,
-    ) -> io::Result<()> {
-        writer.write_all(header).await?;
-        writer.write_all(&payload).await
+    /// One `poll_write_vectored`, so cancel-safe.
+    async fn write_vectored(writer: &mut Self::Writer, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
+        writer.write_vectored(bufs).await
     }
 
     async fn flush(writer: &mut Self::Writer) -> io::Result<()> {

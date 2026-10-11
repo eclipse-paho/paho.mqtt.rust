@@ -26,14 +26,14 @@
 
 use std::{
     future::Future,
-    io,
+    io::{self, IoSlice},
     pin::Pin,
     sync::{Arc, Mutex, Weak},
     task::{Context, Poll},
     time::Duration,
 };
 
-use bytes::{Buf, Bytes, BytesMut};
+use bytes::BytesMut;
 use futures::future::FusedFuture;
 #[cfg(any(feature = "tls", feature = "openssl", feature = "websocket"))]
 use tokio::net::TcpStream;
@@ -372,14 +372,9 @@ impl Backend for TokioBackend {
         writer.write_all(data).await
     }
 
-    /// Chains the two buffers and lets `write_all_buf` issue vectored writes.
-    async fn write_frame(
-        writer: &mut Self::Writer,
-        header: &[u8],
-        payload: Bytes,
-    ) -> io::Result<()> {
-        let mut frame = Buf::chain(header, payload);
-        writer.write_all_buf(&mut frame).await
+    /// One `poll_write_vectored`, which tokio documents as cancel-safe.
+    async fn write_vectored(writer: &mut Self::Writer, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
+        writer.write_vectored(bufs).await
     }
 
     async fn flush(writer: &mut Self::Writer) -> io::Result<()> {

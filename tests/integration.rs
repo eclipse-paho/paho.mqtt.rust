@@ -268,6 +268,204 @@ fn subscribe_and_receive_large(qos: mqtt::QoS) {
     sub.disconnect(None).wait().ok();
 }
 
+/////////////////////////////////////////////////////////////////////////////
+// Bulk publishing
+//
+// Publishes queued faster than the socket takes them go out together, many
+// MQTT packets per write (and, over WebSocket, per frame). These check that
+// every one of them arrives intact and in order.
+/////////////////////////////////////////////////////////////////////////////
+
+const BULK_N: usize = 100_000;
+
+/// Publishes `BULK_N` numbered QoS 0 messages without waiting, then one
+/// QoS 1 message, whose PUBACK means the broker has read everything before
+/// it. Returns once that has been acknowledged.
+fn publish_bulk(cli: &mqtt::AsyncClient, topic: &str) {
+    let mut last = None;
+    for i in 0..BULK_N {
+        let payload = (i as u32).to_be_bytes().to_vec();
+        last = Some(cli.publish(mqtt::Message::new(topic, payload, mqtt::QOS_0)));
+    }
+    last.unwrap()
+        .wait_for(Duration::from_secs(30))
+        .expect("last QoS 0 publish failed");
+    cli.publish(mqtt::Message::new(topic, "end", mqtt::QOS_1))
+        .wait_for(Duration::from_secs(30))
+        .expect("fence publish failed");
+}
+
+/// Publishes in bulk through a broker at `uri` and checks what a subscriber
+/// receives: every message, in order, then the fence. With `lossy`, the
+/// broker may drop messages, the fence included, but those that arrive must
+/// be intact and in order.
+fn bulk_through_broker(
+    uri: &str,
+    opts: impl Fn() -> mqtt::ConnectOptions,
+    topic: &str,
+    lossy: bool,
+) {
+    let sub = mqtt::AsyncClient::new(uri).unwrap();
+    sub.connect(opts()).wait().expect("sub connect failed");
+    let rx = sub.start_consuming();
+    sub.subscribe(topic, mqtt::QOS_1)
+        .wait()
+        .expect("subscribe failed");
+
+    let pub_cli = mqtt::AsyncClient::new(uri).unwrap();
+    pub_cli.connect(opts()).wait().expect("pub connect failed");
+    publish_bulk(&pub_cli, topic);
+
+    // A lossy broker may drop the fence too: then the stream just goes quiet.
+    let quiet = Duration::from_secs(if lossy { 2 } else { 30 });
+    let mut next = 0u32;
+    loop {
+        let msg = match rx.recv_timeout(quiet) {
+            Ok(msg) => msg.expect("connection lost"),
+            Err(_) if lossy && next > 0 => break,
+            Err(e) => panic!("recv timed out: {e:?}"),
+        };
+        if msg.payload() == b"end" {
+            break;
+        }
+        let n = u32::from_be_bytes(msg.payload().try_into().expect("bad payload"));
+        if lossy {
+            assert!(n >= next, "message {n} after {}", next - 1);
+        } else {
+            assert_eq!(n, next, "message out of sequence");
+        }
+        next = n + 1;
+    }
+    if !lossy {
+        assert_eq!(next as usize, BULK_N);
+    }
+
+    pub_cli.disconnect(None).wait().ok();
+    sub.disconnect(None).wait().ok();
+}
+
+/// Checks that a scripted broker received everything [`publish_bulk`] sent,
+/// in order.
+fn check_bulk_received(broker: &common::ScriptedBroker) {
+    use mqtt::paho_mqtt_codec::Packet;
+
+    let payloads = broker.received_matching(|p| match p {
+        Packet::Publish(p) => Some(p.payload.clone()),
+        _ => None,
+    });
+    assert_eq!(payloads.len(), BULK_N + 1);
+    for (i, p) in payloads[..BULK_N].iter().enumerate() {
+        assert_eq!(&p[..], (i as u32).to_be_bytes(), "message {i}");
+    }
+    assert_eq!(&payloads[BULK_N][..], b"end");
+}
+
+/// A broker that just acknowledges, for the bulk tests that check every
+/// packet arrives.
+fn acking_handler(pkt: &mqtt::paho_mqtt_codec::Packet) -> Vec<mqtt::paho_mqtt_codec::Packet> {
+    use mqtt::paho_mqtt_codec::{ConnAck, Packet, PubAck, ReasonCode};
+    match pkt {
+        Packet::Connect(_) => vec![Packet::ConnAck(ConnAck::new(false, ReasonCode::Success))],
+        Packet::Publish(p) => match p.packet_id {
+            Some(id) => vec![Packet::PubAck(PubAck::new(id))],
+            None => vec![],
+        },
+        _ => vec![],
+    }
+}
+
+#[test]
+fn test_bulk_qos0_publish() {
+    let broker = common::spawn_broker(acking_handler);
+    let cli = mqtt::AsyncClient::new(broker.uri.clone()).unwrap();
+    cli.connect(None).wait().expect("connect failed");
+    publish_bulk(&cli, topic!("bulk/tcp"));
+    check_bulk_received(&broker);
+    cli.disconnect(None).wait().ok();
+    broker.join();
+}
+
+/// The same through mosquitto, to a subscriber. mosquitto 2.0 drops QoS 0
+/// messages it cannot queue for a subscriber fast enough, which a burst
+/// like this (or other tests running alongside) can cause, so only order and
+/// integrity are checked.
+#[test]
+fn test_bulk_qos0_publish_through_broker() {
+    bulk_through_broker(HOST, mqtt::ConnectOptions::new, topic!("bulk/tcp"), true);
+}
+
+/// One WebSocket frame now carries several MQTT packets, which MQTT allows
+/// (§6); this checks mosquitto agrees. It takes a whole frame at once, up to
+/// some 1,700 of these messages, and drops QoS 0 it cannot queue for the
+/// subscriber, so as above only order and integrity are checked;
+/// `test_wss_bulk_qos0_publish` checks that every packet arrives.
+#[cfg(any(feature = "websocket", feature = "smol-websocket"))]
+#[test]
+fn test_ws_bulk_qos0_publish() {
+    bulk_through_broker(
+        WS_HOST,
+        mqtt::ConnectOptions::new_ws,
+        topic!("bulk/ws"),
+        true,
+    );
+}
+
+/// TLS holds written bytes until a flush; every message must still arrive.
+#[cfg(any(feature = "tls", feature = "smol-tls", feature = "openssl"))]
+#[test]
+fn test_tls_bulk_qos0_publish() {
+    let certs = common::TestCerts::new("broker.invalid");
+    let broker = common::spawn_tls_broker(&certs, acking_handler);
+
+    let tls = mqtt::TlsOptionsBuilder::new()
+        .trust_store(certs.ca_path())
+        .verify(false) // the certificate names broker.invalid, we dial 127.0.0.1
+        .finalize();
+    let opts = mqtt::ConnectOptionsBuilder::new()
+        .tls_options(tls)
+        .connect_timeout(Duration::from_secs(5))
+        .finalize();
+
+    let cli = mqtt::AsyncClient::new(broker.uri.clone()).unwrap();
+    cli.connect(opts)
+        .wait_for(Duration::from_secs(10))
+        .expect("tls connect failed");
+    publish_bulk(&cli, topic!("bulk/tls"));
+
+    check_bulk_received(&broker);
+
+    cli.disconnect(None).wait().ok();
+    broker.join();
+}
+
+/// Many MQTT packets per WebSocket frame, decoded by a broker that checks
+/// every one arrives.
+#[cfg(all(feature = "tls", feature = "websocket"))]
+#[test]
+fn test_wss_bulk_qos0_publish() {
+    let certs = common::TestCerts::new("broker.invalid");
+    let (broker, uri) = common::spawn_wss_broker(&certs, acking_handler);
+
+    let tls = mqtt::TlsOptionsBuilder::new()
+        .trust_store(certs.ca_path())
+        .verify(false) // the certificate names broker.invalid, we dial 127.0.0.1
+        .finalize();
+    let opts = mqtt::ConnectOptionsBuilder::new_ws()
+        .tls_options(tls)
+        .connect_timeout(Duration::from_secs(5))
+        .finalize();
+
+    let cli = mqtt::AsyncClient::new(uri).unwrap();
+    cli.connect(opts)
+        .wait_for(Duration::from_secs(10))
+        .expect("wss connect failed");
+    publish_bulk(&cli, topic!("bulk/wss"));
+    check_bulk_received(&broker);
+
+    cli.disconnect(None).wait().ok();
+    broker.join();
+}
+
 #[test]
 fn test_subscribe_receive_large_qos0() {
     subscribe_and_receive_large(mqtt::QoS::QoS0);
@@ -2070,7 +2268,10 @@ fn test_persisted_messages_restored_on_connect() {
     assert_eq!(publishes[0].packet_id, Some(4));
 
     // Both complete, so the store empties.
-    std::thread::sleep(Duration::from_millis(200));
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !store.keys().is_empty() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
     assert!(store.keys().is_empty(), "left {:?}", store.keys());
 
     cli.disconnect(None).wait().ok();
