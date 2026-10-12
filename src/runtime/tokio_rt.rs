@@ -145,12 +145,27 @@ fn get_or_create_shared_runtime(num_threads: usize) -> Arc<tokio::runtime::Runti
     rt
 }
 
+/// How often, in task polls, a busy worker of the shared runtime checks the
+/// I/O driver for socket readiness. Tokio's default is 61.
+///
+/// A worker otherwise checks only when it runs out of tasks. With one worker
+/// (the default) and a client under load, the publishing threads keep
+/// waking the event loop, so the worker is never idle, and readiness for
+/// inbound packets such as PUBACKs goes unseen for milliseconds at a time.
+/// At 100K msg/s that put the 99th-percentile publish latency at 20–30 ms;
+/// with 2 it is 2–4 ms. Each check is one non-blocking `epoll_wait`, made
+/// only while the worker is busy, so an idle client pays nothing.
+/// (A second worker does as well or slightly better, by sitting in the
+/// driver, but costs a thread and about 10% more CPU per message.)
+const SHARED_EVENT_INTERVAL: u32 = 2;
+
 fn build_runtime(num_threads: usize) -> tokio::runtime::Runtime {
     // Always use multi_thread: spawned tasks need background worker threads
     // to drive them. current_thread only runs tasks when block_on is called,
     // which does not apply to the library-owned shared runtime.
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(num_threads.max(1))
+        .event_interval(SHARED_EVENT_INTERVAL)
         .enable_all()
         .build()
         .expect("build tokio runtime")

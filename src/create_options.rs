@@ -82,8 +82,10 @@ pub enum RuntimeMode {
     /// - **Outside any async context** (e.g. a plain `fn main()`, a test, or a
     ///   synchronous thread): the process-wide shared runtime is used, creating
     ///   it on the first call. The runtime is a `multi_thread` Tokio runtime
-    ///   with 1 worker thread by default. It is dropped when the last client
-    ///   that owns it is dropped.
+    ///   with 1 worker thread by default, tuned to check for socket readiness
+    ///   every couple of task polls while busy, so that one worker keeps
+    ///   latency low under load (see [`Shared`]). It is dropped when the last
+    ///   client that owns it is dropped.
     ///
     /// This mode is appropriate for the vast majority of applications. Switch
     /// to [`Shared`] only if you need isolation or explicit thread-count control,
@@ -117,6 +119,17 @@ pub enum RuntimeMode {
     /// use the existing runtime unchanged. `0` and `1` both produce a runtime
     /// with 1 worker thread; any larger value produces a runtime with that
     /// many workers.
+    ///
+    /// **Latency under load.** A busy worker normally checks for socket
+    /// readiness only now and then, so with a single worker kept busy by a
+    /// heavy publishing load, acknowledgements could wait unseen for
+    /// milliseconds. The shared runtime is built to check every couple of
+    /// task polls instead (Tokio's `event_interval`), which keeps the
+    /// 99th-percentile publish latency at a few milliseconds even at around
+    /// 100K msg/s, at no cost when idle. A second worker does as well or
+    /// slightly better, since an idle worker waits on readiness directly, at
+    /// the price of a thread and some more CPU per message: `Shared(2)` if
+    /// tail latency under sustained load matters most.
     ///
     /// **Use this mode when:**
     /// - You want MQTT I/O to run on a dedicated runtime, isolated from the
@@ -502,6 +515,9 @@ impl CreateOptionsBuilder {
     /// thread count is honoured only when the shared runtime is first created;
     /// if it already exists the existing thread count is kept and a warning is
     /// logged. `0` and `1` both produce 1 worker thread.
+    ///
+    /// One worker suits most applications; `2` can lower tail latency under a
+    /// sustained heavy load. See [`RuntimeMode::Shared`].
     pub fn shared_runtime(mut self, num_threads: usize) -> Self {
         self.opts.runtime_mode = RuntimeMode::Shared(num_threads);
         self

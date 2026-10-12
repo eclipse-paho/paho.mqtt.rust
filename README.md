@@ -146,7 +146,7 @@ When both `tokio` and `smol` are enabled, tokio takes precedence. OpenSSL is tok
 The library runs the MQTT protocol on an internal async task, and `CreateOptions::runtime_mode` decides where that task lives:
 
 - **`Auto`** *(default)* — inside an async context, borrow the caller's runtime; outside one, use a process-wide runtime the library creates and shares.
-- **`Shared(n)`** — always the library's own runtime, with `n` worker threads.
+- **`Shared(n)`** — always the library's own runtime, with `n` worker threads. One worker suits most applications; two can lower tail latency under a sustained heavy publishing load, at the cost of a thread and some CPU.
 - **`ApplicationRuntime`** — borrow the caller's runtime, and fail loudly if there is none. (Tokio only; smol has no ambient executor to borrow.)
 
 No public API takes or returns an `async fn`, and tokens are plain futures, so the crate works with any executor regardless of which backend drives its I/O.
