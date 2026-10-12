@@ -44,6 +44,7 @@ use std::{
         Arc, Mutex, RwLock,
         atomic::{AtomicBool, Ordering},
     },
+    task::Poll,
     time::Duration,
 };
 
@@ -58,8 +59,8 @@ use paho_mqtt_codec::{
 use super::{
     backend::{Backend, Sleep},
     commands::{
-        BufConfig, Command, ConnectParams, Event, SessionLimits, assigned_client_id,
-        negotiated_keep_alive,
+        BufConfig, Command, ConnectParams, Event, MAX_PACKET_IDS, SessionLimits,
+        assigned_client_id, negotiated_keep_alive,
     },
     outbox::Outbox,
 };
@@ -287,9 +288,11 @@ fn load_persisted(
     }
 }
 
-/// A publish waiting for a slot in the in-flight window.
+/// An operation waiting for a slot in the in-flight window, or for a free
+/// packet identifier.
 enum Deferred {
-    /// A `Command::Publish` from the API, not yet assigned a packet ID.
+    /// A QoS 1/2 `Command::Publish`, `Subscribe` or `Unsubscribe` from the
+    /// API, not yet assigned a packet ID.
     Command(Command),
     /// An established in-flight message, awaiting (re-)transmission under the
     /// identifier it already holds in [`SessionState::inflight`].
@@ -347,7 +350,13 @@ impl InflightPublish {
 #[derive(Default)]
 struct SessionState {
     /// Outbound QoS 1/2 publishes awaiting acknowledgement, by packet ID.
+    /// Changed only through [`insert`](Self::insert),
+    /// [`remove`](Self::remove), [`mark_sent`](Self::mark_sent) and
+    /// [`mark_unsent`](Self::mark_unsent), which keep `sent_count` in step.
     inflight: HashMap<u16, InflightPublish>,
+    /// How many `inflight` records are sent: the in-flight window's
+    /// occupancy, kept so it need not be counted on every publish and ACK.
+    sent_count: usize,
     /// Inbound QoS 2 messages that have been PUBREC'd, held until PUBREL
     /// says to deliver them.
     pending_pub2_in: HashMap<u16, Message>,
@@ -365,15 +374,68 @@ impl SessionState {
     fn insert(&mut self, id: u16, tx: Completer<PublishResponse>, phase: PublishPhase, sent: bool) {
         let seq = self.next_seq;
         self.next_seq += 1;
-        self.inflight.insert(
-            id,
-            InflightPublish {
-                tx,
-                phase,
-                sent,
-                seq,
-            },
-        );
+        let rec = InflightPublish {
+            tx,
+            phase,
+            sent,
+            seq,
+        };
+        if let Some(old) = self.inflight.insert(id, rec)
+            && old.sent
+        {
+            self.sent_count -= 1;
+        }
+        if sent {
+            self.sent_count += 1;
+        }
+        self.check_sent_count();
+    }
+
+    /// Removes and returns the record held under `id`.
+    fn remove(&mut self, id: u16) -> Option<InflightPublish> {
+        let rec = self.inflight.remove(&id)?;
+        if rec.sent {
+            self.sent_count -= 1;
+        }
+        self.check_sent_count();
+        Some(rec)
+    }
+
+    /// Marks the record under `id` as sent, so it occupies a window slot,
+    /// and returns it.
+    fn mark_sent(&mut self, id: u16) -> Option<&mut InflightPublish> {
+        let rec = self.inflight.get_mut(&id)?;
+        if !rec.sent {
+            rec.sent = true;
+            self.sent_count += 1;
+        }
+        Some(rec)
+    }
+
+    /// Marks the record under `id` as waiting for a window slot.
+    fn mark_unsent(&mut self, id: u16) {
+        if let Some(rec) = self.inflight.get_mut(&id)
+            && rec.sent
+        {
+            rec.sent = false;
+            self.sent_count -= 1;
+        }
+    }
+
+    /// Number of records occupying a window slot.
+    fn sent_count(&self) -> usize {
+        self.sent_count
+    }
+
+    /// In the library's own unit tests, checks `sent_count` against a full
+    /// count. Only there, and only for small maps: the count is O(n), the
+    /// integration tests run debug builds with tens of thousands of messages
+    /// in flight, and one unit test fills all 65 535 identifiers.
+    fn check_sent_count(&self) {
+        if cfg!(test) && self.inflight.len() <= 1024 {
+            let n = self.inflight.values().filter(|r| r.sent).count();
+            assert_eq!(self.sent_count, n, "sent_count out of step");
+        }
     }
 
     /// Packet IDs of every in-flight message, oldest first.
@@ -432,6 +494,17 @@ const CLOSE_CAP: Duration = Duration::from_secs(1);
 /// Most slices handed to one vectored write.
 const MAX_IOV: usize = 64;
 
+/// The run loop yields to the executor after this many passes.
+///
+/// Under load every branch of its `select!` can be ready at once (commands
+/// waiting, the socket writable) for as long as the load lasts, so the loop
+/// would never return `Pending`. On smol, where every client's loop shares
+/// one executor thread and nothing forces a yield, that starves the other
+/// clients: their keep-alive timers stop firing. Tokio has its own
+/// cooperative budget; yielding here as well costs it one reschedule per
+/// this many passes.
+const YIELD_EVERY: u32 = 64;
+
 /// Initial capacity of the inbound byte buffer. One buffer serves a whole
 /// connection — from the CONNACK read through to the last packet — and grows
 /// to fit anything larger.
@@ -481,9 +554,10 @@ struct Session<B: Backend> {
     /// alias instead of (or as well as) the name. Valid only for this
     /// connection, so a new session starts with an empty map (§3.3.2.3.4).
     topic_aliases: HashMap<u16, String>,
-    /// QoS 1/2 publishes deferred because the in-flight limit was reached —
-    /// new commands and persisted messages awaiting re-transmission alike.
-    /// Drained one-for-one as PUBACK/PUBCOMP ACKs arrive.
+    /// Operations deferred because the in-flight limit was reached or no
+    /// packet identifier was free: new publishes and messages awaiting
+    /// re-transmission alike, and (un)subscribes. Drained in order as
+    /// acknowledgements free slots and identifiers.
     inflight_deferred: VecDeque<Deferred>,
 }
 
@@ -534,18 +608,49 @@ impl<B: Backend> Session<B> {
     /// awaiting PUBCOMP still does, since its packet identifier is not free
     /// until the exchange finishes.
     fn inflight_count(&self) -> usize {
-        self.state.inflight.values().filter(|r| r.sent).count()
+        self.state.sent_count()
     }
 
-    /// `true` when another QoS 1/2 publish may go out now.
+    /// `true` when the in-flight window has room for another QoS 1/2
+    /// publish. (A new one also needs a packet identifier: [`id_free`].)
+    ///
+    /// [`id_free`]: Self::id_free
     fn inflight_slot_free(&self) -> bool {
-        self.limits.max_inflight == 0 || self.inflight_count() < self.limits.max_inflight
+        self.inflight_count() < self.limits.max_inflight
     }
 
-    /// Drains deferred publishes into the session while the in-flight count
-    /// is below `max_inflight`.  An encoding error propagates immediately.
+    /// `true` when a packet identifier is free for a new QoS 1/2 publish,
+    /// SUBSCRIBE or UNSUBSCRIBE.
+    ///
+    /// Every outstanding exchange holds one, including in-flight messages
+    /// still waiting for a window slot, so the window having room does not
+    /// imply this: with a window of 65 535, pending (un)subscribes and
+    /// messages awaiting re-transmission can use up the last of them.
+    fn id_free(&self) -> bool {
+        self.state.inflight.len() + self.pending_sub.len() + self.pending_unsub.len()
+            < MAX_PACKET_IDS
+    }
+
+    /// Whether the deferred operation `d` can go ahead now.
+    fn can_proceed(&self, d: &Deferred) -> bool {
+        match d {
+            // Already holds its identifier.
+            Deferred::Retransmit(_) => self.inflight_slot_free(),
+            Deferred::Command(Command::Publish { .. }) => {
+                self.inflight_slot_free() && self.id_free()
+            }
+            Deferred::Command(_) => self.id_free(),
+        }
+    }
+
+    /// Takes deferred operations, in order, for as long as the one at the
+    /// front can go ahead. Called whenever an acknowledgement frees a window
+    /// slot or a packet identifier. An encoding error propagates immediately.
     fn drain_deferred(&mut self) -> Result<()> {
-        while self.inflight_slot_free() {
+        while let Some(d) = self.inflight_deferred.front() {
+            if !self.can_proceed(d) {
+                break;
+            }
             match self.inflight_deferred.pop_front() {
                 Some(Deferred::Command(cmd)) => {
                     self.handle_command(cmd)?;
@@ -563,10 +668,9 @@ impl<B: Backend> Session<B> {
     /// PUBLISH with DUP set; one that has been PUBREC'd goes out as a PUBREL.
     /// Marks the record as occupying a window slot.
     fn send_inflight(&mut self, id: u16) -> Result<()> {
-        let Some(rec) = self.state.inflight.get_mut(&id) else {
+        let Some(rec) = self.state.mark_sent(id) else {
             return Ok(());
         };
-        rec.sent = true;
         let max = self.limits.server_max_packet_size;
         let res = match std::mem::replace(&mut rec.phase, PublishPhase::AwaitingPubComp) {
             // The record's own copy is encoded and put back, not cloned. Any
@@ -616,7 +720,14 @@ impl<B: Backend> Session<B> {
     /// session restore `next_id` sits past the highest persisted identifier,
     /// so a wrap-around could otherwise land on one that is still in flight
     /// and silently replace its completer.
+    ///
+    /// The caller must have checked [`id_free`](Self::id_free): with every
+    /// identifier in use this would search forever.
     fn alloc_id(&mut self) -> u16 {
+        debug_assert!(
+            self.id_free(),
+            "alloc_id() with every packet identifier in use"
+        );
         loop {
             self.state.next_id = self.state.next_id.wrapping_add(1);
             if self.state.next_id == 0 {
@@ -665,9 +776,7 @@ impl<B: Backend> Session<B> {
             if self.inflight_slot_free() {
                 self.send_inflight(id)?;
             } else {
-                if let Some(rec) = self.state.inflight.get_mut(&id) {
-                    rec.sent = false;
-                }
+                self.state.mark_unsent(id);
                 self.inflight_deferred.push_back(Deferred::Retransmit(id));
             }
         }
@@ -686,7 +795,7 @@ impl<B: Backend> Session<B> {
             .collect();
 
         for id in abandon {
-            if let Some(rec) = self.state.inflight.remove(&id) {
+            if let Some(rec) = self.state.remove(id) {
                 self.persist_remove(&format!("s{id}"));
                 rec.tx.complete(Err(Error::General(
                     "server did not resume the session; QoS 2 delivery abandoned",
@@ -832,7 +941,13 @@ impl<B: Backend> Session<B> {
         // a read before handling them could wait indefinitely.
         self.handle_buffered()?;
 
+        let mut passes = 0u32;
         loop {
+            passes += 1;
+            if passes.is_multiple_of(YIELD_EVERY) {
+                yield_now().await;
+            }
+
             self.out.prepare_write();
             let take_cmds = self.out.len() < HIGH_WATER;
 
@@ -972,7 +1087,12 @@ impl<B: Backend> Session<B> {
     async fn drain_pending(&mut self, reader: &mut B::Reader, timeout: Duration) {
         let mut deadline = B::Sleep::new(timeout);
 
+        let mut passes = 0u32;
         while self.has_pending() {
+            passes += 1;
+            if passes.is_multiple_of(YIELD_EVERY) {
+                yield_now().await;
+            }
             self.out.prepare_write();
             let ev = select_biased! {
                 res = writer_step::<B>(&mut self.writer, &self.out).fuse() => {
@@ -1013,7 +1133,7 @@ impl<B: Backend> Session<B> {
             // `connect()`. The persisted copy is removed either way — the
             // broker has answered, so there is nothing left to retry.
             Packet::PubAck(ack) => {
-                if let Some(rec) = self.state.inflight.remove(&ack.packet_id) {
+                if let Some(rec) = self.state.remove(ack.packet_id) {
                     self.persist_remove(&format!("s{}", ack.packet_id));
                     rec.tx
                         .complete(publish_outcome(ack.reason_code, ack.properties));
@@ -1024,7 +1144,7 @@ impl<B: Backend> Session<B> {
             // ---- QoS 2 outbound: PUBREC → send PUBREL ----
             Packet::PubRec(rec) => {
                 if rec.reason_code.is_err() {
-                    if let Some(inflight) = self.state.inflight.remove(&rec.packet_id) {
+                    if let Some(inflight) = self.state.remove(rec.packet_id) {
                         self.persist_remove(&format!("s{}", rec.packet_id));
                         inflight
                             .tx
@@ -1040,9 +1160,8 @@ impl<B: Backend> Session<B> {
                 // the persisted PUBLISH with the PUBREL keeps the store in
                 // step, so a crash now cannot resurrect the message.
                 let rel = PubAck::new(rec.packet_id);
-                if let Some(inflight) = self.state.inflight.get_mut(&rec.packet_id) {
+                if let Some(inflight) = self.state.mark_sent(rec.packet_id) {
                     inflight.phase = PublishPhase::AwaitingPubComp;
-                    inflight.sent = true;
                 }
                 let mut enc = BytesMut::with_capacity(8);
                 if Packet::PubRel(rel.clone())
@@ -1056,7 +1175,7 @@ impl<B: Backend> Session<B> {
 
             // ---- QoS 2 outbound: PUBCOMP → resolve token ----
             Packet::PubComp(comp) => {
-                if let Some(rec) = self.state.inflight.remove(&comp.packet_id) {
+                if let Some(rec) = self.state.remove(comp.packet_id) {
                     self.persist_remove(&format!("s{}", comp.packet_id));
                     rec.tx
                         .complete(publish_outcome(comp.reason_code, comp.properties));
@@ -1078,6 +1197,8 @@ impl<B: Backend> Session<B> {
                         |r| r.properties,
                     ));
                 }
+                // Its packet identifier is free again.
+                self.drain_deferred()?;
             }
 
             // ---- Unsubscription acknowledgement ----
@@ -1091,6 +1212,8 @@ impl<B: Backend> Session<B> {
                         |r| r.properties,
                     ));
                 }
+                // Its packet identifier is free again.
+                self.drain_deferred()?;
             }
 
             // ---- Inbound application message ----
@@ -1185,6 +1308,14 @@ impl<B: Backend> Session<B> {
     /// synchronous handler cannot, so it is handed back to the run loop as
     /// [`Flow::Disconnect`].
     fn handle_command(&mut self, cmd: Command) -> Result<Flow> {
+        // A (un)subscribe needs a packet identifier. With all 65 535 in use
+        // it waits, like a publish, until an acknowledgement frees one.
+        if matches!(cmd, Command::Subscribe { .. } | Command::Unsubscribe { .. }) && !self.id_free()
+        {
+            self.inflight_deferred.push_back(Deferred::Command(cmd));
+            return Ok(Flow::Continue);
+        }
+
         match cmd {
             Command::Connect { tx, .. } => {
                 // Already connected; reject duplicate connect.
@@ -1199,9 +1330,10 @@ impl<B: Backend> Session<B> {
                 props,
                 tx,
             } => {
-                // QoS 1/2 publishes are deferred when the in-flight limit is
-                // reached.  QoS 0 is never gated (no ACK, no packet ID).
-                if qos != QoS::QoS0 && !self.inflight_slot_free() {
+                // QoS 1/2 publishes are deferred when the in-flight window is
+                // full or no packet identifier is free. QoS 0 is never gated
+                // (no ACK, no packet ID).
+                if qos != QoS::QoS0 && !(self.inflight_slot_free() && self.id_free()) {
                     self.inflight_deferred
                         .push_back(Deferred::Command(Command::Publish {
                             topic,
@@ -1388,6 +1520,22 @@ async fn writer_step<B: Backend>(writer: &mut B::Writer, out: &Outbox) -> io::Re
     } else {
         pending().await
     }
+}
+
+/// Returns `Pending` once, having asked to be polled again, so the executor
+/// can run other tasks first.
+async fn yield_now() {
+    let mut yielded = false;
+    std::future::poll_fn(|cx| {
+        if yielded {
+            Poll::Ready(())
+        } else {
+            yielded = true;
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        }
+    })
+    .await
 }
 
 /// Receives the next command, or pends forever when `enabled` is false.
@@ -2143,7 +2291,7 @@ mod tests {
 
     fn test_limits() -> SessionLimits {
         SessionLimits {
-            max_inflight: 0,
+            max_inflight: MAX_PACKET_IDS,
             max_packet_size: paho_mqtt_codec::MAX_PACKET_SIZE,
             server_max_packet_size: None,
             server_topic_alias_max: 0,
@@ -2378,6 +2526,82 @@ mod tests {
             state.insert(id, comp, PublishPhase::AwaitingPubComp, true);
         }
         assert_eq!(state.ids_in_order(), vec![9, 3, 7]);
+    }
+
+    /// The in-flight window's occupancy is kept as a count, not recounted
+    /// on every publish and ACK; it must stay in step through every change.
+    #[test]
+    fn test_sent_count_follows_every_change() {
+        let mut state = SessionState::default();
+        let phase = || PublishPhase::AwaitingPubComp;
+
+        state.insert(1, Completer::orphan(), phase(), true);
+        state.insert(2, Completer::orphan(), phase(), false);
+        assert_eq!(state.sent_count(), 1);
+
+        state.mark_sent(2);
+        state.mark_sent(2); // already sent: no change
+        assert_eq!(state.sent_count(), 2);
+
+        state.mark_unsent(1);
+        state.mark_unsent(1);
+        assert_eq!(state.sent_count(), 1);
+
+        // Replacing a record accounts for the one it replaces.
+        state.insert(2, Completer::orphan(), phase(), false);
+        assert_eq!(state.sent_count(), 0);
+
+        state.mark_sent(1);
+        assert!(state.remove(1).is_some());
+        assert!(state.remove(1).is_none());
+        assert!(state.remove(2).is_some());
+        assert_eq!(state.sent_count(), 0);
+    }
+
+    /// Every outstanding exchange holds a 16-bit packet identifier, and there
+    /// are only 65 535. With all of them in use, a QoS 1 publish and a
+    /// subscribe wait for one to be freed, rather than searching forever, and
+    /// go out in order as acknowledgements free them. QoS 0 needs none.
+    #[test]
+    fn test_operations_wait_for_a_free_packet_id() {
+        // Identifiers 1..=65534 in flight, and 65535 held by a SUBSCRIBE.
+        // The window is not full (65 534 < 65 535); the identifiers are.
+        let mut state = SessionState::default();
+        for id in 1..u16::MAX {
+            state.insert(id, Completer::orphan(), PublishPhase::AwaitingPubComp, true);
+        }
+        let mut h = harness(BytesMut::new(), Duration::ZERO, state);
+        let s = &mut h.session;
+        let (_sub_tok, sub_tx) = Token::<SubscribeResponse>::new();
+        s.pending_sub.insert(u16::MAX, (sub_tx, true));
+        assert!(s.inflight_slot_free());
+        assert!(!s.id_free());
+
+        let (mut t1, c1) = publish_cmd("q1", QoS::QoS1, Bytes::from_static(b"1"));
+        assert!(matches!(s.handle_command(c1), Ok(Flow::Continue)));
+        let (_t2, c2) = subscribe_cmd("s/#");
+        assert!(matches!(s.handle_command(c2), Ok(Flow::Continue)));
+        assert_eq!(s.inflight_deferred.len(), 2);
+        assert!(s.out.is_empty(), "nothing went out");
+
+        let (_t0, c0) = publish_cmd("q0", QoS::QoS0, Bytes::from_static(b"0"));
+        assert!(matches!(s.handle_command(c0), Ok(Flow::Continue)));
+        assert!(!s.out.is_empty(), "QoS 0 needs no identifier");
+
+        // The SUBACK frees 65535, which the publish at the front takes.
+        s.handle_packet(Packet::SubAck(paho_mqtt_codec::SubAck::new(
+            u16::MAX,
+            vec![ReasonCode::Success],
+        )))
+        .unwrap();
+        assert_eq!(s.inflight_deferred.len(), 1);
+        assert!(s.state.inflight.contains_key(&u16::MAX));
+        assert!(t1.try_wait().is_none(), "sent, awaiting its PUBACK");
+
+        // A PUBCOMP frees 7, which the subscribe takes.
+        s.handle_packet(Packet::PubComp(PubAck::new(7))).unwrap();
+        assert!(s.inflight_deferred.is_empty());
+        assert!(s.pending_sub.contains_key(&7));
     }
 
     // ---- The write pipeline ----

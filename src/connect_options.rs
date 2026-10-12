@@ -53,7 +53,8 @@ pub struct ConnectOptions {
     pub keep_alive_interval: Duration,
     /// The clean start/session flag.
     pub clean_start: bool,
-    /// The maximum number of messages that can be in flight at once.
+    /// The maximum number of QoS 1/2 messages that can be in flight at once.
+    /// 0, like the default of 65 535, allows as many as the protocol does.
     pub max_inflight: u16,
     /// The Last Will and Testament (LWT) message
     pub will: Option<Message>,
@@ -444,6 +445,15 @@ impl ConnectOptionsBuilder {
 
     /// Sets the maximum number of in-flight messages that can be
     /// simultaneously handled by this client.
+    ///
+    /// Publishes beyond the limit wait in the client until earlier ones are
+    /// acknowledged. With MQTT v5 the server's Receive Maximum narrows the
+    /// limit further.
+    ///
+    /// The protocol itself caps it: every QoS 1/2 message in flight holds a
+    /// 16-bit packet identifier, and 0 is reserved, so no more than 65 535
+    /// can be outstanding (fewer while subscribe and unsubscribe requests
+    /// hold identifiers too). 0, like the default of 65 535, means that many.
     ///
     /// # Arguments
     ///

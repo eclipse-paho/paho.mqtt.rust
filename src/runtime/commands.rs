@@ -170,7 +170,8 @@ pub(crate) struct ConnectParams {
     pub min_retry_interval: Duration,
     /// Maximum backoff interval between reconnect attempts.
     pub max_retry_interval: Duration,
-    /// Maximum concurrent outbound QoS 1/2 publishes; 0 means unlimited.
+    /// Maximum concurrent outbound QoS 1/2 publishes; 0 means as many as the
+    /// protocol allows (see [`MAX_PACKET_IDS`]).
     pub max_inflight: usize,
     /// Deadline for one connection attempt — transport connect, TLS/WebSocket
     /// handshake, CONNECT and CONNACK together. Zero disables the deadline.
@@ -199,12 +200,18 @@ impl ConnectParams {
     }
 }
 
+/// How many packet identifiers there are: 16 bits, with 0 reserved (§2.2.1
+/// in v3.1.1 and v5). Every QoS 1/2 publish, SUBSCRIBE and UNSUBSCRIBE holds
+/// one until it completes, so this bounds what one session can have
+/// outstanding.
+pub(crate) const MAX_PACKET_IDS: usize = u16::MAX as usize;
+
 /// Per-session limits, fixed once the CONNACK has arrived.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct SessionLimits {
     /// Effective cap on concurrent outbound QoS 1/2 publishes: the lesser of
-    /// the configured `max_inflight` and the server's Receive Maximum.
-    /// 0 means unlimited (only reachable on v3, which has no Receive Maximum).
+    /// the configured `max_inflight` and the server's Receive Maximum. Always
+    /// in `1..=MAX_PACKET_IDS`.
     pub max_inflight: usize,
     /// Largest inbound packet accepted by the framing layer, in bytes.
     pub max_packet_size: u32,
@@ -246,20 +253,23 @@ fn u16_prop(props: &CodecProperties, id: PropertyId) -> Option<u16> {
 /// QoS 1/2 PUBLISH packets it will accept, defaulting to 65 535 when the
 /// property is absent; exceeding it earns a DISCONNECT with
 /// `ReceiveMaximumExceeded`. The client's own `max_inflight` narrows that
-/// further. v3 has no such property, so the configured value stands alone
-/// (0 = unlimited).
+/// further. v3 has no such property, so the configured value stands alone.
+///
+/// Either way the result is in `1..=MAX_PACKET_IDS`: each exchange in flight
+/// holds a packet identifier, so no configuration can allow more than there
+/// are identifiers, and 0 ("as many as possible") means exactly that many.
 fn effective_max_inflight(params: &ConnectParams, connack: &ConnAck) -> usize {
+    let configured = match params.max_inflight {
+        0 => MAX_PACKET_IDS,
+        n => n.min(MAX_PACKET_IDS),
+    };
     if !params.ver.is_v5() {
-        return params.max_inflight;
+        return configured;
     }
     let server = u16_prop(&connack.properties, PropertyId::ReceiveMaximum)
         .filter(|&n| n > 0)
         .unwrap_or(u16::MAX) as usize;
-    if params.max_inflight == 0 {
-        server
-    } else {
-        params.max_inflight.min(server)
-    }
+    configured.min(server)
 }
 
 /// The keep-alive the session must use.
@@ -515,10 +525,11 @@ mod tests {
             SessionLimits::new(&params_v(MqttVersion::V5, 0), &bare).max_inflight,
             u16::MAX as usize
         );
-        // v3 has no Receive Maximum, so the configured value stands alone.
+        // v3 has no Receive Maximum, so the configured value stands alone,
+        // and 0 means as many as there are packet identifiers.
         assert_eq!(
             SessionLimits::new(&params_v(MqttVersion::V3_1_1, 0), &bare).max_inflight,
-            0
+            MAX_PACKET_IDS
         );
         assert_eq!(
             SessionLimits::new(&params_v(MqttVersion::V3_1_1, 7), &bare).max_inflight,
