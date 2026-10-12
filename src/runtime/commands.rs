@@ -121,6 +121,28 @@ pub(crate) enum ServerAddr {
     },
 }
 
+impl ServerAddr {
+    /// Whether the transport holds written bytes until it is flushed.
+    ///
+    /// TLS gathers them into records and WebSocket into frames, so for those
+    /// a write is not delivery until a flush completes. A plain TCP or Unix
+    /// socket hands them to the kernel on the write itself, and its flush
+    /// does nothing.
+    pub fn buffers_writes(&self) -> bool {
+        !matches!(self, Self::Tcp { .. }) && !self.is_unix()
+    }
+
+    #[cfg(unix)]
+    fn is_unix(&self) -> bool {
+        matches!(self, Self::Unix { .. })
+    }
+
+    #[cfg(not(unix))]
+    fn is_unix(&self) -> bool {
+        false
+    }
+}
+
 /////////////////////////////////////////////////////////////////////////////
 
 /// Connection parameters grouped for reuse across reconnect attempts.

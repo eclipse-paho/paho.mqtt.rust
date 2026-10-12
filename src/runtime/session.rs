@@ -562,8 +562,13 @@ struct Session<B: Backend> {
 }
 
 impl<B: Backend> Session<B> {
+    /// `flush_needed` says whether the transport holds written bytes until a
+    /// flush (TLS, WebSocket); see [`ServerAddr::buffers_writes`].
+    ///
+    /// [`ServerAddr::buffers_writes`]: super::ServerAddr::buffers_writes
     fn new(
         writer: B::Writer,
+        flush_needed: bool,
         read_buf: BytesMut,
         negotiated: Negotiated,
         event_tx: async_channel::Sender<Event>,
@@ -579,7 +584,7 @@ impl<B: Backend> Session<B> {
             writer,
             ver,
             keep_alive,
-            out: Outbox::new(),
+            out: Outbox::new(flush_needed),
             read_buf,
             state,
             pending_sub: HashMap::new(),
@@ -971,6 +976,9 @@ impl<B: Backend> Session<B> {
                         return Err(Error::Disconnected);
                     }
                     self.handle_buffered()?;
+                    if self.write_now()? && ka_enabled {
+                        ka_sleep.reset(keep_alive);
+                    }
                 }
                 // The API was dropped: send what is already queued, then stop.
                 LoopEvent::Command(Err(_)) => {
@@ -997,6 +1005,9 @@ impl<B: Backend> Session<B> {
                         self.disconnect(req, reader).await;
                         return Ok(());
                     }
+                    if self.write_now()? && ka_enabled {
+                        ka_sleep.reset(keep_alive);
+                    }
                 }
                 LoopEvent::KeepAlive => {
                     if self.ping_outstanding {
@@ -1007,6 +1018,26 @@ impl<B: Backend> Session<B> {
                     ka_sleep.reset(keep_alive);
                 }
             }
+        }
+    }
+
+    /// Writes what a handler just queued, if the transport takes it at once,
+    /// rather than on the loop's next pass. Returns `true` if bytes went out.
+    ///
+    /// On an idle connection that saves a whole pass of the `select!` per
+    /// packet, which is most of what a lone publish costs. It is one poll
+    /// of [`writer_step`], so it never waits: if the transport is not ready,
+    /// the writer branch carries on as usual, and what it registered for
+    /// wakeups here is replaced when that branch polls with the task's own
+    /// waker.
+    fn write_now(&mut self) -> Result<bool> {
+        if self.out.is_empty() && !self.out.needs_flush() {
+            return Ok(false);
+        }
+        self.out.prepare_write();
+        match writer_step::<B>(&mut self.writer, &self.out).now_or_never() {
+            Some(res) => self.writer_done(res),
+            None => Ok(false),
         }
     }
 
@@ -2018,8 +2049,10 @@ pub(crate) async fn run_event_loop<B: Backend>(
                 tx.complete(Ok(response));
             }
 
+            let flush_needed = job.params.servers[job.server_idx].0.buffers_writes();
             let mut session = Session::<B>::new(
                 writer,
+                flush_needed,
                 read_buf,
                 Negotiated {
                     ver: job.params.ver,
@@ -2308,12 +2341,20 @@ mod tests {
         cmd_rx: async_channel::Receiver<Command>,
     }
 
-    fn harness(read_buf: BytesMut, keep_alive: Duration, state: SessionState) -> Harness {
+    /// A session over [`MockBackend`]. The mock transport is treated as one
+    /// that buffers until flushed, like TLS, unless `flush_needed` is false.
+    fn harness_with(
+        read_buf: BytesMut,
+        keep_alive: Duration,
+        state: SessionState,
+        flush_needed: bool,
+    ) -> Harness {
         let (event_tx, event_rx) = async_channel::unbounded();
         let (cmd_tx, cmd_rx) = async_channel::unbounded();
         let wire = MockWriter::default();
         let session = Session::<MockBackend>::new(
             wire.clone(),
+            flush_needed,
             read_buf,
             Negotiated {
                 ver: MqttVersion::V5,
@@ -2331,6 +2372,10 @@ mod tests {
             cmd_tx,
             cmd_rx,
         }
+    }
+
+    fn harness(read_buf: BytesMut, keep_alive: Duration, state: SessionState) -> Harness {
+        harness_with(read_buf, keep_alive, state, true)
     }
 
     /// Builds a session over [`MockBackend`] whose inbound buffer already
@@ -2696,6 +2741,31 @@ mod tests {
         }
         assert!(matches!(tok.try_wait(), Some(Ok(_))));
         assert!(h.wire.wire().flushes >= 1);
+    }
+
+    /// On a transport whose flush does nothing (plain TCP, Unix), a QoS 0
+    /// publish completes as soon as it is written, and the writer makes no
+    /// flush at all: that pass would only add latency.
+    #[test]
+    fn test_qos0_completes_on_write_without_flush() {
+        let mut h = harness_with(
+            BytesMut::new(),
+            Duration::ZERO,
+            SessionState::default(),
+            false,
+        );
+        h.wire.wire().hold_flush = true; // would block any flush
+
+        let (mut tok, cmd) = publish_cmd("q0", QoS::QoS0, Bytes::from_static(b"x"));
+        h.cmd_tx.try_send(cmd).unwrap();
+
+        let mut reader = MockReader::open_with([]);
+        {
+            let run = pin!(h.session.run(&mut reader, &h.cmd_rx));
+            assert!(poll_until(run, SETTLE).is_none());
+        }
+        assert!(matches!(tok.try_wait(), Some(Ok(_))));
+        assert_eq!(h.wire.wire().flushes, 0);
     }
 
     /// A write error ends the session. QoS 0 messages still queued fail with

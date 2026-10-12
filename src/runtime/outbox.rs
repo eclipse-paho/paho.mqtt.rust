@@ -75,19 +75,18 @@ pub(crate) struct Outbox {
     flushed: u64,
     /// QoS 0 completers, each released once `flushed` reaches its offset.
     on_flushed: VecDeque<(u64, Completer<PublishResponse>)>,
+    /// Whether the transport needs a flush before written bytes count as
+    /// delivered. When it does not, writing is flushing: `flushed` follows
+    /// `written`, and the writer never makes a separate flush.
+    flush_needed: bool,
     /// The frame most recently pushed.
     last: LastFrame,
 }
 
-impl Default for Outbox {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl Outbox {
-    /// Creates an empty outbox.
-    pub fn new() -> Self {
+    /// Creates an empty outbox for a transport that does, or does not, hold
+    /// written bytes until a flush.
+    pub fn new(flush_needed: bool) -> Self {
         Self {
             segs: VecDeque::new(),
             tail: BytesMut::with_capacity(TAIL_CAPACITY),
@@ -96,6 +95,7 @@ impl Outbox {
             written: 0,
             flushed: 0,
             on_flushed: VecDeque::new(),
+            flush_needed,
             last: LastFrame::None,
         }
     }
@@ -206,10 +206,14 @@ impl Outbox {
         n
     }
 
-    /// Records that the transport accepted the next `n` bytes.
+    /// Records that the transport accepted the next `n` bytes. On a
+    /// transport that needs no flush, that delivers them too.
     pub fn advance(&mut self, mut n: usize) {
         debug_assert!(n <= self.len(), "advance() past the end of the queue");
         self.written += n as u64;
+        if !self.flush_needed {
+            self.flushed();
+        }
         while n > 0 {
             let Some(front) = self.segs.front() else {
                 break;
@@ -318,7 +322,7 @@ mod tests {
             publish("c", Bytes::from_static(b"after")),
             publish("d", big),
         ];
-        let mut out = Outbox::new();
+        let mut out = Outbox::new(true);
         let mut expect = Vec::new();
         for p in &pkts {
             let end = out.push(p, VER, None).unwrap();
@@ -338,7 +342,7 @@ mod tests {
             publish("y", big),
             Packet::PingReq,
         ];
-        let mut out = Outbox::new();
+        let mut out = Outbox::new(true);
         let mut expect = Vec::new();
         for p in &pkts {
             out.push(p, VER, None).unwrap();
@@ -351,7 +355,7 @@ mod tests {
     #[test]
     fn test_fewer_slots_than_segments() {
         let big = Bytes::from(vec![2u8; INLINE_PAYLOAD_MAX + 1]);
-        let mut out = Outbox::new();
+        let mut out = Outbox::new(true);
         let mut expect = Vec::new();
         for i in 0..5 {
             let p = publish(&format!("t{i}"), big.clone());
@@ -365,7 +369,7 @@ mod tests {
     #[test]
     fn test_large_payload_is_not_copied() {
         let big = Bytes::from(vec![3u8; INLINE_PAYLOAD_MAX + 1]);
-        let mut out = Outbox::new();
+        let mut out = Outbox::new(true);
         out.push(&publish("big", big.clone()), VER, None).unwrap();
         out.prepare_write();
         let mut iov = [IoSlice::new(&[]); 4];
@@ -376,7 +380,7 @@ mod tests {
 
     #[test]
     fn test_failed_push_queues_nothing() {
-        let mut out = Outbox::new();
+        let mut out = Outbox::new(true);
         let first = publish("ok", Bytes::from_static(b"1"));
         out.push(&first, VER, None).unwrap();
         let len = out.len();
@@ -396,7 +400,7 @@ mod tests {
 
     #[test]
     fn test_last_frame() {
-        let mut out = Outbox::new();
+        let mut out = Outbox::new(true);
         out.push(&Packet::PingReq, VER, None).unwrap();
 
         let small = publish("s", Bytes::from_static(b"body"));
@@ -412,7 +416,7 @@ mod tests {
 
     #[test]
     fn test_completers_fire_at_flush_not_write() {
-        let mut out = Outbox::new();
+        let mut out = Outbox::new(true);
         let (mut tok1, tx1) = Token::<PublishResponse>::new();
         let end1 = out
             .push(&publish("a", Bytes::from_static(b"1")), VER, None)
@@ -441,9 +445,27 @@ mod tests {
         assert!(matches!(tok2.try_wait(), Some(Ok(_))));
     }
 
+    /// Where the transport needs no flush, a write completes its frames.
+    #[test]
+    fn test_no_flush_transport_completes_on_write() {
+        let mut out = Outbox::new(false);
+        let (mut tok, tx) = Token::<PublishResponse>::new();
+        let end = out
+            .push(&publish("a", Bytes::from_static(b"1")), VER, None)
+            .unwrap();
+        out.complete_when_flushed(end, tx);
+
+        out.prepare_write();
+        out.advance(end as usize - 1);
+        assert!(tok.try_wait().is_none(), "not all of it written");
+        out.advance(1);
+        assert!(matches!(tok.try_wait(), Some(Ok(_))));
+        assert!(!out.needs_flush(), "the writer makes no separate flush");
+    }
+
     #[test]
     fn test_clear_resolves_pending_disconnected() {
-        let mut out = Outbox::new();
+        let mut out = Outbox::new(true);
         let (mut tok, tx) = Token::<PublishResponse>::new();
         let end = out
             .push(&publish("a", Bytes::from_static(b"1")), VER, None)
