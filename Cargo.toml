@@ -41,7 +41,6 @@ _runtime = []
 paho-mqtt-codec = { version = "0.1", path = "paho-mqtt-codec" }
 bytes = "1"
 futures = "0.3"
-futures-timer = "3.0"
 async-channel = "2.5"
 crossbeam-channel = "0.5"
 log = "0.4"

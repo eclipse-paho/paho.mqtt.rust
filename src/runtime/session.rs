@@ -288,6 +288,41 @@ fn load_persisted(
     }
 }
 
+/// A persistence key, built on the stack: `s` (an outbound message) or `r`
+/// (an inbound QoS 2 message awaiting PUBREL) followed by the packet
+/// identifier in decimal, as in `s42`. The format is what stores written by
+/// earlier versions hold, so it must not change.
+struct PersistKey {
+    buf: [u8; 6],
+    len: usize,
+}
+
+impl PersistKey {
+    fn new(kind: u8, id: u16) -> Self {
+        let mut digits = [0u8; 5];
+        let mut n = id;
+        let mut i = digits.len();
+        loop {
+            i -= 1;
+            digits[i] = b'0' + (n % 10) as u8;
+            n /= 10;
+            if n == 0 {
+                break;
+            }
+        }
+        let mut buf = [0u8; 6];
+        buf[0] = kind;
+        let len = 1 + digits.len() - i;
+        buf[1..len].copy_from_slice(&digits[i..]);
+        Self { buf, len }
+    }
+
+    fn as_str(&self) -> &str {
+        // ASCII by construction: `kind` is always `b's'` or `b'r'`.
+        std::str::from_utf8(&self.buf[..self.len]).unwrap_or_default()
+    }
+}
+
 /// An operation waiting for a slot in the in-flight window, or for a free
 /// packet identifier.
 enum Deferred {
@@ -705,17 +740,36 @@ impl<B: Backend> Session<B> {
             || self.pending_unsub.contains_key(&id)
     }
 
-    /// Persists `data` under `key`, silently ignoring errors.
-    fn persist_put(&self, key: &str, data: Vec<&[u8]>) {
+    /// Persists `parts` under the key for `kind` and `id` (see
+    /// [`PersistKey`]), silently ignoring errors. Without a store this does
+    /// nothing at all, not even build the key.
+    fn persist_put(&self, kind: u8, id: u16, parts: &[&[u8]]) {
         if let Some(p) = &self.persist {
-            let _ = p.lock().unwrap().put(key, data);
+            let key = PersistKey::new(kind, id);
+            let _ = p.lock().unwrap().put(key.as_str(), parts.to_vec());
         }
     }
 
-    /// Removes the persistence entry for `key`, silently ignoring errors.
-    fn persist_remove(&self, key: &str) {
+    /// Persists the frame just queued (see [`Outbox::last_frame`]) under the
+    /// key for `kind` and `id`. Nothing queued is written before the handler
+    /// returns, so the frame is stored before it is sent.
+    fn persist_last_frame(&self, kind: u8, id: u16) {
+        if self.persist.is_some() {
+            let [hdr, payload] = self.out.last_frame();
+            if payload.is_empty() {
+                self.persist_put(kind, id, &[hdr]);
+            } else {
+                self.persist_put(kind, id, &[hdr, payload]);
+            }
+        }
+    }
+
+    /// Removes the persistence entry for `kind` and `id`, silently ignoring
+    /// errors. Without a store this does nothing.
+    fn persist_remove(&self, kind: u8, id: u16) {
         if let Some(p) = &self.persist {
-            let _ = p.lock().unwrap().remove(key);
+            let key = PersistKey::new(kind, id);
+            let _ = p.lock().unwrap().remove(key.as_str());
         }
     }
 
@@ -801,7 +855,7 @@ impl<B: Backend> Session<B> {
 
         for id in abandon {
             if let Some(rec) = self.state.remove(id) {
-                self.persist_remove(&format!("s{id}"));
+                self.persist_remove(b's', id);
                 rec.tx.complete(Err(Error::General(
                     "server did not resume the session; QoS 2 delivery abandoned",
                 )));
@@ -815,7 +869,7 @@ impl<B: Backend> Session<B> {
             .copied()
             .collect::<Vec<_>>()
         {
-            self.persist_remove(&format!("r{id}"));
+            self.persist_remove(b'r', id);
         }
         self.state.pending_pub2_in.clear();
     }
@@ -1165,7 +1219,7 @@ impl<B: Backend> Session<B> {
             // broker has answered, so there is nothing left to retry.
             Packet::PubAck(ack) => {
                 if let Some(rec) = self.state.remove(ack.packet_id) {
-                    self.persist_remove(&format!("s{}", ack.packet_id));
+                    self.persist_remove(b's', ack.packet_id);
                     rec.tx
                         .complete(publish_outcome(ack.reason_code, ack.properties));
                 }
@@ -1176,7 +1230,7 @@ impl<B: Backend> Session<B> {
             Packet::PubRec(rec) => {
                 if rec.reason_code.is_err() {
                     if let Some(inflight) = self.state.remove(rec.packet_id) {
-                        self.persist_remove(&format!("s{}", rec.packet_id));
+                        self.persist_remove(b's', rec.packet_id);
                         inflight
                             .tx
                             .complete(Err(Error::ReasonCode(rec.reason_code, rec.properties)));
@@ -1190,24 +1244,17 @@ impl<B: Backend> Session<B> {
                 // is what a resumed session must re-send (§4.4). Replacing
                 // the persisted PUBLISH with the PUBREL keeps the store in
                 // step, so a crash now cannot resurrect the message.
-                let rel = PubAck::new(rec.packet_id);
                 if let Some(inflight) = self.state.mark_sent(rec.packet_id) {
                     inflight.phase = PublishPhase::AwaitingPubComp;
                 }
-                let mut enc = BytesMut::with_capacity(8);
-                if Packet::PubRel(rel.clone())
-                    .encode(&mut enc, self.ver)
-                    .is_ok()
-                {
-                    self.persist_put(&format!("s{}", rec.packet_id), vec![&enc]);
-                }
-                self.queue(&Packet::PubRel(rel))?;
+                self.queue(&Packet::PubRel(PubAck::new(rec.packet_id)))?;
+                self.persist_last_frame(b's', rec.packet_id);
             }
 
             // ---- QoS 2 outbound: PUBCOMP → resolve token ----
             Packet::PubComp(comp) => {
                 if let Some(rec) = self.state.remove(comp.packet_id) {
-                    self.persist_remove(&format!("s{}", comp.packet_id));
+                    self.persist_remove(b's', comp.packet_id);
                     rec.tx
                         .complete(publish_outcome(comp.reason_code, comp.properties));
                 }
@@ -1265,11 +1312,17 @@ impl<B: Backend> Session<B> {
                     QoS::QoS2 => {
                         let id = pub_pkt.packet_id.unwrap_or(0);
                         // Persist the inbound QoS 2 PUBLISH before acknowledging
-                        // so we can redeliver the message on reconnect.
-                        let mut enc_buf = BytesMut::with_capacity(256);
+                        // so we can redeliver the message on reconnect. The
+                        // payload is stored from its own buffer, not copied.
                         let packet = Packet::Publish(pub_pkt);
-                        if packet.encode(&mut enc_buf, self.ver).is_ok() {
-                            self.persist_put(&format!("r{id}"), vec![&enc_buf]);
+                        if self.persist.is_some() {
+                            let mut hdr = BytesMut::with_capacity(64);
+                            if let Ok(payload) = packet.encode_split(&mut hdr, self.ver) {
+                                match &payload {
+                                    Some(p) => self.persist_put(b'r', id, &[&hdr, p]),
+                                    None => self.persist_put(b'r', id, &[&hdr]),
+                                }
+                            }
                         }
                         let Packet::Publish(pub_pkt) = packet else {
                             unreachable!()
@@ -1285,7 +1338,7 @@ impl<B: Backend> Session<B> {
             // ---- QoS 2 inbound: PUBREL → send PUBCOMP, deliver message ----
             Packet::PubRel(rel) => {
                 if let Some(msg) = self.state.pending_pub2_in.remove(&rel.packet_id) {
-                    self.persist_remove(&format!("r{}", rel.packet_id));
+                    self.persist_remove(b'r', rel.packet_id);
                     self.deliver(Event::MessageArrived(msg));
                 }
                 let comp = PubAck::new(rel.packet_id);
@@ -1419,15 +1472,9 @@ impl<B: Backend> Session<B> {
                 };
 
                 // Persist a QoS 1/2 PUBLISH, exactly as queued, so it can be
-                // re-sent after a crash. Nothing queued is written before
-                // this handler returns, so it is stored before it is sent.
+                // re-sent after a crash.
                 if let Some(pid) = id {
-                    let [hdr, payload] = self.out.last_frame();
-                    let mut parts = vec![hdr];
-                    if !payload.is_empty() {
-                        parts.push(payload);
-                    }
-                    self.persist_put(&format!("s{pid}"), parts);
+                    self.persist_last_frame(b's', pid);
                 }
 
                 let Packet::Publish(pub_pkt) = packet else {
@@ -2571,6 +2618,16 @@ mod tests {
             state.insert(id, comp, PublishPhase::AwaitingPubComp, true);
         }
         assert_eq!(state.ids_in_order(), vec![9, 3, 7]);
+    }
+
+    /// Keys are built without allocating, and must match the format stores
+    /// written by earlier versions hold.
+    #[test]
+    fn test_persist_key_format() {
+        for id in [1u16, 9, 10, 42, 999, 1000, 65535] {
+            assert_eq!(PersistKey::new(b's', id).as_str(), format!("s{id}"));
+            assert_eq!(PersistKey::new(b'r', id).as_str(), format!("r{id}"));
+        }
     }
 
     /// The in-flight window's occupancy is kept as a count, not recounted

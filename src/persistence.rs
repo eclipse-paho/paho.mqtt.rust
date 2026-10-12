@@ -359,12 +359,13 @@ impl ClientPersistence for FilePersistence {
         Ok(std::fs::read(self.key_path(key))?)
     }
 
+    /// Removing a key that is not there succeeds. One `unlink`, rather than
+    /// a check followed by a removal that another process could race.
     fn remove(&mut self, key: &str) -> Result<()> {
-        let path = self.key_path(key);
-        if path.exists() {
-            std::fs::remove_file(path)?;
+        match std::fs::remove_file(self.key_path(key)) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
+            _ => Ok(()),
         }
-        Ok(())
     }
 
     fn keys(&mut self) -> Result<Vec<String>> {
@@ -433,6 +434,14 @@ mod tests {
         assert!(!p.contains_key("k"));
         // Removing a non-existent key must not error.
         p.remove("k").expect("remove missing");
+    }
+
+    /// Only a missing key counts as removed: other failures are reported.
+    #[test]
+    fn test_remove_reports_other_errors() {
+        let (mut p, _tmp) = open_temp();
+        std::fs::create_dir(p.key_path("d")).expect("mkdir");
+        assert!(p.remove("d").is_err(), "a directory cannot be unlinked");
     }
 
     #[test]

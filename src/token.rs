@@ -52,12 +52,10 @@ use crate::{
     Error, Result,
     responses::{ConnectResponse, PublishResponse, SubscribeResponse, UnsubscribeResponse},
 };
-use futures::{executor::block_on, future::FutureExt, pin_mut, select};
-use futures_timer::Delay;
 use std::{
     future::Future,
     pin::Pin,
-    sync::{Arc, Mutex},
+    sync::{Arc, Condvar, Mutex},
     task::{Context, Poll, Waker},
     time::Duration,
 };
@@ -84,7 +82,8 @@ impl<T> Default for FutureData<T> {
 }
 
 impl<T> FutureData<T> {
-    /// Stores `result` and wakes everyone waiting.
+    /// Stores `result` and wakes every task waiting. Threads blocked in
+    /// [`Token::wait`] are woken by the caller, through [`Shared::cv`].
     fn set(&mut self, result: Result<T>) {
         self.result = Some(result);
         for w in self.wakers.drain(..) {
@@ -100,6 +99,36 @@ impl<T> FutureData<T> {
     }
 }
 
+/// What a [`Token`], its clones and its [`Completer`] share.
+///
+/// Tasks awaiting the token register wakers in the data; threads blocked in
+/// [`Token::wait`] or [`Token::wait_for`] sleep on the condition variable.
+/// A blocking wait therefore needs no executor and no timer thread: the
+/// thread completing the token wakes the waiter directly.
+struct Shared<T> {
+    data: Mutex<FutureData<T>>,
+    cv: Condvar,
+}
+
+impl<T> Shared<T> {
+    fn new(data: FutureData<T>) -> Arc<Self> {
+        Arc::new(Self {
+            data: Mutex::new(data),
+            cv: Condvar::new(),
+        })
+    }
+
+    /// Resolves with `result`, unless already resolved, and wakes every
+    /// waiter of either kind.
+    fn complete(&self, result: Result<T>) {
+        let mut data = self.data.lock().unwrap();
+        if data.result.is_none() {
+            data.set(result);
+            self.cv.notify_all();
+        }
+    }
+}
+
 /////////////////////////////////////////////////////////////////////////////
 // Completer<T>
 
@@ -110,7 +139,9 @@ impl<T> FutureData<T> {
 /// calling [`Completer::complete`] resolves the paired token with
 /// [`Error::Disconnected`].
 pub(crate) struct Completer<T: 'static + Send> {
-    inner: Arc<Mutex<FutureData<T>>>,
+    /// `None` once [`complete`](Self::complete) has run, so `Drop` knows the
+    /// token is already resolved.
+    inner: Option<Arc<Shared<T>>>,
 }
 
 impl<T: 'static + Send> Completer<T> {
@@ -123,23 +154,22 @@ impl<T: 'static + Send> Completer<T> {
     /// [`Error::Disconnected`] and the shared state is freed then.
     pub(crate) fn orphan() -> Self {
         Self {
-            inner: Arc::new(Mutex::new(FutureData::default())),
+            inner: Some(Shared::new(FutureData::default())),
         }
     }
 
     /// Resolves the paired [`Token`] with `result`.
-    pub(crate) fn complete(self, result: Result<T>) {
-        let inner = self.inner.clone();
-        std::mem::forget(self);
-        inner.lock().unwrap().set(result);
+    pub(crate) fn complete(mut self, result: Result<T>) {
+        if let Some(inner) = self.inner.take() {
+            inner.complete(result);
+        }
     }
 }
 
 impl<T: 'static + Send> Drop for Completer<T> {
     fn drop(&mut self) {
-        let mut data = self.inner.lock().unwrap();
-        if data.result.is_none() {
-            data.set(Err(Error::Disconnected));
+        if let Some(inner) = self.inner.take() {
+            inner.complete(Err(Error::Disconnected));
         }
     }
 }
@@ -158,7 +188,7 @@ impl<T: 'static + Send> Drop for Completer<T> {
 /// retained, so [`try_wait`](Self::try_wait) can be called repeatedly and a
 /// token can be `.await`-ed after it has already completed.
 pub struct Token<T: 'static + Send> {
-    inner: Arc<Mutex<FutureData<T>>>,
+    inner: Arc<Shared<T>>,
 }
 
 impl<T: 'static + Send> Token<T> {
@@ -166,50 +196,55 @@ impl<T: 'static + Send> Token<T> {
     ///
     /// The runtime holds the `Completer`; the caller receives the `Token`.
     pub(crate) fn new() -> (Self, Completer<T>) {
-        let inner = Arc::new(Mutex::new(FutureData::default()));
+        let inner = Shared::new(FutureData::default());
         let tok = Self {
             inner: inner.clone(),
         };
-        let comp = Completer { inner };
+        let comp = Completer { inner: Some(inner) };
         (tok, comp)
     }
 
     /// Creates a token already resolved with an error.
     pub(crate) fn from_err(err: Error) -> Self {
-        let inner = Arc::new(Mutex::new(FutureData {
+        let inner = Shared::new(FutureData {
             result: Some(Err(err)),
             wakers: Vec::new(),
-        }));
+        });
         Self { inner }
     }
 }
 
 impl<T: 'static + Send + Clone> Token<T> {
     /// Blocks the caller until the asynchronous operation completes.
+    ///
+    /// The thread sleeps on a condition variable that the completing side
+    /// signals, so no executor or timer is involved.
     pub fn wait(self) -> Result<T> {
-        block_on(self)
+        let data = self.inner.data.lock().unwrap();
+        let data = self
+            .inner
+            .cv
+            .wait_while(data, |d| d.result.is_none())
+            .unwrap();
+        data.result.clone().unwrap_or(Err(Error::Disconnected))
     }
 
     /// Non-blocking check — returns `Some(result)` if complete, `None` if
     /// still pending. Does not consume the result: a later `wait()` or
     /// `.await` returns it again.
     pub fn try_wait(&mut self) -> Option<Result<T>> {
-        self.inner.lock().unwrap().result.clone()
+        self.inner.data.lock().unwrap().result.clone()
     }
     /// Blocks the caller for at most `dur`, returning `Err(Error::Timeout)`
     /// if the operation does not complete in time.
     pub fn wait_for(self, dur: Duration) -> Result<T> {
-        block_on(async move {
-            let f = self.fuse();
-            let to = Delay::new(dur).fuse();
-
-            pin_mut!(f, to);
-
-            select! {
-                val = f => val,
-                _ = to => Err(Error::Timeout),
-            }
-        })
+        let data = self.inner.data.lock().unwrap();
+        let (data, _) = self
+            .inner
+            .cv
+            .wait_timeout_while(data, dur, |d| d.result.is_none())
+            .unwrap();
+        data.result.clone().unwrap_or(Err(Error::Timeout))
     }
 }
 
@@ -225,7 +260,7 @@ impl<T: 'static + Send + Clone> Future for Token<T> {
     type Output = Result<T>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let mut data = self.inner.lock().unwrap();
+        let mut data = self.inner.data.lock().unwrap();
         match &data.result {
             Some(r) => Poll::Ready(r.clone()),
             None => {
@@ -275,7 +310,7 @@ mod tests {
     #[test]
     fn test_new_pending() {
         let (tok, _comp) = ConnectToken::new();
-        assert!(tok.inner.lock().unwrap().result.is_none());
+        assert!(tok.inner.data.lock().unwrap().result.is_none());
     }
 
     #[test]
@@ -387,5 +422,56 @@ mod tests {
         drop(comp);
         assert!(matches!(tok.wait(), Err(Error::Disconnected)));
         assert!(matches!(tok2.wait(), Err(Error::Disconnected)));
+    }
+
+    #[test]
+    fn test_wait_for_times_out() {
+        let (tok, _comp) = ConnectToken::new();
+        let start = std::time::Instant::now();
+        let res = tok.wait_for(Duration::from_millis(50));
+        assert!(matches!(res, Err(Error::Timeout)));
+        assert!(start.elapsed() >= Duration::from_millis(50));
+    }
+
+    /// Completed by another thread after the waiter has gone to sleep: the
+    /// condition variable must wake it, for both kinds of wait.
+    #[test]
+    fn test_completed_while_blocked() {
+        use std::thread;
+
+        let (tok, comp) = ConnectToken::new();
+        let waiter = thread::spawn(move || tok.wait());
+        thread::sleep(Duration::from_millis(50));
+        comp.complete(Ok(ConnectResponse::default()));
+        assert!(waiter.join().unwrap().is_ok());
+
+        let (tok, comp) = ConnectToken::new();
+        let waiter = thread::spawn(move || tok.wait_for(Duration::from_secs(10)));
+        thread::sleep(Duration::from_millis(50));
+        let start = std::time::Instant::now();
+        drop(comp);
+        assert!(matches!(waiter.join().unwrap(), Err(Error::Disconnected)));
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "woken, not timed out"
+        );
+    }
+
+    /// One completion wakes a thread blocked in `wait()` and a task that
+    /// `.await`s a clone, the two mechanisms side by side.
+    #[test]
+    fn test_blocking_and_async_waiters_both_woken() {
+        use std::thread;
+
+        let (tok, comp) = ConnectToken::new();
+        let blocking = {
+            let tok = tok.clone();
+            thread::spawn(move || tok.wait())
+        };
+        let awaiting = thread::spawn(move || futures::executor::block_on(tok));
+        thread::sleep(Duration::from_millis(50));
+        comp.complete(Err(Error::Timeout));
+        assert!(matches!(blocking.join().unwrap(), Err(Error::Timeout)));
+        assert!(matches!(awaiting.join().unwrap(), Err(Error::Timeout)));
     }
 }

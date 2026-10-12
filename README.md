@@ -139,7 +139,7 @@ Select the smol backend by turning the default off:
 paho-mqtt = { version = "2.0", default-features = false, features = ["smol", "smol-tls"] }
 ```
 
-When both `tokio` and `smol` are enabled, tokio takes precedence. OpenSSL is tokio-only; use `smol-tls` for TLS with smol.
+OpenSSL is tokio-only; use `smol-tls` for TLS with smol.
 
 ## Runtimes
 
