@@ -375,7 +375,12 @@ fn test_callback_waiting_on_publish_does_not_deadlock() {
         atomic::{AtomicUsize, Ordering},
     };
 
-    const N: usize = 3000;
+    // Bounded by what the broker will hold for a client that has stopped
+    // reading: with Mosquitto's defaults (`max_queued_messages 1000`, 20 in
+    // flight) delivery stops at 2064 messages however many are published,
+    // and the rest are dropped before they ever reach us. Exact delivery
+    // behind a deeper backlog is the scripted brokers' job.
+    const N: usize = 1500;
     let src = topic!("fwd/src");
     let dst = topic!("fwd/dst");
 
@@ -428,6 +433,12 @@ fn test_callback_waiting_on_publish_does_not_deadlock() {
             );
         }
     }
+    // The sink can see the last message before the callback that forwarded
+    // it has returned and counted it, so let the counter catch up.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while forwarded.load(Ordering::SeqCst) < N && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
     assert_eq!(forwarded.load(Ordering::SeqCst), N);
 
     for c in [&src_cli, &sink, &fwd] {
@@ -442,7 +453,12 @@ fn test_callback_waiting_on_publish_does_not_deadlock() {
 fn test_slow_consumer_receives_everything_in_order() {
     use std::sync::{Arc, Mutex};
 
-    const N: u32 = 3000;
+    // Bounded by what the broker will hold for a client that has stopped
+    // reading: with Mosquitto's defaults (`max_queued_messages 1000`, 20 in
+    // flight) delivery stops at 2064 messages however many are published,
+    // and the rest are dropped before they ever reach us. Exact delivery
+    // behind a deeper backlog is the scripted brokers' job.
+    const N: u32 = 1500;
     let topic = topic!("slow_consumer");
 
     let sub = mqtt::AsyncClient::new(HOST).unwrap();

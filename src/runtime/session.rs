@@ -631,6 +631,17 @@ struct Negotiated {
     limits: SessionLimits,
 }
 
+/// Where inbound messages go, and how many may be outstanding there.
+///
+/// The channel carries every event to the dispatcher; the gate counts only
+/// the messages among them, so that a slow consumer holds the session back
+/// without connection events ever having to wait. The two are always used
+/// together, so they travel together.
+struct Delivery {
+    event_tx: async_channel::Sender<Event>,
+    gate: Arc<InboundGate>,
+}
+
 /// Holds all mutable state for a connected MQTT session.
 struct Session<B: Backend> {
     /// Write half of the split transport.
@@ -686,8 +697,7 @@ impl<B: Backend> Session<B> {
         flush_needed: bool,
         read_buf: BytesMut,
         negotiated: Negotiated,
-        event_tx: async_channel::Sender<Event>,
-        gate: Arc<InboundGate>,
+        delivery: Delivery,
         persist: Option<Arc<Mutex<Box<dyn ClientPersistence>>>>,
         state: SessionState,
     ) -> Self {
@@ -696,6 +706,7 @@ impl<B: Backend> Session<B> {
             keep_alive,
             limits,
         } = negotiated;
+        let Delivery { event_tx, gate } = delivery;
         Self {
             writer,
             ver,
@@ -2307,8 +2318,10 @@ pub(crate) async fn run_event_loop<B: Backend>(
                     keep_alive,
                     limits,
                 },
-                event_tx.clone(),
-                gate.clone(),
+                Delivery {
+                    event_tx: event_tx.clone(),
+                    gate: gate.clone(),
+                },
                 job.persist.clone(),
                 state,
             );
@@ -2618,8 +2631,10 @@ mod tests {
                 keep_alive,
                 limits: test_limits(),
             },
-            event_tx,
-            gate.clone(),
+            Delivery {
+                event_tx,
+                gate: gate.clone(),
+            },
             None,
             state,
         );
