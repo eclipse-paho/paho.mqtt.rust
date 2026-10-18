@@ -46,6 +46,9 @@ pub(crate) mod backend;
 pub(crate) mod outbox;
 
 #[cfg(any(feature = "tokio", feature = "smol"))]
+pub(crate) mod sinks;
+
+#[cfg(any(feature = "tokio", feature = "smol"))]
 pub(crate) mod session;
 
 #[cfg(any(feature = "tls", feature = "smol-tls", feature = "openssl"))]
@@ -74,6 +77,9 @@ pub(crate) use commands::{BufConfig, Command, ConnectParams, Event, ServerAddr};
 
 #[cfg(any(feature = "tokio", feature = "smol"))]
 pub(crate) use session::RuntimeHandle;
+
+#[cfg(any(feature = "tokio", feature = "smol"))]
+pub(crate) use sinks::Sink;
 
 #[cfg(feature = "tokio")]
 pub(crate) use tokio_rt::resolve_runtime;

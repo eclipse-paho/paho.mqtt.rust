@@ -364,6 +364,36 @@ fn check_bulk_received(broker: &common::ScriptedBroker) {
 // Inbound backpressure
 /////////////////////////////////////////////////////////////////////////////
 
+/// Publishes `n` QoS 1 messages whose payload is the big-endian index,
+/// pausing every `batch` until the broker has acknowledged.
+///
+/// A publisher that floods flat out can outrun a slow subscriber by more
+/// than the broker is willing to hold for it — Mosquitto queues
+/// `max_queued_messages` (1000 by default) and discards the rest — and what
+/// the broker drops looks exactly like loss in the client. Pacing keeps the
+/// test about the client. It does not pace the *subscriber*, which is what
+/// these tests are slowing down on purpose: a QoS 1 PUBACK comes from the
+/// broker on receipt, not from the far end.
+fn publish_paced(cli: &mqtt::AsyncClient, topic: &str, n: u32, batch: u32) {
+    let mut last = None;
+    for i in 0..n {
+        let tok = cli.publish(mqtt::Message::new(
+            topic,
+            i.to_be_bytes().to_vec(),
+            mqtt::QOS_1,
+        ));
+        if (i + 1) % batch == 0 {
+            tok.wait_for(TIMEOUT).expect("publish");
+            last = None;
+        } else {
+            last = Some(tok);
+        }
+    }
+    if let Some(tok) = last {
+        tok.wait_for(TIMEOUT).expect("publish");
+    }
+}
+
 /// A message callback that publishes and *waits* for each message, as a
 /// forwarder or bridge does, while thousands arrive. The inbound queue fills
 /// behind the waiting callback; the session must keep reading so that the
@@ -375,11 +405,6 @@ fn test_callback_waiting_on_publish_does_not_deadlock() {
         atomic::{AtomicUsize, Ordering},
     };
 
-    // Bounded by what the broker will hold for a client that has stopped
-    // reading: with Mosquitto's defaults (`max_queued_messages 1000`, 20 in
-    // flight) delivery stops at 2064 messages however many are published,
-    // and the rest are dropped before they ever reach us. Exact delivery
-    // behind a deeper backlog is the scripted brokers' job.
     const N: usize = 1500;
     let src = topic!("fwd/src");
     let dst = topic!("fwd/dst");
@@ -412,17 +437,7 @@ fn test_callback_waiting_on_publish_does_not_deadlock() {
 
     let src_cli = mqtt::AsyncClient::new(HOST).unwrap();
     src_cli.connect(None).wait().expect("src connect");
-    let mut last = None;
-    for i in 0..N {
-        last = Some(src_cli.publish(mqtt::Message::new(
-            src,
-            (i as u32).to_be_bytes().to_vec(),
-            mqtt::QOS_1,
-        )));
-    }
-    last.unwrap()
-        .wait_for(Duration::from_secs(30))
-        .expect("source publish");
+    publish_paced(&src_cli, src, N as u32, 200);
 
     for i in 0..N {
         if rx.recv_timeout(Duration::from_secs(10)).is_err() {
@@ -453,11 +468,6 @@ fn test_callback_waiting_on_publish_does_not_deadlock() {
 fn test_slow_consumer_receives_everything_in_order() {
     use std::sync::{Arc, Mutex};
 
-    // Bounded by what the broker will hold for a client that has stopped
-    // reading: with Mosquitto's defaults (`max_queued_messages 1000`, 20 in
-    // flight) delivery stops at 2064 messages however many are published,
-    // and the rest are dropped before they ever reach us. Exact delivery
-    // behind a deeper backlog is the scripted brokers' job.
     const N: u32 = 1500;
     let topic = topic!("slow_consumer");
 
@@ -480,17 +490,7 @@ fn test_slow_consumer_receives_everything_in_order() {
 
     let pub_cli = mqtt::AsyncClient::new(HOST).unwrap();
     pub_cli.connect(None).wait().expect("pub connect");
-    let mut last = None;
-    for i in 0..N {
-        last = Some(pub_cli.publish(mqtt::Message::new(
-            topic,
-            i.to_be_bytes().to_vec(),
-            mqtt::QOS_1,
-        )));
-    }
-    last.unwrap()
-        .wait_for(Duration::from_secs(30))
-        .expect("publish");
+    publish_paced(&pub_cli, topic, N, 200);
 
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     while got.lock().unwrap().len() < N as usize && std::time::Instant::now() < deadline {
@@ -3170,6 +3170,158 @@ fn test_get_stream() {
         .expect("get_stream recv timed out");
     assert_eq!(msg.topic(), topic);
     assert_eq!(msg.payload_str(), "stream-payload");
+
+    pub_cli.disconnect(None).wait().ok();
+    sub.disconnect(None).wait().ok();
+}
+
+/// Streams, consumers and a callback all receive every message, and none
+/// displaces another. Before the runtime fed the application's channels
+/// directly, each stream was a callback in disguise, so registering one
+/// silently stopped whatever held the slot before it.
+#[test]
+fn test_streams_and_callback_all_receive() {
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    let topic = topic!("fanout/all");
+    let mut sub = mqtt::AsyncClient::new(HOST).unwrap();
+
+    let stream = sub.get_stream(Some(16));
+    let events = sub.get_event_stream(Some(16));
+    let consumer = sub.start_consuming();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    {
+        let (calls, seen) = (calls.clone(), seen.clone());
+        sub.set_message_callback(move |_, msg| {
+            if let Some(msg) = msg {
+                calls.fetch_add(1, Ordering::SeqCst);
+                seen.lock().unwrap().push(msg.topic().to_string());
+            }
+        });
+    }
+
+    sub.connect(None).wait().expect("connect");
+    sub.subscribe(topic, mqtt::QOS_1).wait().expect("subscribe");
+
+    let pub_cli = mqtt::AsyncClient::new(HOST).unwrap();
+    pub_cli.connect(None).wait().expect("pub connect");
+    pub_cli
+        .publish(mqtt::Message::new(topic, "fanned-out", mqtt::QOS_1))
+        .wait()
+        .expect("publish");
+
+    // The synchronous consumer is the one that can block, so wait on it.
+    let msg = consumer.recv_timeout(TIMEOUT).expect("consumer").unwrap();
+    assert_eq!(msg.payload_str(), "fanned-out");
+
+    let deadline = std::time::Instant::now() + TIMEOUT;
+    while calls.load(Ordering::SeqCst) == 0 && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(seen.lock().unwrap().clone(), [topic], "the callback");
+
+    let msg = futures::executor::block_on(stream.recv())
+        .expect("message stream")
+        .expect("not the end of the stream");
+    assert_eq!(msg.payload_str(), "fanned-out", "the message stream");
+
+    // The event stream carries the connection events and the messages in
+    // one sequence, so the message arrives behind the Connected.
+    loop {
+        match futures::executor::block_on(events.recv()).expect("event stream") {
+            mqtt::Event::Message(m) => {
+                assert_eq!(m.payload_str(), "fanned-out", "the event stream");
+                break;
+            }
+            mqtt::Event::Connected(_) => {}
+            ev => panic!("unexpected event: {ev:?}"),
+        }
+    }
+
+    pub_cli.disconnect(None).wait().ok();
+    sub.disconnect(None).wait().ok();
+}
+
+/// A message callback registered after a stream leaves the stream running,
+/// and `remove_callbacks` leaves it running too: the callbacks belong to the
+/// application, the streams to the runtime, and neither closes the other.
+#[test]
+fn test_callback_registration_does_not_close_a_stream() {
+    let topic = topic!("fanout/no_contention");
+    let mut sub = mqtt::AsyncClient::new(HOST).unwrap();
+    let stream = sub.get_stream(Some(16));
+
+    sub.set_message_callback(|_, _| {});
+    sub.remove_callbacks();
+    sub.stop_consuming();
+
+    sub.connect(None).wait().expect("connect");
+    sub.subscribe(topic, mqtt::QOS_1).wait().expect("subscribe");
+
+    let pub_cli = mqtt::AsyncClient::new(HOST).unwrap();
+    pub_cli.connect(None).wait().expect("pub connect");
+    pub_cli
+        .publish(mqtt::Message::new(topic, "still-here", mqtt::QOS_1))
+        .wait()
+        .expect("publish");
+
+    let msg = futures::executor::block_on(stream.recv())
+        .expect("the stream was closed by a callback call")
+        .expect("not the end of the stream");
+    assert_eq!(msg.payload_str(), "still-here");
+
+    pub_cli.disconnect(None).wait().ok();
+    sub.disconnect(None).wait().ok();
+}
+
+/// A bounded stream that fills up is not dropped into: the client stops
+/// reading, the broker holds the rest, and everything arrives in order once
+/// the application drains it. A QoS 1 message is acknowledged only after it
+/// has been handed over, so nothing can be lost in between.
+#[test]
+fn test_full_stream_applies_backpressure_without_loss() {
+    const N: u32 = 200;
+    let topic = topic!("stream/backpressure");
+
+    let mut sub = mqtt::AsyncClient::new(HOST).unwrap();
+    // Far smaller than the burst, so the stream is full almost at once.
+    let stream = sub.get_stream(Some(4));
+    sub.connect(None).wait().expect("connect");
+    sub.subscribe(topic, mqtt::QOS_1).wait().expect("subscribe");
+
+    let pub_cli = mqtt::AsyncClient::new(HOST).unwrap();
+    pub_cli.connect(None).wait().expect("pub connect");
+    let mut last = None;
+    for i in 0..N {
+        last = Some(pub_cli.publish(mqtt::Message::new(
+            topic,
+            i.to_be_bytes().to_vec(),
+            mqtt::QOS_1,
+        )));
+    }
+    last.unwrap().wait_for(TIMEOUT).expect("publish");
+
+    // Let the burst reach the subscriber with nothing draining it, so the
+    // stream really is full and the session really has stopped reading
+    // before the first `recv` below.
+    std::thread::sleep(Duration::from_millis(500));
+
+    // Drained with a deadline rather than a blocking `recv`, so a message
+    // dropped for want of room fails the test instead of hanging it.
+    let mut got = Vec::new();
+    let deadline = std::time::Instant::now() + TIMEOUT;
+    while got.len() < N as usize && std::time::Instant::now() < deadline {
+        match stream.try_recv() {
+            Ok(Some(msg)) => got.push(u32::from_be_bytes(msg.payload()[..].try_into().unwrap())),
+            Ok(None) => panic!("the connection was lost"),
+            Err(_) => std::thread::sleep(Duration::from_millis(5)),
+        }
+    }
+    assert_eq!(got, (0..N).collect::<Vec<_>>());
 
     pub_cli.disconnect(None).wait().ok();
     sub.disconnect(None).wait().ok();

@@ -36,6 +36,7 @@ use paho_mqtt_codec::{
     ReasonCode, Will,
 };
 
+use super::sinks::Sink;
 use crate::{
     ClientPersistence, ConnectResponse, Error, Message, PublishResponse, SubscribeOptions,
     SubscribeResponse, UnsubscribeResponse, token::Completer,
@@ -390,6 +391,16 @@ pub(crate) enum Command {
         /// Completer resolved with the UNSUBACK result.
         tx: Completer<UnsubscribeResponse>,
     },
+
+    /// Register an application delivery sink: a message or event stream
+    /// the event loop feeds directly, rather than through a callback.
+    ///
+    /// The sink lasts until its receiver is dropped or `stop_stream` clears
+    /// it; it survives reconnects, as the streams always have.
+    AddSink(Sink),
+
+    /// Close every application sink, from `stop_stream`.
+    ClearSinks,
 
     /// Send a DISCONNECT packet and close the connection.
     Disconnect {

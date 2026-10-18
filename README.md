@@ -238,6 +238,8 @@ Most application code needs little or no change. The client types, builders, tok
 - An acknowledgement carrying an error reason code now fails the operation's token with `Error::ReasonCode`, for `publish`, `subscribe`, and `unsubscribe`. The `*_many` calls still return `Ok` with one code per topic, since they can succeed partially.
 - `client_id()` returns `String` rather than `&str`, so it can report a broker-assigned identifier.
 - `Error::Publish` holds a `Box<Message>`.
+- **Streams and callbacks no longer displace each other.** In v1.x a stream was a callback underneath, so `get_stream()` and `set_message_callback()` cancelled one another and `remove_callbacks()` closed the streams. Now the runtime feeds the streams itself and the callbacks are yours alone: every stream, every consumer and the callback receive each message, and several streams can be live at once. Code that relied on one closing another must close it explicitly, with `stop_stream()` or by dropping the receiver.
+- **A full bounded stream applies backpressure instead of dropping.** `get_stream(Some(n))` used to discard messages when the application fell behind; now the client stops reading from the broker until there is room. An unbounded stream behaves as before. A consumer that wants newest-wins behaviour can register a message callback that tries its own channel and drops when it is full.
 
 The `[Breaking]` entries in the [CHANGELOG](CHANGELOG.md) list these in full.
 

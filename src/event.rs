@@ -23,6 +23,11 @@
 use crate::{ConnectResponse, Message, Properties, ReasonCode};
 
 /// Events emitted by the client.
+///
+/// `Clone` matters when more than one consumer is registered: every stream
+/// and every callback receives each event, so all but the last destination
+/// are given a copy.
+#[derive(Debug, Clone)]
 pub enum Event {
     /// The connection was established/re-established.
     Connected(ConnectResponse),

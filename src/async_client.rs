@@ -50,14 +50,15 @@ use crate::{
     UnsubscribeToken, UserData,
     error::{Error, Result},
     persistence::ClientPersistence,
-    runtime::{BufConfig, Command, ConnectParams, RtOwnership, ServerAddr},
+    runtime::{
+        BufConfig, Command, ConnectParams, RtOwnership, ServerAddr, Sink, session::Dispatch,
+    },
     token::Token,
 };
 use bytes::Bytes;
 use crossbeam_channel as sync_channel;
 use paho_mqtt_codec::types::*;
 use std::{
-    result::Result as StdResult,
     sync::{
         Arc, Mutex, RwLock,
         atomic::{AtomicBool, AtomicU32, Ordering},
@@ -108,6 +109,14 @@ pub(crate) struct InnerAsyncClient {
     conn_opts: RwLock<ConnectOptions>,
     /// User-registered event callbacks.
     callback_context: Mutex<CallbackContext>,
+    /// The synchronous consumers: `start_consuming` and
+    /// `start_consuming_events`. Fed by the dispatcher thread, because a
+    /// `crossbeam` receiver cannot be awaited.
+    sync_sinks: RwLock<Arc<SyncSinks>>,
+    /// What this client shares with its event loop: the gate the dispatcher
+    /// reports consumed messages to, and whether anything on this side
+    /// wants messages at all.
+    dispatch: Dispatch,
     /// Persistence store, if any.
     persist: Option<Arc<Mutex<Box<dyn ClientPersistence>>>>,
     /// Keeps the async runtime alive for the lifetime of this client.
@@ -175,14 +184,6 @@ impl<F: ?Sized> Slot<F> {
         self.generation = self.generation.wrapping_add(1);
     }
 
-    /// Removes the callback only if the slot still holds the one identified
-    /// by `generation`, leaving anything the application put there since.
-    fn clear_if(&mut self, generation: u64) {
-        if self.generation == generation {
-            self.clear();
-        }
-    }
-
     /// Takes the callback out to be run, with the generation to hand back to
     /// [`restore`](Self::restore).
     fn take(&mut self) -> Option<(Box<F>, u64)> {
@@ -198,18 +199,101 @@ impl<F: ?Sized> Slot<F> {
     }
 }
 
-/// The generations of the callbacks a message or event stream installed.
+/// The synchronous consumers of one client: the channels
+/// [`start_consuming`] and [`start_consuming_events`] handed out.
 ///
-/// `stop_stream` closes a stream's channel by dropping the senders the stream
-/// put in the callback slots. It must drop *those* and nothing else: the
-/// application's own handlers are not the stream's to remove, and a callback
-/// the application has since replaced is no longer the stream's either.
+/// These are fed by the dispatcher thread rather than by the event loop,
+/// because a `crossbeam` receiver cannot be awaited. A bounded one that is
+/// full blocks that thread, which stops it draining the event channel, which
+/// is how backpressure from this side reaches the session.
+///
+/// Held behind an `Arc` the dispatcher clones out from under the lock, so a
+/// consumer that blocks does not hold the lock while it does.
+///
+/// [`start_consuming`]: AsyncClient::start_consuming
+/// [`start_consuming_events`]: AsyncClient::start_consuming_events
 #[derive(Default)]
-struct StreamSlots {
-    connected: Option<u64>,
-    connection_lost: Option<u64>,
-    disconnected: Option<u64>,
-    message: Option<u64>,
+struct SyncSinks {
+    msgs: Vec<sync_channel::Sender<Option<Message>>>,
+    events: Vec<sync_channel::Sender<Event>>,
+}
+
+impl SyncSinks {
+    /// Whether any synchronous consumer is registered.
+    fn is_empty(&self) -> bool {
+        self.msgs.is_empty() && self.events.is_empty()
+    }
+
+    /// Sends to every consumer, returning the ones whose receiver is gone
+    /// for the caller to prune.
+    fn send_message(&self, msg: Message) -> DeadSinks {
+        let mut dead = DeadSinks::default();
+        let n = self.msgs.len() + self.events.len();
+        let mut msg = Some(msg);
+        let mut i = 0;
+        for tx in &self.msgs {
+            i += 1;
+            let m = if i == n {
+                msg.take().unwrap()
+            } else {
+                msg.as_ref().unwrap().clone()
+            };
+            if tx.send(Some(m)).is_err() {
+                dead.msgs.push(tx.clone());
+            }
+        }
+        for tx in &self.events {
+            i += 1;
+            let m = if i == n {
+                msg.take().unwrap()
+            } else {
+                msg.as_ref().unwrap().clone()
+            };
+            if tx.send(Event::Message(m)).is_err() {
+                dead.events.push(tx.clone());
+            }
+        }
+        dead
+    }
+
+    /// Sends a connection event to the event consumers.
+    fn send_event(&self, ev: &Event) -> DeadSinks {
+        let mut dead = DeadSinks::default();
+        for tx in &self.events {
+            if tx.send(ev.clone()).is_err() {
+                dead.events.push(tx.clone());
+            }
+        }
+        dead
+    }
+
+    /// Tells every consumer the connection ended: `None` to the message
+    /// consumers, as the message callback is given, and `ConnectionLost` to
+    /// the event consumers.
+    fn send_connection_lost(&self) -> DeadSinks {
+        let mut dead = DeadSinks::default();
+        for tx in &self.msgs {
+            if tx.send(None).is_err() {
+                dead.msgs.push(tx.clone());
+            }
+        }
+        let mut rest = self.send_event(&Event::ConnectionLost);
+        dead.events.append(&mut rest.events);
+        dead
+    }
+}
+
+/// Consumers whose receiver was dropped, found while sending to them.
+#[derive(Default)]
+struct DeadSinks {
+    msgs: Vec<sync_channel::Sender<Option<Message>>>,
+    events: Vec<sync_channel::Sender<Event>>,
+}
+
+impl DeadSinks {
+    fn is_empty(&self) -> bool {
+        self.msgs.is_empty() && self.events.is_empty()
+    }
 }
 
 #[derive(Default)]
@@ -218,8 +302,11 @@ struct CallbackContext {
     on_connection_lost: Slot<ConnectionLostCallback>,
     on_disconnected: Slot<DisconnectedCallback>,
     on_message_arrived: Slot<MessageArrivedCallback>,
-    /// What the current stream, if any, installed.
-    stream: StreamSlots,
+    /// Whether a message callback is registered, including while it is
+    /// taken out to be run — `on_message_arrived` is empty for the length
+    /// of the call, and the event loop must not conclude from that that
+    /// nothing wants messages.
+    msg_cb_installed: bool,
 }
 
 /////////////////////////////////////////////////////////////////////////////
@@ -261,7 +348,7 @@ impl AsyncClient {
             let rt = RuntimeHandle::spawn(&executor, buf_cfg);
             (rt, SmolOwnership::Shared(executor))
         };
-        let (cmd_tx, event_rx, gate) = rt.into_parts();
+        let (cmd_tx, event_rx, dispatch) = rt.into_parts();
 
         // Seed the stored connect opts with the client's initial MQTT version
         // so that reconnect() and pre-connect sends use the right version.
@@ -284,6 +371,8 @@ impl AsyncClient {
             opts,
             conn_opts: RwLock::new(initial_conn_opts),
             callback_context: Mutex::new(CallbackContext::default()),
+            sync_sinks: RwLock::new(Arc::new(SyncSinks::default())),
+            dispatch: dispatch.clone(),
             persist,
             _rt_ownership: rt_ownership,
         });
@@ -299,10 +388,11 @@ impl AsyncClient {
                     let cli = AsyncClient { inner };
                     let is_msg = matches!(ev, crate::runtime::Event::MessageArrived(_));
                     cli.dispatch_event(ev);
-                    // Only now, with the callback done, is there room for
-                    // another: a slow consumer holds the session back.
+                    // Only now, with the callback done and the synchronous
+                    // consumers fed, is there room for another: a slow
+                    // consumer holds the session back.
                     if is_msg {
-                        gate.consumed();
+                        dispatch.gate.consumed();
                     }
                 }
             })
@@ -956,10 +1046,39 @@ impl AsyncClient {
     }
 
     /// Dispatches an event from the runtime to the registered callbacks.
+    /// Sends to the synchronous consumers, outside the lock, and forgets
+    /// the ones whose receiver has been dropped.
+    ///
+    /// A bounded consumer that is full blocks this thread until it has
+    /// room, which stops the event channel draining and, through the gate,
+    /// stops the session reading. That is the backpressure a blocking
+    /// consumer can apply; nothing is dropped.
+    fn to_sync_sinks<F>(&self, send: F)
+    where
+        F: FnOnce(&SyncSinks) -> DeadSinks,
+    {
+        let sinks = self.inner.sync_sinks.read().unwrap().clone();
+        if sinks.is_empty() {
+            return;
+        }
+        let dead = send(&sinks);
+        if !dead.is_empty() {
+            self.update_sync_sinks(|sinks| {
+                sinks
+                    .msgs
+                    .retain(|tx| !dead.msgs.iter().any(|d| tx.same_channel(d)));
+                sinks
+                    .events
+                    .retain(|tx| !dead.events.iter().any(|d| tx.same_channel(d)));
+            });
+        }
+    }
+
     fn dispatch_event(&self, ev: crate::runtime::Event) {
         use crate::runtime::Event as Ev;
         match ev {
             Ev::Connected(response) => {
+                self.to_sync_sinks(|sinks| sinks.send_event(&Event::Connected(response.clone())));
                 // Take the callback out before invoking so we don't hold the
                 // lock across the call — a callback that calls set_*_callback
                 // or remove_callbacks would otherwise deadlock. `restore`
@@ -983,6 +1102,7 @@ impl AsyncClient {
             }
             Ev::ConnectionLost(_err) => {
                 self.inner.connected.store(false, Ordering::SeqCst);
+                self.to_sync_sinks(|sinks| sinks.send_connection_lost());
                 let (msg_cb, lost_cb) = {
                     let mut cbctx = self.inner.callback_context.lock().unwrap();
                     (
@@ -1011,6 +1131,12 @@ impl AsyncClient {
             }
             Ev::Disconnected { reason_code, props } => {
                 self.inner.connected.store(false, Ordering::SeqCst);
+                self.to_sync_sinks(|sinks| {
+                    sinks.send_event(&Event::Disconnected {
+                        props: props.clone(),
+                        reason_code,
+                    })
+                });
                 let taken = self
                     .inner
                     .callback_context
@@ -1036,6 +1162,18 @@ impl AsyncClient {
                     .unwrap()
                     .on_message_arrived
                     .take();
+                // The consumers first, so that a callback which blocks
+                // cannot hold them up; neither displaces the other.
+                let msg = match taken {
+                    Some(_) => {
+                        self.to_sync_sinks(|sinks| sinks.send_message(msg.clone()));
+                        msg
+                    }
+                    None => {
+                        self.to_sync_sinks(|sinks| sinks.send_message(msg));
+                        return;
+                    }
+                };
                 if let Some((mut cb, generation)) = taken {
                     cb(self, Some(msg));
                     self.inner
@@ -1233,22 +1371,25 @@ impl AsyncClient {
     where
         F: FnMut(&AsyncClient, Option<Message>) + Send + 'static,
     {
-        self.inner
-            .callback_context
-            .lock()
-            .unwrap()
-            .on_message_arrived
-            .set(Box::new(cb));
+        {
+            let mut cbctx = self.inner.callback_context.lock().unwrap();
+            cbctx.on_message_arrived.set(Box::new(cb));
+            cbctx.msg_cb_installed = true;
+        }
+        self.refresh_wants_messages(None);
     }
 
     /// Removes the callback for when a message arrives from the broker.
+    ///
+    /// The application's streams and consumers are unaffected: they are not
+    /// callbacks, and never were.
     pub fn remove_message_callback(&self) {
-        self.inner
-            .callback_context
-            .lock()
-            .unwrap()
-            .on_message_arrived
-            .clear();
+        {
+            let mut cbctx = self.inner.callback_context.lock().unwrap();
+            cbctx.on_message_arrived.clear();
+            cbctx.msg_cb_installed = false;
+        }
+        self.refresh_wants_messages(None);
     }
 
     /// Removes all registered callbacks atomically under a single lock.
@@ -1256,39 +1397,55 @@ impl AsyncClient {
     /// A callback may call this from inside itself; it is not reinstated when
     /// it returns.
     pub fn remove_callbacks(&self) {
-        let mut cbctx = self.inner.callback_context.lock().unwrap();
-        cbctx.stream = StreamSlots::default();
-        cbctx.on_connected.clear();
-        cbctx.on_connection_lost.clear();
-        cbctx.on_disconnected.clear();
-        cbctx.on_message_arrived.clear();
+        {
+            let mut cbctx = self.inner.callback_context.lock().unwrap();
+            cbctx.on_connected.clear();
+            cbctx.on_connection_lost.clear();
+            cbctx.on_disconnected.clear();
+            cbctx.on_message_arrived.clear();
+            cbctx.msg_cb_installed = false;
+        }
+        self.refresh_wants_messages(None);
     }
 
     /// Starts the client consuming messages for a blocking (non-async) app.
     ///
     /// Returns the receiving-end of the channel for the application to
-    /// get the messages.
+    /// get the messages. The channel is unbounded, so nothing is dropped
+    /// and nothing is held back; a consumer that falls behind grows it.
+    ///
+    /// This is independent of [`set_message_callback`] and of the async
+    /// streams: each receives every message. Consuming stops when the
+    /// receiver is dropped, or on [`stop_consuming`].
+    ///
+    /// [`set_message_callback`]: AsyncClient::set_message_callback
+    /// [`stop_consuming`]: AsyncClient::stop_consuming
     pub fn start_consuming(&self) -> SyncReceiver<Option<Message>> {
         let (tx, rx) = sync_channel::unbounded();
-
-        self.set_stream_message_callback(move |_, optmsg| {
-            log_channel_err(tx.try_send(optmsg));
-        });
-
+        self.update_sync_sinks(|sinks| sinks.msgs.push(tx));
         rx
     }
 
     /// Stops the client from consuming messages.
+    ///
+    /// Closes the channels handed out by [`start_consuming`], and nothing
+    /// else: an application message callback, the async streams and the
+    /// event consumers are left as they are.
+    ///
+    /// [`start_consuming`]: AsyncClient::start_consuming
     pub fn stop_consuming(&self) {
-        self.remove_message_callback();
+        self.update_sync_sinks(|sinks| sinks.msgs.clear());
     }
 
     /// Creates a synchronous event stream.
     ///
-    /// Returns the receive end of a channel that receives [`Event`] values.
+    /// Returns the receive end of a channel that receives [`Event`] values:
+    /// the messages and the connection events, in one sequence.
     ///
     /// The stream will rely on a bounded channel with the given buffer
-    /// capacity if `buffer_lim` is `Some`, or an unbounded channel if `None`.
+    /// capacity if `buffer_lim` is `Some`, or an unbounded channel if
+    /// `None`. A full bounded channel is **not** dropped into: the client
+    /// waits for room, and stops reading from the broker until it has it.
     pub fn start_consuming_events<L>(&self, buffer_lim: L) -> SyncReceiver<Event>
     where
         L: Into<Option<usize>>,
@@ -1297,81 +1454,75 @@ impl AsyncClient {
             Some(lim) => sync_channel::bounded(lim),
             None => sync_channel::unbounded(),
         };
-
-        self.set_stream_connected_callback({
-            let tx = tx.clone();
-            move |_cli, rsp| {
-                log_channel_err(tx.try_send(Event::Connected(rsp.clone())));
-            }
-        });
-
-        self.set_stream_message_callback({
-            let tx = tx.clone();
-            move |_cli, msg| {
-                if let Some(msg) = msg {
-                    log_channel_err(tx.try_send(Event::Message(msg)));
-                }
-            }
-        });
-
-        self.set_stream_connection_lost_callback({
-            let tx = tx.clone();
-            move |_cli| {
-                log_channel_err(tx.try_send(Event::ConnectionLost));
-            }
-        });
-
-        self.set_stream_disconnected_callback({
-            let tx = tx.clone();
-            move |_cli, props, reason_code| {
-                log_channel_err(tx.try_send(Event::Disconnected { props, reason_code }));
-            }
-        });
-
+        self.update_sync_sinks(|sinks| sinks.events.push(tx));
         rx
     }
 
-    // ---- Callback installation on behalf of a stream ----
-    //
-    // Each of these registers a sender-holding callback and records which
-    // callback the stream owns, so `stop_stream` can take back exactly those.
-
-    fn set_stream_connected_callback<F>(&self, cb: F)
-    where
-        F: FnMut(&AsyncClient, &crate::ConnectResponse) + Send + 'static,
-    {
-        let mut cbctx = self.inner.callback_context.lock().unwrap();
-        cbctx.stream.connected = Some(cbctx.on_connected.set(Box::new(cb)));
+    /// Registers an async delivery sink with the event loop, which feeds it
+    /// directly — no callback, and no dispatcher thread in the way.
+    fn add_sink(&self, sink: Sink) {
+        if self.inner.cmd_tx.try_send(Command::AddSink(sink)).is_err() {
+            warn!("Client is closed; the stream will receive nothing");
+        }
     }
 
-    fn set_stream_connection_lost_callback<F>(&self, cb: F)
+    /// Applies `f` to the synchronous consumers and republishes them.
+    ///
+    /// The list is copy-on-write: the dispatcher thread clones the `Arc`
+    /// out and sends from that, so it never holds the lock while a full
+    /// consumer blocks it.
+    fn update_sync_sinks<F>(&self, f: F)
     where
-        F: FnMut(&AsyncClient) + Send + 'static,
+        F: FnOnce(&mut SyncSinks),
     {
-        let mut cbctx = self.inner.callback_context.lock().unwrap();
-        cbctx.stream.connection_lost = Some(cbctx.on_connection_lost.set(Box::new(cb)));
+        let mut guard = self.inner.sync_sinks.write().unwrap();
+        let mut next = SyncSinks {
+            msgs: guard.msgs.clone(),
+            events: guard.events.clone(),
+        };
+        f(&mut next);
+        let any = !next.is_empty();
+        *guard = Arc::new(next);
+        drop(guard);
+        // Messages reach the callbacks and these consumers through the
+        // dispatcher thread; while neither exists the event loop skips it
+        // and feeds the streams alone.
+        self.refresh_wants_messages(Some(any));
     }
 
-    fn set_stream_disconnected_callback<F>(&self, cb: F)
-    where
-        F: FnMut(&AsyncClient, Properties, ReasonCode) + Send + 'static,
-    {
-        let mut cbctx = self.inner.callback_context.lock().unwrap();
-        cbctx.stream.disconnected = Some(cbctx.on_disconnected.set(Box::new(cb)));
-    }
-
-    fn set_stream_message_callback<F>(&self, cb: F)
-    where
-        F: FnMut(&AsyncClient, Option<Message>) + Send + 'static,
-    {
-        let mut cbctx = self.inner.callback_context.lock().unwrap();
-        cbctx.stream.message = Some(cbctx.on_message_arrived.set(Box::new(cb)));
+    /// Tells the event loop whether anything on this side still wants
+    /// messages: a message callback, or a synchronous consumer.
+    ///
+    /// `sync` saves re-reading the consumer list when the caller has just
+    /// rebuilt it.
+    fn refresh_wants_messages(&self, sync: Option<bool>) {
+        let cb = self.inner.callback_context.lock().unwrap().msg_cb_installed;
+        let sync = sync.unwrap_or_else(|| !self.inner.sync_sinks.read().unwrap().is_empty());
+        self.inner
+            .dispatch
+            .wants_messages
+            .store(cb || sync, Ordering::SeqCst);
     }
 
     /// Creates an async message stream.
     ///
+    /// The event loop delivers into it directly, so a message reaches an
+    /// application waiting on the stream without passing through the
+    /// callback dispatcher first.
+    ///
     /// The stream will rely on a bounded channel with the given buffer
-    /// capacity if `buffer_lim` is `Some`, or an unbounded channel if `None`.
+    /// capacity if `buffer_lim` is `Some`, or an unbounded channel if
+    /// `None`. A full bounded stream is **not** dropped into: the client
+    /// stops reading from the broker until the application takes what is
+    /// there, and an unacknowledged QoS 1 or 2 message stays unacknowledged
+    /// meanwhile. An unbounded stream never blocks the client but grows
+    /// without limit behind a consumer that falls behind.
+    ///
+    /// Several streams may be live at once, and each receives every
+    /// message; so does a message callback, if one is registered. A stream
+    /// ends when its receiver is dropped, or on [`stop_stream`].
+    ///
+    /// [`stop_stream`]: AsyncClient::stop_stream
     pub fn get_stream<L>(&mut self, buffer_lim: L) -> AsyncReceiver<Option<Message>>
     where
         L: Into<Option<usize>>,
@@ -1380,18 +1531,17 @@ impl AsyncClient {
             Some(lim) => async_channel::bounded(lim),
             None => async_channel::unbounded(),
         };
-
-        self.set_stream_message_callback(move |_, msg| {
-            log_stream_err(tx.try_send(msg));
-        });
-
+        self.add_sink(Sink::Messages(tx));
         rx
     }
 
     /// Creates an async event stream.
     ///
-    /// The stream will rely on a bounded channel with the given buffer
-    /// capacity if `buffer_lim` is `Some`, or an unbounded channel if `None`.
+    /// Receives the messages *and* the connection events, in one sequence,
+    /// delivered by the event loop itself. The capacity and backpressure
+    /// are as for [`get_stream`].
+    ///
+    /// [`get_stream`]: AsyncClient::get_stream
     pub fn get_event_stream<L>(&self, buffer_lim: L) -> AsyncReceiver<Event>
     where
         L: Into<Option<usize>>,
@@ -1400,52 +1550,20 @@ impl AsyncClient {
             Some(lim) => async_channel::bounded(lim),
             None => async_channel::unbounded(),
         };
-
-        self.set_stream_connected_callback({
-            let tx = tx.clone();
-            move |_cli, rsp| {
-                log_stream_err(tx.try_send(Event::Connected(rsp.clone())));
-            }
-        });
-
-        self.set_stream_message_callback({
-            let tx = tx.clone();
-            move |_cli, msg| {
-                if let Some(msg) = msg {
-                    log_stream_err(tx.try_send(Event::Message(msg)));
-                }
-            }
-        });
-
-        self.set_stream_connection_lost_callback({
-            let tx = tx.clone();
-            move |_cli| {
-                log_stream_err(tx.try_send(Event::ConnectionLost));
-            }
-        });
-
-        self.set_stream_disconnected_callback({
-            let tx = tx.clone();
-            move |_cli, props, reason_code| {
-                log_stream_err(tx.try_send(Event::Disconnected { props, reason_code }));
-            }
-        });
-
+        self.add_sink(Sink::Events(tx));
         rx
     }
 
-    /// Stops the stream created by [`get_stream`], [`get_event_stream`],
-    /// [`start_consuming`] or [`start_consuming_events`], closing its channel.
+    /// Stops every stream and consumer this client feeds, closing their
+    /// channels: those from [`get_stream`], [`get_event_stream`],
+    /// [`start_consuming`] and [`start_consuming_events`].
     ///
-    /// Removes the callbacks that stream installed, dropping the last
-    /// channel-sender clones so the receiver observes the channel closing. A
-    /// message stream holds one callback and an event stream four, so this
-    /// removes one or four accordingly.
+    /// Callbacks the application registered are left alone — they are the
+    /// application's, and nothing the library does displaces them. Use
+    /// [`remove_callbacks`] to clear those.
     ///
-    /// Callbacks the application registered itself are left alone, as is a
-    /// callback the application has replaced since the stream started — the
-    /// stream no longer owns that slot. Use [`remove_callbacks`] to clear
-    /// everything.
+    /// A stream also ends simply by being dropped, which needs no call at
+    /// all; this is for closing one whose receiver is held elsewhere.
     ///
     /// [`get_stream`]: AsyncClient::get_stream
     /// [`get_event_stream`]: AsyncClient::get_event_stream
@@ -1453,21 +1571,11 @@ impl AsyncClient {
     /// [`start_consuming_events`]: AsyncClient::start_consuming_events
     /// [`remove_callbacks`]: AsyncClient::remove_callbacks
     pub fn stop_stream(&self) {
-        let mut cbctx = self.inner.callback_context.lock().unwrap();
-        let stream = std::mem::take(&mut cbctx.stream);
-
-        if let Some(generation) = stream.connected {
-            cbctx.on_connected.clear_if(generation);
-        }
-        if let Some(generation) = stream.connection_lost {
-            cbctx.on_connection_lost.clear_if(generation);
-        }
-        if let Some(generation) = stream.disconnected {
-            cbctx.on_disconnected.clear_if(generation);
-        }
-        if let Some(generation) = stream.message {
-            cbctx.on_message_arrived.clear_if(generation);
-        }
+        let _ = self.inner.cmd_tx.try_send(Command::ClearSinks);
+        self.update_sync_sinks(|sinks| {
+            sinks.msgs.clear();
+            sinks.events.clear();
+        });
     }
 
     /// Returns the client ID used for the client instance.
@@ -1490,26 +1598,6 @@ impl AsyncClient {
 }
 
 // The client is safe to send or share between threads.
-
-fn log_send_err(is_full: bool) {
-    if is_full {
-        warn!("Event stream full. Losing messages");
-    } else {
-        warn!("Event stream closed");
-    }
-}
-
-fn log_channel_err<T>(res: StdResult<(), sync_channel::TrySendError<T>>) {
-    if let Err(e) = res {
-        log_send_err(e.is_full());
-    }
-}
-
-fn log_stream_err<T>(res: StdResult<(), async_channel::TrySendError<T>>) {
-    if let Err(e) = res {
-        log_send_err(e.is_full());
-    }
-}
 
 /// Extracts `(host, port, path)` from the authority+path portion of a URI.
 ///
@@ -2155,14 +2243,17 @@ mod tests {
         cli.dispatch_event(Ev::ConnectionLost(Error::Disconnected));
     }
 
-    /// A message stream owns one callback, so stopping it must not take the
-    /// application's connection handlers with it. `stop_stream` used to call
-    /// `remove_callbacks()`, which removed all four.
+    /// Streams and consumers are not callbacks. Starting one leaves the
+    /// application's handlers alone, and so does stopping it — which is the
+    /// whole point of the sinks: the library and the application no longer
+    /// bid for the same four slots.
     #[test]
-    fn test_stop_stream_keeps_the_applications_callbacks() {
+    fn test_streams_do_not_displace_the_applications_callbacks() {
         let mut cli = test_client();
         let counts = count_all_callbacks(&cli);
         let _rx = cli.get_stream(10);
+        let _events = cli.get_event_stream(10);
+        let _sync = cli.start_consuming();
 
         cli.stop_stream();
         dispatch_one_of_each(&cli);
@@ -2170,46 +2261,135 @@ mod tests {
         assert_eq!(*counts[0].lock().unwrap(), 1, "connected");
         assert_eq!(*counts[1].lock().unwrap(), 1, "connection lost");
         assert_eq!(*counts[2].lock().unwrap(), 1, "disconnected");
-        assert_eq!(
-            *counts[3].lock().unwrap(),
-            0,
-            "the stream replaced the message callback and then removed it"
-        );
+        // Twice: the arriving message, and the `None` that marks the end.
+        assert_eq!(*counts[3].lock().unwrap(), 2, "message");
     }
 
-    /// An event stream owns all four, so stopping it drops every sender and
-    /// the receiver sees the channel close.
+    /// A message callback and a synchronous consumer both receive every
+    /// message. Before the sinks, whichever was registered second silently
+    /// took the other's place.
     #[test]
-    fn test_stop_stream_closes_an_event_stream() {
+    fn test_callback_and_consumer_both_receive() {
         let cli = test_client();
-        let rx = cli.get_event_stream(10);
-        assert!(!rx.is_closed());
-
-        cli.stop_stream();
-        assert!(rx.is_closed(), "senders still held in the callback slots");
-
-        dispatch_one_of_each(&cli);
-        assert!(rx.try_recv().is_err(), "the stream is still fed");
-    }
-
-    /// A callback the application installed *after* starting a stream is not
-    /// the stream's to remove.
-    #[test]
-    fn test_stop_stream_leaves_a_replaced_callback_alone() {
-        let mut cli = test_client();
-        let _rx = cli.get_stream(10);
-
         let calls = counter();
         let c = calls.clone();
         cli.set_message_callback(move |_, _| *c.lock().unwrap() += 1);
+        let rx = cli.start_consuming();
 
-        cli.stop_stream();
         cli.dispatch_event(crate::runtime::Event::MessageArrived(Message::new(
             "t",
             "p",
             crate::QOS_0,
         )));
-        assert_eq!(*calls.lock().unwrap(), 1, "the replacement was removed");
+
+        assert_eq!(*calls.lock().unwrap(), 1, "the callback");
+        assert_eq!(rx.try_recv().unwrap().unwrap().topic, "t", "the consumer");
+    }
+
+    /// `stop_consuming` closes what `start_consuming` opened and nothing
+    /// else; it used to remove the application's message callback, which it
+    /// had never installed.
+    #[test]
+    fn test_stop_consuming_leaves_the_callback() {
+        let cli = test_client();
+        let calls = counter();
+        let c = calls.clone();
+        cli.set_message_callback(move |_, _| *c.lock().unwrap() += 1);
+        let rx = cli.start_consuming();
+
+        cli.stop_consuming();
+        cli.dispatch_event(crate::runtime::Event::MessageArrived(Message::new(
+            "t",
+            "p",
+            crate::QOS_0,
+        )));
+
+        assert_eq!(*calls.lock().unwrap(), 1, "the callback still runs");
+        assert!(rx.try_recv().is_err(), "the consumer was closed");
+    }
+
+    /// `remove_callbacks` clears the callbacks — which is what it says —
+    /// and leaves the consumers running.
+    #[test]
+    fn test_remove_callbacks_leaves_the_consumers() {
+        let cli = test_client();
+        let counts = count_all_callbacks(&cli);
+        let rx = cli.start_consuming();
+
+        cli.remove_callbacks();
+        dispatch_one_of_each(&cli);
+
+        for (i, count) in counts.iter().enumerate() {
+            assert_eq!(*count.lock().unwrap(), 0, "callback {i}");
+        }
+        assert_eq!(rx.try_recv().unwrap().unwrap().topic, "t");
+    }
+
+    /// The event loop is told whether anything on this side wants messages
+    /// at all. While nothing does it delivers to the streams alone, with no
+    /// dispatcher thread in the way.
+    #[test]
+    fn test_wants_messages_tracks_callbacks_and_consumers() {
+        let cli = test_client();
+        let wants = || cli.inner.dispatch.wants_messages.load(Ordering::SeqCst);
+        assert!(!wants(), "a fresh client has neither");
+
+        cli.set_message_callback(|_, _| {});
+        assert!(wants(), "a callback wants them");
+        cli.remove_message_callback();
+        assert!(!wants());
+
+        let rx = cli.start_consuming();
+        assert!(wants(), "a consumer wants them");
+        cli.set_message_callback(|_, _| {});
+        cli.stop_consuming();
+        assert!(wants(), "the callback is still there");
+        cli.remove_callbacks();
+        assert!(!wants());
+        drop(rx);
+    }
+
+    /// A synchronous event consumer sees the connection events and the
+    /// messages in one sequence, in order.
+    #[test]
+    fn test_event_consumer_sees_events_and_messages() {
+        let cli = test_client();
+        let rx = cli.start_consuming_events(None);
+
+        cli.dispatch_event(crate::runtime::Event::Connected(
+            crate::ConnectResponse::default(),
+        ));
+        cli.dispatch_event(crate::runtime::Event::MessageArrived(Message::new(
+            "t",
+            "p",
+            crate::QOS_0,
+        )));
+        cli.dispatch_event(crate::runtime::Event::ConnectionLost(Error::Disconnected));
+
+        assert!(matches!(rx.try_recv().unwrap(), Event::Connected(_)));
+        assert!(matches!(rx.try_recv().unwrap(), Event::Message(m) if m.topic == "t"));
+        assert!(matches!(rx.try_recv().unwrap(), Event::ConnectionLost));
+    }
+
+    /// `stop_stream` closes every stream and consumer. The synchronous ones
+    /// are held here and close at once; the async streams live in the event
+    /// loop and close once it has seen the command.
+    #[test]
+    fn test_stop_stream_closes_streams_and_consumers() {
+        let mut cli = test_client();
+        let sync_rx = cli.start_consuming();
+        let stream = cli.get_stream(10);
+        let events = cli.get_event_stream(10);
+
+        cli.stop_stream();
+
+        assert!(sync_rx.try_recv().is_err(), "the consumer closed at once");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while (!stream.is_closed() || !events.is_closed()) && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(stream.is_closed(), "the message stream was not closed");
+        assert!(events.is_closed(), "the event stream was not closed");
     }
 
     /// With no stream at all there is nothing to remove.
@@ -2229,19 +2409,20 @@ mod tests {
         assert_eq!(*counts[3].lock().unwrap(), 2, "message");
     }
 
-    /// `remove_callbacks` still clears everything, stream or not.
+    /// `remove_callbacks` clears the callbacks and leaves a stream open:
+    /// the stream is not a callback, and was never the library's to close.
     #[test]
-    fn test_remove_callbacks_clears_a_stream_too() {
+    fn test_remove_callbacks_leaves_a_stream_open() {
         let cli = test_client();
         let counts = count_all_callbacks(&cli);
         let rx = cli.get_event_stream(10);
 
         cli.remove_callbacks();
-        assert!(rx.is_closed());
         dispatch_one_of_each(&cli);
 
         for (i, count) in counts.iter().enumerate() {
             assert_eq!(*count.lock().unwrap(), 0, "callback {i}");
         }
+        assert!(!rx.is_closed(), "the stream was closed with the callbacks");
     }
 }

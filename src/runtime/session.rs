@@ -50,6 +50,7 @@ use std::{
 
 use bytes::BytesMut;
 use futures::{FutureExt, future::pending, select, select_biased, task::AtomicWaker};
+use log::{debug, warn};
 use paho_mqtt_codec::{
     Auth, ConnAck, Disconnect, MqttVersion, Packet, Properties, Property, PropertyId, PubAck, QoS,
     RawPacket, ReasonCode, RetainHandling as CodecRetainHandling, Subscribe, Subscription,
@@ -63,6 +64,7 @@ use super::{
         assigned_client_id, negotiated_keep_alive,
     },
     outbox::Outbox,
+    sinks::{Parked, Sinks, chain, disconnected_event},
 };
 use crate::{
     Error, Message, Result,
@@ -82,7 +84,43 @@ use crate::{
 pub(crate) struct RuntimeHandle {
     cmd_tx: async_channel::Sender<Command>,
     event_rx: async_channel::Receiver<Event>,
-    gate: Arc<InboundGate>,
+    dispatch: Dispatch,
+}
+
+/// What the event-dispatcher thread and the event loop share.
+///
+/// Messages reach the application two ways. Streams are fed by the loop
+/// itself (see [`Sinks`]); callbacks and the synchronous consumers are fed
+/// through the event channel by the dispatcher thread, because a callback
+/// may block and a `crossbeam` receiver cannot be awaited.
+#[derive(Clone)]
+pub(crate) struct Dispatch {
+    /// Bounds the messages waiting for the dispatcher thread.
+    pub(crate) gate: Arc<InboundGate>,
+    /// Whether anything on the dispatcher side wants messages at all — an
+    /// application message callback, or a synchronous consumer.
+    ///
+    /// While this is false the session delivers to the streams alone and
+    /// never touches the event channel for a message, which is the thread
+    /// hop gone. Connection events always go to the dispatcher, whatever
+    /// this says, because the callbacks for them may be registered at any
+    /// time.
+    pub(crate) wants_messages: Arc<AtomicBool>,
+}
+
+impl Dispatch {
+    /// A link with nothing registered on the dispatcher side yet.
+    pub(crate) fn new() -> Self {
+        Self {
+            gate: InboundGate::new(INBOUND_MSG_CAP),
+            wants_messages: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Whether a message should be handed to the dispatcher thread.
+    fn wanted(&self) -> bool {
+        self.wants_messages.load(Ordering::Relaxed)
+    }
 }
 
 impl RuntimeHandle {
@@ -93,28 +131,28 @@ impl RuntimeHandle {
     ) -> (Self, impl Future<Output = ()> + Send + 'static) {
         let (cmd_tx, cmd_rx) = async_channel::unbounded::<Command>();
         let (event_tx, event_rx) = async_channel::unbounded::<Event>();
-        let gate = InboundGate::new(INBOUND_MSG_CAP);
-        let task = run_event_loop::<B>(cmd_rx, event_tx, gate.clone(), buf_cfg);
+        let dispatch = Dispatch::new();
+        let task = run_event_loop::<B>(cmd_rx, event_tx, dispatch.clone(), buf_cfg);
         (
             Self {
                 cmd_tx,
                 event_rx,
-                gate,
+                dispatch,
             },
             task,
         )
     }
 
-    /// Consumes the handle, returning the command sender, the event receiver,
-    /// and the gate the event dispatcher reports consumed messages to.
+    /// Consumes the handle, returning the command sender, the event
+    /// receiver, and the link the event dispatcher shares with the loop.
     pub(crate) fn into_parts(
         self,
     ) -> (
         async_channel::Sender<Command>,
         async_channel::Receiver<Event>,
-        Arc<InboundGate>,
+        Dispatch,
     ) {
-        (self.cmd_tx, self.event_rx, self.gate)
+        (self.cmd_tx, self.event_rx, self.dispatch)
     }
 }
 
@@ -256,6 +294,8 @@ enum LoopEvent {
     KeepAlive,
     /// The event dispatcher has room for a held message.
     Room,
+    /// A fan-out that had blocked on a full stream has completed.
+    Delivered,
 }
 
 // Session
@@ -639,7 +679,10 @@ struct Negotiated {
 /// together, so they travel together.
 struct Delivery {
     event_tx: async_channel::Sender<Event>,
-    gate: Arc<InboundGate>,
+    dispatch: Dispatch,
+    /// The application's own streams, lent to the session for the life of
+    /// the connection and taken back when it ends.
+    sinks: Sinks,
 }
 
 /// Holds all mutable state for a connected MQTT session.
@@ -662,14 +705,27 @@ struct Session<B: Backend> {
     pending_sub: HashMap<u16, (Completer<SubscribeResponse>, bool)>,
     /// Pending UNSUBSCRIBE operations awaiting UNSUBACK, likewise.
     pending_unsub: HashMap<u16, (Completer<UnsubscribeResponse>, bool)>,
-    /// Sender to deliver inbound events to the public layer.
+    /// Sender to deliver inbound events to the dispatcher thread, which
+    /// runs the application's callbacks and feeds its sync consumers.
     event_tx: async_channel::Sender<Event>,
-    /// Bounds the messages waiting for the event dispatcher.
-    gate: Arc<InboundGate>,
-    /// Inbound messages decoded but not yet handed to the dispatcher, for
-    /// want of room, each with the acknowledgement it is owed once handed
-    /// over (PUBACK for QoS 1, PUBCOMP for QoS 2). In arrival order.
+    /// The dispatcher's gate, and whether it wants messages at all.
+    dispatch: Dispatch,
+    /// The application's streams, fed by this loop without the thread hop.
+    sinks: Sinks,
+    /// Inbound messages decoded but not yet delivered, for want of room at
+    /// one of their destinations, each with the acknowledgement it is owed
+    /// once it has been (PUBACK for QoS 1, PUBCOMP for QoS 2). In arrival
+    /// order.
     held: VecDeque<(Message, Option<Packet>)>,
+    /// A fan-out that blocked on a full stream, and the acknowledgement
+    /// waiting on it. Nothing else is delivered until it completes, so
+    /// every destination keeps its order.
+    pending: Option<Parked>,
+    /// The acknowledgement owed once `pending` completes.
+    pending_ack: Option<Packet>,
+    /// When the application last stopped taking messages, so that a stall
+    /// long enough to look like a hang leaves a trace in the log.
+    stalled_since: Option<std::time::Instant>,
     /// True when a PINGREQ has been sent and PINGRESP has not yet arrived.
     ping_outstanding: bool,
     /// Persistence store for in-flight QoS 1/2 messages (if any).
@@ -706,7 +762,11 @@ impl<B: Backend> Session<B> {
             keep_alive,
             limits,
         } = negotiated;
-        let Delivery { event_tx, gate } = delivery;
+        let Delivery {
+            event_tx,
+            dispatch,
+            sinks,
+        } = delivery;
         Self {
             writer,
             ver,
@@ -717,8 +777,12 @@ impl<B: Backend> Session<B> {
             pending_sub: HashMap::new(),
             pending_unsub: HashMap::new(),
             event_tx,
-            gate,
+            dispatch,
+            sinks,
             held: VecDeque::new(),
+            pending: None,
+            pending_ack: None,
+            stalled_since: None,
             ping_outstanding: false,
             persist,
             limits,
@@ -738,23 +802,36 @@ impl<B: Backend> Session<B> {
 
     /// Whether to read more from the socket.
     ///
-    /// Not while messages are held back for want of room at the dispatcher:
-    /// stopping lets TCP flow control push back on the broker, rather than
-    /// buffer without limit. Except while one of our own operations awaits
-    /// an acknowledgement: that may be in the unread bytes, behind the
-    /// backlog, and a consumer waiting on it (a callback that publishes and
-    /// waits, say) would then never make room, a deadlock. So reading goes
-    /// on, held messages accumulate, and QoS 1/2 among them stay
-    /// unacknowledged, which lets the broker's in-flight window bound them.
+    /// Not while messages are held back for want of room at one of their
+    /// destinations: stopping lets TCP flow control push back on the broker,
+    /// rather than buffer without limit. Except while one of our own
+    /// operations awaits an acknowledgement: that may be in the unread
+    /// bytes, behind the backlog, and a consumer waiting on it (a callback
+    /// that publishes and waits, say) would then never make room, a
+    /// deadlock. So reading goes on, held messages accumulate, and QoS 1/2
+    /// among them stay unacknowledged, which lets the broker's in-flight
+    /// window bound them.
     fn reads_allowed(&self) -> bool {
-        self.held.is_empty() || self.has_pending()
+        (self.held.is_empty() && self.pending.is_none()) || self.has_pending()
     }
 
-    /// Hands an inbound message to the dispatcher if there is room and none
-    /// is held back already, queuing `ack` once it is handed over; otherwise
-    /// holds both, in order.
+    /// Whether a message can be handed over now: no fan-out is still in
+    /// progress, and the dispatcher — if it wants messages at all — has
+    /// room for one.
+    fn room_to_deliver(&self) -> bool {
+        self.pending.is_none() && (!self.dispatch.wanted() || self.dispatch.gate.has_room())
+    }
+
+    /// Whether a newly arrived message can go straight out: there is room,
+    /// and nothing is queued ahead of it.
+    fn can_deliver(&self) -> bool {
+        self.held.is_empty() && self.room_to_deliver()
+    }
+
+    /// Delivers an inbound message to every destination, queuing `ack` once
+    /// they all have it; or holds both, in order, until they can take it.
     fn deliver_msg(&mut self, msg: Message, ack: Option<Packet>) -> Result<()> {
-        if self.held.is_empty() && self.gate.has_room() {
+        if self.can_deliver() {
             self.hand_over(msg, ack)
         } else {
             self.held.push_back((msg, ack));
@@ -762,22 +839,44 @@ impl<B: Backend> Session<B> {
         }
     }
 
-    /// Hands `msg` to the dispatcher and queues the acknowledgement it was
-    /// owed. If the API side has gone, the message has nowhere to go; it is
-    /// acknowledged all the same, as it always was.
+    /// Hands `msg` to the dispatcher thread, if anything there wants it, and
+    /// to each of the application's streams, then queues the acknowledgement
+    /// it was owed.
+    ///
+    /// The last destination takes the message by move, so one consumer — the
+    /// usual case — costs no clone. If a stream was full the fan-out is
+    /// parked and the acknowledgement waits with it: nothing is acknowledged
+    /// to the broker before the application has it. With no destination at
+    /// all the message has nowhere to go and is acknowledged all the same,
+    /// as it always was.
     fn hand_over(&mut self, msg: Message, ack: Option<Packet>) -> Result<()> {
-        if self.event_tx.try_send(Event::MessageArrived(msg)).is_ok() {
-            self.gate.sent();
+        let mut msg = Some(msg);
+        if self.dispatch.wanted() {
+            let m = if self.sinks.is_empty() {
+                msg.take().unwrap()
+            } else {
+                msg.as_ref().unwrap().clone()
+            };
+            if self.event_tx.try_send(Event::MessageArrived(m)).is_ok() {
+                self.dispatch.gate.sent();
+            }
         }
-        if let Some(ack) = ack {
-            self.queue(&ack)?;
+        if let Some(m) = msg {
+            self.pending = self.sinks.deliver_message(m);
+        }
+        match ack {
+            Some(ack) if self.pending.is_some() => self.pending_ack = Some(ack),
+            Some(ack) => {
+                self.queue(&ack)?;
+            }
+            None => {}
         }
         Ok(())
     }
 
-    /// Hands over held messages, in order, while there is room.
+    /// Hands over held messages, in order, while they can be taken.
     fn release_held(&mut self) -> Result<()> {
-        while self.gate.has_room() {
+        while self.room_to_deliver() {
             let Some((msg, ack)) = self.held.pop_front() else {
                 break;
             };
@@ -786,16 +885,41 @@ impl<B: Backend> Session<B> {
         Ok(())
     }
 
-    /// Hands every held message to the dispatcher regardless of room, as the
-    /// session ends: they were received, and are delivered rather than lost.
-    /// Their acknowledgements are not sent; the broker re-sends unacknowledged
-    /// QoS 1/2 messages if the session resumes.
-    fn flush_held(&mut self) {
-        for (msg, _) in self.held.drain(..) {
-            if self.event_tx.try_send(Event::MessageArrived(msg)).is_ok() {
-                self.gate.sent();
+    /// Hands every held message to its destinations regardless of room, as
+    /// the session ends: they were received, and are delivered rather than
+    /// lost. Their acknowledgements are not sent; the broker re-sends
+    /// unacknowledged QoS 1/2 messages if the session resumes.
+    ///
+    /// Returns whatever could not be handed over at once, for the caller to
+    /// await outside the session.
+    fn flush_held(&mut self) -> Option<Parked> {
+        let mut parked: Vec<Parked> = self.pending.take().into_iter().collect();
+        for (msg, _) in std::mem::take(&mut self.held) {
+            let mut msg = Some(msg);
+            if self.dispatch.wanted() {
+                let m = if self.sinks.is_empty() {
+                    msg.take().unwrap()
+                } else {
+                    msg.as_ref().unwrap().clone()
+                };
+                if self.event_tx.try_send(Event::MessageArrived(m)).is_ok() {
+                    self.dispatch.gate.sent();
+                }
+            }
+            if let Some(m) = msg
+                && let Some(p) = self.sinks.deliver_message(m)
+            {
+                parked.push(p);
             }
         }
+        if parked.is_empty() {
+            return None;
+        }
+        Some(Box::pin(async move {
+            for p in parked {
+                p.await;
+            }
+        }))
     }
 
     /// Number of outbound QoS 1/2 publishes occupying the in-flight window.
@@ -1173,7 +1297,11 @@ impl<B: Backend> Session<B> {
             self.out.prepare_write();
             let take_cmds = self.out.len() < HIGH_WATER;
             let reading = self.reads_allowed();
-            let holding = !self.held.is_empty();
+            self.note_stall();
+            // Only wait on the gate when something is held *and* it is the
+            // gate holding it up; a fan-out in progress is waited on by its
+            // own branch.
+            let holding = !self.held.is_empty() && self.pending.is_none();
 
             let ev = select_biased! {
                 res = writer_step::<B>(&mut self.writer, &self.out).fuse() => {
@@ -1182,7 +1310,8 @@ impl<B: Backend> Session<B> {
                 res = read_when::<B>(reading, reader, &mut self.read_buf).fuse() => {
                     LoopEvent::Read(res)
                 }
-                _ = room_when(holding, &self.gate).fuse() => LoopEvent::Room,
+                _ = room_when(holding, &self.dispatch).fuse() => LoopEvent::Room,
+                _ = deliver_when(&mut self.pending).fuse() => LoopEvent::Delivered,
                 cmd = recv_when(take_cmds, cmd_rx).fuse() => LoopEvent::Command(cmd),
                 _ = ka_sleep => LoopEvent::KeepAlive,
             };
@@ -1205,6 +1334,20 @@ impl<B: Backend> Session<B> {
                 // The dispatcher made room: hand over what was held, then
                 // carry on with any bytes left buffered when reading paused.
                 LoopEvent::Room => {
+                    self.release_held()?;
+                    self.handle_buffered()?;
+                    if self.write_now()? && ka_enabled {
+                        ka_sleep.reset(keep_alive);
+                    }
+                }
+                // A stream that was full has taken the message. Only now is
+                // it acknowledged to the broker, and only now may the next
+                // message be delivered.
+                LoopEvent::Delivered => {
+                    self.pending = None;
+                    if let Some(ack) = self.pending_ack.take() {
+                        self.queue(&ack)?;
+                    }
                     self.release_held()?;
                     self.handle_buffered()?;
                     if self.write_now()? && ka_enabled {
@@ -1251,6 +1394,38 @@ impl<B: Backend> Session<B> {
                     ka_sleep.reset(keep_alive);
                 }
             }
+        }
+    }
+
+    /// Logs when the application stops taking messages, and how long for.
+    ///
+    /// Backpressure is deliberate, but from the outside a client that has
+    /// stopped reading looks like one that has hung, so a stall past
+    /// [`STALL_WARN`] says so when it ends. Nothing is logged per message.
+    fn note_stall(&mut self) {
+        let blocked = !self.held.is_empty() || self.pending.is_some();
+        match (blocked, self.stalled_since) {
+            (true, None) => {
+                debug!(
+                    "Inbound paused: the application has not taken {} message(s)",
+                    self.held.len() + usize::from(self.pending.is_some())
+                );
+                self.stalled_since = Some(std::time::Instant::now());
+            }
+            (false, Some(since)) => {
+                self.stalled_since = None;
+                let waited = since.elapsed();
+                if waited >= STALL_WARN {
+                    warn!(
+                        "Inbound was paused for {:.1} s waiting for the application to take \
+                         messages; reading has resumed",
+                        waited.as_secs_f32()
+                    );
+                } else {
+                    debug!("Inbound resumed after {} ms", waited.as_millis());
+                }
+            }
+            _ => {}
         }
     }
 
@@ -1552,11 +1727,17 @@ impl<B: Backend> Session<B> {
             Packet::Disconnect(disc) => {
                 // Messages received before the DISCONNECT are delivered
                 // before it.
-                self.flush_held();
+                let flushed = self.flush_held();
+                let (reason_code, props) = (disc.reason_code, disc.properties);
                 self.deliver(Event::Disconnected {
-                    reason_code: disc.reason_code,
-                    props: disc.properties,
+                    reason_code,
+                    props: props.clone(),
                 });
+                let to_streams = self
+                    .sinks
+                    .deliver_event(disconnected_event(reason_code, props));
+                // Awaited by the loop once the session has unwound.
+                self.pending = chain(flushed, to_streams);
                 return Err(Error::Disconnected);
             }
 
@@ -1735,6 +1916,11 @@ impl<B: Backend> Session<B> {
                 self.pending_unsub.insert(id, (tx, single));
             }
 
+            // The streams belong to the client and outlive the connection;
+            // the session is only lent them.
+            Command::AddSink(sink) => self.sinks.add(sink),
+            Command::ClearSinks => self.sinks.clear(),
+
             Command::Disconnect {
                 timeout,
                 reason_code,
@@ -1818,12 +2004,58 @@ async fn read_when<B: Backend>(
 }
 
 /// Completes once the dispatcher has room for another message, or pends
-/// forever when `enabled` is false. Holds nothing, so it is cancel-safe.
-async fn room_when(enabled: bool, gate: &InboundGate) {
-    if enabled {
-        std::future::poll_fn(|cx| gate.poll_room(cx)).await
+/// forever when `enabled` is false or the dispatcher wants no messages at
+/// all. Holds nothing, so it is cancel-safe.
+async fn room_when(enabled: bool, dispatch: &Dispatch) {
+    if enabled && dispatch.wanted() {
+        std::future::poll_fn(|cx| dispatch.gate.poll_room(cx)).await
     } else {
         pending().await
+    }
+}
+
+/// How long the application may leave messages undelivered before the stall
+/// is worth a warning when it ends. A consumer that pauses briefly is
+/// ordinary; one that stops the client for seconds is what someone reading
+/// the log is trying to find.
+const STALL_WARN: Duration = Duration::from_secs(1);
+
+/// How long a delivery made outside a session — the messages held when it
+/// ended, and the connection events around it — waits for a full stream
+/// before it is given up.
+///
+/// Inside a session a full stream simply stops the reads, and waits as long
+/// as it likes. Between sessions there is nothing to stop, and waiting
+/// indefinitely on a consumer that has stopped reading would wedge the loop
+/// where it can no longer answer the API at all, so here the wait is
+/// bounded and what will not fit is dropped with a warning.
+const OFFLINE_DELIVER_WAIT: Duration = Duration::from_secs(5);
+
+/// Awaits a parked fan-out outside a session, for at most
+/// [`OFFLINE_DELIVER_WAIT`].
+async fn deliver_offline<B: Backend>(parked: Option<Parked>) {
+    let Some(parked) = parked else {
+        return;
+    };
+    let mut timeout = B::Sleep::new(OFFLINE_DELIVER_WAIT);
+    select! {
+        _ = parked.fuse() => {}
+        _ = timeout => warn!(
+            "An application stream is still full after {} s; giving up on delivering to it",
+            OFFLINE_DELIVER_WAIT.as_secs()
+        ),
+    }
+}
+
+/// Completes once a parked fan-out has finished, or pends forever when
+/// there is none.
+///
+/// The future itself lives in the session, so a `select!` that drops this
+/// branch mid-poll loses no progress and no message.
+async fn deliver_when(parked: &mut Option<Parked>) {
+    match parked {
+        Some(fut) => fut.await,
+        None => pending().await,
     }
 }
 
@@ -1968,8 +2200,19 @@ fn handle_offline_command(
     buf: &mut VecDeque<Command>,
     cfg: &BufConfig,
     should_buf: bool,
+    sinks: &mut Sinks,
 ) -> Offline {
     match cmd {
+        // A stream may be started before the first connect, and must still
+        // be there for it.
+        Command::AddSink(sink) => {
+            sinks.add(sink);
+            Offline::Handled
+        }
+        Command::ClearSinks => {
+            sinks.clear();
+            Offline::Handled
+        }
         Command::Connect {
             params,
             tx,
@@ -2041,6 +2284,7 @@ async fn attempt_connect<B: Backend>(
     buf: &mut VecDeque<Command>,
     buf_cfg: &BufConfig,
     should_buf: bool,
+    sinks: &mut Sinks,
 ) -> Attempt<B> {
     let timeout = job.params.connect_timeout;
     let mut deadline = if timeout.is_zero() {
@@ -2067,7 +2311,7 @@ async fn attempt_connect<B: Backend>(
             Ok(Command::Connect { tx, .. }) => {
                 tx.complete(Err(Error::General("connect already in progress")));
             }
-            Ok(cmd) => match handle_offline_command(cmd, buf, buf_cfg, should_buf) {
+            Ok(cmd) => match handle_offline_command(cmd, buf, buf_cfg, should_buf, sinks) {
                 Offline::Handled => {}
                 Offline::Disconnect => return Attempt::Aborted,
                 Offline::Connect(..) => unreachable!("Connect is matched above"),
@@ -2096,6 +2340,7 @@ async fn reconnect_wait<B: Backend>(
     cmd_rx: &async_channel::Receiver<Command>,
     buf: &mut VecDeque<Command>,
     buf_cfg: &BufConfig,
+    sinks: &mut Sinks,
 ) -> WaitOutcome {
     let mut sleep = B::Sleep::new(delay);
 
@@ -2107,7 +2352,13 @@ async fn reconnect_wait<B: Backend>(
         match result {
             Err(_) => return WaitOutcome::Abort,
             Ok(cmd) => {
-                match handle_offline_command(cmd, buf, buf_cfg, buf_cfg.send_while_disconnected) {
+                match handle_offline_command(
+                    cmd,
+                    buf,
+                    buf_cfg,
+                    buf_cfg.send_while_disconnected,
+                    sinks,
+                ) {
                     Offline::Handled => {}
                     Offline::Disconnect => return WaitOutcome::Abort,
                     Offline::Connect(job, tx) => return WaitOutcome::Replace(job, tx),
@@ -2153,13 +2404,17 @@ fn build_connect_response(job: &ConnectJob, connack: ConnAck) -> ConnectResponse
 pub(crate) async fn run_event_loop<B: Backend>(
     cmd_rx: async_channel::Receiver<Command>,
     event_tx: async_channel::Sender<Event>,
-    gate: Arc<InboundGate>,
+    dispatch: Dispatch,
     buf_cfg: BufConfig,
 ) {
     // Buffer for Publish commands received while disconnected.
     let mut buf: VecDeque<Command> = VecDeque::new();
     // True once the first successful CONNACK has been received.
     let mut ever_connected = false;
+    // The application's streams belong to the client, not to a session or a
+    // connection: they are registered here, lent to each session in turn,
+    // and taken back when it ends.
+    let mut sinks = Sinks::default();
 
     'outer: loop {
         // Message state belongs to the session, not the connection, so it is
@@ -2174,7 +2429,7 @@ pub(crate) async fn run_event_loop<B: Backend>(
             };
             let should_buf =
                 buf_cfg.allow_send_any_time || (ever_connected && buf_cfg.send_while_disconnected);
-            match handle_offline_command(cmd, &mut buf, &buf_cfg, should_buf) {
+            match handle_offline_command(cmd, &mut buf, &buf_cfg, should_buf, &mut sinks) {
                 Offline::Handled | Offline::Disconnect => {}
                 Offline::Connect(job, tx) => break (job, Some(tx)),
             }
@@ -2197,7 +2452,10 @@ pub(crate) async fn run_event_loop<B: Backend>(
                 let mut result = None;
                 for idx in 0..n {
                     job.server_idx = idx;
-                    match attempt_connect::<B>(&job, &cmd_rx, &mut buf, &buf_cfg, should_buf).await
+                    match attempt_connect::<B>(
+                        &job, &cmd_rx, &mut buf, &buf_cfg, should_buf, &mut sinks,
+                    )
+                    .await
                     {
                         Attempt::Connected(c) if c.connack.reason_code.is_err() => {
                             last_err = Some(Error::ReasonCode(
@@ -2220,7 +2478,9 @@ pub(crate) async fn run_event_loop<B: Backend>(
                     }
                 }
             } else {
-                match reconnect_wait::<B>(retry_delay, &cmd_rx, &mut buf, &buf_cfg).await {
+                match reconnect_wait::<B>(retry_delay, &cmd_rx, &mut buf, &buf_cfg, &mut sinks)
+                    .await
+                {
                     WaitOutcome::Abort => break 'retry,
                     WaitOutcome::Retry => {
                         // Advance to the next server in round-robin order.
@@ -2235,7 +2495,11 @@ pub(crate) async fn run_event_loop<B: Backend>(
                         tx_opt = Some(new_tx);
                     }
                 }
-                match attempt_connect::<B>(&job, &cmd_rx, &mut buf, &buf_cfg, should_buf).await {
+                match attempt_connect::<B>(
+                    &job, &cmd_rx, &mut buf, &buf_cfg, should_buf, &mut sinks,
+                )
+                .await
+                {
                     Attempt::Connected(c) if c.connack.reason_code.is_err() => Attempt::Failed(
                         Error::ReasonCode(c.connack.reason_code, c.connack.properties),
                     ),
@@ -2304,6 +2568,11 @@ pub(crate) async fn run_event_loop<B: Backend>(
             job.connected_flag.store(true, Ordering::SeqCst);
             ever_connected = true;
             let _ = event_tx.send(Event::Connected(response.clone())).await;
+            // Event streams see the connection come up before any of its
+            // messages, because the session that delivers those is not
+            // built until below.
+            deliver_offline::<B>(sinks.deliver_event(crate::Event::Connected(response.clone())))
+                .await;
             if let Some(tx) = tx_opt.take() {
                 tx.complete(Ok(response));
             }
@@ -2320,7 +2589,8 @@ pub(crate) async fn run_event_loop<B: Backend>(
                 },
                 Delivery {
                     event_tx: event_tx.clone(),
-                    gate: gate.clone(),
+                    dispatch: dispatch.clone(),
+                    sinks,
                 },
                 job.persist.clone(),
                 state,
@@ -2328,13 +2598,16 @@ pub(crate) async fn run_event_loop<B: Backend>(
             let result = session.serve(&mut reader, &cmd_rx, &mut buf, resumed).await;
             // Whatever was received and held back is delivered, ahead of the
             // ConnectionLost below.
-            session.flush_held();
+            let flushed = session.flush_held();
             if let Some(p) = &session.persist {
                 let _ = p.lock().unwrap().close();
             }
             // Carry what is still in flight into the next connection of this
             // session; a clean disconnect below drops it.
             state = session.state;
+            // Take the streams back for the next connection.
+            sinks = session.sinks;
+            deliver_offline::<B>(flushed).await;
 
             match result {
                 // Clean disconnect: back to waiting for a Connect.
@@ -2342,6 +2615,11 @@ pub(crate) async fn run_event_loop<B: Backend>(
                 Err(e) => {
                     job.connected_flag.store(false, Ordering::SeqCst);
                     let _ = event_tx.send(Event::ConnectionLost(e)).await;
+                    // A message stream ends its connection with `None`, as
+                    // the message callback is given; an event stream gets
+                    // `ConnectionLost`. After the messages above, never
+                    // before them.
+                    deliver_offline::<B>(sinks.deliver_connection_lost()).await;
                     if !job.params.auto_reconnect {
                         continue 'outer;
                     }
@@ -2368,7 +2646,7 @@ mod tests {
 
     use bytes::Bytes;
 
-    use super::{super::ServerAddr, *};
+    use super::{super::ServerAddr, super::sinks::Sink, *};
     use crate::Token;
 
     /// A timer on the wall clock. `never()` reports itself terminated, so
@@ -2603,6 +2881,7 @@ mod tests {
         wire: MockWriter,
         event_rx: async_channel::Receiver<Event>,
         gate: Arc<InboundGate>,
+        dispatch: Dispatch,
         cmd_tx: async_channel::Sender<Command>,
         cmd_rx: async_channel::Receiver<Command>,
     }
@@ -2621,7 +2900,13 @@ mod tests {
         let (event_tx, event_rx) = async_channel::unbounded();
         let (cmd_tx, cmd_rx) = async_channel::unbounded();
         let wire = MockWriter::default();
-        let gate = InboundGate::new(msg_cap);
+        let dispatch = Dispatch {
+            gate: InboundGate::new(msg_cap),
+            // A dispatcher that wants messages, as one with a callback or a
+            // synchronous consumer does; the sink tests clear this.
+            wants_messages: Arc::new(AtomicBool::new(true)),
+        };
+        let gate = dispatch.gate.clone();
         let session = Session::<MockBackend>::new(
             wire.clone(),
             flush_needed,
@@ -2633,7 +2918,8 @@ mod tests {
             },
             Delivery {
                 event_tx,
-                gate: gate.clone(),
+                dispatch: dispatch.clone(),
+                sinks: Sinks::default(),
             },
             None,
             state,
@@ -2643,6 +2929,7 @@ mod tests {
             wire,
             event_rx,
             gate,
+            dispatch,
             cmd_tx,
             cmd_rx,
         }
@@ -3260,6 +3547,124 @@ mod tests {
 
     fn gated(keep_alive: Duration, state: SessionState, msg_cap: usize) -> Harness {
         harness_with(BytesMut::new(), keep_alive, state, true, msg_cap)
+    }
+
+    /// Gives the session an async message stream, as a `get_stream` whose
+    /// `AddSink` command the loop has already taken would have.
+    fn add_stream(h: &mut Harness, cap: usize) -> async_channel::Receiver<Option<Message>> {
+        let (tx, rx) = async_channel::bounded(cap);
+        h.session.sinks.add(Sink::Messages(tx));
+        rx
+    }
+
+    /// `get_stream` reaches the event loop as a command, which registers the
+    /// stream for this connection and the ones after it.
+    #[test]
+    fn test_add_sink_command_registers_a_stream() {
+        let mut h = gated(Duration::ZERO, SessionState::default(), 1024);
+        let (tx, _rx) = async_channel::bounded::<Option<Message>>(4);
+        h.cmd_tx
+            .try_send(Command::AddSink(Sink::Messages(tx)))
+            .unwrap();
+        let mut reader = MockReader::open_with([]);
+        {
+            let run = pin!(h.session.run(&mut reader, &h.cmd_rx));
+            assert!(poll_until(run, SETTLE).is_none());
+        }
+        assert!(!h.session.sinks.is_empty(), "the stream was not registered");
+    }
+
+    /// The topics a stream has received so far.
+    fn stream_topics(rx: &async_channel::Receiver<Option<Message>>) -> Vec<String> {
+        let mut topics = Vec::new();
+        while let Ok(Some(msg)) = rx.try_recv() {
+            topics.push(msg.topic);
+        }
+        topics
+    }
+
+    /// With nothing registered on the dispatcher side, messages go straight
+    /// into the application's stream and the event channel is not touched
+    /// at all — the thread hop the sinks exist to remove.
+    #[test]
+    fn test_stream_is_fed_without_the_dispatcher() {
+        let mut h = gated(Duration::ZERO, SessionState::default(), 1024);
+        h.dispatch.wants_messages.store(false, Ordering::SeqCst);
+        let rx = add_stream(&mut h, 16);
+        let mut reader = MockReader::open_with([qos1_msgs(1..=3)]);
+        {
+            let run = pin!(h.session.run(&mut reader, &h.cmd_rx));
+            assert!(poll_until(run, SETTLE).is_none());
+        }
+        assert_eq!(stream_topics(&rx), ["m1", "m2", "m3"]);
+        assert_eq!(h.event_rx.len(), 0, "nothing went to the dispatcher");
+        assert_eq!(pubacks(&h.wire), vec![1, 2, 3]);
+    }
+
+    /// A stream and the dispatcher both receive every message: neither
+    /// displaces the other, and each sees them in order.
+    #[test]
+    fn test_stream_and_dispatcher_both_receive() {
+        let mut h = gated(Duration::ZERO, SessionState::default(), 1024);
+        let rx = add_stream(&mut h, 16);
+        let mut reader = MockReader::open_with([qos1_msgs(1..=2)]);
+        {
+            let run = pin!(h.session.run(&mut reader, &h.cmd_rx));
+            assert!(poll_until(run, SETTLE).is_none());
+        }
+        assert_eq!(stream_topics(&rx), ["m1", "m2"]);
+        assert_eq!(consume(&h.event_rx, &h.gate), ["m1", "m2"]);
+    }
+
+    /// A full stream is not dropped into. The session parks the delivery,
+    /// stops reading, and withholds the PUBACK until the application has
+    /// taken the message; then everything goes through, in order.
+    #[test]
+    fn test_full_stream_parks_and_stops_reads() {
+        let mut h = gated(Duration::ZERO, SessionState::default(), 1024);
+        h.dispatch.wants_messages.store(false, Ordering::SeqCst);
+        let rx = add_stream(&mut h, 1);
+        let mut reader = MockReader::open_with([qos1_msgs(1..=3), qos1_msgs(4..=4)]);
+        let mut topics = Vec::new();
+        {
+            let run = pin!(h.session.run(&mut reader, &h.cmd_rx));
+            assert!(poll_until(run, SETTLE).is_none());
+        }
+        // One message fits; the second is parked on the full stream and is
+        // not acknowledged, and the last read was not made.
+        assert_eq!(pubacks(&h.wire), vec![1], "acknowledged what was taken");
+        assert_eq!(reader.chunks.len(), 1, "the next read was not made");
+        assert!(h.session.pending.is_some(), "the delivery is parked");
+
+        {
+            let mut run = pin!(h.session.run(&mut reader, &h.cmd_rx));
+            // The application drains, a message at a time.
+            for _ in 0..10 {
+                topics.extend(stream_topics(&rx));
+                assert!(poll_until(run.as_mut(), SETTLE).is_none());
+            }
+        }
+        topics.extend(stream_topics(&rx));
+        assert_eq!(topics, ["m1", "m2", "m3", "m4"]);
+        assert_eq!(pubacks(&h.wire), vec![1, 2, 3, 4]);
+        assert!(reader.chunks.is_empty(), "reading resumed");
+    }
+
+    /// A stream whose receiver has been dropped is forgotten, and the rest
+    /// of the session carries on as though it had never been there.
+    #[test]
+    fn test_dropped_stream_stops_holding_the_session() {
+        let mut h = gated(Duration::ZERO, SessionState::default(), 1024);
+        h.dispatch.wants_messages.store(false, Ordering::SeqCst);
+        let rx = add_stream(&mut h, 1);
+        drop(rx);
+        let mut reader = MockReader::open_with([qos1_msgs(1..=3)]);
+        {
+            let run = pin!(h.session.run(&mut reader, &h.cmd_rx));
+            assert!(poll_until(run, SETTLE).is_none());
+        }
+        assert_eq!(pubacks(&h.wire), vec![1, 2, 3], "nothing held anything up");
+        assert!(h.session.sinks.is_empty(), "the dead stream was forgotten");
     }
 
     /// A consumer slower than the broker: once the dispatcher is full the
