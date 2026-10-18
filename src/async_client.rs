@@ -113,6 +113,10 @@ pub(crate) struct InnerAsyncClient {
     /// `start_consuming_events`. Fed by the dispatcher thread, because a
     /// `crossbeam` receiver cannot be awaited.
     sync_sinks: RwLock<Arc<SyncSinks>>,
+    /// Whether `sync_sinks` holds anything, so that the dispatcher can skip
+    /// the lock — and the `Arc` clone it takes out of it — for every
+    /// message when there is no synchronous consumer.
+    has_sync_sinks: AtomicBool,
     /// What this client shares with its event loop: the gate the dispatcher
     /// reports consumed messages to, and whether anything on this side
     /// wants messages at all.
@@ -372,6 +376,7 @@ impl AsyncClient {
             conn_opts: RwLock::new(initial_conn_opts),
             callback_context: Mutex::new(CallbackContext::default()),
             sync_sinks: RwLock::new(Arc::new(SyncSinks::default())),
+            has_sync_sinks: AtomicBool::new(false),
             dispatch: dispatch.clone(),
             persist,
             _rt_ownership: rt_ownership,
@@ -1057,6 +1062,11 @@ impl AsyncClient {
     where
         F: FnOnce(&SyncSinks) -> DeadSinks,
     {
+        // Checked before the lock: this runs for every message, and most
+        // applications have no synchronous consumer at all.
+        if !self.inner.has_sync_sinks.load(Ordering::Acquire) {
+            return;
+        }
         let sinks = self.inner.sync_sinks.read().unwrap().clone();
         if sinks.is_empty() {
             return;
@@ -1163,16 +1173,23 @@ impl AsyncClient {
                     .on_message_arrived
                     .take();
                 // The consumers first, so that a callback which blocks
-                // cannot hold them up; neither displaces the other.
-                let msg = match taken {
-                    Some(_) => {
+                // cannot hold them up; neither displaces the other. The
+                // message is copied only when both want it — with just one
+                // of them, which is the usual case, it is handed over.
+                let msg = match (
+                    self.inner.has_sync_sinks.load(Ordering::Acquire),
+                    taken.is_some(),
+                ) {
+                    (true, true) => {
                         self.to_sync_sinks(|sinks| sinks.send_message(msg.clone()));
                         msg
                     }
-                    None => {
+                    (true, false) => {
                         self.to_sync_sinks(|sinks| sinks.send_message(msg));
                         return;
                     }
+                    (false, true) => msg,
+                    (false, false) => return,
                 };
                 if let Some((mut cb, generation)) = taken {
                     cb(self, Some(msg));
@@ -1483,6 +1500,7 @@ impl AsyncClient {
         f(&mut next);
         let any = !next.is_empty();
         *guard = Arc::new(next);
+        self.inner.has_sync_sinks.store(any, Ordering::Release);
         drop(guard);
         // Messages reach the callbacks and these consumers through the
         // dispatcher thread; while neither exists the event loop skips it

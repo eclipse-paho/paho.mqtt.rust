@@ -174,6 +174,12 @@ pub(crate) struct InboundGate {
     queued: AtomicUsize,
     capacity: usize,
     waker: AtomicWaker,
+    /// Whether the session is waiting for room.
+    ///
+    /// Read by the dispatcher on every message it finishes, so that the
+    /// usual case — a consumer keeping up, nobody waiting — costs a relaxed
+    /// load rather than the compare-and-swap inside [`AtomicWaker::wake`].
+    waiting: AtomicBool,
 }
 
 impl InboundGate {
@@ -182,12 +188,21 @@ impl InboundGate {
             queued: AtomicUsize::new(0),
             capacity,
             waker: AtomicWaker::new(),
+            waiting: AtomicBool::new(false),
         })
     }
 
     /// `true` while another message may be handed to the dispatcher.
+    ///
+    /// `SeqCst` rather than `Acquire` because of the pair in
+    /// [`poll_room`](Self::poll_room) and [`consumed`](Self::consumed):
+    /// each stores one flag and then reads the other, and with anything
+    /// weaker both are allowed to read the stale value — the session would
+    /// sleep believing the queue full while the dispatcher went on
+    /// believing nobody was waiting. On x86 the load is the same
+    /// instruction either way.
     fn has_room(&self) -> bool {
-        self.queued.load(Ordering::Acquire) < self.capacity
+        self.queued.load(Ordering::SeqCst) < self.capacity
     }
 
     /// Records a message handed to the dispatcher.
@@ -198,22 +213,36 @@ impl InboundGate {
     /// Records that the dispatcher has finished with one message, and wakes
     /// the session if it is waiting for room.
     pub(crate) fn consumed(&self) {
-        self.queued.fetch_sub(1, Ordering::AcqRel);
-        self.waker.wake();
+        self.queued.fetch_sub(1, Ordering::SeqCst);
+        if self.waiting.load(Ordering::SeqCst) {
+            self.waker.wake();
+        }
     }
 
     /// Ready once there is room. Registers the waker before checking again,
     /// so a `consumed` between the two is not missed.
     fn poll_room(&self, cx: &mut Context<'_>) -> Poll<()> {
         if self.has_room() {
+            self.waiting.store(false, Ordering::SeqCst);
             return Poll::Ready(());
         }
+        // The flag is set before the second check, so a `consumed` that
+        // slips between them either sees `waiting` and wakes us, or frees a
+        // slot that the check then finds. Both sides are `SeqCst` so that
+        // they cannot each read the other's stale value, which would be a
+        // lost wakeup. Cleared on the way out, so that the dispatcher is
+        // back to a plain load once we are running again.
+        self.waiting.store(true, Ordering::SeqCst);
         self.waker.register(cx.waker());
         if self.has_room() {
+            self.waiting.store(false, Ordering::SeqCst);
             Poll::Ready(())
         } else {
             Poll::Pending
         }
+        // Dropped mid-poll (another branch won) `waiting` stays set, which
+        // only means the dispatcher takes the slower wake until the next
+        // poll clears it.
     }
 }
 
@@ -3668,6 +3697,79 @@ mod tests {
         }
         assert_eq!(pubacks(&h.wire), vec![1, 2, 3], "nothing held anything up");
         assert!(h.session.sinks.is_empty(), "the dead stream was forgotten");
+    }
+
+    /// Each destination keeps its own order while another comes and goes
+    /// mid-flow. A stream registered part-way through starts from the next
+    /// message — it cannot see what came before it — and one that is
+    /// dropped leaves the rest undisturbed.
+    #[test]
+    fn test_order_holds_while_a_second_stream_comes_and_goes() {
+        let mut h = gated(Duration::ZERO, SessionState::default(), 1024);
+        h.dispatch.wants_messages.store(false, Ordering::SeqCst);
+        let first = add_stream(&mut h, 64);
+
+        // One batch alone, then a second stream for the next batch, then
+        // back to one for the last.
+        let mut reader = MockReader::open_with([qos1_msgs(1..=2)]);
+        {
+            let run = pin!(h.session.run(&mut reader, &h.cmd_rx));
+            assert!(poll_until(run, SETTLE).is_none());
+        }
+        let second = add_stream(&mut h, 64);
+        let mut reader = MockReader::open_with([qos1_msgs(3..=4)]);
+        {
+            let run = pin!(h.session.run(&mut reader, &h.cmd_rx));
+            assert!(poll_until(run, SETTLE).is_none());
+        }
+        assert_eq!(stream_topics(&second), ["m3", "m4"], "from where it joined");
+        drop(second);
+
+        let mut reader = MockReader::open_with([qos1_msgs(5..=6)]);
+        {
+            let run = pin!(h.session.run(&mut reader, &h.cmd_rx));
+            assert!(poll_until(run, SETTLE).is_none());
+        }
+        assert_eq!(
+            stream_topics(&first),
+            ["m1", "m2", "m3", "m4", "m5", "m6"],
+            "in order throughout"
+        );
+        assert_eq!(pubacks(&h.wire), vec![1, 2, 3, 4, 5, 6]);
+    }
+
+    /// A stall is recorded when the application stops taking messages and
+    /// cleared when it starts again, which is what the log reports: a
+    /// client that has stopped reading looks like one that has hung, and
+    /// should not be silent about it.
+    #[test]
+    fn test_stall_is_noted_and_cleared() {
+        let mut h = gated(Duration::ZERO, SessionState::default(), 1);
+        let mut reader = MockReader::open_with([qos1_msgs(1..=3)]);
+        {
+            let run = pin!(h.session.run(&mut reader, &h.cmd_rx));
+            assert!(poll_until(run, SETTLE).is_none());
+        }
+        assert!(!h.session.held.is_empty(), "the gate is full");
+        assert!(
+            h.session.stalled_since.is_some(),
+            "a stall that nothing reports is a client that looks hung"
+        );
+
+        // The application catches up, a message at a time: the gate holds
+        // one, so the backlog clears over several passes.
+        for _ in 0..5 {
+            consume(&h.event_rx, &h.gate);
+            let run = pin!(h.session.run(&mut reader, &h.cmd_rx));
+            assert!(poll_until(run, SETTLE).is_none());
+        }
+        consume(&h.event_rx, &h.gate);
+        {
+            let run = pin!(h.session.run(&mut reader, &h.cmd_rx));
+            assert!(poll_until(run, SETTLE).is_none());
+        }
+        assert!(h.session.held.is_empty(), "the backlog cleared");
+        assert!(h.session.stalled_since.is_none(), "and so did the stall");
     }
 
     /// A consumer slower than the broker: once the dispatcher is full the
