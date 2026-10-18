@@ -404,7 +404,10 @@ impl Backend for TokioBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::{Command, Event, session::run_event_loop};
+    use crate::runtime::{
+        Command, Event,
+        session::{InboundGate, run_event_loop},
+    };
 
     fn assert_send<F: Send + 'static>(_: F) {}
 
@@ -416,6 +419,7 @@ mod tests {
         assert_send(run_event_loop::<TokioBackend>(
             cmd_rx,
             event_tx,
+            InboundGate::new(1),
             BufConfig {
                 send_while_disconnected: false,
                 max_buffered_msgs: 100,

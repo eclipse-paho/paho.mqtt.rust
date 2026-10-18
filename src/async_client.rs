@@ -261,7 +261,7 @@ impl AsyncClient {
             let rt = RuntimeHandle::spawn(&executor, buf_cfg);
             (rt, SmolOwnership::Shared(executor))
         };
-        let (cmd_tx, event_rx) = rt.into_parts();
+        let (cmd_tx, event_rx, gate) = rt.into_parts();
 
         // Seed the stored connect opts with the client's initial MQTT version
         // so that reconnect() and pre-connect sends use the right version.
@@ -297,7 +297,13 @@ impl AsyncClient {
                         break;
                     };
                     let cli = AsyncClient { inner };
+                    let is_msg = matches!(ev, crate::runtime::Event::MessageArrived(_));
                     cli.dispatch_event(ev);
+                    // Only now, with the callback done, is there room for
+                    // another: a slow consumer holds the session back.
+                    if is_msg {
+                        gate.consumed();
+                    }
                 }
             })
             .expect("spawn mqtt event thread");

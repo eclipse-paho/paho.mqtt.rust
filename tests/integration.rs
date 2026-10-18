@@ -360,6 +360,133 @@ fn check_bulk_received(broker: &common::ScriptedBroker) {
     assert_eq!(&payloads[BULK_N][..], b"end");
 }
 
+/////////////////////////////////////////////////////////////////////////////
+// Inbound backpressure
+/////////////////////////////////////////////////////////////////////////////
+
+/// A message callback that publishes and *waits* for each message, as a
+/// forwarder or bridge does, while thousands arrive. The inbound queue fills
+/// behind the waiting callback; the session must keep reading so that the
+/// PUBACK it waits for, which arrives behind the backlog, can be seen.
+#[test]
+fn test_callback_waiting_on_publish_does_not_deadlock() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    const N: usize = 3000;
+    let src = topic!("fwd/src");
+    let dst = topic!("fwd/dst");
+
+    let fwd = mqtt::AsyncClient::new(HOST).unwrap();
+    let forwarded = Arc::new(AtomicUsize::new(0));
+    {
+        let forwarded = forwarded.clone();
+        fwd.set_message_callback(move |cli, msg| {
+            if let Some(msg) = msg {
+                let out = mqtt::Message::new(dst, msg.payload().to_vec(), mqtt::QOS_1);
+                cli.publish(out)
+                    .wait_for(Duration::from_secs(30))
+                    .expect("forward");
+                forwarded.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+    }
+    fwd.connect(None).wait().expect("fwd connect");
+    fwd.subscribe(src, mqtt::QOS_1)
+        .wait()
+        .expect("fwd subscribe");
+
+    let sink = mqtt::AsyncClient::new(HOST).unwrap();
+    sink.connect(None).wait().expect("sink connect");
+    let rx = sink.start_consuming();
+    sink.subscribe(dst, mqtt::QOS_1)
+        .wait()
+        .expect("sink subscribe");
+
+    let src_cli = mqtt::AsyncClient::new(HOST).unwrap();
+    src_cli.connect(None).wait().expect("src connect");
+    let mut last = None;
+    for i in 0..N {
+        last = Some(src_cli.publish(mqtt::Message::new(
+            src,
+            (i as u32).to_be_bytes().to_vec(),
+            mqtt::QOS_1,
+        )));
+    }
+    last.unwrap()
+        .wait_for(Duration::from_secs(30))
+        .expect("source publish");
+
+    for i in 0..N {
+        if rx.recv_timeout(Duration::from_secs(10)).is_err() {
+            panic!(
+                "DEBUG stalled after {i} received; forwarded {}; fwd connected {}",
+                forwarded.load(Ordering::SeqCst),
+                fwd.is_connected()
+            );
+        }
+    }
+    assert_eq!(forwarded.load(Ordering::SeqCst), N);
+
+    for c in [&src_cli, &sink, &fwd] {
+        c.disconnect(None).wait().ok();
+    }
+}
+
+/// A consumer slower than the messages arrive: the client holds messages
+/// back and stops reading rather than buffering without limit, and every
+/// QoS 1 message still arrives, in order.
+#[test]
+fn test_slow_consumer_receives_everything_in_order() {
+    use std::sync::{Arc, Mutex};
+
+    const N: u32 = 3000;
+    let topic = topic!("slow_consumer");
+
+    let sub = mqtt::AsyncClient::new(HOST).unwrap();
+    let got = Arc::new(Mutex::new(Vec::new()));
+    {
+        let got = got.clone();
+        sub.set_message_callback(move |_, msg| {
+            if let Some(msg) = msg {
+                let n = u32::from_be_bytes(msg.payload().try_into().unwrap());
+                got.lock().unwrap().push(n);
+                if n % 500 == 0 {
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            }
+        });
+    }
+    sub.connect(None).wait().expect("sub connect");
+    sub.subscribe(topic, mqtt::QOS_1).wait().expect("subscribe");
+
+    let pub_cli = mqtt::AsyncClient::new(HOST).unwrap();
+    pub_cli.connect(None).wait().expect("pub connect");
+    let mut last = None;
+    for i in 0..N {
+        last = Some(pub_cli.publish(mqtt::Message::new(
+            topic,
+            i.to_be_bytes().to_vec(),
+            mqtt::QOS_1,
+        )));
+    }
+    last.unwrap()
+        .wait_for(Duration::from_secs(30))
+        .expect("publish");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while got.lock().unwrap().len() < N as usize && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let got = got.lock().unwrap().clone();
+    assert_eq!(got, (0..N).collect::<Vec<_>>());
+
+    pub_cli.disconnect(None).wait().ok();
+    sub.disconnect(None).wait().ok();
+}
+
 /// A broker that just acknowledges, for the bulk tests that check every
 /// packet arrives.
 fn acking_handler(pkt: &mqtt::paho_mqtt_codec::Packet) -> Vec<mqtt::paho_mqtt_codec::Packet> {

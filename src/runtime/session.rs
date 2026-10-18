@@ -42,14 +42,14 @@ use std::{
     pin::pin,
     sync::{
         Arc, Mutex, RwLock,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
-    task::Poll,
+    task::{Context, Poll},
     time::Duration,
 };
 
 use bytes::BytesMut;
-use futures::{FutureExt, future::pending, select, select_biased};
+use futures::{FutureExt, future::pending, select, select_biased, task::AtomicWaker};
 use paho_mqtt_codec::{
     Auth, ConnAck, Disconnect, MqttVersion, Packet, Properties, Property, PropertyId, PubAck, QoS,
     RawPacket, ReasonCode, RetainHandling as CodecRetainHandling, Subscribe, Subscription,
@@ -82,6 +82,7 @@ use crate::{
 pub(crate) struct RuntimeHandle {
     cmd_tx: async_channel::Sender<Command>,
     event_rx: async_channel::Receiver<Event>,
+    gate: Arc<InboundGate>,
 }
 
 impl RuntimeHandle {
@@ -92,18 +93,89 @@ impl RuntimeHandle {
     ) -> (Self, impl Future<Output = ()> + Send + 'static) {
         let (cmd_tx, cmd_rx) = async_channel::unbounded::<Command>();
         let (event_tx, event_rx) = async_channel::unbounded::<Event>();
-        let task = run_event_loop::<B>(cmd_rx, event_tx, buf_cfg);
-        (Self { cmd_tx, event_rx }, task)
+        let gate = InboundGate::new(INBOUND_MSG_CAP);
+        let task = run_event_loop::<B>(cmd_rx, event_tx, gate.clone(), buf_cfg);
+        (
+            Self {
+                cmd_tx,
+                event_rx,
+                gate,
+            },
+            task,
+        )
     }
 
-    /// Consumes the handle, returning the underlying sender and receiver.
+    /// Consumes the handle, returning the command sender, the event receiver,
+    /// and the gate the event dispatcher reports consumed messages to.
     pub(crate) fn into_parts(
         self,
     ) -> (
         async_channel::Sender<Command>,
         async_channel::Receiver<Event>,
+        Arc<InboundGate>,
     ) {
-        (self.cmd_tx, self.event_rx)
+        (self.cmd_tx, self.event_rx, self.gate)
+    }
+}
+
+/// How many inbound messages may wait for the event dispatcher before the
+/// session holds further ones back.
+const INBOUND_MSG_CAP: usize = 1024;
+
+/// Bounds the inbound messages waiting for the event dispatcher.
+///
+/// The event channel itself is unbounded, so that connection events
+/// (`Connected`, `ConnectionLost`, ...) never wait: a callback blocked on a
+/// token could otherwise deadlock the session's teardown. Messages are
+/// counted here instead. The session hands one over only while the count is
+/// below capacity; beyond that it holds them, and stops reading the socket
+/// (see `Session::reads_allowed`). The dispatcher calls
+/// [`consumed`](Self::consumed) once a message's callback has returned,
+/// which wakes the session to hand over the next.
+pub(crate) struct InboundGate {
+    queued: AtomicUsize,
+    capacity: usize,
+    waker: AtomicWaker,
+}
+
+impl InboundGate {
+    pub(crate) fn new(capacity: usize) -> Arc<Self> {
+        Arc::new(Self {
+            queued: AtomicUsize::new(0),
+            capacity,
+            waker: AtomicWaker::new(),
+        })
+    }
+
+    /// `true` while another message may be handed to the dispatcher.
+    fn has_room(&self) -> bool {
+        self.queued.load(Ordering::Acquire) < self.capacity
+    }
+
+    /// Records a message handed to the dispatcher.
+    fn sent(&self) {
+        self.queued.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Records that the dispatcher has finished with one message, and wakes
+    /// the session if it is waiting for room.
+    pub(crate) fn consumed(&self) {
+        self.queued.fetch_sub(1, Ordering::AcqRel);
+        self.waker.wake();
+    }
+
+    /// Ready once there is room. Registers the waker before checking again,
+    /// so a `consumed` between the two is not missed.
+    fn poll_room(&self, cx: &mut Context<'_>) -> Poll<()> {
+        if self.has_room() {
+            return Poll::Ready(());
+        }
+        self.waker.register(cx.waker());
+        if self.has_room() {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
     }
 }
 
@@ -182,6 +254,8 @@ enum LoopEvent {
     Command(std::result::Result<Command, async_channel::RecvError>),
     /// The keep-alive timer fired.
     KeepAlive,
+    /// The event dispatcher has room for a held message.
+    Room,
 }
 
 // Session
@@ -579,6 +653,12 @@ struct Session<B: Backend> {
     pending_unsub: HashMap<u16, (Completer<UnsubscribeResponse>, bool)>,
     /// Sender to deliver inbound events to the public layer.
     event_tx: async_channel::Sender<Event>,
+    /// Bounds the messages waiting for the event dispatcher.
+    gate: Arc<InboundGate>,
+    /// Inbound messages decoded but not yet handed to the dispatcher, for
+    /// want of room, each with the acknowledgement it is owed once handed
+    /// over (PUBACK for QoS 1, PUBCOMP for QoS 2). In arrival order.
+    held: VecDeque<(Message, Option<Packet>)>,
     /// True when a PINGREQ has been sent and PINGRESP has not yet arrived.
     ping_outstanding: bool,
     /// Persistence store for in-flight QoS 1/2 messages (if any).
@@ -607,6 +687,7 @@ impl<B: Backend> Session<B> {
         read_buf: BytesMut,
         negotiated: Negotiated,
         event_tx: async_channel::Sender<Event>,
+        gate: Arc<InboundGate>,
         persist: Option<Arc<Mutex<Box<dyn ClientPersistence>>>>,
         state: SessionState,
     ) -> Self {
@@ -625,6 +706,8 @@ impl<B: Backend> Session<B> {
             pending_sub: HashMap::new(),
             pending_unsub: HashMap::new(),
             event_tx,
+            gate,
+            held: VecDeque::new(),
             ping_outstanding: false,
             persist,
             limits,
@@ -640,6 +723,68 @@ impl<B: Backend> Session<B> {
             || !self.pending_sub.is_empty()
             || !self.pending_unsub.is_empty()
             || !self.inflight_deferred.is_empty()
+    }
+
+    /// Whether to read more from the socket.
+    ///
+    /// Not while messages are held back for want of room at the dispatcher:
+    /// stopping lets TCP flow control push back on the broker, rather than
+    /// buffer without limit. Except while one of our own operations awaits
+    /// an acknowledgement: that may be in the unread bytes, behind the
+    /// backlog, and a consumer waiting on it (a callback that publishes and
+    /// waits, say) would then never make room, a deadlock. So reading goes
+    /// on, held messages accumulate, and QoS 1/2 among them stay
+    /// unacknowledged, which lets the broker's in-flight window bound them.
+    fn reads_allowed(&self) -> bool {
+        self.held.is_empty() || self.has_pending()
+    }
+
+    /// Hands an inbound message to the dispatcher if there is room and none
+    /// is held back already, queuing `ack` once it is handed over; otherwise
+    /// holds both, in order.
+    fn deliver_msg(&mut self, msg: Message, ack: Option<Packet>) -> Result<()> {
+        if self.held.is_empty() && self.gate.has_room() {
+            self.hand_over(msg, ack)
+        } else {
+            self.held.push_back((msg, ack));
+            Ok(())
+        }
+    }
+
+    /// Hands `msg` to the dispatcher and queues the acknowledgement it was
+    /// owed. If the API side has gone, the message has nowhere to go; it is
+    /// acknowledged all the same, as it always was.
+    fn hand_over(&mut self, msg: Message, ack: Option<Packet>) -> Result<()> {
+        if self.event_tx.try_send(Event::MessageArrived(msg)).is_ok() {
+            self.gate.sent();
+        }
+        if let Some(ack) = ack {
+            self.queue(&ack)?;
+        }
+        Ok(())
+    }
+
+    /// Hands over held messages, in order, while there is room.
+    fn release_held(&mut self) -> Result<()> {
+        while self.gate.has_room() {
+            let Some((msg, ack)) = self.held.pop_front() else {
+                break;
+            };
+            self.hand_over(msg, ack)?;
+        }
+        Ok(())
+    }
+
+    /// Hands every held message to the dispatcher regardless of room, as the
+    /// session ends: they were received, and are delivered rather than lost.
+    /// Their acknowledgements are not sent; the broker re-sends unacknowledged
+    /// QoS 1/2 messages if the session resumes.
+    fn flush_held(&mut self) {
+        for (msg, _) in self.held.drain(..) {
+            if self.event_tx.try_send(Event::MessageArrived(msg)).is_ok() {
+                self.gate.sent();
+            }
+        }
     }
 
     /// Number of outbound QoS 1/2 publishes occupying the in-flight window.
@@ -957,10 +1102,17 @@ impl<B: Backend> Session<B> {
     /// One read can carry any number of packets, and the first `read_buf` of
     /// a connection can arrive already full of them, so this is driven by
     /// what the buffer holds rather than by what a single read returned.
+    ///
+    /// It stops early, leaving the rest buffered, once messages are being
+    /// held back and reading should pause (see [`reads_allowed`]).
+    ///
+    /// [`reads_allowed`]: Self::reads_allowed
     fn handle_buffered(&mut self) -> Result<()> {
-        while let Some(raw) =
-            RawPacket::decode_max(&mut self.read_buf, self.limits.max_packet_size)?
-        {
+        while self.reads_allowed() {
+            let Some(raw) = RawPacket::decode_max(&mut self.read_buf, self.limits.max_packet_size)?
+            else {
+                break;
+            };
             let packet = Packet::from_raw(raw, self.ver)?;
             self.handle_packet(packet)?;
         }
@@ -1009,12 +1161,17 @@ impl<B: Backend> Session<B> {
 
             self.out.prepare_write();
             let take_cmds = self.out.len() < HIGH_WATER;
+            let reading = self.reads_allowed();
+            let holding = !self.held.is_empty();
 
             let ev = select_biased! {
                 res = writer_step::<B>(&mut self.writer, &self.out).fuse() => {
                     LoopEvent::Writer(res)
                 }
-                res = B::read_buf(reader, &mut self.read_buf).fuse() => LoopEvent::Read(res),
+                res = read_when::<B>(reading, reader, &mut self.read_buf).fuse() => {
+                    LoopEvent::Read(res)
+                }
+                _ = room_when(holding, &self.gate).fuse() => LoopEvent::Room,
                 cmd = recv_when(take_cmds, cmd_rx).fuse() => LoopEvent::Command(cmd),
                 _ = ka_sleep => LoopEvent::KeepAlive,
             };
@@ -1029,6 +1186,15 @@ impl<B: Backend> Session<B> {
                     if res? == 0 {
                         return Err(Error::Disconnected);
                     }
+                    self.handle_buffered()?;
+                    if self.write_now()? && ka_enabled {
+                        ka_sleep.reset(keep_alive);
+                    }
+                }
+                // The dispatcher made room: hand over what was held, then
+                // carry on with any bytes left buffered when reading paused.
+                LoopEvent::Room => {
+                    self.release_held()?;
                     self.handle_buffered()?;
                     if self.write_now()? && ka_enabled {
                         ka_sleep.reset(keep_alive);
@@ -1064,7 +1230,9 @@ impl<B: Backend> Session<B> {
                     }
                 }
                 LoopEvent::KeepAlive => {
-                    if self.ping_outstanding {
+                    // A PINGRESP cannot be seen while reading is paused, so
+                    // its absence then proves nothing; ping again instead.
+                    if self.ping_outstanding && self.reads_allowed() {
                         return Err(Error::Timeout);
                     }
                     self.queue(&Packet::PingReq)?;
@@ -1203,6 +1371,7 @@ impl<B: Backend> Session<B> {
                             Err(_) => return,
                         }
                     }
+                    let _ = self.release_held();
                 }
                 _ => return,
             }
@@ -1300,14 +1469,14 @@ impl<B: Backend> Session<B> {
                 match pub_pkt.qos {
                     QoS::QoS0 => {
                         let msg = Message::from(pub_pkt);
-                        self.deliver(Event::MessageArrived(msg));
+                        self.deliver_msg(msg, None)?;
                     }
+                    // Acknowledged only once handed over, so a backlog is
+                    // bounded by the broker's in-flight window.
                     QoS::QoS1 => {
                         let id = pub_pkt.packet_id.unwrap_or(0);
                         let msg = Message::from(pub_pkt);
-                        self.deliver(Event::MessageArrived(msg));
-                        let ack = PubAck::new(id);
-                        self.queue(&Packet::PubAck(ack))?;
+                        self.deliver_msg(msg, Some(Packet::PubAck(PubAck::new(id))))?;
                     }
                     QoS::QoS2 => {
                         let id = pub_pkt.packet_id.unwrap_or(0);
@@ -1337,12 +1506,17 @@ impl<B: Backend> Session<B> {
 
             // ---- QoS 2 inbound: PUBREL → send PUBCOMP, deliver message ----
             Packet::PubRel(rel) => {
-                if let Some(msg) = self.state.pending_pub2_in.remove(&rel.packet_id) {
-                    self.persist_remove(b'r', rel.packet_id);
-                    self.deliver(Event::MessageArrived(msg));
+                let comp = Packet::PubComp(PubAck::new(rel.packet_id));
+                match self.state.pending_pub2_in.remove(&rel.packet_id) {
+                    Some(msg) => {
+                        self.persist_remove(b'r', rel.packet_id);
+                        self.deliver_msg(msg, Some(comp))?;
+                    }
+                    // Already delivered, its PUBCOMP lost: just complete.
+                    None => {
+                        self.queue(&comp)?;
+                    }
                 }
-                let comp = PubAck::new(rel.packet_id);
-                self.queue(&Packet::PubComp(comp))?;
             }
 
             // ---- Enhanced authentication ----
@@ -1365,6 +1539,9 @@ impl<B: Backend> Session<B> {
             // As in the C library, this also fires ConnectionLost and
             // triggers auto-reconnect once the session loop unwinds.
             Packet::Disconnect(disc) => {
+                // Messages received before the DISCONNECT are delivered
+                // before it.
+                self.flush_held();
                 self.deliver(Event::Disconnected {
                     reason_code: disc.reason_code,
                     props: disc.properties,
@@ -1614,6 +1791,29 @@ async fn yield_now() {
         }
     })
     .await
+}
+
+/// Reads from the transport, or pends forever when `enabled` is false.
+async fn read_when<B: Backend>(
+    enabled: bool,
+    reader: &mut B::Reader,
+    buf: &mut BytesMut,
+) -> io::Result<usize> {
+    if enabled {
+        B::read_buf(reader, buf).await
+    } else {
+        pending().await
+    }
+}
+
+/// Completes once the dispatcher has room for another message, or pends
+/// forever when `enabled` is false. Holds nothing, so it is cancel-safe.
+async fn room_when(enabled: bool, gate: &InboundGate) {
+    if enabled {
+        std::future::poll_fn(|cx| gate.poll_room(cx)).await
+    } else {
+        pending().await
+    }
 }
 
 /// Receives the next command, or pends forever when `enabled` is false.
@@ -1942,6 +2142,7 @@ fn build_connect_response(job: &ConnectJob, connack: ConnAck) -> ConnectResponse
 pub(crate) async fn run_event_loop<B: Backend>(
     cmd_rx: async_channel::Receiver<Command>,
     event_tx: async_channel::Sender<Event>,
+    gate: Arc<InboundGate>,
     buf_cfg: BufConfig,
 ) {
     // Buffer for Publish commands received while disconnected.
@@ -2107,10 +2308,14 @@ pub(crate) async fn run_event_loop<B: Backend>(
                     limits,
                 },
                 event_tx.clone(),
+                gate.clone(),
                 job.persist.clone(),
                 state,
             );
             let result = session.serve(&mut reader, &cmd_rx, &mut buf, resumed).await;
+            // Whatever was received and held back is delivered, ahead of the
+            // ConnectionLost below.
+            session.flush_held();
             if let Some(p) = &session.persist {
                 let _ = p.lock().unwrap().close();
             }
@@ -2384,21 +2589,26 @@ mod tests {
         session: Session<MockBackend>,
         wire: MockWriter,
         event_rx: async_channel::Receiver<Event>,
+        gate: Arc<InboundGate>,
         cmd_tx: async_channel::Sender<Command>,
         cmd_rx: async_channel::Receiver<Command>,
     }
 
     /// A session over [`MockBackend`]. The mock transport is treated as one
     /// that buffers until flushed, like TLS, unless `flush_needed` is false.
+    /// `msg_cap` is how many messages may wait for the (simulated)
+    /// dispatcher; see [`consume`].
     fn harness_with(
         read_buf: BytesMut,
         keep_alive: Duration,
         state: SessionState,
         flush_needed: bool,
+        msg_cap: usize,
     ) -> Harness {
         let (event_tx, event_rx) = async_channel::unbounded();
         let (cmd_tx, cmd_rx) = async_channel::unbounded();
         let wire = MockWriter::default();
+        let gate = InboundGate::new(msg_cap);
         let session = Session::<MockBackend>::new(
             wire.clone(),
             flush_needed,
@@ -2409,6 +2619,7 @@ mod tests {
                 limits: test_limits(),
             },
             event_tx,
+            gate.clone(),
             None,
             state,
         );
@@ -2416,13 +2627,14 @@ mod tests {
             session,
             wire,
             event_rx,
+            gate,
             cmd_tx,
             cmd_rx,
         }
     }
 
     fn harness(read_buf: BytesMut, keep_alive: Duration, state: SessionState) -> Harness {
-        harness_with(read_buf, keep_alive, state, true)
+        harness_with(read_buf, keep_alive, state, true, INBOUND_MSG_CAP)
     }
 
     /// Builds a session over [`MockBackend`] whose inbound buffer already
@@ -2810,6 +3022,7 @@ mod tests {
             Duration::ZERO,
             SessionState::default(),
             false,
+            INBOUND_MSG_CAP,
         );
         h.wire.wire().hold_flush = true; // would block any flush
 
@@ -2987,5 +3200,161 @@ mod tests {
         assert!(matches!(res, Err(Error::Timeout)), "{res:?}");
         assert!(start.elapsed() >= 2 * ka);
         assert_eq!(h.wire.wire().bytes, wire_packet(Packet::PingReq));
+    }
+
+    // ---- Inbound backpressure ----
+
+    /// Plays the event dispatcher: takes every message waiting for it,
+    /// reporting each consumed, and returns their topics.
+    fn consume(event_rx: &async_channel::Receiver<Event>, gate: &InboundGate) -> Vec<String> {
+        let mut topics = Vec::new();
+        while let Ok(ev) = event_rx.try_recv() {
+            if let Event::MessageArrived(msg) = ev {
+                gate.consumed();
+                topics.push(msg.topic);
+            }
+        }
+        topics
+    }
+
+    /// The PUBACK packet identifiers on the wire so far, in order.
+    fn pubacks(wire: &MockWriter) -> Vec<u16> {
+        let bytes = wire.wire().bytes.clone();
+        let mut buf = BytesMut::from(&bytes[..]);
+        let mut ids = Vec::new();
+        while let Ok(Some(raw)) = RawPacket::decode(&mut buf) {
+            if let Ok(Packet::PubAck(ack)) = Packet::from_raw(raw, MqttVersion::V5) {
+                ids.push(ack.packet_id);
+            }
+        }
+        ids
+    }
+
+    fn qos1_msgs(ids: impl IntoIterator<Item = u16>) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for id in ids {
+            bytes.extend(wire_publish(
+                &format!("m{id}"),
+                QoS::QoS1,
+                Some(id),
+                &Bytes::from_static(b"x"),
+            ));
+        }
+        bytes
+    }
+
+    fn gated(keep_alive: Duration, state: SessionState, msg_cap: usize) -> Harness {
+        harness_with(BytesMut::new(), keep_alive, state, true, msg_cap)
+    }
+
+    /// A consumer slower than the broker: once the dispatcher is full the
+    /// session holds the next message back and stops reading, so TCP pushes
+    /// back on the broker rather than memory growing. Each QoS 1 message is
+    /// acknowledged only once handed over, and none is lost or reordered.
+    #[test]
+    fn test_slow_consumer_pauses_reads() {
+        let mut h = gated(Duration::ZERO, SessionState::default(), 2);
+        let mut reader = MockReader::open_with([qos1_msgs(1..=4), qos1_msgs(5..=5)]);
+        let mut topics = Vec::new();
+        {
+            let mut run = pin!(h.session.run(&mut reader, &h.cmd_rx));
+            assert!(poll_until(run.as_mut(), SETTLE).is_none());
+
+            // Two handed over and acknowledged; the third held, unacknowledged.
+            assert_eq!(h.event_rx.len(), 2);
+            assert_eq!(pubacks(&h.wire), vec![1, 2]);
+
+            // The consumer catches up, a little at a time.
+            for _ in 0..10 {
+                topics.extend(consume(&h.event_rx, &h.gate));
+                assert!(poll_until(run.as_mut(), SETTLE).is_none());
+            }
+        }
+        assert_eq!(topics, ["m1", "m2", "m3", "m4", "m5"]);
+        assert_eq!(pubacks(&h.wire), vec![1, 2, 3, 4, 5]);
+        assert!(reader.chunks.is_empty());
+    }
+
+    /// Reading stops while messages are held back...
+    #[test]
+    fn test_reads_stop_while_held() {
+        let mut h = gated(Duration::ZERO, SessionState::default(), 1);
+        let mut reader = MockReader::open_with([qos1_msgs(1..=2), qos1_msgs(3..=3)]);
+        {
+            let run = pin!(h.session.run(&mut reader, &h.cmd_rx));
+            assert!(poll_until(run, SETTLE).is_none());
+        }
+        assert_eq!(h.session.held.len(), 1);
+        assert_eq!(reader.chunks.len(), 1, "the next read was not made");
+    }
+
+    /// ...except while one of our own operations awaits an acknowledgement,
+    /// which may be behind the backlog: a consumer waiting on it would never
+    /// make room. Reading goes on, the acknowledgement is processed, and the
+    /// held QoS 1 messages stay unacknowledged until handed over.
+    #[test]
+    fn test_reads_continue_while_own_ack_awaited() {
+        let mut state = SessionState::default();
+        let (mut tok, tx) = Token::<PublishResponse>::new();
+        state.insert(9, tx, PublishPhase::AwaitingPubComp, true);
+        let mut h = gated(Duration::ZERO, state, 1);
+
+        let mut chunk = qos1_msgs(1..=3);
+        chunk.extend(wire_packet(Packet::PubComp(PubAck::new(9))));
+        let mut reader = MockReader::open_with([chunk]);
+        {
+            let run = pin!(h.session.run(&mut reader, &h.cmd_rx));
+            assert!(poll_until(run, SETTLE).is_none());
+        }
+        assert!(matches!(tok.try_wait(), Some(Ok(_))), "no deadlock");
+        assert_eq!(h.session.held.len(), 2);
+        assert_eq!(
+            pubacks(&h.wire),
+            vec![1],
+            "held messages are not acknowledged"
+        );
+    }
+
+    /// While reading is paused a PINGRESP cannot be seen, so its absence is
+    /// not taken for a dead connection; PINGREQs keep going out, so the
+    /// broker does not drop us either.
+    #[test]
+    fn test_keep_alive_continues_while_reads_paused() {
+        let ka = Duration::from_millis(30);
+        let mut h = gated(ka, SessionState::default(), 1);
+        let mut reader = MockReader::open_with([qos1_msgs(1..=2)]);
+        {
+            let run = pin!(h.session.run(&mut reader, &h.cmd_rx));
+            assert!(poll_until(run, ka * 5).is_none(), "the session ended");
+        }
+        let pings = h
+            .wire
+            .wire()
+            .bytes
+            .windows(2)
+            .filter(|w| w == &[0xC0, 0x00])
+            .count();
+        assert!(pings >= 2, "{pings} PINGREQs");
+    }
+
+    /// Held messages are not lost when the session ends: they are handed to
+    /// the dispatcher, in order, ahead of the ConnectionLost that follows.
+    #[test]
+    fn test_held_messages_flushed_at_session_end() {
+        let mut h = gated(Duration::ZERO, SessionState::default(), 1);
+        let mut reader = MockReader::open_with([qos1_msgs(1..=3)]);
+        {
+            let run = pin!(h.session.run(&mut reader, &h.cmd_rx));
+            assert!(poll_until(run, SETTLE).is_none());
+        }
+        assert_eq!(h.session.held.len(), 1);
+        h.session.flush_held();
+        let topics: Vec<_> = std::iter::from_fn(|| h.event_rx.try_recv().ok())
+            .filter_map(|ev| match ev {
+                Event::MessageArrived(m) => Some(m.topic),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(topics, ["m1", "m2"]);
     }
 }
