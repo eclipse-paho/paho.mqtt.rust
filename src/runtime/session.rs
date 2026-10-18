@@ -58,7 +58,7 @@ use paho_mqtt_codec::{
 };
 
 use super::{
-    backend::{Backend, Sleep},
+    backend::{Backend, READ_CHUNK, Sleep},
     commands::{
         BufConfig, Command, ConnectParams, Event, MAX_PACKET_IDS, SessionLimits,
         assigned_client_id, negotiated_keep_alive,
@@ -657,7 +657,10 @@ const YIELD_EVERY: u32 = 64;
 /// Initial capacity of the inbound byte buffer. One buffer serves a whole
 /// connection — from the CONNACK read through to the last packet — and grows
 /// to fit anything larger.
-const READ_BUF_CAPACITY: usize = 4096;
+///
+/// Sized to what a read is offered, so the buffer a burst arrives in is the
+/// one allocated for the CONNACK.
+const READ_BUF_CAPACITY: usize = READ_CHUNK;
 
 /// What the CONNECT exchange settled, fixed for the life of the connection.
 ///

@@ -56,7 +56,7 @@ use super::tls_config::make_tls_config;
 #[cfg(feature = "smol-websocket")]
 use super::ws_util::build_ws_request;
 use super::{
-    backend::{Backend, Sleep},
+    backend::{Backend, READ_CHUNK, Sleep},
     commands::{BufConfig, ConnectParams, ServerAddr},
     connection::Connection,
     session::RuntimeHandle,
@@ -203,7 +203,27 @@ impl Sleep for SmolSleep {
 }
 
 /// Bytes read from the transport per `read_buf` call.
-const READ_CHUNK: usize = 4096;
+/// The read half of a connection, with the buffer its reads land in.
+///
+/// `futures::io::AsyncRead` reads into an initialized `&mut [u8]`, so this
+/// backend cannot read straight into `BytesMut`'s spare capacity the way
+/// tokio's `ReadBuf` can: there has to be a buffer in between. Keeping one
+/// per connection, allocated when it is opened, means a read costs one copy
+/// and nothing else — a fresh array would have to be zeroed every time,
+/// which at [`READ_CHUNK`] bytes would be felt on the single-message path.
+pub(crate) struct SmolReader {
+    half: ReadHalf<Box<dyn Connection>>,
+    scratch: Vec<u8>,
+}
+
+impl SmolReader {
+    fn new(half: ReadHalf<Box<dyn Connection>>) -> Self {
+        Self {
+            half,
+            scratch: vec![0u8; READ_CHUNK],
+        }
+    }
+}
 
 /// Opens a TCP connection to `host:port`, tunnelling through `proxy_uri` if
 /// one is configured.
@@ -250,7 +270,7 @@ async fn tcp_maybe_proxied(proxy_uri: &str, host: &str, port: u16) -> Result<Tcp
 pub(crate) struct SmolBackend;
 
 impl Backend for SmolBackend {
-    type Reader = ReadHalf<Box<dyn Connection>>;
+    type Reader = SmolReader;
     type Writer = WriteHalf<Box<dyn Connection>>;
     type Sleep = SmolSleep;
 
@@ -340,16 +360,17 @@ impl Backend for SmolBackend {
         // Split with `futures::io` rather than `smol::io`: the latter's write
         // half does not forward `poll_write_vectored`, so every vectored
         // write would send only its first slice.
-        Ok(futures::io::AsyncReadExt::split(conn))
+        let (half, writer) = futures::io::AsyncReadExt::split(conn);
+        Ok((SmolReader::new(half), writer))
     }
 
     /// `futures::io::AsyncRead` only reads into an initialised slice, so
     /// read into a stack buffer and append; `buf` is untouched until the read
     /// completes, which keeps this cancel-safe.
     async fn read_buf(reader: &mut Self::Reader, buf: &mut BytesMut) -> io::Result<usize> {
-        let mut tmp = [0u8; READ_CHUNK];
-        let n = reader.read(&mut tmp).await?;
-        buf.extend_from_slice(&tmp[..n]);
+        let SmolReader { half, scratch } = reader;
+        let n = half.read(scratch).await?;
+        buf.extend_from_slice(&scratch[..n]);
         Ok(n)
     }
 

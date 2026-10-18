@@ -59,6 +59,15 @@ pub(crate) trait Sleep: Future<Output = ()> + FusedFuture + Send + Unpin {
     fn reset(&mut self, dur: Duration);
 }
 
+/// How many bytes a read is offered when the buffer is nearly full.
+///
+/// Small packets arrive in bursts — a flood of QoS 0 publishes is about
+/// seventy to a 4 KiB read — so the read size decides how many syscalls a
+/// burst costs. 16 KiB is four times fewer than the 4 KiB the buffer used
+/// to settle at, and still small enough that the chunk a delivered message
+/// pins is a fraction of what a slow consumer may hold.
+pub(crate) const READ_CHUNK: usize = 16 * 1024;
+
 /// The runtime-specific half of the MQTT event loop.
 pub(crate) trait Backend: 'static {
     /// Read half of the split transport.
@@ -83,6 +92,13 @@ pub(crate) trait Backend: 'static {
     /// Must be cancel-safe: if the future is dropped before completion, `buf`
     /// must be unchanged.  The session drops it on every `select!` that is
     /// won by another branch.
+    ///
+    /// An implementation should be prepared to take up to [`READ_CHUNK`]
+    /// bytes in one call. A read capped well below that costs a syscall for
+    /// every few packets of a burst; one much larger buys little, because a
+    /// payload is a slice of the buffer it arrived in (the codec's decode is
+    /// zero-copy), so a message waiting for a slow consumer keeps its whole
+    /// chunk alive.
     fn read_buf(
         reader: &mut Self::Reader,
         buf: &mut BytesMut,

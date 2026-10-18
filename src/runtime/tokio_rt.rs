@@ -59,7 +59,7 @@ use super::tokio_conn::WsConnection;
 #[cfg(feature = "websocket")]
 use super::ws_util::build_ws_request;
 use super::{
-    backend::{Backend, Sleep},
+    backend::{Backend, READ_CHUNK, Sleep},
     commands::{BufConfig, ConnectParams, ServerAddr},
     connection::Connection,
     session::RuntimeHandle,
@@ -276,6 +276,27 @@ async fn tcp_maybe_proxied(proxy_uri: &str, host: &str, port: u16) -> Result<Tcp
 /// The Tokio [`Backend`].
 pub(crate) struct TokioBackend;
 
+/// Below this much spare room, the buffer is grown before the next read.
+///
+/// Only this backend needs it: tokio reads into the buffer's spare
+/// capacity, so the room left in it *is* the read size. The smol backend
+/// reads into a buffer of its own and always offers a full
+/// [`READ_CHUNK`](super::backend::READ_CHUNK).
+const READ_LOW_WATER: usize = 4 * 1024;
+
+/// Makes sure the next read has room to be worth making.
+///
+/// Left alone, the buffer settles at whatever is spare after the packets
+/// read so far were taken out of it, and a burst then costs a syscall every
+/// few packets. Growing it when it runs low keeps reads at
+/// [`READ_CHUNK`](super::backend::READ_CHUNK) without reallocating on every
+/// one.
+fn make_room(buf: &mut BytesMut) {
+    if buf.capacity() - buf.len() < READ_LOW_WATER {
+        buf.reserve(READ_CHUNK);
+    }
+}
+
 impl Backend for TokioBackend {
     type Reader = ReadHalf<Box<dyn Connection>>;
     type Writer = WriteHalf<Box<dyn Connection>>;
@@ -379,7 +400,10 @@ impl Backend for TokioBackend {
 
     /// `tokio::io::read_buf` appends into the spare capacity of `buf`,
     /// growing it when full, and is cancel-safe.
+    /// Tokio reads into the buffer's spare capacity, so the room left in it
+    /// *is* the read size; see [`make_room`].
     async fn read_buf(reader: &mut Self::Reader, buf: &mut BytesMut) -> io::Result<usize> {
+        make_room(buf);
         reader.read_buf(buf).await
     }
 
@@ -410,6 +434,26 @@ mod tests {
     };
 
     fn assert_send<F: Send + 'static>(_: F) {}
+
+    /// A buffer with little room left is grown to a full chunk; one with
+    /// room to spare is left alone, so a read does not reallocate.
+    #[test]
+    fn test_make_room_grows_only_when_low() {
+        let mut buf = BytesMut::with_capacity(READ_CHUNK);
+        let (cap, ptr) = (buf.capacity(), buf.as_ptr());
+        make_room(&mut buf);
+        assert_eq!(buf.capacity(), cap, "untouched while there is room");
+        assert_eq!(buf.as_ptr(), ptr, "and not reallocated");
+
+        // Nearly full: what is left would make a small read.
+        buf.resize(READ_CHUNK - 1024, 0);
+        make_room(&mut buf);
+        assert!(
+            buf.capacity() - buf.len() >= READ_CHUNK,
+            "a full chunk of room: {} spare",
+            buf.capacity() - buf.len()
+        );
+    }
 
     /// The event loop must be `Send` to run on a multi-threaded runtime.
     #[test]
