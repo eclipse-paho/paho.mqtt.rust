@@ -71,11 +71,15 @@ use std::{
 /// Constructs a boxed, mutex-wrapped persistence store from a `PersistenceType`.
 ///
 /// Returns `None` when `typ` is `PersistenceType::None`.
-fn make_persistence(typ: PersistenceType) -> Option<Arc<Mutex<Box<dyn ClientPersistence>>>> {
+fn make_persistence(
+    typ: PersistenceType,
+    sync: bool,
+) -> Option<Arc<Mutex<Box<dyn ClientPersistence>>>> {
     let store: Box<dyn ClientPersistence> = match typ {
         PersistenceType::None => return None,
-        PersistenceType::File => Box::new(FilePersistence::new(".")),
-        PersistenceType::FilePath(p) => Box::new(FilePersistence::new(p)),
+        PersistenceType::File => Box::new(FilePersistence::new(".").with_sync(sync)),
+        PersistenceType::FilePath(p) => Box::new(FilePersistence::new(p).with_sync(sync)),
+        // A store of the application's own decides its own durability.
         PersistenceType::User(up) => up.into_inner(),
     };
     Some(Arc::new(Mutex::new(store)))
@@ -336,6 +340,7 @@ impl AsyncClient {
             delete_oldest: opts.delete_oldest,
             restore_msgs: opts.restore_msgs,
             persist_qos0: opts.persist_qos0,
+            persist_timeout: opts.persist_timeout,
         };
 
         #[cfg(feature = "tokio")]
@@ -365,7 +370,7 @@ impl AsyncClient {
         // Extract persistence before moving opts into inner, so we can consume
         // PersistenceType::User without cloning the trait object.
         let persist_type = std::mem::replace(&mut opts.persistence, PersistenceType::None);
-        let persist = make_persistence(persist_type);
+        let persist = make_persistence(persist_type, opts.persistence_sync);
 
         let inner = Arc::new(InnerAsyncClient {
             cmd_tx,

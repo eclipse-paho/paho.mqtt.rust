@@ -48,7 +48,7 @@ use std::{
     time::Duration,
 };
 
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use futures::{FutureExt, future::pending, select, select_biased, task::AtomicWaker};
 use log::{debug, warn};
 use paho_mqtt_codec::{
@@ -64,6 +64,7 @@ use super::{
         assigned_client_id, negotiated_keep_alive,
     },
     outbox::Outbox,
+    persist::{PersistWorker, Store},
     sinks::{Parked, Sinks, chain, disconnected_event},
 };
 use crate::{
@@ -325,6 +326,10 @@ enum LoopEvent {
     Room,
     /// A fan-out that had blocked on a full stream has completed.
     Delivered,
+    /// The persistence store has caught up with what the writer waits on.
+    Persisted,
+    /// The persistence store has not answered for long enough to give up.
+    PersistStalled,
 }
 
 // Session
@@ -691,6 +696,61 @@ const YIELD_EVERY: u32 = 64;
 /// one allocated for the CONNACK.
 const READ_BUF_CAPACITY: usize = READ_CHUNK;
 
+/// Where a session's persistence work goes.
+///
+/// Decided once per client, from
+/// [`ClientPersistence::is_blocking`](crate::ClientPersistence::is_blocking):
+/// a store quick enough to run on the event loop does, and one that may
+/// wait on a disk gets a thread. Owned by the event loop and lent to each
+/// session, so the thread belongs to the client rather than to one
+/// connection.
+enum Persist {
+    /// No store configured.
+    None,
+    /// A store that cannot block, run on the loop as it always was.
+    Inline(Store),
+    /// A store that may block, queued to its own thread.
+    Worker(PersistWorker),
+}
+
+impl Persist {
+    /// Whether anything is being stored at all.
+    fn is_some(&self) -> bool {
+        !matches!(self, Self::None)
+    }
+
+    /// Lets the queue drain, so that the caller may use the store directly
+    /// without contending with the worker.
+    async fn idle(&mut self) {
+        if let Self::Worker(w) = self {
+            w.idle().await;
+        }
+    }
+
+    /// How long a session waits for this store before giving up on the
+    /// connection. Zero — which is what a store on the loop gets — means
+    /// no limit, since there is nothing to wait for.
+    fn timeout(&self) -> Duration {
+        match self {
+            Self::Worker(w) => w.timeout(),
+            _ => Duration::ZERO,
+        }
+    }
+
+    /// Closes the store at the end of a connection — through the queue,
+    /// when there is one, so that it happens after the writes it follows
+    /// and not on this thread.
+    fn close(&mut self) {
+        match self {
+            Self::None => {}
+            Self::Inline(store) => {
+                let _ = store.lock().unwrap().close();
+            }
+            Self::Worker(w) => w.close(),
+        }
+    }
+}
+
 /// What the CONNECT exchange settled, fixed for the life of the connection.
 ///
 /// Each of these is read from the connect options and the CONNACK together —
@@ -760,8 +820,13 @@ struct Session<B: Backend> {
     stalled_since: Option<std::time::Instant>,
     /// True when a PINGREQ has been sent and PINGRESP has not yet arrived.
     ping_outstanding: bool,
-    /// Persistence store for in-flight QoS 1/2 messages (if any).
-    persist: Option<Arc<Mutex<Box<dyn ClientPersistence>>>>,
+    /// Where in-flight QoS 1/2 messages are stored, if anywhere.
+    persist: Persist,
+    /// Puts queued to the persistence worker and not yet stored, each with
+    /// the offset at which the frame it belongs to begins. The first of
+    /// them is the outbox's gate: a message's bytes do not go out before
+    /// the store has it.
+    pending_puts: VecDeque<(u64, u64)>,
     /// Limits fixed once the CONNACK arrived.
     limits: SessionLimits,
     /// Topic alias → topic name, for inbound PUBLISH packets that carry an
@@ -786,7 +851,7 @@ impl<B: Backend> Session<B> {
         read_buf: BytesMut,
         negotiated: Negotiated,
         delivery: Delivery,
-        persist: Option<Arc<Mutex<Box<dyn ClientPersistence>>>>,
+        persist: Persist,
         state: SessionState,
     ) -> Self {
         let Negotiated {
@@ -817,6 +882,7 @@ impl<B: Backend> Session<B> {
             stalled_since: None,
             ping_outstanding: false,
             persist,
+            pending_puts: VecDeque::new(),
             limits,
             topic_aliases: HashMap::new(),
             inflight_deferred: VecDeque::new(),
@@ -1055,33 +1121,110 @@ impl<B: Backend> Session<B> {
     /// Persists `parts` under the key for `kind` and `id` (see
     /// [`PersistKey`]), silently ignoring errors. Without a store this does
     /// nothing at all, not even build the key.
-    fn persist_put(&self, kind: u8, id: u16, parts: &[&[u8]]) {
-        if let Some(p) = &self.persist {
-            let key = PersistKey::new(kind, id);
-            let _ = p.lock().unwrap().put(key.as_str(), parts.to_vec());
+    /// Stores `parts` under the key for `id`.
+    ///
+    /// `gate_at` is where in the outbound stream the frame this message
+    /// belongs to begins: nothing from there on goes out until the store
+    /// has it. For a frame already queued that is its start; for one not
+    /// yet encoded — an inbound QoS 2 message, whose PUBREC follows — it
+    /// is the end of what is queued now.
+    fn persist_put(&mut self, kind: u8, id: u16, parts: &[&[u8]], gate_at: u64) {
+        let key = PersistKey::new(kind, id);
+        match &mut self.persist {
+            Persist::None => {}
+            Persist::Inline(store) => {
+                let _ = store.lock().unwrap().put(key.as_str(), parts.to_vec());
+            }
+            Persist::Worker(w) => {
+                let owned = parts.iter().map(|p| Bytes::copy_from_slice(p)).collect();
+                let seq = w.put(key.as_str().to_string(), owned);
+                self.hold_until_stored(seq, gate_at);
+            }
+        }
+    }
+
+    /// Records that the frame at `frame_start` may not go out until the
+    /// store has reported `seq` done.
+    fn hold_until_stored(&mut self, seq: u64, frame_start: u64) {
+        self.pending_puts.push_back((seq, frame_start));
+        if self.pending_puts.len() == 1 {
+            self.out.set_gate(Some(frame_start));
+        }
+    }
+
+    /// Releases whatever the store has caught up with.
+    fn persist_done(&mut self, done: u64) {
+        while self
+            .pending_puts
+            .front()
+            .is_some_and(|&(seq, _)| seq <= done)
+        {
+            self.pending_puts.pop_front();
+        }
+        self.out
+            .set_gate(self.pending_puts.front().map(|&(_, start)| start));
+    }
+
+    /// The sequence number the session is waiting for, if any.
+    fn awaited_seq(&self) -> Option<u64> {
+        self.pending_puts.front().map(|&(seq, _)| seq)
+    }
+
+    /// Moves the gate on to whatever the store has not stored yet.
+    fn release_persisted(&mut self) {
+        if let Persist::Worker(w) = &self.persist {
+            let done = w.done_seq();
+            self.persist_done(done);
         }
     }
 
     /// Persists the frame just queued (see [`Outbox::last_frame`]) under the
     /// key for `kind` and `id`. Nothing queued is written before the handler
     /// returns, so the frame is stored before it is sent.
-    fn persist_last_frame(&self, kind: u8, id: u16) {
-        if self.persist.is_some() {
-            let [hdr, payload] = self.out.last_frame();
-            if payload.is_empty() {
-                self.persist_put(kind, id, &[hdr]);
-            } else {
-                self.persist_put(kind, id, &[hdr, payload]);
+    fn persist_last_frame(&mut self, kind: u8, id: u16) {
+        if !self.persist.is_some() {
+            return;
+        }
+        let gate_at = self.out.last_frame_start();
+        match &mut self.persist {
+            // The worker needs data of its own: the header is copied out
+            // of the encode buffer, which the outbox goes on using, and a
+            // large payload is a `Bytes` clone, which copies nothing.
+            Persist::Worker(w) => {
+                let key = PersistKey::new(kind, id);
+                let seq = w.put(key.as_str().to_string(), self.out.last_frame_owned());
+                self.hold_until_stored(seq, gate_at);
+            }
+            _ => {
+                let [hdr, payload] = self.out.last_frame();
+                let parts: &[&[u8]] = if payload.is_empty() {
+                    &[hdr]
+                } else {
+                    &[hdr, payload]
+                };
+                // Borrowed from the outbox, so it cannot go through
+                // `persist_put`, which takes `&mut self`.
+                if let Persist::Inline(store) = &self.persist {
+                    let key = PersistKey::new(kind, id);
+                    let _ = store.lock().unwrap().put(key.as_str(), parts.to_vec());
+                }
             }
         }
     }
 
     /// Removes the persistence entry for `kind` and `id`, silently ignoring
     /// errors. Without a store this does nothing.
-    fn persist_remove(&self, kind: u8, id: u16) {
-        if let Some(p) = &self.persist {
-            let key = PersistKey::new(kind, id);
-            let _ = p.lock().unwrap().remove(key.as_str());
+    fn persist_remove(&mut self, kind: u8, id: u16) {
+        let key = PersistKey::new(kind, id);
+        match &mut self.persist {
+            Persist::None => {}
+            Persist::Inline(store) => {
+                let _ = store.lock().unwrap().remove(key.as_str());
+            }
+            // Queued, so it cannot overtake the put it undoes. Nothing
+            // waits for it: the message is gone from the session either
+            // way.
+            Persist::Worker(w) => w.remove(key.as_str().to_string()),
         }
     }
 
@@ -1319,6 +1462,11 @@ impl<B: Backend> Session<B> {
         // a read before handling them could wait indefinitely.
         self.handle_buffered()?;
 
+        // Nothing is waiting on the store yet, so the timer starts off.
+        let persist_timeout = self.persist.timeout();
+        let mut persist_sleep = B::Sleep::never();
+        let mut persist_armed = false;
+
         let mut passes = 0u32;
         loop {
             passes += 1;
@@ -1330,6 +1478,18 @@ impl<B: Backend> Session<B> {
             let take_cmds = self.out.len() < HIGH_WATER;
             let reading = self.reads_allowed();
             self.note_stall();
+            // The stall timer measures how long the gate has stood still,
+            // so it is armed when the gate engages and re-armed whenever
+            // it moves (below), not restarted on every put.
+            let awaited = self.awaited_seq();
+            if awaited.is_some() != persist_armed {
+                persist_armed = awaited.is_some();
+                persist_sleep = if persist_armed && !persist_timeout.is_zero() {
+                    B::Sleep::new(persist_timeout)
+                } else {
+                    B::Sleep::never()
+                };
+            }
             // Only wait on the gate when something is held *and* it is the
             // gate holding it up; a fan-out in progress is waited on by its
             // own branch.
@@ -1344,8 +1504,10 @@ impl<B: Backend> Session<B> {
                 }
                 _ = room_when(holding, &self.dispatch).fuse() => LoopEvent::Room,
                 _ = deliver_when(&mut self.pending).fuse() => LoopEvent::Delivered,
+                _ = persist_when(&self.persist, awaited).fuse() => LoopEvent::Persisted,
                 cmd = recv_when(take_cmds, cmd_rx).fuse() => LoopEvent::Command(cmd),
                 _ = ka_sleep => LoopEvent::KeepAlive,
+                _ = persist_sleep => LoopEvent::PersistStalled,
             };
 
             match ev {
@@ -1371,6 +1533,27 @@ impl<B: Backend> Session<B> {
                     if self.write_now()? && ka_enabled {
                         ka_sleep.reset(keep_alive);
                     }
+                }
+                // The store has caught up: the frames it was holding back
+                // may go out now.
+                LoopEvent::Persisted => {
+                    self.release_persisted();
+                    if !self.pending_puts.is_empty() {
+                        persist_sleep.reset(persist_timeout);
+                    }
+                    if self.write_now()? && ka_enabled {
+                        ka_sleep.reset(keep_alive);
+                    }
+                }
+                // The store has not answered for `persist_timeout` while
+                // messages wait on it. Ending the session is the same
+                // answer this loop gives a broker that stops responding:
+                // the connection goes, and auto-reconnect tries again.
+                LoopEvent::PersistStalled => {
+                    return Err(Error::GeneralString(format!(
+                        "the persistence store has not responded in {} s",
+                        persist_timeout.as_secs()
+                    )));
                 }
                 // A stream that was full has taken the message. Only now is
                 // it acknowledged to the broker, and only now may the next
@@ -1471,7 +1654,7 @@ impl<B: Backend> Session<B> {
     /// wakeups here is replaced when that branch polls with the task's own
     /// waker.
     fn write_now(&mut self) -> Result<bool> {
-        if self.out.is_empty() && !self.out.needs_flush() {
+        if self.out.nothing_writable() && !self.out.needs_flush() {
             return Ok(false);
         }
         self.out.prepare_write();
@@ -1527,11 +1710,17 @@ impl<B: Backend> Session<B> {
             if self.out.is_empty() && !self.out.needs_flush() {
                 return;
             }
+            // The store is waited on here as well as in the run loop: the
+            // DISCONNECT is queued behind whatever it is holding, and
+            // closing without sending it would have the broker publish the
+            // will. The deadline still bounds the wait.
+            let awaited = self.awaited_seq();
             let ev = select_biased! {
                 res = writer_step::<B>(&mut self.writer, &self.out).fuse() => {
                     LoopEvent::Writer(res)
                 }
                 res = B::read_buf(reader, &mut self.read_buf).fuse() => LoopEvent::Read(res),
+                _ = persist_when(&self.persist, awaited).fuse() => LoopEvent::Persisted,
                 _ = deadline => return,
             };
             match ev {
@@ -1540,6 +1729,7 @@ impl<B: Backend> Session<B> {
                         return;
                     }
                 }
+                LoopEvent::Persisted => self.release_persisted(),
                 LoopEvent::Read(Ok(n)) if n > 0 => self.read_buf.clear(),
                 _ => return,
             }
@@ -1705,9 +1895,14 @@ impl<B: Backend> Session<B> {
                         if self.persist.is_some() {
                             let mut hdr = BytesMut::with_capacity(64);
                             if let Ok(payload) = packet.encode_split(&mut hdr, self.ver) {
+                                // The PUBREC this message earns is queued
+                                // below, so the gate goes at the end of
+                                // what is queued now: the acknowledgement
+                                // waits for the store, as it must.
+                                let gate_at = self.out.queued_end();
                                 match &payload {
-                                    Some(p) => self.persist_put(b'r', id, &[&hdr, p]),
-                                    None => self.persist_put(b'r', id, &[&hdr]),
+                                    Some(p) => self.persist_put(b'r', id, &[&hdr, p], gate_at),
+                                    None => self.persist_put(b'r', id, &[&hdr], gate_at),
                                 }
                             }
                         }
@@ -1995,7 +2190,7 @@ enum Step {
 /// Takes the writer and the outbox as separate borrows rather than the whole
 /// session, so that it can be polled in the same `select!` as a read.
 async fn writer_step<B: Backend>(writer: &mut B::Writer, out: &Outbox) -> io::Result<Step> {
-    if !out.is_empty() {
+    if !out.nothing_writable() {
         let mut iov = [IoSlice::new(&[]); MAX_IOV];
         let n = out.io_slices(&mut iov);
         B::write_vectored(writer, &iov[..n]).await.map(Step::Wrote)
@@ -2076,6 +2271,15 @@ async fn deliver_offline<B: Backend>(parked: Option<Parked>) {
             "An application stream is still full after {} s; giving up on delivering to it",
             OFFLINE_DELIVER_WAIT.as_secs()
         ),
+    }
+}
+
+/// Completes once the store has stored `seq`, or pends forever when
+/// nothing is waiting on it. Holds nothing, so it is cancel-safe.
+async fn persist_when(persist: &Persist, seq: Option<u64>) {
+    match (persist, seq) {
+        (Persist::Worker(w), Some(seq)) => std::future::poll_fn(|cx| w.poll_done(cx, seq)).await,
+        _ => pending().await,
     }
 }
 
@@ -2447,6 +2651,10 @@ pub(crate) async fn run_event_loop<B: Backend>(
     // connection: they are registered here, lent to each session in turn,
     // and taken back when it ends.
     let mut sinks = Sinks::default();
+    // So does the persistence store, and the thread it runs on if it needs
+    // one: built when the first connection brings a store, kept for as
+    // long as the client, and lent to each session the same way.
+    let mut persist = Persist::None;
 
     'outer: loop {
         // Message state belongs to the session, not the connection, so it is
@@ -2476,6 +2684,22 @@ pub(crate) async fn run_event_loop<B: Backend>(
         'retry: loop {
             let should_buf =
                 buf_cfg.allow_send_any_time || (ever_connected && buf_cfg.send_while_disconnected);
+
+            if !persist.is_some()
+                && let Some(store) = &job.persist
+            {
+                let blocking = store.lock().unwrap().is_blocking();
+                persist = if blocking {
+                    Persist::Worker(PersistWorker::start(store.clone(), buf_cfg.persist_timeout))
+                } else {
+                    Persist::Inline(store.clone())
+                };
+            }
+            // The connect below opens the store, reads it back and may
+            // clear it, all directly. Letting the queue drain first keeps
+            // that off the worker's toes — and off a state it is half way
+            // through writing.
+            persist.idle().await;
 
             // ---- One connection attempt (or one pass over the server list) ----
             let attempt: Attempt<B> = if !reconnecting {
@@ -2624,21 +2848,20 @@ pub(crate) async fn run_event_loop<B: Backend>(
                     dispatch: dispatch.clone(),
                     sinks,
                 },
-                job.persist.clone(),
+                persist,
                 state,
             );
             let result = session.serve(&mut reader, &cmd_rx, &mut buf, resumed).await;
             // Whatever was received and held back is delivered, ahead of the
             // ConnectionLost below.
             let flushed = session.flush_held();
-            if let Some(p) = &session.persist {
-                let _ = p.lock().unwrap().close();
-            }
+            session.persist.close();
             // Carry what is still in flight into the next connection of this
             // session; a clean disconnect below drops it.
             state = session.state;
-            // Take the streams back for the next connection.
+            // Take the streams and the store back for the next connection.
             sinks = session.sinks;
+            persist = session.persist;
             deliver_offline::<B>(flushed).await;
 
             match result {
@@ -2953,7 +3176,7 @@ mod tests {
                 dispatch: dispatch.clone(),
                 sinks: Sinks::default(),
             },
-            None,
+            Persist::None,
             state,
         );
         Harness {
@@ -3697,6 +3920,77 @@ mod tests {
         }
         assert_eq!(pubacks(&h.wire), vec![1, 2, 3], "nothing held anything up");
         assert!(h.session.sinks.is_empty(), "the dead stream was forgotten");
+    }
+
+    /// A QoS 1 publish does not reach the wire until the store has it.
+    ///
+    /// The store runs on its own thread now, so "persist before send" is
+    /// no longer a matter of doing one before the other in the same
+    /// function: the bytes are encoded and queued immediately and held at
+    /// the outbox until the worker reports them stored.
+    #[test]
+    fn test_publish_waits_for_the_store() {
+        use super::super::persist::testing::HeldStore;
+
+        let (store, released, writes) = HeldStore::held();
+        let mut h = gated(Duration::ZERO, SessionState::default(), INBOUND_MSG_CAP);
+        h.session.persist = Persist::Worker(PersistWorker::start(store, Duration::ZERO));
+
+        // A PINGREQ first: queued ahead of the publish, so the gate must
+        // not hold it back.
+        h.session.queue(&Packet::PingReq).unwrap();
+        let (mut tok, cmd) = publish_cmd("gated", QoS::QoS1, Bytes::from_static(b"payload"));
+        h.cmd_tx.try_send(cmd).unwrap();
+
+        let mut reader = MockReader::open_with([]);
+        {
+            let run = pin!(h.session.run(&mut reader, &h.cmd_rx));
+            assert!(poll_until(run, SETTLE).is_none());
+        }
+        let sent = h.wire.wire().bytes.clone();
+        assert_eq!(sent, vec![0xC0, 0x00], "only the PINGREQ went out");
+        assert_eq!(writes.load(Ordering::SeqCst), 0, "the store is still busy");
+        assert!(tok.try_wait().is_none(), "and the publish is outstanding");
+
+        // The store catches up; the publish follows it onto the wire.
+        released.store(true, Ordering::SeqCst);
+        {
+            let run = pin!(h.session.run(&mut reader, &h.cmd_rx));
+            assert!(poll_until(run, SETTLE).is_none());
+        }
+        let sent = h.wire.wire().bytes.clone();
+        assert!(sent.len() > 2, "the publish was still held: {sent:?}");
+        assert_eq!(sent[2] >> 4, 3, "a PUBLISH followed the PINGREQ");
+        assert!(
+            sent.windows(7).any(|w| w == b"payload"),
+            "the payload went out"
+        );
+        assert_eq!(writes.load(Ordering::SeqCst), 1, "and was stored first");
+    }
+
+    /// A store that stops answering ends the session rather than stopping
+    /// it silently: the connection drops and auto-reconnect tries again,
+    /// exactly as it would for a broker that went quiet.
+    #[test]
+    fn test_session_ends_when_the_store_stops_answering() {
+        use super::super::persist::testing::HeldStore;
+
+        let (store, _released, _writes) = HeldStore::held();
+        let mut h = gated(Duration::ZERO, SessionState::default(), INBOUND_MSG_CAP);
+        h.session.persist = Persist::Worker(PersistWorker::start(store, Duration::from_millis(50)));
+
+        let (_tok, cmd) = publish_cmd("stuck", QoS::QoS1, Bytes::from_static(b"x"));
+        h.cmd_tx.try_send(cmd).unwrap();
+
+        let mut reader = MockReader::open_with([]);
+        let run = pin!(h.session.run(&mut reader, &h.cmd_rx));
+        let out = poll_until(run, Duration::from_secs(2));
+        match out {
+            Some(Err(Error::GeneralString(msg))) => {
+                assert!(msg.contains("persistence"), "unexpected message: {msg}");
+            }
+            other => panic!("the session did not end: {other:?}"),
+        }
     }
 
     /// Each destination keeps its own order while another comes and goes

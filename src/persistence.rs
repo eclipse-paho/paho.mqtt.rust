@@ -25,6 +25,7 @@
 //! can be recovered in the event of an application crash or restart.
 
 use crate::error::{Error, Result};
+use bytes::Bytes;
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 use std::{
@@ -150,6 +151,35 @@ pub trait ClientPersistence: Send {
     ///   concatenated into a single, contiguous unit if helpful.
     fn put(&mut self, key: &str, buffers: Vec<&[u8]>) -> Result<()>;
 
+    /// Puts several entries, which a store may do more cheaply than one at
+    /// a time — one directory flush, one transaction, one round trip.
+    ///
+    /// The default implementation calls [`put`](Self::put) for each in
+    /// turn, so an existing store needs no change. The client batches
+    /// whatever a burst of publishes queued together into one call.
+    fn put_many(&mut self, items: Vec<(String, Vec<Bytes>)>) -> Result<()> {
+        for (key, parts) in items {
+            self.put(&key, parts.iter().map(|b| &b[..]).collect())?;
+        }
+        Ok(())
+    }
+
+    /// Whether this store's calls may block for long enough to matter.
+    ///
+    /// The default is `true`, which is the safe answer: the client then
+    /// runs the store on a thread of its own, so that a slow disk cannot
+    /// stall the event loop — nor, when the client borrows the
+    /// application's runtime, one of its worker threads. A message is
+    /// still stored before it goes on the wire; the client holds the bytes
+    /// back until the store has it.
+    ///
+    /// Return `false` only for a store that is as quick as a memory write
+    /// and cannot block, as [`MemPersistence`] does. It then runs inline on
+    /// the event loop, with no thread and no hand-off.
+    fn is_blocking(&self) -> bool {
+        true
+    }
+
     /// Gets data from the persistence store.
     /// * `key` They key for the desired data.
     fn get(&mut self, key: &str) -> Result<Vec<u8>>;
@@ -239,6 +269,12 @@ impl MemPersistence {
 }
 
 impl ClientPersistence for MemPersistence {
+    /// A map in this process: nothing to wait for, so the client keeps it
+    /// on the event loop rather than giving it a thread.
+    fn is_blocking(&self) -> bool {
+        false
+    }
+
     /// Nothing to open: the store is created empty and stays in this
     /// process, so it holds nothing from a previous run to reopen.
     fn open(&mut self, _client_id: &str, _server_uri: &str) -> Result<()> {
@@ -312,6 +348,9 @@ pub struct FilePersistence {
     base_dir: PathBuf,
     /// Active store directory; set by [`open`](Self::open).
     dir: PathBuf,
+    /// Whether each batch is flushed to the disk before it is reported
+    /// stored; see [`with_sync`](Self::with_sync).
+    sync: bool,
 }
 
 impl FilePersistence {
@@ -323,11 +362,40 @@ impl FilePersistence {
         Self {
             base_dir: base_dir.into(),
             dir: PathBuf::new(),
+            sync: false,
         }
+    }
+
+    /// Whether to flush each batch to the disk before reporting it stored.
+    ///
+    /// Off by default, which is what this store has always done: an entry
+    /// is written and left in the kernel's page cache, so it survives the
+    /// process dying but not the machine losing power. Turning it on makes
+    /// a stored message durable in the stronger sense, at the cost of
+    /// waiting for the disk — set it through
+    /// [`CreateOptionsBuilder::persistence_sync`](crate::CreateOptionsBuilder::persistence_sync)
+    /// rather than here, unless you are building the store yourself.
+    pub fn with_sync(mut self, sync: bool) -> Self {
+        self.sync = sync;
+        self
     }
 
     fn key_path(&self, key: &str) -> PathBuf {
         self.dir.join(key)
+    }
+
+    /// Writes one entry, returning the file so that a batch can flush them
+    /// together afterwards.
+    fn write_file<'a>(
+        &self,
+        key: &str,
+        parts: impl Iterator<Item = &'a [u8]>,
+    ) -> Result<std::fs::File> {
+        let mut f = std::fs::File::create(self.key_path(key))?;
+        for buf in parts {
+            f.write_all(buf)?;
+        }
+        Ok(f)
     }
 }
 
@@ -348,9 +416,28 @@ impl ClientPersistence for FilePersistence {
     }
 
     fn put(&mut self, key: &str, buffers: Vec<&[u8]>) -> Result<()> {
-        let mut f = std::fs::File::create(self.key_path(key))?;
-        for buf in buffers {
-            f.write_all(buf)?;
+        let f = self.write_file(key, buffers.into_iter())?;
+        if self.sync {
+            f.sync_all()?;
+        }
+        Ok(())
+    }
+
+    /// Writes every entry, then — with
+    /// [`persistence_sync`](crate::CreateOptionsBuilder::persistence_sync)
+    /// on — flushes them all to the disk. Doing the writes first lets the
+    /// kernel start them together, so a batch costs one wait rather than
+    /// one per message.
+    fn put_many(&mut self, items: Vec<(String, Vec<Bytes>)>) -> Result<()> {
+        let mut files = Vec::with_capacity(if self.sync { items.len() } else { 0 });
+        for (key, parts) in items {
+            let f = self.write_file(&key, parts.iter().map(|b| &b[..]))?;
+            if self.sync {
+                files.push(f);
+            }
+        }
+        for f in files {
+            f.sync_all()?;
         }
         Ok(())
     }

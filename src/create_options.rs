@@ -25,7 +25,7 @@ use crate::{AsyncClient, Client, Result};
 use crate::{ClientPersistence, MqttVersion, PersistenceType, UserData, UserPersistence};
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
-use std::cmp;
+use std::{cmp, time::Duration};
 
 /////////////////////////////////////////////////////////////////////////////
 //                            RuntimeMode
@@ -227,6 +227,31 @@ pub struct CreateOptions {
     /// this client: with nothing to acknowledge, there is no state to
     /// recover.
     pub persist_qos0: bool,
+    /// Whether the file persistence store flushes each batch to the disk
+    /// before the client treats a message as stored. Defaults to `false`.
+    ///
+    /// Off, an entry is written and left in the kernel's page cache: it
+    /// survives the process dying, which is what the store has always
+    /// promised, but not the machine losing power. On, a stored message is
+    /// durable in the stronger sense, at the cost of waiting for the disk
+    /// — which the client does on the store's own thread, so the event
+    /// loop is not held up, but the publish it belongs to is.
+    ///
+    /// Applies to [`PersistenceType::File`] and
+    /// [`FilePath`](PersistenceType::FilePath). A store of your own decides
+    /// its own durability.
+    pub persistence_sync: bool,
+    /// How long the client waits for the persistence store before giving
+    /// up on the connection. Defaults to 30 seconds; zero means forever.
+    ///
+    /// A message is stored before it goes on the wire, so a store that
+    /// stops answering would otherwise stop the session silently and for
+    /// good. Instead the session ends with an error and reconnects as
+    /// usual, in the same way it would for a broker that stopped
+    /// answering. The store's own thread may still be stuck in the call;
+    /// nothing else touches the store, so the next session's work simply
+    /// queues behind it.
+    pub persist_timeout: Duration,
     /// The MQTT protocol version to use for connections from this client.
     /// Defaults to v5, which enables a persistence store compatible with
     /// either v3.x or v5 connections.
@@ -271,6 +296,8 @@ impl Default for CreateOptions {
             delete_oldest: false,
             restore_msgs: true,
             persist_qos0: true,
+            persistence_sync: false,
+            persist_timeout: Duration::from_secs(30),
             mqtt_version: MqttVersion::Default,
             persistence: PersistenceType::default(),
             user_data: None,
@@ -494,6 +521,24 @@ impl CreateOptionsBuilder {
     /// turn it off.
     pub fn persist_qos0(mut self, persist: bool) -> Self {
         self.opts.persist_qos0 = persist;
+        self
+    }
+
+    /// Whether the file persistence store flushes each batch to the disk
+    /// before the client treats a message as stored. Defaults to `false`.
+    ///
+    /// See [`CreateOptions::persistence_sync`].
+    pub fn persistence_sync(mut self, sync: bool) -> Self {
+        self.opts.persistence_sync = sync;
+        self
+    }
+
+    /// How long to wait for the persistence store before giving up on the
+    /// connection. Defaults to 30 seconds; zero means forever.
+    ///
+    /// See [`CreateOptions::persist_timeout`].
+    pub fn persist_timeout(mut self, timeout: Duration) -> Self {
+        self.opts.persist_timeout = timeout;
         self
     }
 

@@ -471,6 +471,7 @@ mod tests {
                 delete_oldest: false,
                 restore_msgs: false,
                 persist_qos0: true,
+                persist_timeout: std::time::Duration::from_secs(30),
             },
         ));
     }

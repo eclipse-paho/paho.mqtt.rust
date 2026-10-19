@@ -68,6 +68,10 @@ pub(crate) struct BufConfig {
     /// When `false`, QoS 0 publishes received while disconnected are completed
     /// immediately with `Ok` (silently dropped) rather than queued.
     pub persist_qos0: bool,
+    /// How long a session waits for a blocking persistence store before
+    /// ending the connection; zero means forever. See
+    /// [`CreateOptions::persist_timeout`](crate::CreateOptions::persist_timeout).
+    pub persist_timeout: Duration,
 }
 
 /////////////////////////////////////////////////////////////////////////////

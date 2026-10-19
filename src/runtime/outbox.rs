@@ -81,6 +81,14 @@ pub(crate) struct Outbox {
     flush_needed: bool,
     /// The frame most recently pushed.
     last: LastFrame,
+    /// Offset at which the most recent frame begins, for
+    /// [`last_frame_start`](Self::last_frame_start).
+    last_start: u64,
+    /// Bytes at or beyond this offset may not be written yet: they belong
+    /// to a frame whose message the store has not accepted. `None` when
+    /// nothing is held back, which is every connection without a blocking
+    /// persistence store.
+    gate: Option<u64>,
 }
 
 impl Outbox {
@@ -97,10 +105,13 @@ impl Outbox {
             on_flushed: VecDeque::new(),
             flush_needed,
             last: LastFrame::None,
+            last_start: 0,
+            gate: None,
         }
     }
 
-    /// Number of bytes queued but not yet accepted by the transport.
+    /// Number of bytes queued but not yet accepted by the transport,
+    /// whether or not they may be written yet.
     pub fn len(&self) -> usize {
         (self.queued - self.written) as usize
     }
@@ -110,9 +121,47 @@ impl Outbox {
         self.queued == self.written
     }
 
-    /// `true` when everything is written but not yet flushed.
+    /// How many bytes may go out now: everything queued, less anything
+    /// held behind the gate.
+    pub fn writable_len(&self) -> usize {
+        let limit = self.gate.unwrap_or(self.queued).min(self.queued);
+        limit.saturating_sub(self.written) as usize
+    }
+
+    /// `true` when there is nothing the transport may be given right now —
+    /// either because everything is written, or because what is left is
+    /// waiting for the store.
+    pub fn nothing_writable(&self) -> bool {
+        self.writable_len() == 0
+    }
+
+    /// `true` when everything writable is written but not yet flushed.
     pub fn needs_flush(&self) -> bool {
-        self.is_empty() && self.flushed < self.written
+        self.nothing_writable() && self.flushed < self.written
+    }
+
+    /// Holds back everything from `offset` on, until
+    /// [`set_gate`](Self::set_gate) moves or clears it.
+    ///
+    /// This is how "persist before send" is kept when the store runs on its
+    /// own thread: the frame is encoded and queued as usual, and the bytes
+    /// simply do not go out until the store has the message.
+    pub fn set_gate(&mut self, offset: Option<u64>) {
+        self.gate = offset;
+    }
+
+    /// The offset at which the most recently pushed frame begins.
+    ///
+    /// Paired with [`last_frame`](Self::last_frame): what is persisted is
+    /// the frame, and what must be held back is the same frame.
+    pub fn last_frame_start(&self) -> u64 {
+        self.last_start
+    }
+
+    /// The offset one past everything queued so far, which is where the
+    /// next frame will begin.
+    pub fn queued_end(&self) -> u64 {
+        self.queued
     }
 
     /// Encodes `pkt` onto the end of the queue and returns the offset at
@@ -122,6 +171,7 @@ impl Outbox {
     /// segment, without a copy. A frame larger than `max`, the server's
     /// maximum packet size, is refused. On error nothing is queued.
     pub fn push(&mut self, pkt: &Packet, ver: MqttVersion, max: Option<u32>) -> Result<u64> {
+        let frame_start = self.queued;
         let start = self.tail.len();
         let payload = pkt.encode_split(&mut self.tail, ver)?;
         let hdr_len = self.tail.len() - start;
@@ -146,6 +196,7 @@ impl Outbox {
             }
             None => self.last = LastFrame::Inline(start),
         }
+        self.last_start = frame_start;
         self.queued += frame_len as u64;
         Ok(self.queued)
     }
@@ -165,6 +216,30 @@ impl Outbox {
             LastFrame::None => {
                 debug_assert!(false, "last_frame() with no frame pushed");
                 [&[], &[]]
+            }
+        }
+    }
+
+    /// The most recently pushed frame as owned parts, for a store running
+    /// on another thread.
+    ///
+    /// The header, and any body encoded in with it, is copied: it lives in
+    /// the encode buffer, which this outbox goes on writing into. A large
+    /// payload is its own segment and is handed over as a `Bytes` clone,
+    /// which copies nothing.
+    pub fn last_frame_owned(&self) -> Vec<Bytes> {
+        match self.last {
+            LastFrame::Inline(start) => vec![Bytes::copy_from_slice(&self.tail[start..])],
+            LastFrame::Split(start) => {
+                let n = self.segs.len();
+                vec![
+                    Bytes::copy_from_slice(&self.segs[n - 2][start..]),
+                    self.segs[n - 1].clone(),
+                ]
+            }
+            LastFrame::None => {
+                debug_assert!(false, "last_frame_owned() with no frame pushed");
+                Vec::new()
             }
         }
     }
@@ -194,13 +269,16 @@ impl Outbox {
     /// [`prepare_write`](Self::prepare_write).
     pub fn io_slices<'a>(&'a self, dst: &mut [IoSlice<'a>]) -> usize {
         debug_assert!(self.tail.is_empty(), "io_slices() before prepare_write()");
+        let mut budget = self.writable_len();
         let mut n = 0;
         for (i, seg) in self.segs.iter().enumerate() {
-            if n == dst.len() {
+            if n == dst.len() || budget == 0 {
                 break;
             }
             let off = if i == 0 { self.front_off } else { 0 };
-            dst[n] = IoSlice::new(&seg[off..]);
+            let take = (seg.len() - off).min(budget);
+            dst[n] = IoSlice::new(&seg[off..off + take]);
+            budget -= take;
             n += 1;
         }
         n
@@ -209,7 +287,10 @@ impl Outbox {
     /// Records that the transport accepted the next `n` bytes. On a
     /// transport that needs no flush, that delivers them too.
     pub fn advance(&mut self, mut n: usize) {
-        debug_assert!(n <= self.len(), "advance() past the end of the queue");
+        debug_assert!(
+            n <= self.writable_len(),
+            "advance() past what may be written"
+        );
         self.written += n as u64;
         if !self.flush_needed {
             self.flushed();

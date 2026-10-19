@@ -46,6 +46,9 @@ pub(crate) mod backend;
 pub(crate) mod outbox;
 
 #[cfg(any(feature = "tokio", feature = "smol"))]
+pub(crate) mod persist;
+
+#[cfg(any(feature = "tokio", feature = "smol"))]
 pub(crate) mod sinks;
 
 #[cfg(any(feature = "tokio", feature = "smol"))]
