@@ -160,7 +160,10 @@ impl ConnectOptions {
     ///
     /// Rules:
     /// - If you specify a secure URI ("tls://", "wss://", etc), you must
-    ///   supply SSL options.
+    ///   supply TLS options.
+    /// - No v5 properties in a v3 connection.
+    /// - v5 properties, if present, must be valid
+    /// - Advanced auth must be configured for both client and server.
     pub fn check(&self) -> Result<()> {
         if !self.server_uris.is_empty() {
             let uris = &self.server_uris;
@@ -169,6 +172,20 @@ impl ConnectOptions {
             if any_secure && !self.has_tls_options() {
                 return Err(Error::MissingTlsOptions);
             }
+        }
+
+        // No properties allowed with MQTT v3
+        if !self.props.is_empty() && self.mqtt_version < MqttVersion::V5 {
+            return Err(Error::WrongMqttVersion);
+        }
+
+        // The Will's v5 properties (delay interval, expiry, content type, …)
+        // travel with it; like connect properties they need a v5 connection.
+        if let Some(msg) = &self.will
+            && !msg.props.is_empty()
+            && self.mqtt_version < MqttVersion::V5
+        {
+            return Err(Error::WrongMqttVersion);
         }
 
         // A property the specification does not allow would be refused when

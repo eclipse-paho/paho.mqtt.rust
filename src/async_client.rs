@@ -443,10 +443,6 @@ impl AsyncClient {
             return ConnectToken::from(err);
         }
 
-        if !opts.props.is_empty() && ver < MqttVersion::V5 {
-            return ConnectToken::from(Error::WrongMqttVersion);
-        }
-
         // Build the ordered server list: explicit list from connect opts, or
         // fall back to the URI given at client creation time.
         let uris: Vec<String> = if opts.server_uris.is_empty() {
@@ -458,20 +454,12 @@ impl AsyncClient {
         for uri in uris {
             match parse_server_uri(&uri) {
                 Ok(addr) => servers.push((addr, uri)),
-                Err(e) => return ConnectToken::from(e),
+                Err(err) => return ConnectToken::from(err),
             }
         }
 
         let keep_alive_secs = opts.keep_alive_interval.as_secs().min(u16::MAX as u64) as u16;
 
-        // The Will's v5 properties (delay interval, expiry, content type, …)
-        // travel with it; like connect properties they need a v5 connection.
-        if let Some(msg) = &opts.will
-            && !msg.props.is_empty()
-            && ver < MqttVersion::V5
-        {
-            return ConnectToken::from(Error::WrongMqttVersion);
-        }
         let will = opts.will.as_ref().map(|msg| paho_mqtt_codec::Will {
             topic: msg.topic.clone(),
             payload: msg.payload.clone(),
@@ -544,11 +532,11 @@ impl AsyncClient {
         // A v5 reason code and v5 properties cannot go on a v3 connection;
         // the codec refuses to encode either, and the DISCONNECT would never
         // be sent.
-        if let Err(e) = self
+        if let Err(err) = self
             .require_v5_for_props(&opts.props)
             .and_then(|()| self.require_v5_for_disconnect_reason(opts.reason_code))
         {
-            return Token::<()>::from_err(e);
+            return Token::<()>::from_err(err);
         }
 
         let (tok, comp) = Token::<()>::new();
@@ -649,7 +637,7 @@ impl AsyncClient {
             tx: comp,
         };
 
-        if let Err(e) = self.inner.cmd_tx.send_blocking(cmd) {
+        if let Err(err) = self.inner.cmd_tx.send_blocking(cmd) {
             // A closed channel gives the command back, so the message can be
             // reassembled rather than lost with it.
             let Command::Publish {
@@ -659,7 +647,7 @@ impl AsyncClient {
                 retain,
                 props,
                 ..
-            } = e.into_inner()
+            } = err.into_inner()
             else {
                 unreachable!("the command sent above is a Publish");
             };
@@ -690,7 +678,7 @@ impl AsyncClient {
             // Unwrap the message this call has taken ownership of, so the
             // token reports the same cause it always did.
             Err(Error::Publish(cause, _)) => DeliveryToken::from_err(*cause),
-            Err(e) => DeliveryToken::from_err(e),
+            Err(err) => DeliveryToken::from_err(err),
             Ok(tok) => tok,
         }
     }
@@ -710,7 +698,7 @@ impl AsyncClient {
     {
         let qos = match qos.try_into() {
             Ok(q) => q,
-            Err(e) => return SubscribeToken::from_err(e.into()),
+            Err(err) => return SubscribeToken::from_err(err.into()),
         };
         let (tok, comp) = SubscribeToken::new();
         let cmd = Command::Subscribe {
@@ -750,15 +738,15 @@ impl AsyncClient {
     {
         let qos = match qos.try_into() {
             Ok(q) => q,
-            Err(e) => return SubscribeToken::from_err(e.into()),
+            Err(err) => return SubscribeToken::from_err(err.into()),
         };
         let opts: SubscribeOptions = opts.into();
         let props = props.into().unwrap_or_default();
-        if let Err(e) = self.require_v5_for_sub_opts(&opts) {
-            return SubscribeToken::from_err(e);
+        if let Err(err) = self.require_v5_for_sub_opts(&opts) {
+            return SubscribeToken::from_err(err);
         }
-        if let Err(e) = self.require_v5_for_props(&props) {
-            return SubscribeToken::from_err(e);
+        if let Err(err) = self.require_v5_for_props(&props) {
+            return SubscribeToken::from_err(err);
         }
         let (tok, comp) = SubscribeToken::new();
         let cmd = Command::Subscribe {
@@ -801,7 +789,7 @@ impl AsyncClient {
             .collect();
         let filters = match filters {
             Ok(f) => f,
-            Err(e) => return SubscribeManyToken::from_err(e),
+            Err(err) => return SubscribeManyToken::from_err(err),
         };
 
         let (tok, comp) = SubscribeManyToken::new();
@@ -834,7 +822,7 @@ impl AsyncClient {
     {
         let qos = match qos.try_into() {
             Ok(q) => q,
-            Err(e) => return SubscribeManyToken::from_err(e.into()),
+            Err(err) => return SubscribeManyToken::from_err(err.into()),
         };
         let qos = vec![qos; topics.len()];
         self.subscribe_many(topics, &qos)
@@ -871,8 +859,8 @@ impl AsyncClient {
         }
 
         let props = props.into().unwrap_or_default();
-        if let Err(e) = self.require_v5_for_props(&props) {
-            return SubscribeManyToken::from_err(e);
+        if let Err(err) = self.require_v5_for_props(&props) {
+            return SubscribeManyToken::from_err(err);
         }
 
         let filters: Result<Vec<_>> = topics
@@ -889,7 +877,7 @@ impl AsyncClient {
 
         let filters = match filters {
             Ok(f) => f,
-            Err(e) => return SubscribeManyToken::from_err(e),
+            Err(err) => return SubscribeManyToken::from_err(err),
         };
 
         let (tok, comp) = SubscribeManyToken::new();
@@ -940,8 +928,8 @@ impl AsyncClient {
     where
         S: Into<String>,
     {
-        if let Err(e) = self.require_v5_for_props(&props) {
-            return UnsubscribeToken::from_err(e);
+        if let Err(err) = self.require_v5_for_props(&props) {
+            return UnsubscribeToken::from_err(err);
         }
         let (tok, comp) = UnsubscribeToken::new();
         let cmd = Command::Unsubscribe {
@@ -996,8 +984,8 @@ impl AsyncClient {
     where
         T: AsRef<str>,
     {
-        if let Err(e) = self.require_v5_for_props(&props) {
-            return UnsubscribeManyToken::from_err(e);
+        if let Err(err) = self.require_v5_for_props(&props) {
+            return UnsubscribeManyToken::from_err(err);
         }
         let (tok, comp) = UnsubscribeManyToken::new();
         let filters = topics.iter().map(|t| t.as_ref().to_string()).collect();
@@ -2182,7 +2170,7 @@ mod tests {
                 assert_same(&back, &msg);
             }
             Ok(_) => panic!("the message should not have been queued"),
-            Err(e) => panic!("expected the message back, got {e}"),
+            Err(err) => panic!("expected the message back, got {err}"),
         }
     }
 
@@ -2207,7 +2195,7 @@ mod tests {
                 assert_same(&back, &msg);
             }
             Ok(_) => panic!("the message should not have been queued"),
-            Err(e) => panic!("expected the message back, got {e}"),
+            Err(err) => panic!("expected the message back, got {err}"),
         }
     }
 
