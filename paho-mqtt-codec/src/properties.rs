@@ -1551,8 +1551,7 @@ macro_rules! typed_property_accessors {
                 ///
                 #[doc = concat!(
                     "Shorthand for [`push`](Self::push) with [`Property::",
-                    stringify!($id), "`](Property::", stringify!($id),
-                    "), whose payload type it takes."
+                    stringify!($id), "`], whose payload type it takes."
                 )]
                 pub fn $push_name(&mut self, val: $push_ty) {
                     self.push(Property::$id(val.into()))
@@ -1562,8 +1561,7 @@ macro_rules! typed_property_accessors {
                 ///
                 #[doc = concat!(
                     "Shorthand for [`", stringify!($get_fn), "`](Self::", stringify!($get_fn),
-                    ") with [`PropertyId::", stringify!($id), "`](PropertyId::", stringify!($id),
-                    ")."
+                    ") with [`PropertyId::", stringify!($id), "`]."
                 )]
                 pub fn $get_name(&self) -> Option<$get_ty> {
                     self.$get_fn(PropertyId::$id)
@@ -1576,8 +1574,7 @@ macro_rules! typed_property_accessors {
                 #[doc = concat!("Sets ", $what, ".")]
                 ///
                 #[doc = concat!(
-                    "The builder's form of [`Properties::", stringify!($push_name),
-                    "`](Properties::", stringify!($push_name), ")."
+                    "The builder's form of [`Properties::", stringify!($push_name), "`]."
                 )]
                 pub fn $name(mut self, val: $push_ty) -> Self {
                     self.0.$push_name(val);
@@ -1675,8 +1672,7 @@ macro_rules! flag_property_accessors {
                 /// 1, which this writes as `0` for `false` and `1` for
                 /// `true`; the variant
                 #[doc = concat!(
-                    "[`Property::", stringify!($id), "`](Property::",
-                    stringify!($id), ") takes it as the `u8` it is on the wire."
+                    "[`Property::", stringify!($id), "`] takes it as the `u8` it is on the wire."
                 )]
                 pub fn $push_name(&mut self, val: bool) {
                     self.push(Property::$id(u8::from(val)))
@@ -1689,8 +1685,7 @@ macro_rules! flag_property_accessors {
                 /// `push` and `decode` refuse it. Use
                 #[doc = concat!(
                     "[`get_byte`](Self::get_byte) with [`PropertyId::",
-                    stringify!($id), "`](PropertyId::", stringify!($id),
-                    ") for the raw byte."
+                    stringify!($id), "`] for the raw byte."
                 )]
                 pub fn $get_name(&self) -> Option<bool> {
                     self.get_byte(PropertyId::$id).map(|v| v != 0)
@@ -1704,8 +1699,7 @@ macro_rules! flag_property_accessors {
                 ///
                 /// The property is a one-byte 0 or 1 on the wire; see
                 #[doc = concat!(
-                    "[`Properties::", stringify!($push_name), "`](Properties::",
-                    stringify!($push_name), ")."
+                    "[`Properties::", stringify!($push_name), "`]."
                 )]
                 pub fn $name(mut self, val: bool) -> Self {
                     self.0.$push_name(val);
