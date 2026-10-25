@@ -2622,13 +2622,37 @@ fn build_connect_response(job: &ConnectJob, connack: ConnAck) -> ConnectResponse
 /// Drives the MQTT event loop on behalf of a [`RuntimeHandle`].
 ///
 /// Runs indefinitely as a task on the backend's executor.  Waits for a
+/// The delay the first backoff step uses when `min_retry_interval` is zero.
+///
+/// A zero minimum says "retry at once", which is a reasonable thing to ask
+/// for after a connection drops: the next attempt waits for nothing. It
+/// cannot be the step the backoff then doubles, though, since doubling zero
+/// is zero and the loop would retry without pause for as long as the broker
+/// stayed down. So the first *failed* retry starts the backoff here.
+const FIRST_BACKOFF: Duration = Duration::from_millis(100);
+
+/// The delay for the next retry after one has failed.
+///
+/// Doubles, capped at `max`. A zero current delay starts at
+/// [`FIRST_BACKOFF`] rather than staying zero — see that constant.
+fn next_retry_delay(current: Duration, max: Duration) -> Duration {
+    let next = if current.is_zero() {
+        FIRST_BACKOFF
+    } else {
+        current * 2
+    };
+    next.min(max)
+}
+
 /// [`Command::Connect`], tries each configured server in turn under the
 /// connect timeout, then delegates to [`Session::serve`] for the lifetime of
 /// the connection.
 ///
 /// If `auto_reconnect` is set in the connect options and an established
-/// session ends unexpectedly, the loop retries with exponential backoff
-/// (capped at `max_retry_interval`), rotating through the server list,
+/// session ends unexpectedly, the loop retries with exponential backoff —
+/// starting at `min_retry_interval`, doubling on each failure and capped at
+/// `max_retry_interval`, with [`next_retry_delay`] handling a zero minimum —
+/// rotating through the server list,
 /// without re-waiting for a new `Command::Connect`. A failed *initial*
 /// connect is reported to the caller and not retried. An explicit
 /// `Command::Disconnect` at any point — waiting, connecting, backing off —
@@ -2780,7 +2804,7 @@ pub(crate) async fn run_event_loop<B: Backend>(
                     if !reconnecting {
                         continue 'outer;
                     }
-                    retry_delay = (retry_delay * 2).min(job.params.max_retry_interval);
+                    retry_delay = next_retry_delay(retry_delay, job.params.max_retry_interval);
                     continue 'retry;
                 }
                 Attempt::Connected(c) => c,
@@ -4175,5 +4199,50 @@ mod tests {
             })
             .collect();
         assert_eq!(topics, ["m1", "m2"]);
+    }
+
+    // The backoff must climb out of a zero delay. `min_retry_interval` of
+    // zero is a legitimate "retry at once", but doubling zero is zero, so
+    // the old `(retry_delay * 2).min(max)` left the loop retrying with no
+    // pause for as long as the broker stayed down.
+    #[test]
+    fn test_retry_backoff_climbs_out_of_zero() {
+        let max = Duration::from_secs(60);
+
+        // The step after an immediate retry is not zero again.
+        let d = next_retry_delay(Duration::ZERO, max);
+        assert_eq!(FIRST_BACKOFF, d);
+        assert!(!d.is_zero(), "a zero delay would retry without pause");
+
+        // And from there it doubles to the cap and stays.
+        let mut d = Duration::ZERO;
+        let mut seen = vec![];
+        for _ in 0..16 {
+            d = next_retry_delay(d, max);
+            seen.push(d);
+        }
+        assert_eq!(
+            &seen[..4],
+            &[
+                Duration::from_millis(100),
+                Duration::from_millis(200),
+                Duration::from_millis(400),
+                Duration::from_millis(800),
+            ]
+        );
+        assert_eq!(max, *seen.last().unwrap());
+        assert!(seen.windows(2).all(|w| w[1] >= w[0]), "never decreases");
+
+        // A non-zero start doubles from there, untouched by FIRST_BACKOFF.
+        assert_eq!(
+            Duration::from_secs(2),
+            next_retry_delay(Duration::from_secs(1), max)
+        );
+
+        // The cap holds, and an equal min/max is a fixed interval.
+        assert_eq!(max, next_retry_delay(Duration::from_secs(45), max));
+        assert_eq!(max, next_retry_delay(max, max));
+        let fixed = Duration::from_secs(5);
+        assert_eq!(fixed, next_retry_delay(fixed, fixed));
     }
 }

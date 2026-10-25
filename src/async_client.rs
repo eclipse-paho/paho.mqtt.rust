@@ -458,7 +458,7 @@ impl AsyncClient {
             }
         }
 
-        let keep_alive_secs = opts.keep_alive_interval.as_secs().min(u16::MAX as u64) as u16;
+        let keep_alive_secs = opts.keep_alive_secs();
 
         let will = opts.will.as_ref().map(|msg| paho_mqtt_codec::Will {
             topic: msg.topic.clone(),

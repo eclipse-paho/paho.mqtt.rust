@@ -302,6 +302,12 @@ pub struct MessageBuilder(Message);
 
 impl MessageBuilder {
     /// Create a new message builder.
+    ///
+    /// The message starts with an empty topic and payload, no properties,
+    /// the retain flag clear, and **QoS 0**. Note for anyone coming from
+    /// v1.x of this library, where the default was QoS 1: a chain that does
+    /// not call [`qos`](Self::qos) now publishes at most once, so the
+    /// message is not acknowledged, persisted or re-sent.
     pub fn new() -> Self {
         Self::default()
     }
@@ -327,6 +333,8 @@ impl MessageBuilder {
     }
 
     /// Sets the Quality of Service for the message.
+    ///
+    /// The default is QoS 0 — see [`new`](Self::new).
     ///
     /// # Arguments
     ///

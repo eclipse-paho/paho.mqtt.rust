@@ -156,6 +156,23 @@ impl ConnectOptions {
         }
     }
 
+    /// The keep-alive interval as the whole seconds a CONNECT packet carries.
+    ///
+    /// The wire field is a `u16` count of seconds (MQTT §3.1.2.10), so a
+    /// fractional part cannot be sent. Zero means keep-alive is disabled.
+    /// A non-zero interval shorter than a second rounds **up** to one
+    /// second: truncating it to zero would disable keep-alive, the opposite
+    /// of what was asked for. Anything longer saturates at `u16::MAX`
+    /// seconds, a little over 18 hours.
+    pub(crate) fn keep_alive_secs(&self) -> u16 {
+        let secs = self.keep_alive_interval.as_secs();
+        if self.keep_alive_interval.is_zero() {
+            0
+        } else {
+            secs.clamp(1, u16::MAX as u64) as u16
+        }
+    }
+
     /// Does a check of the options to determine if they're valid.
     ///
     /// Rules:
@@ -164,6 +181,8 @@ impl ConnectOptions {
     /// - No v5 properties in a v3 connection.
     /// - v5 properties, if present, must be valid
     /// - Advanced auth must be configured for both client and server.
+    /// - With auto-reconnect on, `max_retry_interval` must be at least
+    ///   `min_retry_interval`.
     pub fn check(&self) -> Result<()> {
         if !self.server_uris.is_empty() {
             let uris = &self.server_uris;
@@ -186,6 +205,17 @@ impl ConnectOptions {
             && self.mqtt_version < MqttVersion::V5
         {
             return Err(Error::WrongMqttVersion);
+        }
+
+        // An upper retry bound below the lower one has no coherent reading:
+        // the backoff starts at the minimum and is then capped at the
+        // maximum, so the delay would *shrink* on the first failure. There
+        // is nothing to guess at, so say so rather than quietly reordering
+        // the two. Only meaningful when reconnecting is enabled.
+        if self.auto_reconnect && self.max_retry_interval < self.min_retry_interval {
+            return Err(Error::General(
+                "max_retry_interval is less than min_retry_interval",
+            ));
         }
 
         // A property the specification does not allow would be refused when
@@ -413,13 +443,22 @@ impl ConnectOptionsBuilder {
 
     /// Sets the keep alive interval for the client session.
     ///
+    /// The protocol carries this as a whole number of seconds, so the
+    /// interval is rounded: a fractional part is dropped, and a non-zero
+    /// interval shorter than a second becomes one second rather than zero,
+    /// which would switch keep-alive off instead of speeding it up. An
+    /// interval over `u16::MAX` seconds saturates there.
+    ///
+    /// `Duration::ZERO` **disables** keep-alive: no PINGREQ is sent and the
+    /// server is told not to expect one. Note that v1.x of this library
+    /// clamped zero to one second, so it had no way to turn keep-alive off.
+    ///
     /// # Arguments
     ///
     /// `keep_alive_interval` The maximum time that should pass without
     ///                       communication between the client and server.
     ///                       This has a resolution in seconds.
     pub fn keep_alive_interval(&mut self, keep_alive_interval: Duration) -> &mut Self {
-        // TODO: Set a lower limit?
         self.0.keep_alive_interval = keep_alive_interval;
         self
     }
@@ -584,13 +623,22 @@ impl ConnectOptionsBuilder {
 
     /// Sets the time interval to allow the connection to complete.
     ///
+    /// This is a timer the client runs itself, so the interval is used as
+    /// given, to whatever resolution the runtime provides; sub-second
+    /// timeouts work. The default is 30 seconds.
+    ///
+    /// `Duration::ZERO` **disables** the timeout: the attempt then takes as
+    /// long as the transport takes, which for a server that accepts the
+    /// connection and then goes quiet during a TLS handshake may be
+    /// indefinitely. It is the only way to opt out of a deadline, so it is
+    /// passed through rather than overridden — note that v1.x of this
+    /// library clamped zero to one second.
+    ///
     /// # Arguments
     ///
-    /// `timeout` The time interval to allow the connection to
-    ///           complete. This has a resolution of seconds.
+    /// `timeout` The time interval to allow the connection to complete.
     ///
     pub fn connect_timeout(&mut self, timeout: Duration) -> &mut Self {
-        // TODO: Lower limit of 1 sec?
         self.0.timeout = timeout;
         self
     }
@@ -615,20 +663,34 @@ impl ConnectOptionsBuilder {
 
     /// Sets the client to automatically reconnect if the connection is lost.
     ///
+    /// The first retry waits `min_retry_interval`, and each failed retry
+    /// doubles the wait until it reaches `max_retry_interval`, where it
+    /// stays. A successful connection resets it. These are the client's own
+    /// timers, so sub-second intervals work.
+    ///
+    /// A `min_retry_interval` of `Duration::ZERO` means the first retry
+    /// waits for nothing; the backoff then starts at 100 ms rather than
+    /// staying at zero, since a doubling sequence cannot climb out of zero
+    /// and the client would otherwise retry without pause for as long as
+    /// the broker stayed down.
+    ///
+    /// A `max_retry_interval` below `min_retry_interval` is rejected, by
+    /// [`ConnectOptions::check`] and so by `connect()`: the delay would
+    /// shrink on the first failure, and there is no sensible way to guess
+    /// which of the two was meant.
+    ///
     /// # Arguments
     ///
     /// `min_retry_interval` The minimum retry interval. Doubled on each
-    ///                      failed retry. This has a resolution in seconds.
+    ///                      failed retry.
     /// `max_retry_interval` The maximum retry interval. Doubling stops here
-    ///                      on failed retries. This has a resolution in
-    ///                      seconds.
+    ///                      on failed retries.
     pub fn automatic_reconnect(
         &mut self,
         min_retry_interval: Duration,
         max_retry_interval: Duration,
     ) -> &mut Self {
         self.0.auto_reconnect = true;
-        // TODO: Lower limit? Ensure max >= min?
         self.0.min_retry_interval = min_retry_interval;
         self.0.max_retry_interval = max_retry_interval;
         self
@@ -912,6 +974,91 @@ mod tests {
         let mut good = Properties::new();
         good.try_push(Property::ReceiveMaximum(20)).unwrap();
         let opts = ConnectOptionsBuilder::new_v5().properties(good).finalize();
+        assert!(opts.check().is_ok());
+    }
+
+    // The keep-alive goes on the wire as whole seconds, so the conversion
+    // has to round. The case that matters is a non-zero interval under a
+    // second: truncating it to zero would *disable* keep-alive, which is
+    // the opposite of asking for a fast one.
+    #[test]
+    fn test_keep_alive_secs_rounding() {
+        let secs = |d| {
+            ConnectOptionsBuilder::new()
+                .keep_alive_interval(d)
+                .finalize()
+                .keep_alive_secs()
+        };
+
+        // Zero stays zero: that is how keep-alive is switched off.
+        assert_eq!(0, secs(Duration::ZERO));
+
+        // Anything non-zero below a second rounds up to one.
+        assert_eq!(1, secs(Duration::from_nanos(1)));
+        assert_eq!(1, secs(Duration::from_millis(1)));
+        assert_eq!(1, secs(Duration::from_millis(500)));
+        assert_eq!(1, secs(Duration::from_millis(999)));
+
+        // At or above a second, the fractional part is dropped.
+        assert_eq!(1, secs(Duration::from_secs(1)));
+        assert_eq!(1, secs(Duration::from_millis(1900)));
+        assert_eq!(45, secs(Duration::from_millis(45_999)));
+        assert_eq!(60, secs(Duration::from_secs(60)));
+
+        // The field is a u16, so a longer interval saturates.
+        assert_eq!(u16::MAX, secs(Duration::from_secs(u16::MAX as u64)));
+        assert_eq!(u16::MAX, secs(Duration::from_secs(1_000_000)));
+
+        // And the default.
+        assert_eq!(60, ConnectOptions::new().keep_alive_secs());
+    }
+
+    // A connect timeout is the client's own timer, so it is used as given,
+    // and zero means no deadline at all.
+    #[test]
+    fn test_connect_timeout_passed_through() {
+        let opts = ConnectOptionsBuilder::new()
+            .connect_timeout(Duration::from_millis(250))
+            .finalize();
+        assert_eq!(Duration::from_millis(250), opts.timeout);
+
+        let opts = ConnectOptionsBuilder::new()
+            .connect_timeout(Duration::ZERO)
+            .finalize();
+        assert!(opts.timeout.is_zero());
+
+        assert_eq!(Duration::from_secs(30), ConnectOptions::new().timeout);
+    }
+
+    // An upper retry bound below the lower one would make the delay shrink
+    // on the first failure, so it is refused rather than reordered.
+    #[test]
+    fn test_retry_interval_order_is_checked() {
+        let opts = ConnectOptionsBuilder::new()
+            .automatic_reconnect(Duration::from_secs(10), Duration::from_secs(2))
+            .finalize();
+        assert!(
+            matches!(opts.check(), Err(Error::General(msg)) if msg.contains("max_retry_interval"))
+        );
+
+        // Equal is fine: a fixed retry interval with no backoff.
+        let opts = ConnectOptionsBuilder::new()
+            .automatic_reconnect(Duration::from_secs(5), Duration::from_secs(5))
+            .finalize();
+        assert!(opts.check().is_ok());
+
+        // A zero minimum is allowed; the backoff handles it.
+        let opts = ConnectOptionsBuilder::new()
+            .automatic_reconnect(Duration::ZERO, Duration::from_secs(60))
+            .finalize();
+        assert!(opts.check().is_ok());
+
+        // Without auto-reconnect the intervals are unused, so the order of
+        // two values nothing reads is not worth failing a connect over.
+        let mut opts = ConnectOptions::new();
+        opts.min_retry_interval = Duration::from_secs(10);
+        opts.max_retry_interval = Duration::from_secs(2);
+        assert!(!opts.auto_reconnect);
         assert!(opts.check().is_ok());
     }
 }
