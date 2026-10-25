@@ -2960,6 +2960,61 @@ fn test_connection_lost_callback() {
 
     let (tx, rx) = mpsc::channel::<()>();
 
+    // Deliberately v3: it has no server DISCONNECT packet, so a takeover
+    // simply closes the socket and the client has to infer the loss. That is
+    // what `connection_lost` is for. The v5 case, where the broker announces
+    // the takeover with a reason, is the test below.
+    let cli = mqtt::AsyncClient::new(
+        mqtt::CreateOptionsBuilder::new()
+            .server_uri(HOST)
+            .client_id(CLIENT_ID)
+            .mqtt_version(mqtt::MQTT_VERSION_3_1_1)
+            .finalize(),
+    )
+    .unwrap();
+    cli.set_connection_lost_callback(move |_cli| {
+        let _ = tx.send(());
+    });
+    cli.set_disconnected_callback(|_, _, rc| {
+        panic!("v3 has no server DISCONNECT, yet `disconnected` fired with {rc:?}");
+    });
+
+    let opts = mqtt::ConnectOptionsBuilder::new_v3().finalize();
+    cli.connect(opts).wait().expect("connect failed");
+
+    // Kick our client off by connecting an intruder with the same ID
+    let intruder = mqtt::AsyncClient::new(
+        mqtt::CreateOptionsBuilder::new()
+            .server_uri(HOST)
+            .client_id(CLIENT_ID)
+            .mqtt_version(mqtt::MQTT_VERSION_3_1_1)
+            .finalize(),
+    )
+    .unwrap();
+    intruder
+        .connect(mqtt::ConnectOptionsBuilder::new_v3().finalize())
+        .wait()
+        .expect("intruder connect failed");
+
+    rx.recv_timeout(Duration::from_secs(5))
+        .expect("connection_lost callback did not fire within 5 s");
+
+    drop(intruder);
+}
+
+/// The v5 counterpart, against a real broker: a session taken over by
+/// another client with the same identifier is announced with a DISCONNECT
+/// carrying `SessionTakenOver`, so it is reported as `disconnected` with
+/// that reason — and **not** as `connection_lost`, which means a connection
+/// lost without notice.
+#[test]
+fn test_v5_session_taken_over_reports_disconnected() {
+    use std::sync::mpsc;
+
+    const CLIENT_ID: &str = "paho-rust-v2-takeover-v5";
+
+    let (tx, rx) = mpsc::channel::<Result<mqtt::ReasonCode, ()>>();
+
     let cli = mqtt::AsyncClient::new(
         mqtt::CreateOptionsBuilder::new()
             .server_uri(HOST)
@@ -2967,13 +3022,16 @@ fn test_connection_lost_callback() {
             .finalize(),
     )
     .unwrap();
+    let dtx = tx.clone();
+    cli.set_disconnected_callback(move |_, _props, rc| {
+        let _ = dtx.send(Ok(rc));
+    });
     cli.set_connection_lost_callback(move |_cli| {
-        let _ = tx.send(());
+        let _ = tx.send(Err(()));
     });
 
     cli.connect(None).wait().expect("connect failed");
 
-    // Kick our client off by connecting an intruder with the same ID
     let intruder = mqtt::AsyncClient::new(
         mqtt::CreateOptionsBuilder::new()
             .server_uri(HOST)
@@ -2986,8 +3044,21 @@ fn test_connection_lost_callback() {
         .wait()
         .expect("intruder connect failed");
 
-    rx.recv_timeout(Duration::from_secs(5))
-        .expect("connection_lost callback did not fire within 5 s");
+    // Whichever callback fires first; it must be `disconnected`.
+    let first = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("neither callback fired within 5 s");
+    assert_eq!(
+        Ok(mqtt::ReasonCode::SessionTakenOver),
+        first,
+        "a takeover is announced, so it is `disconnected`, not `connection_lost`"
+    );
+
+    // And the other one must not follow.
+    assert!(
+        rx.recv_timeout(Duration::from_millis(500)).is_err(),
+        "only one of `disconnected` and `connection_lost` may fire"
+    );
 
     drop(intruder);
 }
@@ -3130,6 +3201,120 @@ fn test_max_inflight() {
 /////////////////////////////////////////////////////////////////////////////
 // Async stream API
 /////////////////////////////////////////////////////////////////////////////
+
+/// A broker-initiated DISCONNECT (v5) is reported as `disconnected`, with
+/// its reason code, and **not** as `connection_lost`: that one means the
+/// connection was lost unexpectedly, which an announced close is not. Every
+/// established connection ends with one of the two, never both.
+///
+/// The message routes still have to be told the connection is over, so the
+/// DISCONNECT carries the `None` that a lost connection would have.
+#[test]
+fn test_server_disconnect_reports_disconnected_not_lost() {
+    use mqtt::paho_mqtt_codec::{ConnAck, Disconnect, Packet, ReasonCode, SubAck};
+    use std::sync::{Arc, Mutex};
+
+    // `spawn_broker_seq` so the handler can return a `Reply` and close.
+    let broker = common::spawn_broker_seq(1, |pkt, _conn| match pkt {
+        Packet::Connect(_) => {
+            vec![Packet::ConnAck(ConnAck::new(false, ReasonCode::Success))].into()
+        }
+        // Acknowledge the subscription, then shut down with a reason — and
+        // close the socket, as a server does after sending DISCONNECT.
+        Packet::Subscribe(sub) => common::Reply::close_after(vec![
+            Packet::SubAck(SubAck {
+                packet_id: sub.packet_id,
+                reason_codes: vec![ReasonCode::GrantedQos1],
+                properties: Default::default(),
+            }),
+            Packet::Disconnect(Disconnect::with_properties(
+                ReasonCode::ServerShuttingDown,
+                None,
+            )),
+        ]),
+        _ => common::Reply::none(),
+    });
+
+    let mut cli = mqtt::AsyncClient::new(broker.uri.clone()).unwrap();
+
+    // One log for all three callbacks, so the test can see not just what
+    // fired but in what order — and, more to the point, what did not.
+    let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+
+    let l = log.clone();
+    cli.set_connection_lost_callback(move |_| l.lock().unwrap().push("lost".into()));
+    let l = log.clone();
+    cli.set_disconnected_callback(move |_, _props, rc| {
+        l.lock().unwrap().push(format!("disconnected:{}", rc as u8))
+    });
+    let l = log.clone();
+    cli.set_message_callback(move |_, msg| {
+        l.lock().unwrap().push(if msg.is_none() {
+            "none".into()
+        } else {
+            "msg".into()
+        })
+    });
+
+    // Both message routes, to check each gets its end-of-connection marker.
+    let stream = cli.get_stream(Some(8));
+    let consumer = cli.start_consuming();
+
+    // No auto-reconnect: the loop should settle back to waiting, so once the
+    // disconnect has been reported nothing further is coming.
+    let opts = mqtt::ConnectOptionsBuilder::new_v5().finalize();
+    cli.connect(opts).wait().expect("connect failed");
+    cli.subscribe("test/disc", 1).wait().ok();
+
+    // Wait for the disconnect to be reported...
+    let deadline = std::time::Instant::now() + TIMEOUT;
+    while std::time::Instant::now() < deadline {
+        if log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|e| e.starts_with("disconnected:"))
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // ... then give anything else that was coming time to arrive. Without
+    // this the assertion below would pass against the old behaviour, which
+    // delivered the stream's `None` from the `ConnectionLost` arm *before*
+    // invoking the lost callback.
+    std::thread::sleep(Duration::from_millis(500));
+
+    let log = log.lock().unwrap().clone();
+    assert!(
+        log.contains(&format!(
+            "disconnected:{}",
+            ReasonCode::ServerShuttingDown as u8
+        )),
+        "the disconnected callback should carry the server's reason code; log: {log:?}"
+    );
+    assert!(
+        !log.contains(&"lost".to_string()),
+        "connection_lost must not fire for an announced disconnect; log: {log:?}"
+    );
+    assert!(
+        log.contains(&"none".to_string()),
+        "the message callback should be given None to end the connection; log: {log:?}"
+    );
+
+    // Both message routes see the end of the connection.
+    assert!(
+        matches!(consumer.recv_timeout(TIMEOUT), Ok(None)),
+        "a sync consumer should see None at the end of the connection"
+    );
+    assert!(
+        matches!(stream.try_recv(), Ok(None)),
+        "an async message stream should see None at the end of the connection"
+    );
+
+    cli.disconnect(None).wait().ok();
+    broker.join();
+}
 
 // The get_stream() async channel API must deliver messages like start_consuming().
 #[test]

@@ -65,7 +65,7 @@ use super::{
     },
     outbox::Outbox,
     persist::{PersistWorker, Store},
-    sinks::{Parked, Sinks, chain, disconnected_event},
+    sinks::{Parked, Sinks, chain},
 };
 use crate::{
     Error, Message, Result,
@@ -815,6 +815,12 @@ struct Session<B: Backend> {
     pending: Option<Parked>,
     /// The acknowledgement owed once `pending` completes.
     pending_ack: Option<Packet>,
+    /// Set when the session ended because the server sent a DISCONNECT.
+    ///
+    /// It ends with `Err(Error::Disconnected)` either way, but a server
+    /// DISCONNECT has already told the application what happened, and why,
+    /// so the run loop must not report `ConnectionLost` over the top of it.
+    server_disconnect: bool,
     /// When the application last stopped taking messages, so that a stall
     /// long enough to look like a hang leaves a trace in the log.
     stalled_since: Option<std::time::Instant>,
@@ -878,6 +884,7 @@ impl<B: Backend> Session<B> {
             sinks,
             held: VecDeque::new(),
             pending: None,
+            server_disconnect: false,
             pending_ack: None,
             stalled_since: None,
             ping_outstanding: false,
@@ -1949,8 +1956,12 @@ impl<B: Backend> Session<B> {
             }
 
             // ---- Broker-initiated disconnect (v5) ----
-            // As in the C library, this also fires ConnectionLost and
-            // triggers auto-reconnect once the session loop unwinds.
+            // This is how an established connection ends when the server
+            // closes it and says why, so it is reported as `Disconnected`
+            // and *not* also as `ConnectionLost`: that one means the
+            // connection was lost unexpectedly. Every `Connected` is
+            // matched by one or the other, never both. Auto-reconnect
+            // still runs, once the session loop unwinds.
             Packet::Disconnect(disc) => {
                 // Messages received before the DISCONNECT are delivered
                 // before it.
@@ -1960,11 +1971,13 @@ impl<B: Backend> Session<B> {
                     reason_code,
                     props: props.clone(),
                 });
-                let to_streams = self
-                    .sinks
-                    .deliver_event(disconnected_event(reason_code, props));
+                // The event streams are told why; the message streams get
+                // the `None` that ends their connection, as they would on a
+                // lost one. The run loop adds nothing after this.
+                let to_streams = self.sinks.deliver_disconnected(reason_code, props);
                 // Awaited by the loop once the session has unwound.
                 self.pending = chain(flushed, to_streams);
+                self.server_disconnect = true;
                 return Err(Error::Disconnected);
             }
 
@@ -2876,8 +2889,11 @@ pub(crate) async fn run_event_loop<B: Backend>(
                 state,
             );
             let result = session.serve(&mut reader, &cmd_rx, &mut buf, resumed).await;
+            // A server DISCONNECT has reported itself already, reason code
+            // and all, and ended the streams with it; the loop adds nothing.
+            let server_disconnect = session.server_disconnect;
             // Whatever was received and held back is delivered, ahead of the
-            // ConnectionLost below.
+            // end-of-connection notice below.
             let flushed = session.flush_held();
             session.persist.close();
             // Carry what is still in flight into the next connection of this
@@ -2893,12 +2909,20 @@ pub(crate) async fn run_event_loop<B: Backend>(
                 Ok(()) => continue 'outer,
                 Err(e) => {
                     job.connected_flag.store(false, Ordering::SeqCst);
-                    let _ = event_tx.send(Event::ConnectionLost(e)).await;
-                    // A message stream ends its connection with `None`, as
-                    // the message callback is given; an event stream gets
-                    // `ConnectionLost`. After the messages above, never
-                    // before them.
-                    deliver_offline::<B>(sinks.deliver_connection_lost()).await;
+                    // `ConnectionLost` means the connection was lost
+                    // *unexpectedly*. A server DISCONNECT is not that: it
+                    // reported itself as `Disconnected`, with the reason,
+                    // and gave the message streams their `None` along with
+                    // it. So exactly one of the two is delivered for any
+                    // connection that was established.
+                    if !server_disconnect {
+                        let _ = event_tx.send(Event::ConnectionLost(e)).await;
+                        // A message stream ends its connection with `None`,
+                        // as the message callback is given; an event stream
+                        // gets `ConnectionLost`. After the messages above,
+                        // never before them.
+                        deliver_offline::<B>(sinks.deliver_connection_lost()).await;
+                    }
                     if !job.params.auto_reconnect {
                         continue 'outer;
                     }

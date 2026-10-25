@@ -147,7 +147,8 @@ impl Sinks {
     ///
     /// Message streams carry messages alone, so they are not told; the one
     /// thing they do see is the end of the connection, through
-    /// [`deliver_connection_lost`](Self::deliver_connection_lost).
+    /// [`deliver_connection_lost`](Self::deliver_connection_lost) or
+    /// [`deliver_disconnected`](Self::deliver_disconnected).
     pub(crate) fn deliver_event(&mut self, ev: Event) -> Option<Parked> {
         self.prune();
         let mut blocked = Blocked::default();
@@ -172,21 +173,48 @@ impl Sinks {
     }
 
     /// Tells every sink the connection has ended: `None` to the message
-    /// streams, as the message callback is given, and
-    /// `Event::ConnectionLost` to the event streams.
+    /// streams, as the message callback is given, and `ev` to the event
+    /// streams.
+    ///
+    /// A connection ends in one of two ways, and `ev` says which:
+    /// [`Event::ConnectionLost`] when it was lost unexpectedly, or
+    /// [`Event::Disconnected`] when the server closed it and said why. A
+    /// message stream cannot carry a reason, so it sees the same `None`
+    /// either way — what it needs to know is that the connection is over.
     ///
     /// Sent from the same task that fed them the messages, after the last of
     /// those, so the end cannot overtake what came before it.
-    pub(crate) fn deliver_connection_lost(&mut self) -> Option<Parked> {
+    fn deliver_session_end(&mut self, ev: Event) -> Option<Parked> {
         self.prune();
         let mut blocked = Blocked::default();
         for sink in &self.list {
             match sink {
                 Sink::Messages(tx) => blocked.push_msg(tx, None),
-                Sink::Events(tx) => blocked.push_event(tx, Event::ConnectionLost),
+                Sink::Events(tx) => blocked.push_event(tx, ev.clone()),
             }
         }
         blocked.into_parked()
+    }
+
+    /// Ends the connection on every sink, unexpectedly: `None` to the
+    /// message streams and [`Event::ConnectionLost`] to the event streams.
+    pub(crate) fn deliver_connection_lost(&mut self) -> Option<Parked> {
+        self.deliver_session_end(Event::ConnectionLost)
+    }
+
+    /// Ends the connection on every sink because the server closed it:
+    /// `None` to the message streams and [`Event::Disconnected`], carrying
+    /// the reason, to the event streams.
+    ///
+    /// The counterpart to
+    /// [`deliver_connection_lost`](Self::deliver_connection_lost); a
+    /// connection that was established gets one or the other, never both.
+    pub(crate) fn deliver_disconnected(
+        &mut self,
+        reason_code: ReasonCode,
+        props: Properties,
+    ) -> Option<Parked> {
+        self.deliver_session_end(disconnected_event(reason_code, props))
     }
 }
 
@@ -251,7 +279,7 @@ pub(crate) fn chain(first: Option<Parked>, second: Option<Parked>) -> Option<Par
 
 /// Builds the public `Disconnected` event. Keeps the mapping to the public
 /// types in this module, where the rest of it lives.
-pub(crate) fn disconnected_event(reason_code: ReasonCode, props: Properties) -> Event {
+fn disconnected_event(reason_code: ReasonCode, props: Properties) -> Event {
     Event::Disconnected { props, reason_code }
 }
 
@@ -349,6 +377,42 @@ mod tests {
             "end of the message stream"
         );
         assert!(matches!(erx.try_recv().unwrap(), Event::ConnectionLost));
+    }
+
+    /// A server DISCONNECT ends the connection just as a lost one does, so
+    /// the message streams get the same `None`; only the event streams can
+    /// carry the reason. The two are alternatives — a connection that was
+    /// established sees one or the other, never both — so a message stream
+    /// that was not given its `None` here would never get one.
+    #[test]
+    fn test_server_disconnect_ends_the_message_streams_too() {
+        let (mtx, mrx) = async_channel::unbounded();
+        let (etx, erx) = async_channel::unbounded();
+        let mut sinks = Sinks::default();
+        sinks.add(Sink::Messages(mtx));
+        sinks.add(Sink::Events(etx));
+
+        assert!(
+            sinks
+                .deliver_disconnected(ReasonCode::ServerShuttingDown, Properties::new())
+                .is_none()
+        );
+
+        assert!(
+            mrx.try_recv().unwrap().is_none(),
+            "end of the message stream"
+        );
+        assert!(matches!(
+            erx.try_recv().unwrap(),
+            Event::Disconnected {
+                reason_code: ReasonCode::ServerShuttingDown,
+                ..
+            }
+        ));
+
+        // And nothing more on either.
+        assert!(mrx.try_recv().is_err());
+        assert!(erx.try_recv().is_err());
     }
 
     /// A connection event goes to the event streams only.

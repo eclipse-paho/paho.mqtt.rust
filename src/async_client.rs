@@ -276,16 +276,21 @@ impl SyncSinks {
     }
 
     /// Tells every consumer the connection ended: `None` to the message
-    /// consumers, as the message callback is given, and `ConnectionLost` to
-    /// the event consumers.
-    fn send_connection_lost(&self) -> DeadSinks {
+    /// consumers, as the message callback is given, and `ev` to the event
+    /// consumers.
+    ///
+    /// `ev` is [`Event::ConnectionLost`] when the connection was lost
+    /// unexpectedly, or [`Event::Disconnected`] when the server closed it
+    /// and said why. A message consumer cannot carry a reason, so it sees
+    /// the same `None` either way.
+    fn send_session_end(&self, ev: &Event) -> DeadSinks {
         let mut dead = DeadSinks::default();
         for tx in &self.msgs {
             if tx.send(None).is_err() {
                 dead.msgs.push(tx.clone());
             }
         }
-        let mut rest = self.send_event(&Event::ConnectionLost);
+        let mut rest = self.send_event(ev);
         dead.events.append(&mut rest.events);
         dead
     }
@@ -1105,7 +1110,7 @@ impl AsyncClient {
             }
             Ev::ConnectionLost(_err) => {
                 self.inner.connected.store(false, Ordering::SeqCst);
-                self.to_sync_sinks(|sinks| sinks.send_connection_lost());
+                self.to_sync_sinks(|sinks| sinks.send_session_end(&Event::ConnectionLost));
                 let (msg_cb, lost_cb) = {
                     let mut cbctx = self.inner.callback_context.lock().unwrap();
                     (
@@ -1134,20 +1139,34 @@ impl AsyncClient {
             }
             Ev::Disconnected { reason_code, props } => {
                 self.inner.connected.store(false, Ordering::SeqCst);
+                // The server closing the connection ends it just as surely
+                // as losing it does, so the message consumers get their
+                // `None` here too — this is the end of their connection,
+                // and no `ConnectionLost` is coming to deliver it. The
+                // event consumers get the reason along with it.
                 self.to_sync_sinks(|sinks| {
-                    sinks.send_event(&Event::Disconnected {
+                    sinks.send_session_end(&Event::Disconnected {
                         props: props.clone(),
                         reason_code,
                     })
                 });
-                let taken = self
-                    .inner
-                    .callback_context
-                    .lock()
-                    .unwrap()
-                    .on_disconnected
-                    .take();
-                if let Some((mut cb, generation)) = taken {
+                let (msg_cb, disc_cb) = {
+                    let mut cbctx = self.inner.callback_context.lock().unwrap();
+                    (
+                        cbctx.on_message_arrived.take(),
+                        cbctx.on_disconnected.take(),
+                    )
+                };
+                if let Some((mut cb, generation)) = msg_cb {
+                    cb(self, None);
+                    self.inner
+                        .callback_context
+                        .lock()
+                        .unwrap()
+                        .on_message_arrived
+                        .restore(cb, generation);
+                }
+                if let Some((mut cb, generation)) = disc_cb {
                     cb(self, props, reason_code);
                     self.inner
                         .callback_context
@@ -2239,18 +2258,25 @@ mod tests {
         counts
     }
 
-    /// Dispatches one of each event the callbacks answer. Note that a lost
-    /// connection calls the message callback too, with `None`, so a message
-    /// callback that is still registered sees two calls in all.
+    /// Dispatches one of each event the callbacks answer, in an order a
+    /// connection could produce them: established, a message, then the two
+    /// ways one ends.
+    ///
+    /// Note that a real connection ends *either* by being lost or by the
+    /// server disconnecting, never both; this sends both only to exercise
+    /// all four callbacks from one helper. Each of those two also calls the
+    /// message callback with `None` to mark the end of the message stream,
+    /// so a message callback that is still registered sees three calls in
+    /// all: the message and two ends.
     fn dispatch_one_of_each(cli: &AsyncClient) {
         use crate::runtime::Event as Ev;
         cli.dispatch_event(Ev::Connected(crate::ConnectResponse::default()));
+        cli.dispatch_event(Ev::MessageArrived(Message::new("t", "p", crate::QOS_0)));
+        // Both clear the connected flag and call the message callback.
         cli.dispatch_event(Ev::Disconnected {
             reason_code: ReasonCode::NormalDisconnection,
             props: Properties::new(),
         });
-        cli.dispatch_event(Ev::MessageArrived(Message::new("t", "p", crate::QOS_0)));
-        // Last: it clears the connected flag and calls two callbacks.
         cli.dispatch_event(Ev::ConnectionLost(Error::Disconnected));
     }
 
@@ -2272,8 +2298,9 @@ mod tests {
         assert_eq!(*counts[0].lock().unwrap(), 1, "connected");
         assert_eq!(*counts[1].lock().unwrap(), 1, "connection lost");
         assert_eq!(*counts[2].lock().unwrap(), 1, "disconnected");
-        // Twice: the arriving message, and the `None` that marks the end.
-        assert_eq!(*counts[3].lock().unwrap(), 2, "message");
+        // Three times: the arriving message, and the `None` that each of
+        // the two ways a connection can end sends to mark it.
+        assert_eq!(*counts[3].lock().unwrap(), 3, "message");
     }
 
     /// A message callback and a synchronous consumer both receive every
@@ -2415,9 +2442,9 @@ mod tests {
         assert_eq!(*counts[0].lock().unwrap(), 1, "connected");
         assert_eq!(*counts[1].lock().unwrap(), 1, "connection lost");
         assert_eq!(*counts[2].lock().unwrap(), 1, "disconnected");
-        // Twice: the arriving message, and the `None` that a lost connection
-        // sends to mark the end of the message stream.
-        assert_eq!(*counts[3].lock().unwrap(), 2, "message");
+        // Three times: the arriving message, and the `None` that each of
+        // the two ways a connection can end sends to mark it.
+        assert_eq!(*counts[3].lock().unwrap(), 3, "message");
     }
 
     /// `remove_callbacks` clears the callbacks and leaves a stream open:
@@ -2435,5 +2462,75 @@ mod tests {
             assert_eq!(*count.lock().unwrap(), 0, "callback {i}");
         }
         assert!(!rx.is_closed(), "the stream was closed with the callbacks");
+    }
+
+    /// A server DISCONNECT ends the connection on the callback route and
+    /// for the synchronous consumers, and it is the *only* notice sent:
+    /// `connection_lost` means the connection was lost unexpectedly, which
+    /// this was not. Every established connection gets one or the other,
+    /// never both and never neither. (The async streams are fed by the
+    /// event loop's sinks, not by the dispatcher; see
+    /// `runtime::sinks::tests::test_server_disconnect_ends_the_message_streams_too`.)
+    #[test]
+    fn test_server_disconnect_ends_every_dispatched_route() {
+        use crate::runtime::Event as Ev;
+
+        let cli = test_client();
+        let counts = count_all_callbacks(&cli);
+        let sync_msgs = cli.start_consuming();
+        let sync_events = cli.start_consuming_events(10);
+
+        cli.dispatch_event(Ev::Disconnected {
+            reason_code: ReasonCode::ServerShuttingDown,
+            props: Properties::new(),
+        });
+
+        // The callback route: `disconnected` with the reason, the message
+        // callback with `None`, and nothing on `connection_lost`.
+        assert_eq!(*counts[2].lock().unwrap(), 1, "disconnected");
+        assert_eq!(*counts[3].lock().unwrap(), 1, "message callback given None");
+        assert_eq!(
+            *counts[1].lock().unwrap(),
+            0,
+            "connection_lost must not fire"
+        );
+
+        // The synchronous consumers end the same way.
+        assert!(
+            matches!(sync_msgs.try_recv(), Ok(None)),
+            "a sync consumer ends with None"
+        );
+        assert!(
+            matches!(
+                sync_events.try_recv(),
+                Ok(Event::Disconnected { reason_code, .. })
+                    if reason_code == ReasonCode::ServerShuttingDown
+            ),
+            "a sync event consumer is given the reason"
+        );
+
+        // Nothing is left behind on either.
+        assert!(sync_msgs.try_recv().is_err());
+        assert!(sync_events.try_recv().is_err());
+    }
+
+    /// The counterpart: a connection lost without a DISCONNECT reports
+    /// `connection_lost` and not `disconnected`.
+    #[test]
+    fn test_lost_connection_does_not_report_disconnected() {
+        use crate::runtime::Event as Ev;
+
+        let cli = test_client();
+        let counts = count_all_callbacks(&cli);
+        let sync_msgs = cli.start_consuming();
+        let sync_events = cli.start_consuming_events(10);
+
+        cli.dispatch_event(Ev::ConnectionLost(Error::Disconnected));
+
+        assert_eq!(*counts[1].lock().unwrap(), 1, "connection lost");
+        assert_eq!(*counts[2].lock().unwrap(), 0, "disconnected must not fire");
+        assert_eq!(*counts[3].lock().unwrap(), 1, "message callback given None");
+        assert!(matches!(sync_msgs.try_recv(), Ok(None)));
+        assert!(matches!(sync_events.try_recv(), Ok(Event::ConnectionLost)));
     }
 }
