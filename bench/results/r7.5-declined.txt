@@ -1,0 +1,76 @@
+# R7.5: persistent futures in the loop — measured and declined (2026-10-18).
+
+## 1. Syscalls per message today (strace -f -c, n=20000, null broker)
+#
+# scenario           recvfrom  of which  epoll_ctl  epoll_wait
+#                              EAGAIN                        
+# smol pub1-seq      2.088     1.088     1.275      -
+# smol rtt           2.075     1.075     1.901      -
+# tokio pub1-seq     1.000     0.000     0.000      2.825
+# tokio rtt          1.000     0.000     0.000      3.968
+#
+# Note the shape: smol's EAGAIN count is ~1 per *read*, not per pass. tokio makes
+# no speculative read at all, because its TcpStream checks the driver's cached
+# readiness before trying; async-io has no such cache and tries the syscall first.
+# Under load the EAGAIN is amortised away: smol sub cb is 0.0035 recvfrom/message.
+
+## 2. Does pinning the read future help? No.
+#
+# A standalone program (smol 2 + async-io 2.6): one task selects over a socket
+# read and a 50us timer, with the peer sending only every tenth tick, so most
+# passes are woken by something other than the read — the shape R7.5 describes.
+# Two variants, one creating the read future per pass, one keeping it pinned and
+# rebuilding only after it completes. 2000 passes each:
+#
+#   fresh:  1.473 EAGAIN recvfrom/pass,  2.336 epoll_ctl/pass
+#   pinned: 1.461 EAGAIN recvfrom/pass,  2.223 epoll_ctl/pass
+#
+# Within noise. Reading async-io 2.6 says why:
+#   - AsyncRead::poll_read tries the read on every poll, new future or not, so the
+#     EAGAIN is per poll rather than per future;
+#   - Source::poll_ready keeps the registered waker when will_wake() matches, so
+#     re-creating the future does not re-register. The epoll_ctl calls come from
+#     re-arming after each delivered event, which no caller can avoid.
+
+## 3. The gap R7.5 was meant to close (5 reps interleaved, medians, ivcsw-filtered)
+#
+# scenario    tokio cpu/msg  smol cpu/msg  ratio
+# pub0-seq          16.88        14.31   0.85   <- smol cheaper where nothing is read
+# pub1-seq          23.84        30.32   1.27
+# rtt               36.90        43.75   1.19
+#
+# Syscalls per message are comparable (smol ~5.7, tokio ~6.3 — tokio makes more),
+# so the remaining difference is not syscall-bound and R7.5 could not have closed
+# it even if pinning had worked.
+
+## Raw CPU-gap runs
+tokio pub1-seq RESULT backend=tokio scenario=pub1-seq mode=wait v5=false persist=false size=32 n=20000 window=0 target_rate=0 sent_rate=0 secs=0.6457 rate=30975 MBps=0.99 cpu_us_per_msg=24.792 cpu_util=0.77 vcsw_per_msg=2.990 ivcsw=3 lat_mean_us=32.2 lat_p50_us=25.4 lat_p99_us=130.6 lat_p999_us=209.4 lat_max_us=659.8
+tokio rtt      RESULT backend=tokio scenario=rtt mode=wait v5=false persist=false size=32 n=20000 window=0 target_rate=0 sent_rate=0 secs=0.7093 rate=28197 MBps=0.90 cpu_us_per_msg=35.386 cpu_util=1.00 vcsw_per_msg=3.995 ivcsw=10 lat_mean_us=35.4 lat_p50_us=30.8 lat_p99_us=103.8 lat_p999_us=165.9 lat_max_us=1003.2
+tokio pub0-seq RESULT backend=tokio scenario=pub0-seq mode=wait v5=false persist=false size=32 n=20000 window=0 target_rate=0 sent_rate=0 secs=0.3280 rate=60974 MBps=1.95 cpu_us_per_msg=17.539 cpu_util=1.07 vcsw_per_msg=1.910 ivcsw=0 lat_mean_us=16.4 lat_p50_us=13.6 lat_p99_us=61.2 lat_p999_us=113.8 lat_max_us=588.7
+smol pub1-seq RESULT backend=smol scenario=pub1-seq mode=wait v5=false persist=false size=32 n=20000 window=0 target_rate=0 sent_rate=0 secs=0.6385 rate=31324 MBps=1.00 cpu_us_per_msg=30.716 cpu_util=0.96 vcsw_per_msg=2.672 ivcsw=8 lat_mean_us=31.9 lat_p50_us=27.2 lat_p99_us=104.8 lat_p999_us=192.0 lat_max_us=844.7
+smol rtt      RESULT backend=smol scenario=rtt mode=wait v5=false persist=false size=32 n=20000 window=0 target_rate=0 sent_rate=0 secs=0.8025 rate=24923 MBps=0.80 cpu_us_per_msg=44.750 cpu_util=1.12 vcsw_per_msg=3.792 ivcsw=267 lat_mean_us=40.1 lat_p50_us=33.2 lat_p99_us=122.5 lat_p999_us=339.7 lat_max_us=1679.6
+smol pub0-seq RESULT backend=smol scenario=pub0-seq mode=wait v5=false persist=false size=32 n=20000 window=0 target_rate=0 sent_rate=0 secs=0.2977 rate=67185 MBps=2.15 cpu_us_per_msg=16.623 cpu_util=1.12 vcsw_per_msg=1.056 ivcsw=243 lat_mean_us=14.8 lat_p50_us=11.7 lat_p99_us=59.3 lat_p999_us=133.6 lat_max_us=618.1
+tokio pub1-seq RESULT backend=tokio scenario=pub1-seq mode=wait v5=false persist=false size=32 n=20000 window=0 target_rate=0 sent_rate=0 secs=0.5908 rate=33851 MBps=1.08 cpu_us_per_msg=22.838 cpu_util=0.77 vcsw_per_msg=2.990 ivcsw=9 lat_mean_us=29.5 lat_p50_us=25.1 lat_p99_us=88.6 lat_p999_us=157.9 lat_max_us=583.0
+tokio rtt      RESULT backend=tokio scenario=rtt mode=wait v5=false persist=false size=32 n=20000 window=0 target_rate=0 sent_rate=0 secs=0.7530 rate=26562 MBps=0.85 cpu_us_per_msg=37.991 cpu_util=1.01 vcsw_per_msg=3.989 ivcsw=5 lat_mean_us=37.6 lat_p50_us=32.8 lat_p99_us=110.8 lat_p999_us=197.2 lat_max_us=969.8
+tokio pub0-seq RESULT backend=tokio scenario=pub0-seq mode=wait v5=false persist=false size=32 n=20000 window=0 target_rate=0 sent_rate=0 secs=0.3113 rate=64250 MBps=2.06 cpu_us_per_msg=16.293 cpu_util=1.05 vcsw_per_msg=1.978 ivcsw=1 lat_mean_us=15.5 lat_p50_us=12.7 lat_p99_us=58.7 lat_p999_us=118.0 lat_max_us=737.0
+smol pub1-seq RESULT backend=smol scenario=pub1-seq mode=wait v5=false persist=false size=32 n=20000 window=0 target_rate=0 sent_rate=0 secs=0.5850 rate=34189 MBps=1.09 cpu_us_per_msg=28.532 cpu_util=0.98 vcsw_per_msg=2.697 ivcsw=0 lat_mean_us=29.2 lat_p50_us=24.9 lat_p99_us=85.0 lat_p999_us=157.7 lat_max_us=242.4
+smol rtt      RESULT backend=smol scenario=rtt mode=wait v5=false persist=false size=32 n=20000 window=0 target_rate=0 sent_rate=0 secs=0.7716 rate=25919 MBps=0.83 cpu_us_per_msg=44.000 cpu_util=1.14 vcsw_per_msg=3.767 ivcsw=7 lat_mean_us=38.5 lat_p50_us=32.8 lat_p99_us=115.6 lat_p999_us=181.1 lat_max_us=617.6
+smol pub0-seq RESULT backend=smol scenario=pub0-seq mode=wait v5=false persist=false size=32 n=20000 window=0 target_rate=0 sent_rate=0 secs=0.2550 rate=78422 MBps=2.51 cpu_us_per_msg=14.401 cpu_util=1.13 vcsw_per_msg=1.017 ivcsw=1 lat_mean_us=12.7 lat_p50_us=9.6 lat_p99_us=64.8 lat_p999_us=126.9 lat_max_us=181.4
+tokio pub1-seq RESULT backend=tokio scenario=pub1-seq mode=wait v5=false persist=false size=32 n=20000 window=0 target_rate=0 sent_rate=0 secs=0.5618 rate=35598 MBps=1.14 cpu_us_per_msg=22.183 cpu_util=0.79 vcsw_per_msg=2.995 ivcsw=0 lat_mean_us=28.0 lat_p50_us=24.1 lat_p99_us=82.6 lat_p999_us=149.5 lat_max_us=674.7
+tokio rtt      RESULT backend=tokio scenario=rtt mode=wait v5=false persist=false size=32 n=20000 window=0 target_rate=0 sent_rate=0 secs=0.7279 rate=27475 MBps=0.88 cpu_us_per_msg=36.898 cpu_util=1.01 vcsw_per_msg=3.993 ivcsw=17 lat_mean_us=36.3 lat_p50_us=31.0 lat_p99_us=113.8 lat_p999_us=191.5 lat_max_us=676.8
+tokio pub0-seq RESULT backend=tokio scenario=pub0-seq mode=wait v5=false persist=false size=32 n=20000 window=0 target_rate=0 sent_rate=0 secs=0.3240 rate=61731 MBps=1.98 cpu_us_per_msg=16.878 cpu_util=1.04 vcsw_per_msg=1.936 ivcsw=1 lat_mean_us=16.1 lat_p50_us=13.4 lat_p99_us=68.9 lat_p999_us=118.2 lat_max_us=1022.8
+smol pub1-seq RESULT backend=smol scenario=pub1-seq mode=wait v5=false persist=false size=32 n=20000 window=0 target_rate=0 sent_rate=0 secs=0.7678 rate=26047 MBps=0.83 cpu_us_per_msg=35.594 cpu_util=0.93 vcsw_per_msg=2.611 ivcsw=325 lat_mean_us=38.3 lat_p50_us=32.8 lat_p99_us=110.5 lat_p999_us=617.7 lat_max_us=1725.6
+smol rtt      RESULT backend=smol scenario=rtt mode=wait v5=false persist=false size=32 n=20000 window=0 target_rate=0 sent_rate=0 secs=0.7997 rate=25010 MBps=0.80 cpu_us_per_msg=45.674 cpu_util=1.14 vcsw_per_msg=3.784 ivcsw=5 lat_mean_us=39.9 lat_p50_us=34.1 lat_p99_us=104.5 lat_p999_us=181.4 lat_max_us=1068.3
+smol pub0-seq RESULT backend=smol scenario=pub0-seq mode=wait v5=false persist=false size=32 n=20000 window=0 target_rate=0 sent_rate=0 secs=0.2441 rate=81923 MBps=2.62 cpu_us_per_msg=14.098 cpu_util=1.15 vcsw_per_msg=1.019 ivcsw=1 lat_mean_us=12.2 lat_p50_us=10.1 lat_p99_us=49.3 lat_p999_us=106.8 lat_max_us=207.0
+tokio pub1-seq RESULT backend=tokio scenario=pub1-seq mode=wait v5=false persist=false size=32 n=20000 window=0 target_rate=0 sent_rate=0 secs=0.6049 rate=33063 MBps=1.06 cpu_us_per_msg=23.838 cpu_util=0.79 vcsw_per_msg=2.984 ivcsw=1 lat_mean_us=30.2 lat_p50_us=25.3 lat_p99_us=101.9 lat_p999_us=187.7 lat_max_us=1035.7
+tokio rtt      RESULT backend=tokio scenario=rtt mode=wait v5=false persist=false size=32 n=20000 window=0 target_rate=0 sent_rate=0 secs=0.7320 rate=27322 MBps=0.87 cpu_us_per_msg=36.620 cpu_util=1.00 vcsw_per_msg=3.991 ivcsw=17 lat_mean_us=36.5 lat_p50_us=31.6 lat_p99_us=107.0 lat_p999_us=179.8 lat_max_us=498.3
+tokio pub0-seq RESULT backend=tokio scenario=pub0-seq mode=wait v5=false persist=false size=32 n=20000 window=0 target_rate=0 sent_rate=0 secs=0.3014 rate=66367 MBps=2.12 cpu_us_per_msg=15.878 cpu_util=1.05 vcsw_per_msg=1.972 ivcsw=0 lat_mean_us=15.0 lat_p50_us=12.1 lat_p99_us=62.2 lat_p999_us=119.5 lat_max_us=294.5
+smol pub1-seq RESULT backend=smol scenario=pub1-seq mode=wait v5=false persist=false size=32 n=20000 window=0 target_rate=0 sent_rate=0 secs=0.6388 rate=31307 MBps=1.00 cpu_us_per_msg=30.538 cpu_util=0.96 vcsw_per_msg=2.632 ivcsw=1 lat_mean_us=31.9 lat_p50_us=27.3 lat_p99_us=99.6 lat_p999_us=164.6 lat_max_us=723.0
+smol rtt      RESULT backend=smol scenario=rtt mode=wait v5=false persist=false size=32 n=20000 window=0 target_rate=0 sent_rate=0 secs=0.7571 rate=26417 MBps=0.85 cpu_us_per_msg=42.831 cpu_util=1.13 vcsw_per_msg=3.811 ivcsw=8 lat_mean_us=37.8 lat_p50_us=31.3 lat_p99_us=119.6 lat_p999_us=196.1 lat_max_us=3827.3
+smol pub0-seq RESULT backend=smol scenario=pub0-seq mode=wait v5=false persist=false size=32 n=20000 window=0 target_rate=0 sent_rate=0 secs=0.2490 rate=80335 MBps=2.57 cpu_us_per_msg=14.466 cpu_util=1.16 vcsw_per_msg=1.023 ivcsw=5 lat_mean_us=12.4 lat_p50_us=10.3 lat_p99_us=45.0 lat_p999_us=100.4 lat_max_us=278.8
+tokio pub1-seq RESULT backend=tokio scenario=pub1-seq mode=wait v5=false persist=false size=32 n=20000 window=0 target_rate=0 sent_rate=0 secs=0.6980 rate=28654 MBps=0.92 cpu_us_per_msg=25.889 cpu_util=0.74 vcsw_per_msg=2.974 ivcsw=159 lat_mean_us=34.8 lat_p50_us=28.1 lat_p99_us=111.6 lat_p999_us=503.7 lat_max_us=3350.7
+tokio rtt      RESULT backend=tokio scenario=rtt mode=wait v5=false persist=false size=32 n=20000 window=0 target_rate=0 sent_rate=0 secs=0.7590 rate=26351 MBps=0.84 cpu_us_per_msg=37.250 cpu_util=0.98 vcsw_per_msg=3.971 ivcsw=8 lat_mean_us=37.9 lat_p50_us=31.4 lat_p99_us=138.2 lat_p999_us=247.5 lat_max_us=688.1
+tokio pub0-seq RESULT backend=tokio scenario=pub0-seq mode=wait v5=false persist=false size=32 n=20000 window=0 target_rate=0 sent_rate=0 secs=0.3382 rate=59134 MBps=1.89 cpu_us_per_msg=17.952 cpu_util=1.06 vcsw_per_msg=1.916 ivcsw=0 lat_mean_us=16.9 lat_p50_us=13.7 lat_p99_us=68.5 lat_p999_us=130.6 lat_max_us=213.5
+smol pub1-seq RESULT backend=smol scenario=pub1-seq mode=wait v5=false persist=false size=32 n=20000 window=0 target_rate=0 sent_rate=0 secs=0.6528 rate=30638 MBps=0.98 cpu_us_per_msg=30.100 cpu_util=0.92 vcsw_per_msg=2.584 ivcsw=2 lat_mean_us=32.6 lat_p50_us=27.3 lat_p99_us=103.9 lat_p999_us=287.4 lat_max_us=2521.1
+smol rtt      RESULT backend=smol scenario=rtt mode=wait v5=false persist=false size=32 n=20000 window=0 target_rate=0 sent_rate=0 secs=0.7474 rate=26758 MBps=0.86 cpu_us_per_msg=43.507 cpu_util=1.16 vcsw_per_msg=3.739 ivcsw=9 lat_mean_us=37.3 lat_p50_us=31.9 lat_p99_us=106.4 lat_p999_us=186.6 lat_max_us=1259.6
+smol pub0-seq RESULT backend=smol scenario=pub0-seq mode=wait v5=false persist=false size=32 n=20000 window=0 target_rate=0 sent_rate=0 secs=0.2468 rate=81039 MBps=2.59 cpu_us_per_msg=14.226 cpu_util=1.15 vcsw_per_msg=1.021 ivcsw=0 lat_mean_us=12.3 lat_p50_us=10.1 lat_p99_us=46.8 lat_p999_us=106.0 lat_max_us=160.4
