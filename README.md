@@ -40,6 +40,12 @@ To keep up with the latest announcements for this project, follow:
 
 **EMail:** [Eclipse Paho Mailing List](https://accounts.eclipse.org/mailing-list/paho-dev)
 
+### A full 100% Rust rewrite is Coming Soon!
+
+A new version, completely written in Rust is coming by the end of 2026!
+
+See the [Discussion Here](https://github.com/eclipse-paho/paho.mqtt.rust/discussions/267) for details.
+
 ### What's New in v0.14
 
 Version v0.14.0 now wraps Paho C v0.3.16, which was mainly concerned with internal performance improvements. For may aplications, there is a noticable decrease in latency for a number of operations.
