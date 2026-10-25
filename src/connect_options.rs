@@ -314,6 +314,12 @@ impl ConnectOptions {
     pub fn has_tls_options(&self) -> bool {
         self.tls.is_some()
     }
+
+    /// Whether the options have TLS options for a secure connection.
+    #[deprecated(since = "2.0.0", note = "renamed to `has_tls_options`")]
+    pub fn has_ssl_options(&self) -> bool {
+        self.has_tls_options()
+    }
 }
 
 impl Default for ConnectOptions {

@@ -137,6 +137,25 @@ impl SubscribeOptions {
             ..SubscribeOptions::default()
         }
     }
+
+    /// Gets whether the client asks not to be sent its own publications.
+    ///
+    /// The fields of this struct are public, so new code can simply read
+    /// [`no_local`](Self::no_local). The accessors are kept for
+    /// compatibility with the v1.x API.
+    pub fn no_local(&self) -> bool {
+        self.no_local
+    }
+
+    /// Gets whether the retain flag is kept as the publisher set it.
+    pub fn retain_as_published(&self) -> bool {
+        self.retain_as_published
+    }
+
+    /// Gets when retained messages are sent for a new subscription.
+    pub fn retain_handling(&self) -> RetainHandling {
+        self.retain_handling
+    }
 }
 
 // TODO Does any of this still make sense?!?!
@@ -317,5 +336,23 @@ mod tests {
 
         let empty: SubscribeOptions = serde_json::from_str("{}").unwrap();
         assert!(!empty.no_local);
+    }
+
+    // The accessors removed when the fields became public.
+    #[test]
+    fn test_accessors() {
+        let opts = SubscribeOptionsBuilder::new()
+            .no_local(true)
+            .retain_as_published(true)
+            .retain_handling(RetainHandling::DontSendRetained)
+            .finalize();
+        assert!(opts.no_local());
+        assert!(opts.retain_as_published());
+        assert_eq!(RetainHandling::DontSendRetained, opts.retain_handling());
+
+        let opts = SubscribeOptions::default();
+        assert!(!opts.no_local());
+        assert!(!opts.retain_as_published());
+        assert_eq!(RetainHandling::default(), opts.retain_handling());
     }
 }

@@ -77,6 +77,21 @@ pub enum Error {
     /// Any reason code >= 0x80 indicates an error.
     #[error("{0}")]
     ReasonCode(ReasonCode, Properties),
+    /// A persistence store failed.
+    ///
+    /// Carries whatever the store reported. A [`ClientPersistence`]
+    /// implementation should return this for a failure of its own that is
+    /// not an [`Io`](Self::Io) error; it replaces v1.x's
+    /// `Error::PersistenceError`, which carried nothing.
+    ///
+    /// A failure to store an outbound message does not fail the publish: the
+    /// message has already been queued for the broker, so the operation
+    /// proceeds and the error is logged. What is lost is the ability to
+    /// re-send that message after a restart.
+    ///
+    /// [`ClientPersistence`]: crate::ClientPersistence
+    #[error("Persistence error: {0}")]
+    Persistence(String),
     /// A bad topic filter.
     #[error("Bad topic filter")]
     BadTopicFilter,
@@ -124,6 +139,7 @@ impl Clone for Error {
             Protocol(e) => Protocol(*e),
             Publish(s, m) => Publish(s.clone(), m.clone()),
             ReasonCode(rc, props) => ReasonCode(*rc, props.clone()),
+            Persistence(s) => Persistence(s.clone()),
             BadTopicFilter => BadTopicFilter,
             Io(e) => Io(io::Error::new(e.kind(), e.to_string())),
             Utf8(e) => Utf8(*e),
@@ -202,5 +218,13 @@ mod tests {
             }
             _ => panic!("clone changed variant"),
         }
+    }
+
+    // The replacement for v1.x's payload-free `PersistenceError`.
+    #[test]
+    fn test_persistence_error() {
+        let err = Error::Persistence("disk full".into());
+        assert_eq!("Persistence error: disk full", err.to_string());
+        assert!(matches!(err.clone(), Error::Persistence(s) if s == "disk full"));
     }
 }

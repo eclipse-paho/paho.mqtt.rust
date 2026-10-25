@@ -237,7 +237,7 @@ pub use crate::{
     disconnect_options::{DisconnectOptions, DisconnectOptionsBuilder},
     error::{Error, Result},
     event::Event,
-    message::{Message, MessageBuilder},
+    message::{IntoPayload, Message, MessageBuilder},
     persistence::{
         ClientPersistence, ClientPersistenceBox, FilePersistence, MemPersistence,
         PERSISTENCE_ERROR, PERSISTENCE_SUCCESS, PersistenceType, UserPersistence,

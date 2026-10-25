@@ -20,11 +20,127 @@
  *******************************************************************************/
 
 use crate::{QoS, properties::Properties};
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use paho_mqtt_codec::Publish as PublishPacket;
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 use std::{borrow::Cow, fmt};
+
+/////////////////////////////////////////////////////////////////////////////
+
+/// A type that can be used as the payload of a [`Message`].
+///
+/// This exists so that a payload can be given as borrowed data. A message
+/// payload is a [`Bytes`], and a `Bytes` can only be built from a borrowed
+/// slice or string when that borrow is `'static`, so a bound of
+/// `Into<Bytes>` would reject the common cases of a byte-string literal
+/// (`b"data"`), a slice of a local buffer (`&buf[..]`), or a `&str` taken
+/// from an owned `String`.
+///
+/// The impls for the owning types — [`Bytes`], `BytesMut`, `Vec<u8>`,
+/// `String`, `Box<[u8]>` and an owned [`Cow`] — move the buffer and do not
+/// copy it. The impls for borrowed data necessarily copy, including for a
+/// `&'static` slice, which `Bytes::from_static` could have aliased. Pass an
+/// owned value where that copy would matter.
+///
+/// # Examples
+///
+/// ```
+/// use paho_mqtt::{Message, QOS_1};
+///
+/// let buf = vec![0u8, 1, 2, 3];
+/// let text = String::from("hello");
+///
+/// // All of these are accepted.
+/// let _ = Message::new("data", b"literal", QOS_1);
+/// let _ = Message::new("data", &buf[..], QOS_1);
+/// let _ = Message::new("text", text.as_str(), QOS_1);
+/// let _ = Message::new("text", text, QOS_1);
+/// ```
+pub trait IntoPayload {
+    /// Converts the value into a message payload.
+    fn into_payload(self) -> Bytes;
+}
+
+impl IntoPayload for Bytes {
+    fn into_payload(self) -> Bytes {
+        self
+    }
+}
+
+impl IntoPayload for BytesMut {
+    fn into_payload(self) -> Bytes {
+        self.freeze()
+    }
+}
+
+impl IntoPayload for Vec<u8> {
+    fn into_payload(self) -> Bytes {
+        Bytes::from(self)
+    }
+}
+
+impl IntoPayload for String {
+    fn into_payload(self) -> Bytes {
+        Bytes::from(self)
+    }
+}
+
+impl IntoPayload for Box<[u8]> {
+    fn into_payload(self) -> Bytes {
+        Bytes::from(self)
+    }
+}
+
+impl IntoPayload for &[u8] {
+    fn into_payload(self) -> Bytes {
+        Bytes::copy_from_slice(self)
+    }
+}
+
+impl IntoPayload for &mut [u8] {
+    fn into_payload(self) -> Bytes {
+        Bytes::copy_from_slice(self)
+    }
+}
+
+impl<const N: usize> IntoPayload for [u8; N] {
+    fn into_payload(self) -> Bytes {
+        Bytes::copy_from_slice(&self)
+    }
+}
+
+impl<const N: usize> IntoPayload for &[u8; N] {
+    fn into_payload(self) -> Bytes {
+        Bytes::copy_from_slice(self)
+    }
+}
+
+impl IntoPayload for &str {
+    fn into_payload(self) -> Bytes {
+        Bytes::copy_from_slice(self.as_bytes())
+    }
+}
+
+impl IntoPayload for Cow<'_, [u8]> {
+    fn into_payload(self) -> Bytes {
+        match self {
+            Cow::Borrowed(v) => Bytes::copy_from_slice(v),
+            Cow::Owned(v) => Bytes::from(v),
+        }
+    }
+}
+
+impl IntoPayload for Cow<'_, str> {
+    fn into_payload(self) -> Bytes {
+        match self {
+            Cow::Borrowed(s) => Bytes::copy_from_slice(s.as_bytes()),
+            Cow::Owned(s) => Bytes::from(s),
+        }
+    }
+}
+
+/////////////////////////////////////////////////////////////////////////////
 
 /// An MQTT Message.
 ///
@@ -69,12 +185,12 @@ impl Message {
     pub fn new<S, V, Q>(topic: S, payload: V, qos: Q) -> Self
     where
         S: Into<String>,
-        V: Into<Bytes>,
+        V: IntoPayload,
         Q: Into<QoS>,
     {
         Self {
             topic: topic.into(),
-            payload: payload.into(),
+            payload: payload.into_payload(),
             qos: qos.into(),
             ..Self::default()
         }
@@ -90,7 +206,7 @@ impl Message {
     pub fn new_retained<S, V, Q>(topic: S, payload: V, qos: Q) -> Self
     where
         S: Into<String>,
-        V: Into<Bytes>,
+        V: IntoPayload,
         Q: Into<QoS>,
     {
         Self {
@@ -205,8 +321,8 @@ impl MessageBuilder {
     /// # Arguments
     ///
     /// `payload` The binary payload of the message
-    pub fn payload<V: Into<Bytes>>(mut self, payload: V) -> Self {
-        self.0.payload = payload.into();
+    pub fn payload<V: IntoPayload>(mut self, payload: V) -> Self {
+        self.0.payload = payload.into_payload();
         self
     }
 
@@ -341,5 +457,65 @@ mod tests {
             assert_eq!(QOS, msg.qos());
         });
         thr.join().unwrap();
+    }
+
+    // Every shape of payload v0.14 accepted through `Into<Vec<u8>>` must be
+    // accepted here, including the borrowed ones that `Into<Bytes>` refused:
+    // a byte-string literal, a slice of a local buffer, and a `&str` that
+    // isn't `'static`. This test is mostly a compile-time proof.
+    #[test]
+    fn test_payload_conversions() {
+        // Builds the message as an application would, and hands back the
+        // payload so the conversion can be checked.
+        fn payload_of<V: IntoPayload>(payload: V) -> Bytes {
+            Message::new("t", payload, QOS).payload
+        }
+
+        let owned = vec![1u8, 2, 3];
+        let text = String::from("abc");
+        let mut scratch = [1u8, 2, 3];
+        let abc = &b"abc"[..];
+        let num = &[1u8, 2, 3][..];
+
+        // Borrowed, and none of it `'static`: these are what `Into<Bytes>`
+        // refused.
+        assert_eq!(payload_of(b"abc"), abc);
+        assert_eq!(payload_of(*b"abc"), abc);
+        assert_eq!(payload_of(&owned[..]), num);
+        assert_eq!(payload_of(&mut scratch[..]), num);
+        assert_eq!(payload_of(text.as_str()), abc);
+        assert_eq!(payload_of("abc"), abc);
+        assert_eq!(payload_of(Cow::Borrowed("abc")), abc);
+        assert_eq!(payload_of(Cow::Borrowed(num)), num);
+
+        // Owning.
+        assert_eq!(payload_of(Cow::<[u8]>::Owned(owned.clone())), num);
+        assert_eq!(payload_of(Cow::<str>::Owned(text.clone())), abc);
+        assert_eq!(payload_of(owned.clone().into_boxed_slice()), num);
+        assert_eq!(payload_of(text.clone()), abc);
+        assert_eq!(payload_of(Bytes::from_static(b"abc")), abc);
+        assert_eq!(payload_of(BytesMut::from(abc)), abc);
+        assert_eq!(payload_of(owned), num);
+
+        // The builder and the retained constructor take the same set.
+        assert_eq!(
+            MessageBuilder::new()
+                .topic("t")
+                .payload(&text[..])
+                .finalize()
+                .payload,
+            abc
+        );
+        assert_eq!(Message::new_retained("t", b"abc", QOS).payload, abc);
+    }
+
+    // An owned buffer must be moved into the payload, not copied. The `Bytes`
+    // impl is the identity, so the payload aliases the same allocation.
+    #[test]
+    fn test_owned_payload_is_not_copied() {
+        let src = Bytes::from(vec![9u8; 64]);
+        let addr = src.as_ptr();
+        let msg = Message::new("t", src, QOS);
+        assert_eq!(msg.payload().as_ptr(), addr);
     }
 }

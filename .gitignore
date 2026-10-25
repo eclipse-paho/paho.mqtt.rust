@@ -2,6 +2,9 @@ target/
 **/*.rs.bk
 **/*.orig
 Cargo.lock
+# The benchmark harness is a separate crate whose lockfile is pinned on
+# purpose: comparable measurements need the same dependency versions.
+!bench/mqttbench/Cargo.lock
 /.hg
 /.hgtags
 /.hgignore

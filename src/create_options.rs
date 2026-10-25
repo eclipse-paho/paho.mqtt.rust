@@ -283,6 +283,45 @@ impl CreateOptions {
             ..Self::default()
         }
     }
+
+    /// Create a new set of create options for an MQTT v3.1.1 client with
+    /// the specified URL and Client ID.
+    ///
+    /// The v1.x `new_v3()` took no arguments, so a call written against it
+    /// still needs the server URI and client ID added. Equivalent to
+    /// [`new`](Self::new) followed by setting
+    /// [`mqtt_version`](Self::mqtt_version) to [`MQTT_VERSION_3_1_1`].
+    ///
+    /// [`MQTT_VERSION_3_1_1`]: crate::MQTT_VERSION_3_1_1
+    pub fn new_v3<U, C>(server_uri: U, client_id: C) -> Self
+    where
+        U: Into<String>,
+        C: Into<String>,
+    {
+        Self {
+            mqtt_version: MqttVersion::V3_1_1,
+            ..Self::new(server_uri, client_id)
+        }
+    }
+
+    /// Gets the MQTT protocol version used when creating the client.
+    ///
+    /// This version is used by the client as the default when connecting.
+    /// It can be overridden in the connect options to request a different
+    /// version, but typically this is the highest version that can be used
+    /// by the client.
+    ///
+    /// The fields of this struct are public, so new code can simply read
+    /// [`mqtt_version`](Self::mqtt_version). The accessors are kept for
+    /// compatibility with the v1.x API.
+    pub fn mqtt_version(&self) -> MqttVersion {
+        self.mqtt_version
+    }
+
+    /// Gets the raw, integer value of the MQTT version.
+    pub fn mqtt_version_raw(&self) -> u32 {
+        self.mqtt_version as u32
+    }
 }
 
 impl Default for CreateOptions {
@@ -380,6 +419,15 @@ impl CreateOptionsBuilder {
     /// Creates a default client create options builder.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Creates a client create options builder for an MQTT v3.1.1 client.
+    ///
+    /// Identical to [`new`](Self::new) but for the protocol version, which
+    /// defaults to v5. Note that this is the version the *client* is created
+    /// with; the connect options can still ask for a different one.
+    pub fn new_v3() -> Self {
+        Self::default().mqtt_version(MqttVersion::V3_1_1)
     }
 
     /// Sets the the URI to the MQTT broker.
@@ -733,5 +781,39 @@ mod tests {
         assert_eq!(opts.max_buffered_msgs, dflt.max_buffered_msgs);
         assert_eq!(opts.mqtt_version, dflt.mqtt_version);
         assert!(matches!(opts.runtime_mode, RuntimeMode::Auto));
+    }
+
+    // The v1.x `new_v3()` constructors, restored. The builder's takes no
+    // arguments, as it did then; `CreateOptions::new_v3` has to take the URI
+    // and client ID, since v2's `new` does.
+    #[test]
+    fn test_new_v3() {
+        let opts = CreateOptions::new_v3("tcp://localhost:1883", "myid");
+        assert_eq!(MqttVersion::V3_1_1, opts.mqtt_version);
+        assert_eq!("tcp://localhost:1883", &opts.server_uri);
+        assert_eq!("myid", &opts.client_id);
+
+        let opts = CreateOptionsBuilder::new_v3().finalize();
+        assert_eq!(MqttVersion::V3_1_1, opts.mqtt_version);
+
+        // Still v5 without it.
+        assert_eq!(
+            MqttVersion::V5,
+            CreateOptionsBuilder::new().finalize().mqtt_version
+        );
+    }
+
+    // The accessors removed when the field became public.
+    #[test]
+    fn test_version_accessors() {
+        let opts = CreateOptionsBuilder::new()
+            .mqtt_version(MqttVersion::V3_1_1)
+            .finalize();
+        assert_eq!(MqttVersion::V3_1_1, opts.mqtt_version());
+        assert_eq!(4, opts.mqtt_version_raw());
+
+        let opts = CreateOptions::default();
+        assert_eq!(MqttVersion::V5, opts.mqtt_version());
+        assert_eq!(5, opts.mqtt_version_raw());
     }
 }

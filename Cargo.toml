@@ -18,6 +18,11 @@ description = """
 The Eclipse Paho MQTT Rust client library. 
 A pure-Rust MQTT v5, v3.1.1, and v3.1 client.
 """
+# Files kept in the repository but not shipped in the crate. Note that this is
+# the *package* exclude; the `exclude` under [workspace] above is a different
+# key, naming directories that are not workspace members. `bench/mqttbench`
+# is in both, for the two separate reasons.
+exclude = ["/bench"]
 
 [features]
 default = ["tokio"]

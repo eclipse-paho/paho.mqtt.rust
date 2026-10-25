@@ -154,6 +154,63 @@ impl TlsOptions {
     pub fn new() -> Self {
         Self::default()
     }
+
+    /// Gets the path to the trust store.
+    ///
+    /// The fields of this struct are public, so new code can simply read
+    /// [`trust_store`](Self::trust_store). This accessor is kept for
+    /// compatibility with the v1.x `SslOptions` API, and clones the value
+    /// as that one did.
+    pub fn trust_store(&self) -> PathBuf {
+        self.trust_store.clone()
+    }
+
+    /// Gets the path to the key store.
+    ///
+    /// See [`trust_store`](Self::trust_store) on why this clones.
+    pub fn key_store(&self) -> PathBuf {
+        self.key_store.clone()
+    }
+
+    /// Gets the path to the private key.
+    ///
+    /// See [`trust_store`](Self::trust_store) on why this clones.
+    pub fn private_key(&self) -> PathBuf {
+        self.private_key.clone()
+    }
+
+    /// Gets the list of enabled cipher suites.
+    ///
+    /// See [`trust_store`](Self::trust_store) on why this clones.
+    pub fn enabled_cipher_suites(&self) -> String {
+        self.enabled_cipher_suites.clone()
+    }
+
+    /// Gets whether the server's certificate chain is verified.
+    pub fn enable_server_cert_auth(&self) -> bool {
+        self.enable_server_cert_auth
+    }
+
+    /// Gets the path to a directory of trusted certificates.
+    ///
+    /// See [`trust_store`](Self::trust_store) on why this clones.
+    pub fn ca_path(&self) -> PathBuf {
+        self.ca_path.clone()
+    }
+
+    /// Gets whether the platform's default trust store is suppressed.
+    pub fn is_default_trust_store_disabled(&self) -> bool {
+        self.disable_default_trust_store
+    }
+
+    /// Gets the ALPN protocols to offer, in order of preference.
+    ///
+    /// This replaces v1.x's `alpn_proto_vec()`, which returned the protocol
+    /// list already encoded in the wire format that OpenSSL wanted. Nothing
+    /// here keeps that encoded form, so the names are returned as given.
+    pub fn alpn_protos(&self) -> &[String] {
+        &self.protos
+    }
 }
 
 // We manually define a Debug implementation to get around
@@ -439,5 +496,32 @@ mod tests {
         let empty: TlsOptions = serde_json::from_str("{}").unwrap();
         assert!(empty.enable_server_cert_auth);
         assert!(empty.verify);
+    }
+
+    // The accessors removed when the fields became public. They clone, as
+    // the v1.x ones did, so a call site that bound an owned value still
+    // compiles.
+    #[test]
+    fn test_accessors() {
+        let opts = TlsOptionsBuilder::new()
+            .trust_store("ca.pem")
+            .key_store("client.pem")
+            .private_key("client.key")
+            .ca_path("/etc/ssl/certs")
+            .enabled_cipher_suites("TLS13_AES_128_GCM_SHA256")
+            .enable_server_cert_auth(false)
+            .disable_default_trust_store(true)
+            .alpn_protos(&["mqtt", "x-amzn-mqtt-ca"])
+            .finalize();
+
+        let trust: PathBuf = opts.trust_store();
+        assert_eq!(PathBuf::from("ca.pem"), trust);
+        assert_eq!(PathBuf::from("client.pem"), opts.key_store());
+        assert_eq!(PathBuf::from("client.key"), opts.private_key());
+        assert_eq!(PathBuf::from("/etc/ssl/certs"), opts.ca_path());
+        assert_eq!("TLS13_AES_128_GCM_SHA256", opts.enabled_cipher_suites());
+        assert!(!opts.enable_server_cert_auth());
+        assert!(opts.is_default_trust_store_disabled());
+        assert_eq!(["mqtt", "x-amzn-mqtt-ca"], opts.alpn_protos());
     }
 }

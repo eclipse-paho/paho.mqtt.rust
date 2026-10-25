@@ -61,6 +61,15 @@ impl DisconnectOptions {
     pub fn properties(&self) -> &Properties {
         &self.props
     }
+
+    /// Gets the reason code sent with the disconnect.
+    ///
+    /// The fields of this struct are public, so new code can simply read
+    /// [`reason_code`](Self::reason_code). The accessor is kept for
+    /// compatibility with the v1.x API.
+    pub fn reason_code(&self) -> ReasonCode {
+        self.reason_code
+    }
 }
 
 /////////////////////////////////////////////////////////////////////////////
@@ -198,5 +207,18 @@ mod tests {
         // Missing fields come from the default.
         let empty: DisconnectOptions = serde_json::from_str("{}").unwrap();
         assert_eq!(empty.reason_code, DisconnectOptions::default().reason_code);
+    }
+
+    // The accessor removed when the field became public.
+    #[test]
+    fn test_reason_code_accessor() {
+        let opts = DisconnectOptionsBuilder::new()
+            .reason_code(ReasonCode::DisconnectWithWillMessage)
+            .finalize();
+        assert_eq!(ReasonCode::DisconnectWithWillMessage, opts.reason_code());
+        assert_eq!(
+            ReasonCode::NormalDisconnection,
+            DisconnectOptions::new().reason_code()
+        );
     }
 }

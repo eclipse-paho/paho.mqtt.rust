@@ -294,7 +294,7 @@ impl ClientPersistence for MemPersistence {
         self.store
             .get(key)
             .cloned()
-            .ok_or_else(|| Error::General("key not found"))
+            .ok_or_else(|| Error::Persistence(format!("key not found: {key}")))
     }
 
     fn remove(&mut self, key: &str) -> Result<()> {
