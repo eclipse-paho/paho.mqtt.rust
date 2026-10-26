@@ -81,16 +81,56 @@ pub(crate) enum RuntimeOwnership {
     /// The library created this runtime; the `Arc` keeps it alive until the
     /// last client that shares it is dropped.
     #[allow(dead_code)] // held purely for its Drop effect
-    Owned(Arc<tokio::runtime::Runtime>),
+    Owned(Arc<LibRuntime>),
     /// The application owns the runtime; the library only holds a `Handle`.
     Borrowed,
+}
+
+/// A runtime the library created, which shuts down safely wherever its last
+/// owner is dropped.
+///
+/// Dropping a tokio [`Runtime`](tokio::runtime::Runtime) blocks while its
+/// worker threads stop, and tokio panics if that happens inside an async
+/// context. The last client to hold this runtime may well be dropped from
+/// async code — and a [`Client`](crate::Client) made there always uses it —
+/// so in that case the runtime is shut down in the background instead.
+/// Anywhere else it is dropped as usual, which waits for its threads.
+pub(crate) struct LibRuntime(Option<tokio::runtime::Runtime>);
+
+impl LibRuntime {
+    /// A handle to the runtime.
+    fn handle(&self) -> &tokio::runtime::Handle {
+        self.0
+            .as_ref()
+            .expect("runtime present until drop")
+            .handle()
+    }
+
+    /// The number of worker threads.
+    fn num_workers(&self) -> usize {
+        self.0
+            .as_ref()
+            .expect("runtime present until drop")
+            .metrics()
+            .num_workers()
+    }
+}
+
+impl Drop for LibRuntime {
+    fn drop(&mut self) {
+        if let Some(rt) = self.0.take()
+            && tokio::runtime::Handle::try_current().is_ok()
+        {
+            rt.shutdown_background();
+        }
+    }
 }
 
 /// Process-wide shared runtime registry.
 ///
 /// Holds a `Weak` reference so the runtime is dropped automatically when
 /// the last owned client is dropped.
-static SHARED_RT: Mutex<Option<Weak<tokio::runtime::Runtime>>> = Mutex::new(None);
+static SHARED_RT: Mutex<Option<Weak<LibRuntime>>> = Mutex::new(None);
 
 /// Returns a `Handle` to the appropriate runtime and the corresponding
 /// ownership record, based on `mode`.
@@ -125,12 +165,12 @@ pub(crate) fn resolve_runtime(
 /// `num_threads` is only honoured on first creation. If the runtime already
 /// exists and the requested thread count differs, a warning is logged and
 /// the existing runtime is returned unchanged.
-fn get_or_create_shared_runtime(num_threads: usize) -> Arc<tokio::runtime::Runtime> {
+fn get_or_create_shared_runtime(num_threads: usize) -> Arc<LibRuntime> {
     let mut guard = SHARED_RT.lock().unwrap();
     if let Some(weak) = guard.as_ref()
         && let Some(rt) = weak.upgrade()
     {
-        let existing = rt.metrics().num_workers();
+        let existing = rt.num_workers();
         let requested = num_threads.max(1);
         if requested != existing {
             warn!(
@@ -140,7 +180,7 @@ fn get_or_create_shared_runtime(num_threads: usize) -> Arc<tokio::runtime::Runti
         }
         return rt;
     }
-    let rt = Arc::new(build_runtime(num_threads));
+    let rt = Arc::new(LibRuntime(Some(build_runtime(num_threads))));
     *guard = Some(Arc::downgrade(&rt));
     rt
 }
@@ -453,6 +493,35 @@ mod tests {
             "a full chunk of room: {} spare",
             buf.capacity() - buf.len()
         );
+    }
+
+    /// The last owner of a library runtime may be dropped inside async code,
+    /// where dropping a plain `Runtime` panics. Fails against an
+    /// `Arc<Runtime>` with "Cannot drop a runtime in a context where
+    /// blocking is not allowed".
+    #[test]
+    fn test_lib_runtime_drops_inside_async_context() {
+        let app = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let lib = Arc::new(LibRuntime(Some(build_runtime(1))));
+        let task = lib.handle().spawn(std::future::pending::<()>());
+        app.block_on(async move {
+            drop(lib);
+        });
+        // The background shutdown cancels what was still running.
+        let res = app.block_on(task);
+        assert!(res.unwrap_err().is_cancelled());
+    }
+
+    /// Outside async code the runtime is dropped as usual.
+    #[test]
+    fn test_lib_runtime_drops_outside_async_context() {
+        let lib = Arc::new(LibRuntime(Some(build_runtime(1))));
+        let n = lib.handle().block_on(async { 1 + 1 });
+        assert_eq!(n, 2);
+        drop(lib);
     }
 
     /// The event loop must be `Send` to run on a multi-threaded runtime.
