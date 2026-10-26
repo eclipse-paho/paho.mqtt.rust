@@ -3791,3 +3791,50 @@ fn test_tls_connect_publish() {
     assert!(!cli.is_connected());
     broker.join();
 }
+
+/// A SUBSCRIBE whose SUBACK has not arrived when the connection drops is
+/// sent again once auto-reconnect succeeds, under the same packet
+/// identifier, and its token resolves with the new connection's answer.
+///
+/// The broker drops the first connection on receiving the SUBSCRIBE, and
+/// the reconnect does not resume the session — the case where re-sending
+/// matters most, since the broker then holds no subscriptions at all.
+#[test]
+fn test_subscribe_in_flight_is_resent_after_reconnect() {
+    use mqtt::paho_mqtt_codec::{ConnAck, Packet, ReasonCode, SubAck};
+
+    let broker = common::spawn_broker_seq(2, |pkt, conn| match pkt {
+        Packet::Connect(_) => {
+            vec![Packet::ConnAck(ConnAck::new(false, ReasonCode::Success))].into()
+        }
+        // The first connection drops without answering.
+        Packet::Subscribe(_) if conn == 0 => common::Reply::close_after(Vec::new()),
+        Packet::Subscribe(sub) => vec![Packet::SubAck(SubAck {
+            packet_id: sub.packet_id,
+            reason_codes: vec![ReasonCode::GrantedQos1],
+            properties: Default::default(),
+        })]
+        .into(),
+        _ => common::Reply::none(),
+    });
+
+    let cli = mqtt::AsyncClient::new(broker.uri.clone()).unwrap();
+    let opts = mqtt::ConnectOptionsBuilder::new_v5()
+        .automatic_reconnect(Duration::from_millis(10), Duration::from_millis(100))
+        .finalize();
+    cli.connect(opts).wait().expect("connect failed");
+
+    let rsp = cli
+        .subscribe("test/resend", 1)
+        .wait_for(TIMEOUT)
+        .expect("the subscribe should complete on the second connection");
+    assert_eq!(rsp.reason_codes, [ReasonCode::GrantedQos1]);
+
+    let subs = broker.received_matching(|p| match p {
+        Packet::Subscribe(s) => Some(s.clone()),
+        _ => None,
+    });
+    assert_eq!(subs.len(), 2, "sent once on each connection");
+    assert_eq!(subs[0].packet_id, subs[1].packet_id);
+    assert_eq!(subs[1].subscriptions[0].topic_filter, "test/resend");
+}

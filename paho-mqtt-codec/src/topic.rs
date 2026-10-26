@@ -1,4 +1,4 @@
-// paho-mqtt-codec/src/wire.rs
+// paho-mqtt-codec/src/topic.rs
 //
 // This file is part of the Eclipse Paho MQTT Rust Codec library.
 

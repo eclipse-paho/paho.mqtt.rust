@@ -1,4 +1,4 @@
-// paho-mqtt/src/runtime/tokio_rt.rs
+// paho-mqtt/src/runtime/session.rs
 //
 // This file is part of the Eclipse Paho MQTT Rust Client library.
 
@@ -376,63 +376,165 @@ fn session_resumed(params: &ConnectParams, connack: &ConnAck) -> bool {
 ///
 /// Nothing is sent here: [`Session::resume`] decides what goes back on the
 /// wire once the CONNACK says whether the session survived. An entry that
-/// cannot be decoded is skipped rather than failing the connection — it is
+/// cannot be used is skipped rather than failing the connection — it is
 /// one message lost, against a store that may be from an older version of
-/// the program or a different protocol level.
+/// the program or a different protocol level — but never silently: each
+/// one is logged with its reason, and a summary follows. A store that
+/// cannot even be listed is logged too, since otherwise it would look
+/// exactly like an empty one.
 fn load_persisted(
     state: &mut SessionState,
     persist: Option<&Arc<Mutex<Box<dyn ClientPersistence>>>>,
     ver: MqttVersion,
-) {
+) -> Restored {
+    let mut restored = Restored::default();
     let Some(persist) = persist else {
-        return;
+        return restored;
     };
-    let Ok(keys) = persist.lock().unwrap().keys() else {
-        return;
+    let keys = match persist.lock().unwrap().keys() {
+        Ok(keys) => keys,
+        Err(e) => {
+            warn!(
+                "Could not list the persistence store ({e}); no in-flight messages were restored"
+            );
+            return restored;
+        }
     };
 
     for key in &keys {
-        let Ok(data) = persist.lock().unwrap().get(key) else {
-            continue;
-        };
-        let mut buf = BytesMut::from(data.as_slice());
-        let pkt = match RawPacket::decode(&mut buf) {
-            Ok(Some(raw)) => match Packet::from_raw(raw, ver) {
-                Ok(p) => p,
-                Err(_) => continue,
-            },
-            _ => continue,
-        };
-
-        match (key.as_bytes().first(), pkt) {
-            (Some(b's'), Packet::Publish(pub_pkt)) => {
-                let Some(id) = pub_pkt.packet_id else {
-                    continue;
-                };
-                state.next_id = state.next_id.max(id);
-                state.insert(
-                    id,
-                    Completer::orphan(),
-                    PublishPhase::AwaitingAck(Box::new(pub_pkt)),
-                    false,
-                );
+        match restore_entry(state, persist, key, ver) {
+            Ok(Restore::Outbound) => restored.outbound += 1,
+            Ok(Restore::Inbound) => restored.inbound += 1,
+            Err(why) => {
+                warn!("Skipped persisted entry {key:?} while restoring the session: {why}");
+                restored.skipped += 1;
             }
-            (Some(b's'), Packet::PubRel(rel)) => {
-                state.next_id = state.next_id.max(rel.packet_id);
-                state.insert(
-                    rel.packet_id,
-                    Completer::orphan(),
-                    PublishPhase::AwaitingPubComp,
-                    false,
-                );
-            }
-            (Some(b'r'), Packet::Publish(pub_pkt)) => {
-                let id = pub_pkt.packet_id.unwrap_or(0);
-                state.next_id = state.next_id.max(id);
-                state.pending_pub2_in.insert(id, Message::from(pub_pkt));
-            }
-            _ => {}
         }
+    }
+
+    if restored.skipped > 0 {
+        warn!(
+            "Restored {} outbound and {} inbound message(s) from the persistence store; \
+             {} entr{} could not be used, and those messages are lost",
+            restored.outbound,
+            restored.inbound,
+            restored.skipped,
+            if restored.skipped == 1 { "y" } else { "ies" }
+        );
+    } else if restored.outbound + restored.inbound > 0 {
+        debug!(
+            "Restored {} outbound and {} inbound message(s) from the persistence store",
+            restored.outbound, restored.inbound
+        );
+    }
+    restored
+}
+
+/// What [`load_persisted`] made of a store.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Restored {
+    /// Outbound QoS 1/2 messages reinstated, from `s{id}` entries.
+    outbound: usize,
+    /// Inbound QoS 2 messages awaiting PUBREL, from `r{id}` entries.
+    inbound: usize,
+    /// Entries that could not be used, each logged with its reason.
+    skipped: usize,
+}
+
+/// Which half of the session state a restored entry went into.
+enum Restore {
+    Outbound,
+    Inbound,
+}
+
+/// Reads one persisted entry back into `state`, or says why it cannot be.
+///
+/// The key must be one this client writes — `s` or `r` and the packet
+/// identifier, as [`PersistKey`] builds them — and must agree with the
+/// identifier in the packet it holds. A mismatch would reinstate the message
+/// under one identifier while its entry stayed under another, which the
+/// acknowledgement would then never remove.
+fn restore_entry(
+    state: &mut SessionState,
+    persist: &Arc<Mutex<Box<dyn ClientPersistence>>>,
+    key: &str,
+    ver: MqttVersion,
+) -> std::result::Result<Restore, String> {
+    let (kind, key_id) = parse_persist_key(key)
+        .ok_or("the key is not one this client writes (`s<id>` or `r<id>`)")?;
+
+    let data = persist
+        .lock()
+        .unwrap()
+        .get(key)
+        .map_err(|e| format!("it could not be read ({e})"))?;
+    let mut buf = BytesMut::from(data.as_slice());
+    let raw = match RawPacket::decode(&mut buf) {
+        Ok(Some(raw)) => raw,
+        Ok(None) => return Err("it holds an incomplete packet".into()),
+        Err(e) => return Err(format!("it does not hold an MQTT packet ({e})")),
+    };
+    let pkt =
+        Packet::from_raw(raw, ver).map_err(|e| format!("it is not a valid {ver} packet ({e})"))?;
+
+    let check_id = |id: Option<u16>| match id {
+        Some(id) if id == key_id => Ok(id),
+        Some(id) => Err(format!("it holds packet identifier {id}, not {key_id}")),
+        None => Err("it holds a PUBLISH with no packet identifier".to_string()),
+    };
+
+    match (kind, pkt) {
+        (b's', Packet::Publish(pub_pkt)) => {
+            let id = check_id(pub_pkt.packet_id)?;
+            state.next_id = state.next_id.max(id);
+            state.insert(
+                id,
+                Completer::orphan(),
+                PublishPhase::AwaitingAck(Box::new(pub_pkt)),
+                false,
+            );
+            Ok(Restore::Outbound)
+        }
+        (b's', Packet::PubRel(rel)) => {
+            let id = check_id(Some(rel.packet_id))?;
+            state.next_id = state.next_id.max(id);
+            state.insert(
+                id,
+                Completer::orphan(),
+                PublishPhase::AwaitingPubComp,
+                false,
+            );
+            Ok(Restore::Outbound)
+        }
+        (b'r', Packet::Publish(pub_pkt)) => {
+            let id = check_id(pub_pkt.packet_id)?;
+            state.next_id = state.next_id.max(id);
+            state.pending_pub2_in.insert(id, Message::from(pub_pkt));
+            Ok(Restore::Inbound)
+        }
+        (b's', pkt) => Err(format!(
+            "an outbound entry holds a {}, not a PUBLISH or PUBREL",
+            format!("{:?}", pkt.packet_type()).to_uppercase()
+        )),
+        (_, pkt) => Err(format!(
+            "an inbound entry holds a {}, not a PUBLISH",
+            format!("{:?}", pkt.packet_type()).to_uppercase()
+        )),
+    }
+}
+
+/// Splits a persistence key into its kind (`b's'` or `b'r'`) and packet
+/// identifier — the inverse of [`PersistKey`] — or `None` for a key this
+/// client never writes.
+fn parse_persist_key(key: &str) -> Option<(u8, u16)> {
+    let kind = *key.as_bytes().first()?;
+    let digits = &key[1..];
+    if !matches!(kind, b's' | b'r') || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    match digits.parse::<u16>() {
+        Ok(id) if id != 0 && PersistKey::new(kind, id).as_str() == key => Some((kind, id)),
+        _ => None,
     }
 }
 
@@ -520,6 +622,30 @@ impl InflightPublish {
     }
 }
 
+/// A SUBSCRIBE or UNSUBSCRIBE awaiting its acknowledgement.
+///
+/// Kept with the session rather than the connection, so that one sent just
+/// before a connection drops is sent again on the next, resumed or not, and
+/// its token resolves with the broker's actual answer. The specification
+/// requires re-sending only PUBLISH and PUBREL (§4.4), but both of these
+/// are safe to repeat: a SUBSCRIBE for an existing filter replaces that
+/// subscription (§3.8.4), and an UNSUBSCRIBE that matches nothing is still
+/// acknowledged (§3.10.4). The one visible effect of a repeat the broker
+/// had already processed is that matching retained messages may be sent
+/// again, as with any at-least-once delivery.
+struct PendingAck<T: 'static + Send> {
+    /// The packet as sent, under the identifier it keeps for its lifetime.
+    packet: Packet,
+    tx: Completer<T>,
+    /// `true` for `subscribe()` / `unsubscribe()`, whose one reason code
+    /// decides the outcome; see [`single_outcome`].
+    single: bool,
+    /// Order it was first handed to the session, shared with
+    /// [`InflightPublish::seq`], so a re-send keeps it in place among the
+    /// publishes around it.
+    seq: u64,
+}
+
 /// The message state of an MQTT session, which outlives any one connection.
 ///
 /// A session is the client's and server's shared memory of what is still in
@@ -543,9 +669,13 @@ struct SessionState {
     /// Inbound QoS 2 messages that have been PUBREC'd, held until PUBREL
     /// says to deliver them.
     pending_pub2_in: HashMap<u16, Message>,
+    /// SUBSCRIBEs awaiting SUBACK, by packet ID.
+    pending_sub: HashMap<u16, PendingAck<SubscribeResponse>>,
+    /// UNSUBSCRIBEs awaiting UNSUBACK, by packet ID.
+    pending_unsub: HashMap<u16, PendingAck<UnsubscribeResponse>>,
     /// Last packet identifier handed out.
     next_id: u16,
-    /// Counter behind [`InflightPublish::seq`].
+    /// Counter behind [`InflightPublish::seq`] and [`PendingAck::seq`].
     next_seq: u64,
     /// Whether a persistence store has already been read into this state;
     /// only the first connection of a session needs to.
@@ -555,8 +685,7 @@ struct SessionState {
 impl SessionState {
     /// Records `record` under `id`, stamped with the next sequence number.
     fn insert(&mut self, id: u16, tx: Completer<PublishResponse>, phase: PublishPhase, sent: bool) {
-        let seq = self.next_seq;
-        self.next_seq += 1;
+        let seq = self.take_seq();
         let rec = InflightPublish {
             tx,
             phase,
@@ -621,12 +750,56 @@ impl SessionState {
         }
     }
 
-    /// Packet IDs of every in-flight message, oldest first.
-    fn ids_in_order(&self) -> Vec<u16> {
-        let mut ids: Vec<_> = self.inflight.iter().map(|(id, r)| (r.seq, *id)).collect();
-        ids.sort_unstable();
-        ids.into_iter().map(|(_, id)| id).collect()
+    /// The next sequence number, for an operation first handed over now.
+    fn take_seq(&mut self) -> u64 {
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        seq
     }
+
+    /// Everything outstanding that a new connection must send again, in the
+    /// order it was first handed to the session.
+    fn resend_order(&self) -> Vec<Resend> {
+        let publishes = self
+            .inflight
+            .iter()
+            .map(|(&id, r)| (r.seq, Resend::Publish(id)));
+        let subs = self
+            .pending_sub
+            .iter()
+            .map(|(&id, p)| (p.seq, Resend::Subscribe(id)));
+        let unsubs = self
+            .pending_unsub
+            .iter()
+            .map(|(&id, p)| (p.seq, Resend::Unsubscribe(id)));
+        let mut all: Vec<_> = publishes.chain(subs).chain(unsubs).collect();
+        all.sort_unstable_by_key(|(seq, _)| *seq);
+        all.into_iter().map(|(_, r)| r).collect()
+    }
+
+    /// Moves the (un)subscribes awaiting acknowledgement into a fresh state,
+    /// dropping everything else.
+    ///
+    /// For a clean start that discards a persisted session: the messages go,
+    /// since the server has discarded its half of them, but an (un)subscribe
+    /// is not part of what the server discards — it is re-sent as it would
+    /// be on any new connection (see [`PendingAck`]).
+    fn restart_keeping_subscribes(&mut self) {
+        *self = Self {
+            pending_sub: std::mem::take(&mut self.pending_sub),
+            pending_unsub: std::mem::take(&mut self.pending_unsub),
+            next_seq: self.next_seq,
+            ..Self::default()
+        };
+    }
+}
+
+/// One item [`SessionState::resend_order`] says to send again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Resend {
+    Publish(u16),
+    Subscribe(u16),
+    Unsubscribe(u16),
 }
 
 /// Resolves a publish token from its PUBACK/PUBCOMP: `Ok` for a success
@@ -792,11 +965,6 @@ struct Session<B: Backend> {
     read_buf: BytesMut,
     /// Message state carried across the connections of one session.
     state: SessionState,
-    /// Pending SUBSCRIBE operations awaiting SUBACK, with the `single` flag
-    /// that decides how an error code in the SUBACK is reported.
-    pending_sub: HashMap<u16, (Completer<SubscribeResponse>, bool)>,
-    /// Pending UNSUBSCRIBE operations awaiting UNSUBACK, likewise.
-    pending_unsub: HashMap<u16, (Completer<UnsubscribeResponse>, bool)>,
     /// Sender to deliver inbound events to the dispatcher thread, which
     /// runs the application's callbacks and feeds its sync consumers.
     event_tx: async_channel::Sender<Event>,
@@ -877,8 +1045,6 @@ impl<B: Backend> Session<B> {
             out: Outbox::new(flush_needed),
             read_buf,
             state,
-            pending_sub: HashMap::new(),
-            pending_unsub: HashMap::new(),
             event_tx,
             dispatch,
             sinks,
@@ -900,8 +1066,8 @@ impl<B: Backend> Session<B> {
     /// or are queued in the in-flight deferred buffer.
     fn has_pending(&self) -> bool {
         !self.state.inflight.is_empty()
-            || !self.pending_sub.is_empty()
-            || !self.pending_unsub.is_empty()
+            || !self.state.pending_sub.is_empty()
+            || !self.state.pending_unsub.is_empty()
             || !self.inflight_deferred.is_empty()
     }
 
@@ -1052,7 +1218,7 @@ impl<B: Backend> Session<B> {
     /// imply this: with a window of 65 535, pending (un)subscribes and
     /// messages awaiting re-transmission can use up the last of them.
     fn id_free(&self) -> bool {
-        self.state.inflight.len() + self.pending_sub.len() + self.pending_unsub.len()
+        self.state.inflight.len() + self.state.pending_sub.len() + self.state.pending_unsub.len()
             < MAX_PACKET_IDS
     }
 
@@ -1121,8 +1287,8 @@ impl<B: Backend> Session<B> {
     /// `true` if `id` is currently in use by any outstanding operation.
     fn id_in_use(&self, id: u16) -> bool {
         self.state.inflight.contains_key(&id)
-            || self.pending_sub.contains_key(&id)
-            || self.pending_unsub.contains_key(&id)
+            || self.state.pending_sub.contains_key(&id)
+            || self.state.pending_unsub.contains_key(&id)
     }
 
     /// Persists `parts` under the key for `kind` and `id` (see
@@ -1291,14 +1457,26 @@ impl<B: Backend> Session<B> {
             self.discard_unresumable();
         }
 
-        // Re-send in the order the messages were first published (§4.6),
-        // respecting the in-flight window as new publishes do.
-        for id in self.state.ids_in_order() {
-            if self.inflight_slot_free() {
-                self.send_inflight(id)?;
-            } else {
-                self.state.mark_unsent(id);
-                self.inflight_deferred.push_back(Deferred::Retransmit(id));
+        // Re-send in the order everything was first handed over: publishes
+        // in publish order (§4.6), respecting the in-flight window as new
+        // publishes do, and the (un)subscribes still awaiting an
+        // acknowledgement in their places among them, under the identifiers
+        // they already hold. The broker's answer resolves their tokens.
+        for item in self.state.resend_order() {
+            match item {
+                Resend::Publish(id) if self.inflight_slot_free() => self.send_inflight(id)?,
+                Resend::Publish(id) => {
+                    self.state.mark_unsent(id);
+                    self.inflight_deferred.push_back(Deferred::Retransmit(id));
+                }
+                Resend::Subscribe(id) => {
+                    let packet = self.state.pending_sub[&id].packet.clone();
+                    self.queue(&packet)?;
+                }
+                Resend::Unsubscribe(id) => {
+                    let packet = self.state.pending_unsub[&id].packet.clone();
+                    self.queue(&packet)?;
+                }
             }
         }
         Ok(())
@@ -1850,7 +2028,9 @@ impl<B: Backend> Session<B> {
             // outcome. `subscribe_many()` may succeed partially, so it always
             // resolves `Ok` and the caller inspects the per-filter codes.
             Packet::SubAck(ack) => {
-                if let Some((tx, single)) = self.pending_sub.remove(&ack.packet_id) {
+                if let Some(PendingAck { tx, single, .. }) =
+                    self.state.pending_sub.remove(&ack.packet_id)
+                {
                     let rsp = SubscribeResponse::new(ack.reason_codes, ack.properties);
                     tx.complete(single_outcome(
                         single,
@@ -1865,7 +2045,9 @@ impl<B: Backend> Session<B> {
 
             // ---- Unsubscription acknowledgement ----
             Packet::UnsubAck(ack) => {
-                if let Some((tx, single)) = self.pending_unsub.remove(&ack.packet_id) {
+                if let Some(PendingAck { tx, single, .. }) =
+                    self.state.pending_unsub.remove(&ack.packet_id)
+                {
                     let rsp = UnsubscribeResponse::new(ack.reason_codes, ack.properties);
                     tx.complete(single_outcome(
                         single,
@@ -2131,13 +2313,22 @@ impl<B: Backend> Session<B> {
                         }
                     })
                     .collect();
-                let sub = Subscribe {
+                let packet = Packet::Subscribe(Subscribe {
                     packet_id: id,
                     subscriptions,
                     properties: props,
-                };
-                self.queue(&Packet::Subscribe(sub))?;
-                self.pending_sub.insert(id, (tx, single));
+                });
+                self.queue(&packet)?;
+                let seq = self.state.take_seq();
+                self.state.pending_sub.insert(
+                    id,
+                    PendingAck {
+                        packet,
+                        tx,
+                        single,
+                        seq,
+                    },
+                );
             }
 
             Command::Unsubscribe {
@@ -2147,13 +2338,22 @@ impl<B: Backend> Session<B> {
                 tx,
             } => {
                 let id = self.alloc_id();
-                let unsub = Unsubscribe {
+                let packet = Packet::Unsubscribe(Unsubscribe {
                     packet_id: id,
                     topic_filters: filters,
                     properties: props,
-                };
-                self.queue(&Packet::Unsubscribe(unsub))?;
-                self.pending_unsub.insert(id, (tx, single));
+                });
+                self.queue(&packet)?;
+                let seq = self.state.take_seq();
+                self.state.pending_unsub.insert(
+                    id,
+                    PendingAck {
+                        packet,
+                        tx,
+                        single,
+                        seq,
+                    },
+                );
             }
 
             // The streams belong to the client and outlive the connection;
@@ -2569,6 +2769,18 @@ async fn attempt_connect<B: Backend>(
     }
 }
 
+/// Tells the dispatcher about a failed TLS handshake, for the application's
+/// `on_tls_error` callback.
+///
+/// Called for every attempt that fails this way — each server of a
+/// multi-server connect, and each reconnect — rather than only for the error
+/// the connect token ends up carrying, which is the last server's.
+async fn report_tls_error(event_tx: &async_channel::Sender<Event>, err: &Error) {
+    if matches!(err, Error::Tls(_)) {
+        let _ = event_tx.send(Event::TlsError(err.to_string())).await;
+    }
+}
+
 /// Result of waiting for the reconnect timer to fire.
 enum WaitOutcome {
     /// Timer expired — proceed with the current [`ConnectJob`].
@@ -2760,7 +2972,12 @@ pub(crate) async fn run_event_loop<B: Backend>(
                             result = Some(c);
                             break;
                         }
-                        Attempt::Failed(e) => last_err = Some(e),
+                        // Reported now: only the last server's error reaches
+                        // the connect token, but each TLS failure is news.
+                        Attempt::Failed(e) => {
+                            report_tls_error(&event_tx, &e).await;
+                            last_err = Some(e);
+                        }
                         Attempt::Aborted => continue 'outer,
                     }
                 }
@@ -2796,6 +3013,10 @@ pub(crate) async fn run_event_loop<B: Backend>(
                     Attempt::Connected(c) if c.connack.reason_code.is_err() => Attempt::Failed(
                         Error::ReasonCode(c.connack.reason_code, c.connack.properties),
                     ),
+                    Attempt::Failed(e) => {
+                        report_tls_error(&event_tx, &e).await;
+                        Attempt::Failed(e)
+                    }
                     other => other,
                 }
             };
@@ -2807,10 +3028,8 @@ pub(crate) async fn run_event_loop<B: Backend>(
                 read_buf,
             } = match attempt {
                 Attempt::Aborted => break 'retry,
+                // A TLS failure was reported as it happened, above.
                 Attempt::Failed(err) => {
-                    if matches!(err, Error::Tls(_)) {
-                        let _ = event_tx.send(Event::TlsError(err.to_string())).await;
-                    }
                     if let Some(tx) = tx_opt.take() {
                         tx.complete(Err(err));
                     }
@@ -2830,12 +3049,14 @@ pub(crate) async fn run_event_loop<B: Backend>(
 
             // A clean start throws away whatever the previous session left
             // behind: the server has already discarded its half, so the
-            // store holds nothing that can still be completed.
+            // store holds nothing that can still be completed. An
+            // (un)subscribe awaiting its acknowledgement is kept and sent
+            // again, as on any reconnect.
             if job.params.clean_start
                 && let Some(p) = &job.persist
             {
                 let _ = p.lock().unwrap().clear();
-                state = SessionState::default();
+                state.restart_keeping_subscribes();
             }
 
             // Read a store written by an earlier run of the program into the
@@ -3404,6 +3625,114 @@ mod tests {
         }
     }
 
+    /// A backend whose every `open` fails: with a TLS error for a host whose
+    /// name starts `tls-`, and a refused connection for any other.
+    struct FailingBackend;
+
+    impl Backend for FailingBackend {
+        type Reader = MockReader;
+        type Writer = MockWriter;
+        type Sleep = MockSleep;
+
+        async fn open(
+            addr: &ServerAddr,
+            _: &ConnectParams,
+        ) -> Result<(Self::Reader, Self::Writer)> {
+            match addr {
+                ServerAddr::Tcp { host, .. } if host.starts_with("tls-") => {
+                    Err(Error::Tls(format!("handshake with {host} failed")))
+                }
+                _ => Err(io::Error::from(io::ErrorKind::ConnectionRefused).into()),
+            }
+        }
+
+        async fn read_buf(reader: &mut Self::Reader, buf: &mut BytesMut) -> io::Result<usize> {
+            MockBackend::read_buf(reader, buf).await
+        }
+
+        async fn write_all(writer: &mut Self::Writer, data: &[u8]) -> io::Result<()> {
+            MockBackend::write_all(writer, data).await
+        }
+
+        async fn write_vectored(
+            writer: &mut Self::Writer,
+            bufs: &[IoSlice<'_>],
+        ) -> io::Result<usize> {
+            MockBackend::write_vectored(writer, bufs).await
+        }
+
+        async fn flush(writer: &mut Self::Writer) -> io::Result<()> {
+            MockBackend::flush(writer).await
+        }
+    }
+
+    /// Every server whose TLS handshake fails is reported to `on_tls_error`,
+    /// not just the last one tried. The connect token carries only the last
+    /// server's error, which here is not a TLS error at all, so before the
+    /// fix nothing was reported.
+    #[test]
+    fn test_tls_error_reported_for_every_server() {
+        let (cmd_tx, cmd_rx) = async_channel::unbounded();
+        let (event_tx, event_rx) = async_channel::unbounded();
+        let buf_cfg = BufConfig {
+            send_while_disconnected: false,
+            max_buffered_msgs: 0,
+            allow_send_any_time: false,
+            delete_oldest: false,
+            restore_msgs: false,
+            persist_qos0: true,
+            persist_timeout: Duration::ZERO,
+        };
+        let mut task = pin!(run_event_loop::<FailingBackend>(
+            cmd_rx,
+            event_tx,
+            Dispatch::new(),
+            buf_cfg
+        ));
+
+        let server = |host: &str| {
+            let addr = ServerAddr::Tcp {
+                host: host.into(),
+                port: 8883,
+            };
+            (addr, format!("tcp://{host}:8883"))
+        };
+        let mut p = params(MqttVersion::V5, true);
+        p.servers = vec![server("tls-a"), server("tls-b"), server("plain-c")];
+        let (mut tok, tx) = Token::new();
+        cmd_tx
+            .send_blocking(Command::Connect {
+                params: Box::new(p),
+                tx,
+                connected_flag: Arc::new(AtomicBool::new(false)),
+                assigned_id: Arc::new(RwLock::new(None)),
+                persist: None,
+            })
+            .unwrap();
+
+        // The loop never returns; run it until it is idle again, waiting
+        // for the next `Connect`.
+        assert!(poll_until(task.as_mut(), Duration::from_millis(100)).is_none());
+
+        let res = tok.try_wait().expect("the connect has finished");
+        assert!(
+            matches!(res, Err(Error::Io(ref e)) if e.kind() == io::ErrorKind::ConnectionRefused),
+            "the token carries the last server's error: {res:?}"
+        );
+
+        let tls: Vec<String> = std::iter::from_fn(|| event_rx.try_recv().ok())
+            .filter_map(|ev| match ev {
+                Event::TlsError(s) => Some(s),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tls.len(), 2, "one report per failed handshake: {tls:?}");
+        assert!(
+            tls[0].contains("tls-a") && tls[1].contains("tls-b"),
+            "{tls:?}"
+        );
+    }
+
     /// v3.1.1 and v5 are told by the CONNACK; v3.1 has no such flag, so the
     /// client's own request is all there is to go on.
     #[test]
@@ -3434,7 +3763,10 @@ mod tests {
             let (_tok, comp) = Token::<PublishResponse>::new();
             state.insert(id, comp, PublishPhase::AwaitingPubComp, true);
         }
-        assert_eq!(state.ids_in_order(), vec![9, 3, 7]);
+        assert_eq!(
+            state.resend_order(),
+            [Resend::Publish(9), Resend::Publish(3), Resend::Publish(7)]
+        );
     }
 
     /// Keys are built without allocating, and must match the format stores
@@ -3445,6 +3777,130 @@ mod tests {
             assert_eq!(PersistKey::new(b's', id).as_str(), format!("s{id}"));
             assert_eq!(PersistKey::new(b'r', id).as_str(), format!("r{id}"));
         }
+    }
+
+    /// `parse_persist_key` accepts exactly the keys `PersistKey` builds.
+    #[test]
+    fn test_parse_persist_key() {
+        for id in [1u16, 9, 10, 42, 65535] {
+            assert_eq!(parse_persist_key(&format!("s{id}")), Some((b's', id)));
+            assert_eq!(parse_persist_key(&format!("r{id}")), Some((b'r', id)));
+        }
+        // v0.14 (C library) keys, a zero or out-of-range identifier, leading
+        // zeros or a sign, and anything else.
+        for key in [
+            "s-1", "sc-1", "r-1", "s0", "s65536", "s007", "s+1", "s", "", "x1", "foo",
+        ] {
+            assert_eq!(parse_persist_key(key), None, "{key:?}");
+        }
+    }
+
+    fn store_with(entries: &[(&str, Vec<u8>)]) -> Arc<Mutex<Box<dyn ClientPersistence>>> {
+        let mut store = crate::MemPersistence::new();
+        for (key, data) in entries {
+            store.put(key, vec![data.as_slice()]).unwrap();
+        }
+        Arc::new(Mutex::new(Box::new(store)))
+    }
+
+    /// Every entry is either restored or counted as skipped — each with a
+    /// logged reason — and nothing unusable reaches the session state. In
+    /// particular an inbound entry with no packet identifier, which used to
+    /// be reinstated under the invalid identifier 0, is refused.
+    #[test]
+    fn test_load_persisted_reports_what_it_skips() {
+        let body = Bytes::from_static(b"body");
+        let mut truncated = wire_publish("t", QoS::QoS1, Some(12), &body);
+        truncated.truncate(truncated.len() - 2);
+
+        let store = store_with(&[
+            // Usable: an unacknowledged PUBLISH, a PUBREL, an inbound QoS 2.
+            ("s5", wire_publish("t", QoS::QoS1, Some(5), &body)),
+            ("s6", wire_packet(Packet::PubRel(PubAck::new(6)))),
+            ("r7", wire_publish("t", QoS::QoS2, Some(7), &body)),
+            // Unusable, one per reason.
+            ("s8", wire_publish("t", QoS::QoS1, Some(9), &body)),
+            ("r10", wire_publish("t", QoS::QoS0, None, &body)),
+            ("s11", vec![0x00, 0x00]),
+            ("s12", truncated),
+            ("s13", wire_packet(Packet::PubAck(PubAck::new(13)))),
+            ("r14", wire_packet(Packet::PubRel(PubAck::new(14)))),
+            ("s-3", wire_publish("t", QoS::QoS1, Some(3), &body)),
+            ("foo", Vec::new()),
+        ]);
+
+        let mut state = SessionState::default();
+        let restored = load_persisted(&mut state, Some(&store), MqttVersion::V5);
+
+        assert_eq!(
+            restored,
+            Restored {
+                outbound: 2,
+                inbound: 1,
+                skipped: 8,
+            }
+        );
+        let mut ids: Vec<u16> = state.inflight.keys().copied().collect();
+        ids.sort();
+        assert_eq!(ids, [5, 6]);
+        assert_eq!(state.pending_pub2_in.keys().collect::<Vec<_>>(), [&7]);
+        assert_eq!(state.next_id, 7, "only restored identifiers count");
+    }
+
+    /// A store that fails is reported, not mistaken for an empty one.
+    #[test]
+    fn test_load_persisted_survives_a_failing_store() {
+        struct Broken {
+            list_fails: bool,
+        }
+        impl ClientPersistence for Broken {
+            fn open(&mut self, _: &str, _: &str) -> Result<()> {
+                Ok(())
+            }
+            fn close(&mut self) -> Result<()> {
+                Ok(())
+            }
+            fn put(&mut self, _: &str, _: Vec<&[u8]>) -> Result<()> {
+                Ok(())
+            }
+            fn get(&mut self, _: &str) -> Result<Vec<u8>> {
+                Err(Error::Persistence("disk on fire".into()))
+            }
+            fn remove(&mut self, _: &str) -> Result<()> {
+                Ok(())
+            }
+            fn keys(&mut self) -> Result<Vec<String>> {
+                if self.list_fails {
+                    Err(Error::Persistence("disk on fire".into()))
+                } else {
+                    Ok(vec!["s1".into(), "r2".into()])
+                }
+            }
+            fn clear(&mut self) -> Result<()> {
+                Ok(())
+            }
+            fn contains_key(&mut self, _: &str) -> bool {
+                false
+            }
+        }
+
+        let store = |list_fails| -> Arc<Mutex<Box<dyn ClientPersistence>>> {
+            Arc::new(Mutex::new(Box::new(Broken { list_fails })))
+        };
+
+        let mut state = SessionState::default();
+        let restored = load_persisted(&mut state, Some(&store(true)), MqttVersion::V5);
+        assert_eq!(restored, Restored::default());
+
+        let restored = load_persisted(&mut state, Some(&store(false)), MqttVersion::V5);
+        assert_eq!(
+            restored,
+            Restored {
+                skipped: 2,
+                ..Restored::default()
+            }
+        );
+        assert!(state.inflight.is_empty() && state.pending_pub2_in.is_empty());
     }
 
     /// The in-flight window's occupancy is kept as a count, not recounted
@@ -3492,7 +3948,15 @@ mod tests {
         let mut h = harness(BytesMut::new(), Duration::ZERO, state);
         let s = &mut h.session;
         let (_sub_tok, sub_tx) = Token::<SubscribeResponse>::new();
-        s.pending_sub.insert(u16::MAX, (sub_tx, true));
+        s.state.pending_sub.insert(
+            u16::MAX,
+            PendingAck {
+                packet: Packet::PingReq,
+                tx: sub_tx,
+                single: true,
+                seq: 0,
+            },
+        );
         assert!(s.inflight_slot_free());
         assert!(!s.id_free());
 
@@ -3520,7 +3984,151 @@ mod tests {
         // A PUBCOMP frees 7, which the subscribe takes.
         s.handle_packet(Packet::PubComp(PubAck::new(7))).unwrap();
         assert!(s.inflight_deferred.is_empty());
-        assert!(s.pending_sub.contains_key(&7));
+        assert!(s.state.pending_sub.contains_key(&7));
+    }
+
+    fn unsubscribe_cmd(filter: &str) -> (Token<UnsubscribeResponse>, Command) {
+        let (tok, tx) = Token::new();
+        let cmd = Command::Unsubscribe {
+            single: true,
+            filters: vec![filter.into()],
+            props: Properties::new(),
+            tx,
+        };
+        (tok, cmd)
+    }
+
+    /// Writes out whatever the session has queued and decodes it again.
+    fn sent_packets(h: &mut Harness) -> Vec<Packet> {
+        while h.session.write_now().unwrap() {}
+        let mut buf = BytesMut::from(&std::mem::take(&mut h.wire.wire().bytes)[..]);
+        let mut pkts = Vec::new();
+        while let Some(raw) = RawPacket::decode(&mut buf).unwrap() {
+            pkts.push(Packet::from_raw(raw, MqttVersion::V5).unwrap());
+        }
+        pkts
+    }
+
+    /// A one-line summary of a packet, for comparing sequences.
+    fn describe(pkt: &Packet) -> String {
+        match pkt {
+            Packet::Publish(p) => format!("PUBLISH {} {:?} dup={}", p.topic, p.packet_id, p.dup),
+            Packet::Subscribe(s) => format!(
+                "SUBSCRIBE {} {}",
+                s.packet_id, s.subscriptions[0].topic_filter
+            ),
+            Packet::Unsubscribe(u) => format!("UNSUBSCRIBE {} {}", u.packet_id, u.topic_filters[0]),
+            other => format!("{:?}", other.packet_type()),
+        }
+    }
+
+    /// An (un)subscribe still awaiting its acknowledgement when the
+    /// connection ends is sent again on the next one — whether or not the
+    /// server resumed the session — under the identifier it already holds
+    /// and in its place among the publishes around it, and its token then
+    /// resolves with the new connection's answer.
+    #[test]
+    fn test_pending_subscribes_are_resent_on_the_next_connection() {
+        for resumed in [true, false] {
+            // The first connection: publish, subscribe, unsubscribe,
+            // publish, and no acknowledgement for any of them.
+            let mut first = harness(BytesMut::new(), Duration::ZERO, SessionState::default());
+            let s = &mut first.session;
+            let (_p1, c) = publish_cmd("p1", QoS::QoS1, Bytes::from_static(b"1"));
+            s.handle_command(c).unwrap();
+            let (mut sub_tok, c) = subscribe_cmd("a/#");
+            s.handle_command(c).unwrap();
+            let (mut unsub_tok, c) = unsubscribe_cmd("b");
+            s.handle_command(c).unwrap();
+            let (_p2, c) = publish_cmd("p2", QoS::QoS1, Bytes::from_static(b"2"));
+            s.handle_command(c).unwrap();
+            let original: Vec<String> = sent_packets(&mut first).iter().map(describe).collect();
+
+            // The connection drops; the state goes on to the next one.
+            let state = std::mem::take(&mut first.session.state);
+            drop(first);
+            assert!(sub_tok.try_wait().is_none(), "still pending, not failed");
+            assert!(unsub_tok.try_wait().is_none(), "still pending, not failed");
+
+            let mut second = harness(BytesMut::new(), Duration::ZERO, state);
+            second.session.resume(resumed).unwrap();
+            let resent: Vec<String> = sent_packets(&mut second).iter().map(describe).collect();
+
+            // The same packets in the same order; the publishes now DUP.
+            let expected: Vec<String> = original
+                .iter()
+                .map(|d| d.replace("dup=false", "dup=true"))
+                .collect();
+            assert_eq!(resent, expected, "resumed = {resumed}");
+
+            // The new connection's acknowledgements resolve the tokens.
+            let s = &mut second.session;
+            let sub_id = *s.state.pending_sub.keys().next().unwrap();
+            let unsub_id = *s.state.pending_unsub.keys().next().unwrap();
+            s.handle_packet(Packet::SubAck(paho_mqtt_codec::SubAck::new(
+                sub_id,
+                vec![ReasonCode::GrantedQos1],
+            )))
+            .unwrap();
+            s.handle_packet(Packet::UnsubAck(paho_mqtt_codec::UnsubAck {
+                packet_id: unsub_id,
+                reason_codes: vec![ReasonCode::NoSubscriptionFound],
+                properties: Properties::new(),
+            }))
+            .unwrap();
+            let rsp = sub_tok.try_wait().unwrap().unwrap();
+            assert_eq!(rsp.reason_codes, [ReasonCode::GrantedQos1]);
+            let rsp = unsub_tok.try_wait().unwrap().unwrap();
+            assert_eq!(rsp.reason_codes, [ReasonCode::NoSubscriptionFound]);
+            assert!(s.state.pending_sub.is_empty() && s.state.pending_unsub.is_empty());
+        }
+    }
+
+    /// The clean start that discards a persisted session drops its messages
+    /// but keeps the (un)subscribes awaiting an acknowledgement, and the
+    /// ordering counter, so they are still re-sent in their places.
+    #[test]
+    fn test_clean_start_restart_keeps_pending_subscribes() {
+        let mut h = harness(BytesMut::new(), Duration::ZERO, SessionState::default());
+        let s = &mut h.session;
+        let (mut pub_tok, c) = publish_cmd("p", QoS::QoS1, Bytes::from_static(b"1"));
+        s.handle_command(c).unwrap();
+        let (mut sub_tok, c) = subscribe_cmd("a/#");
+        s.handle_command(c).unwrap();
+        let (_u, c) = unsubscribe_cmd("b");
+        s.handle_command(c).unwrap();
+        let next_seq = s.state.next_seq;
+
+        let mut state = std::mem::take(&mut s.state);
+        state.restart_keeping_subscribes();
+
+        assert!(state.inflight.is_empty());
+        assert!(matches!(pub_tok.try_wait(), Some(Err(Error::Disconnected))));
+        assert_eq!(state.pending_sub.len(), 1);
+        assert_eq!(state.pending_unsub.len(), 1);
+        assert!(sub_tok.try_wait().is_none());
+        assert_eq!(state.next_seq, next_seq);
+        assert_eq!(
+            state
+                .resend_order()
+                .iter()
+                .map(|r| matches!(r, Resend::Subscribe(_)))
+                .collect::<Vec<_>>(),
+            [true, false]
+        );
+    }
+
+    /// A clean disconnect ends the session: an (un)subscribe still awaiting
+    /// its acknowledgement then fails rather than waiting for a connection
+    /// that belongs to a new session.
+    #[test]
+    fn test_pending_subscribe_fails_when_the_session_ends() {
+        let mut h = harness(BytesMut::new(), Duration::ZERO, SessionState::default());
+        let (mut sub_tok, c) = subscribe_cmd("a/#");
+        h.session.handle_command(c).unwrap();
+        // What the event loop does after a clean disconnect: a new session.
+        h.session.state = SessionState::default();
+        assert!(matches!(sub_tok.try_wait(), Some(Err(Error::Disconnected))));
     }
 
     // ---- The write pipeline ----
