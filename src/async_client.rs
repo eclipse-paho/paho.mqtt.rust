@@ -1096,9 +1096,30 @@ impl AsyncClient {
         }
     }
 
-    /// Returns the server URI used for connection.
+    /// Returns the server URI the client was created with.
+    ///
+    /// This is the URI from the [`CreateOptions`]. A connection made with a
+    /// list of servers in its [`ConnectOptions`] may be to another of them;
+    /// [`current_server_uri`](Self::current_server_uri) names that one.
     pub fn server_uri(&self) -> &str {
         &self.inner.opts.server_uri
+    }
+
+    /// Returns the URI of the server the client is connected to, or `None`
+    /// if it is not connected.
+    ///
+    /// When the connect options list several servers, this is the one that
+    /// accepted the connection — after an automatic reconnect, the one that
+    /// accepted that. It is the same URI as the
+    /// [`ConnectResponse::server_uri`](crate::ConnectResponse::server_uri) of
+    /// the connection, and is set by the time that response is delivered: when
+    /// the connect token resolves, or the connected callback or
+    /// [`Event::Connected`] runs.
+    ///
+    /// It follows [`state`](Self::state): `Some` exactly when the state is
+    /// [`Connected`](ConnectionState::Connected).
+    pub fn current_server_uri(&self) -> Option<String> {
+        self.inner.state.server_uri()
     }
 
     /// Gets the most recent MQTT version for the client.

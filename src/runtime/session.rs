@@ -3268,8 +3268,9 @@ pub(crate) async fn run_event_loop<B: Backend>(
 
             let response = build_connect_response(&job, connack);
             // Set the state before resolving the token so `is_connected()` is
-            // true as soon as `wait()` / `.await` returns in the caller.
-            conn_state.set(ConnectionState::Connected);
+            // true, and `current_server_uri()` names this server, as soon as
+            // `wait()` / `.await` returns in the caller.
+            conn_state.set_connected(&response.server_uri);
             ever_connected = true;
             let _ = event_tx.send(Event::Connected(response.clone())).await;
             // Event streams see the connection come up before any of its

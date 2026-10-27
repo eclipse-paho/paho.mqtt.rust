@@ -3843,6 +3843,49 @@ fn test_subscribe_in_flight_is_resent_after_reconnect() {
     assert_eq!(subs[1].subscriptions[0].topic_filter, "test/resend");
 }
 
+/// With a list of servers, `current_server_uri()` names the one that took
+/// the connection — not the creation URI, nor the first in the list — and is
+/// already set when the connected callback runs.
+#[test]
+fn test_current_server_uri_names_the_server_connected_to() {
+    use std::sync::{Arc, Mutex};
+
+    // Nothing listens on port 1, so the first server refuses at once.
+    const REFUSED: &str = "tcp://localhost:1";
+
+    let cli = mqtt::AsyncClient::new(REFUSED).unwrap();
+    assert_eq!(cli.current_server_uri(), None);
+
+    let seen = Arc::new(Mutex::new(None));
+    let seen_cb = Arc::clone(&seen);
+    cli.set_connected_callback(move |cli, rsp| {
+        *seen_cb.lock().unwrap() = Some((cli.current_server_uri(), rsp.server_uri.clone()));
+    });
+
+    let opts = mqtt::ConnectOptionsBuilder::new()
+        .server_uris(&[REFUSED, HOST])
+        .finalize();
+    let rsp = cli.connect(opts).wait_for(TIMEOUT).expect("connect failed");
+    assert_eq!(rsp.server_uri, HOST);
+    assert_eq!(cli.current_server_uri().as_deref(), Some(HOST));
+    assert_eq!(cli.server_uri(), REFUSED);
+
+    // The callback runs on the dispatcher thread; give it a moment.
+    let deadline = std::time::Instant::now() + TIMEOUT;
+    while seen.lock().unwrap().is_none() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        *seen.lock().unwrap(),
+        Some((Some(HOST.to_string()), HOST.to_string()))
+    );
+
+    cli.disconnect(None)
+        .wait_for(TIMEOUT)
+        .expect("disconnect failed");
+    assert_eq!(cli.current_server_uri(), None);
+}
+
 /// `is_connected()` stays true across an automatic reconnect even when the
 /// callback thread is still working through the old connection's events.
 ///

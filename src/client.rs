@@ -385,9 +385,20 @@ impl Client {
         self.cli.client_id()
     }
 
-    /// Returns the server URI used for connection.
+    /// Returns the server URI the client was created with.
+    ///
+    /// See [`AsyncClient::server_uri`]; the server actually connected to is
+    /// given by [`current_server_uri`](Self::current_server_uri).
     pub fn server_uri(&self) -> &str {
         self.cli.server_uri()
+    }
+
+    /// Returns the URI of the server the client is connected to, or `None`
+    /// if it is not connected.
+    ///
+    /// See [`AsyncClient::current_server_uri`].
+    pub fn current_server_uri(&self) -> Option<String> {
+        self.cli.current_server_uri()
     }
 
     /// Returns the MQTT protocol version negotiated for the last connection.

@@ -58,20 +58,42 @@ use crate::{
 /// through a [`StateView`], which cannot write.
 ///
 /// Every change is made before the token or event that reveals it.
+///
+/// The cell also holds the URI of the server the client is connected to, for
+/// a client given a list of servers. It is written under its lock together
+/// with the move to [`Connected`](ConnectionState::Connected), so a reader
+/// holding the lock that sees `Connected` sees that connection's URI.
 #[derive(Clone)]
-pub(crate) struct StateCell(Arc<AtomicU8>);
+pub(crate) struct StateCell(Arc<Shared>);
+
+/// What a [`StateCell`] and its [`StateView`]s share.
+struct Shared {
+    state: AtomicU8,
+    server_uri: RwLock<Option<String>>,
+}
 
 impl StateCell {
     /// A new cell, [`Disconnected`](ConnectionState::Disconnected).
     pub(crate) fn new() -> Self {
-        Self(Arc::new(AtomicU8::new(
-            ConnectionState::Disconnected.as_u8(),
-        )))
+        Self(Arc::new(Shared {
+            state: AtomicU8::new(ConnectionState::Disconnected.as_u8()),
+            server_uri: RwLock::new(None),
+        }))
     }
 
     /// Records the state the event loop has moved to.
+    ///
+    /// A connection is recorded with [`set_connected`](Self::set_connected),
+    /// which also says to which server.
     pub(crate) fn set(&self, state: ConnectionState) {
-        self.0.store(state.as_u8(), Ordering::SeqCst);
+        self.0.state.store(state.as_u8(), Ordering::SeqCst);
+    }
+
+    /// Records a connection to the server at `server_uri`.
+    pub(crate) fn set_connected(&self, server_uri: &str) {
+        let mut uri = self.0.server_uri.write().unwrap();
+        *uri = Some(server_uri.to_string());
+        self.set(ConnectionState::Connected);
     }
 
     /// A read-only handle on the same state, for the API.
@@ -81,12 +103,25 @@ impl StateCell {
 }
 
 /// A read-only handle on the client's [`ConnectionState`]; see [`StateCell`].
-pub(crate) struct StateView(Arc<AtomicU8>);
+pub(crate) struct StateView(Arc<Shared>);
 
 impl StateView {
     /// The current state.
     pub(crate) fn get(&self) -> ConnectionState {
-        ConnectionState::from_u8(self.0.load(Ordering::SeqCst))
+        ConnectionState::from_u8(self.0.state.load(Ordering::SeqCst))
+    }
+
+    /// The URI of the server the client is connected to, or `None` when it
+    /// is not [`Connected`](ConnectionState::Connected).
+    ///
+    /// The URI is left in place when the connection ends; it is the state,
+    /// read under the lock that [`StateCell::set_connected`] writes both
+    /// under, that says whether it is still current.
+    pub(crate) fn server_uri(&self) -> Option<String> {
+        let uri = self.0.server_uri.read().unwrap();
+        (self.get() == ConnectionState::Connected)
+            .then(|| uri.clone())
+            .flatten()
     }
 }
 
@@ -673,5 +708,26 @@ mod tests {
         let limits = SessionLimits::new(&params_v(MqttVersion::V5, 0), &connack_with(vec![]));
         assert_eq!(limits.server_topic_alias_max, 0);
         assert_eq!(limits.topic_alias_max, 0);
+    }
+
+    #[test]
+    fn test_server_uri_follows_the_state() {
+        let cell = StateCell::new();
+        let view = cell.view();
+        assert_eq!(view.server_uri(), None);
+
+        cell.set(ConnectionState::Connecting);
+        assert_eq!(view.server_uri(), None);
+
+        cell.set_connected("tcp://b:1883");
+        assert_eq!(view.get(), ConnectionState::Connected);
+        assert_eq!(view.server_uri().as_deref(), Some("tcp://b:1883"));
+
+        // Kept in the cell, but no longer current.
+        cell.set(ConnectionState::Retrying);
+        assert_eq!(view.server_uri(), None);
+
+        cell.set_connected("tcp://a:1883");
+        assert_eq!(view.server_uri().as_deref(), Some("tcp://a:1883"));
     }
 }
