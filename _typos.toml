@@ -1,6 +1,11 @@
+[default]
+# The RFC 4648 base64 test vector `b"fo"` (`src/runtime/proxy.rs`)
+extend-ignore-re = [
+    'b"fo"',
+    '\*\*fo\*\*',
+]
 
 [default.extend-identifiers]
-#pn = "pn"
 mosquitto = "mosquitto"
 Mosquitto = "Mosquitto"
 thr = "thr"
