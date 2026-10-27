@@ -35,6 +35,9 @@ use thiserror::Error;
 #[non_exhaustive]
 pub enum Error {
     /// A generic error code indicating the failure of an MQTT client operation.
+    ///
+    /// Kept from v1.x so that code naming it still compiles; this library
+    /// does not return it.
     #[error("General failure")]
     Failure,
     /// The client is disconnected.
@@ -86,6 +89,21 @@ pub enum Error {
     /// [`TlsOptions`]: crate::TlsOptions
     #[error("TLS error: {0}")]
     Tls(String),
+    /// The WebSocket upgrade of a `ws://` or `wss://` connection failed, or
+    /// its request could not be built from the server URI and headers.
+    #[error("WebSocket error: {0}")]
+    WebSocket(String),
+    /// The exchange with an HTTP proxy broke down: it closed the connection,
+    /// or sent something other than a well-formed HTTP response.
+    #[error("HTTP proxy error: {0}")]
+    Proxy(String),
+    /// An HTTP proxy refused to open the tunnel, with this HTTP status code
+    /// and status line.
+    ///
+    /// `407` means the proxy wants credentials, or did not accept the ones
+    /// given in the proxy URI.
+    #[error("HTTP proxy refused the tunnel: {1}")]
+    ProxyRefused(u16, String),
     /// Call not applicable to the client's version of MQTT.
     #[error("Wrong MQTT version")]
     WrongMqttVersion,
@@ -94,6 +112,12 @@ pub enum Error {
     /// An error from the MQTT codec.
     #[error("{0}")]
     Protocol(#[from] paho_mqtt_codec::Error),
+    /// The server broke the MQTT protocol: a packet that is well-formed but not
+    /// allowed where it came, such as something other than CONNACK in
+    /// answer to CONNECT, or an AUTH challenge the client did not offer
+    /// authentication for.
+    #[error("Protocol violation by the server: {0}")]
+    ProtocolViolation(&'static str),
     /// A synchronous failure when publishing — creating or queuing the
     /// message — carrying the cause and the message back to the caller.
     ///
@@ -131,6 +155,14 @@ pub enum Error {
     /// A bad topic filter.
     #[error("Bad topic filter")]
     BadTopicFilter,
+    /// An argument or option the client cannot use: an unparsable server or
+    /// proxy URI, connect options that contradict each other, lists of
+    /// topics and QoS of different lengths, an out-of-range value.
+    ///
+    /// Reported by the call that was given the bad value where it can be,
+    /// rather than left for the connection or the broker to fail on.
+    #[error("Invalid argument: {0}")]
+    InvalidArgument(String),
     /// A low-level I/O error.
     #[error("I/O failed: {0}")]
     Io(#[from] io::Error),
@@ -141,18 +173,32 @@ pub enum Error {
     #[error("Missing TLS options")]
     MissingTlsOptions,
     /// Bad property, typically from an improper value type for the code.
+    ///
+    /// Kept from v1.x so that code naming it still compiles; this library
+    /// does not return it. A property value the specification does not
+    /// allow is reported by `Properties::try_push`, or by the encode.
     #[error("Bad v5 property")]
     BadProperty,
     /// Conversion error between types.
+    ///
+    /// Kept from v1.x so that code naming it still compiles; this library
+    /// does not return it.
     #[error("Conversion Error")]
     Conversion,
     /// A timeout, particularly from a synchronous operation.
     #[error("Timeout")]
     Timeout,
     /// A general error with description.
+    ///
+    /// Not returned by this library, which has a variant for each failure it
+    /// reports. It is here for application code — an `AuthHandler`, a
+    /// `ClientPersistence` implementation — with a failure of its own to
+    /// return.
     #[error("{0}")]
     General(&'static str),
     /// A general error with an owned description.
+    ///
+    /// Not returned by this library; see [`General`](Self::General).
     #[error("{0}")]
     GeneralString(String),
 }
@@ -174,12 +220,17 @@ impl Clone for Error {
             TlsNotSupported => TlsNotSupported,
             WebSocketNotSupported => WebSocketNotSupported,
             Tls(s) => Tls(s.clone()),
+            WebSocket(s) => WebSocket(s.clone()),
+            Proxy(s) => Proxy(s.clone()),
+            ProxyRefused(code, s) => ProxyRefused(*code, s.clone()),
             WrongMqttVersion => WrongMqttVersion,
             Protocol(e) => Protocol(*e),
+            ProtocolViolation(s) => ProtocolViolation(s),
             Publish(s, m) => Publish(s.clone(), m.clone()),
             ReasonCode(rc, props) => ReasonCode(*rc, props.clone()),
             Persistence(s) => Persistence(s.clone()),
             BadTopicFilter => BadTopicFilter,
+            InvalidArgument(s) => InvalidArgument(s.clone()),
             Io(e) => Io(io::Error::new(e.kind(), e.to_string())),
             Utf8(e) => Utf8(*e),
             MissingTlsOptions => MissingTlsOptions,
@@ -257,6 +308,29 @@ mod tests {
             }
             _ => panic!("clone changed variant"),
         }
+    }
+
+    #[test]
+    fn test_new_variants_clone_and_display() {
+        let errs = [
+            Error::WebSocket("upgrade failed".into()),
+            Error::Proxy("the proxy closed the connection".into()),
+            Error::ProxyRefused(407, "HTTP/1.1 407 Proxy Authentication Required".into()),
+            Error::ProtocolViolation("expected CONNACK"),
+            Error::InvalidArgument("topics/qos length mismatch".into()),
+        ];
+        let shown = [
+            "WebSocket error: upgrade failed",
+            "HTTP proxy error: the proxy closed the connection",
+            "HTTP proxy refused the tunnel: HTTP/1.1 407 Proxy Authentication Required",
+            "Protocol violation by the server: expected CONNACK",
+            "Invalid argument: topics/qos length mismatch",
+        ];
+        for (err, shown) in errs.iter().zip(shown) {
+            assert_eq!(err.to_string(), shown);
+            assert_eq!(err.clone().to_string(), shown);
+        }
+        assert!(matches!(errs[2].clone(), Error::ProxyRefused(407, _)));
     }
 
     #[test]

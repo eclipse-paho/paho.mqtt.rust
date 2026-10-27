@@ -213,8 +213,8 @@ impl ConnectOptions {
         // is nothing to guess at, so say so rather than quietly reordering
         // the two. Only meaningful when reconnecting is enabled.
         if self.auto_reconnect && self.max_retry_interval < self.min_retry_interval {
-            return Err(Error::General(
-                "max_retry_interval is less than min_retry_interval",
+            return Err(Error::InvalidArgument(
+                "max_retry_interval is less than min_retry_interval".into(),
             ));
         }
 
@@ -222,8 +222,8 @@ impl ConnectOptions {
         // the CONNECT is encoded, failing the connect token; `check` is where
         // a configuration mistake is supposed to surface.
         if !self.props.is_valid() {
-            return Err(Error::General(
-                "the connect properties hold a value the specification does not allow",
+            return Err(Error::InvalidArgument(
+                "the connect properties hold a value the specification does not allow".into(),
             ));
         }
 
@@ -235,11 +235,12 @@ impl ConnectOptions {
             crate::auth::auth_method(&self.props).is_some(),
             self.auth_handler.is_some(),
         ) {
-            (true, false) => Err(Error::General(
-                "connect properties name an AuthenticationMethod but no auth handler is set",
+            (true, false) => Err(Error::InvalidArgument(
+                "connect properties name an AuthenticationMethod but no auth handler is set".into(),
             )),
-            (false, true) => Err(Error::General(
-                "an auth handler is set but the connect properties name no AuthenticationMethod",
+            (false, true) => Err(Error::InvalidArgument(
+                "an auth handler is set but the connect properties name no AuthenticationMethod"
+                    .into(),
             )),
             _ => Ok(()),
         }
@@ -968,7 +969,7 @@ mod tests {
         assert!(!props.is_valid());
 
         let opts = ConnectOptionsBuilder::new_v5().properties(props).finalize();
-        assert!(matches!(opts.check(), Err(Error::General(_))));
+        assert!(matches!(opts.check(), Err(Error::InvalidArgument(_))));
 
         // A sound set still passes.
         let mut good = Properties::new();
@@ -1038,7 +1039,7 @@ mod tests {
             .automatic_reconnect(Duration::from_secs(10), Duration::from_secs(2))
             .finalize();
         assert!(
-            matches!(opts.check(), Err(Error::General(msg)) if msg.contains("max_retry_interval"))
+            matches!(opts.check(), Err(Error::InvalidArgument(msg)) if msg.contains("max_retry_interval"))
         );
 
         // Equal is fine: a fixed retry interval with no backoff.

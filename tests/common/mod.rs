@@ -117,7 +117,7 @@ impl paho_mqtt::ClientPersistence for SpyPersistence {
             .unwrap()
             .get(key)
             .cloned()
-            .ok_or(paho_mqtt::Error::General("key not found"))
+            .ok_or_else(|| paho_mqtt::Error::Persistence(format!("key not found: {key}")))
     }
     fn remove(&mut self, key: &str) -> paho_mqtt::Result<()> {
         self.0.lock().unwrap().remove(key);

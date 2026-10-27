@@ -49,7 +49,7 @@ pub(crate) fn build_ws_request(
 
     let mut request = url
         .into_client_request()
-        .map_err(|e| Error::GeneralString(e.to_string()))?;
+        .map_err(|e| Error::WebSocket(e.to_string()))?;
 
     {
         let headers = request.headers_mut();

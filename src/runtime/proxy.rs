@@ -65,13 +65,15 @@ pub(crate) fn parse(uri: &str) -> Result<Proxy> {
     };
 
     if authority.is_empty() {
-        return Err(Error::General("proxy URI has no host"));
+        return Err(Error::InvalidArgument(format!(
+            "proxy URI has no host: {uri}"
+        )));
     }
     let (host, port) = match authority.rsplit_once(':') {
         Some((h, p)) => (
             h,
             p.parse::<u16>()
-                .map_err(|_| Error::General("invalid port in proxy URI"))?,
+                .map_err(|_| Error::InvalidArgument(format!("invalid port in proxy URI: {uri}")))?,
         ),
         None => (authority, 3128),
     };
@@ -107,13 +109,13 @@ pub(crate) fn check_response(buf: &[u8]) -> Result<Option<usize>> {
     let Some(end) = find_header_end(buf) else {
         // A proxy that says nothing at all is more likely broken than slow.
         if buf.len() > 8192 {
-            return Err(Error::General("proxy sent an over-long response"));
+            return Err(Error::Proxy("the response is over-long".into()));
         }
         return Ok(None);
     };
 
     let head = core::str::from_utf8(&buf[..end])
-        .map_err(|_| Error::General("proxy response is not valid UTF-8"))?;
+        .map_err(|_| Error::Proxy("the response is not valid UTF-8".into()))?;
     let status_line = head.lines().next().unwrap_or_default();
 
     // "HTTP/1.1 200 Connection established"
@@ -122,15 +124,12 @@ pub(crate) fn check_response(buf: &[u8]) -> Result<Option<usize>> {
     let code = parts
         .next()
         .and_then(|c| c.parse::<u16>().ok())
-        .ok_or(Error::General("proxy sent a malformed status line"))?;
+        .ok_or_else(|| Error::Proxy(format!("malformed status line: {}", status_line.trim())))?;
 
     if (200..300).contains(&code) {
         Ok(Some(end))
     } else {
-        Err(Error::GeneralString(format!(
-            "proxy refused the tunnel: {}",
-            status_line.trim()
-        )))
+        Err(Error::ProxyRefused(code, status_line.trim().to_string()))
     }
 }
 
@@ -200,8 +199,11 @@ mod tests {
         assert_eq!(p.host, "proxy.example");
         assert_eq!(p.auth.as_deref(), Some("Basic dXNlcjpwYXNz"));
 
-        assert!(parse("http://proxy:notaport").is_err());
-        assert!(parse("http://").is_err());
+        assert!(matches!(
+            parse("http://proxy:notaport"),
+            Err(Error::InvalidArgument(_))
+        ));
+        assert!(matches!(parse("http://"), Err(Error::InvalidArgument(_))));
     }
 
     #[test]
@@ -236,12 +238,17 @@ mod tests {
                 .is_some()
         );
 
-        // A refusal carries the proxy's own words.
-        let err = check_response(b"HTTP/1.1 407 Proxy Authentication Required\r\n\r\n")
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("407"), "{err}");
+        // A refusal carries the status code and the proxy's own words.
+        let err =
+            check_response(b"HTTP/1.1 407 Proxy Authentication Required\r\n\r\n").unwrap_err();
+        assert!(
+            matches!(&err, Error::ProxyRefused(407, line) if line.ends_with("Required")),
+            "{err:?}"
+        );
 
-        assert!(check_response(b"garbage\r\n\r\n").is_err());
+        assert!(matches!(
+            check_response(b"garbage\r\n\r\n"),
+            Err(Error::Proxy(_))
+        ));
     }
 }

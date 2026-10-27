@@ -835,7 +835,9 @@ impl AsyncClient {
     {
         let n = topics.len();
         if n != qos.len() {
-            return SubscribeManyToken::from_err(Error::General("topics/qos length mismatch"));
+            return SubscribeManyToken::from_err(Error::InvalidArgument(
+                "topics/qos length mismatch".into(),
+            ));
         }
 
         let filters: Result<Vec<_>> = topics
@@ -911,10 +913,14 @@ impl AsyncClient {
     {
         let n = topics.len();
         if n != qos.len() {
-            return SubscribeManyToken::from_err(Error::General("topics/qos length mismatch"));
+            return SubscribeManyToken::from_err(Error::InvalidArgument(
+                "topics/qos length mismatch".into(),
+            ));
         }
         if !opts.is_empty() && opts.len() != n {
-            return SubscribeManyToken::from_err(Error::General("topics/opts length mismatch"));
+            return SubscribeManyToken::from_err(Error::InvalidArgument(
+                "topics/opts length mismatch".into(),
+            ));
         }
 
         let props = props.into().unwrap_or_default();
@@ -1713,7 +1719,7 @@ fn parse_host_port_path(rest: &str, default_port: u16) -> Result<(String, u16, S
         let host = authority[..colon].to_string();
         let port = authority[colon + 1..]
             .parse::<u16>()
-            .map_err(|_| Error::General("invalid port in server URI"))?;
+            .map_err(|_| Error::InvalidArgument(format!("invalid port in server URI: {rest}")))?;
         (host, port)
     } else {
         (authority.to_string(), default_port)
@@ -1980,6 +1986,20 @@ mod tests {
         let cli = cli.unwrap();
         let retrieved = cli.server_uri();
         assert_eq!(retrieved, server_uri);
+    }
+
+    #[test]
+    fn test_bad_arguments_are_invalid_argument() {
+        assert!(matches!(
+            parse_server_uri("tcp://localhost:notaport"),
+            Err(Error::InvalidArgument(msg)) if msg.contains("notaport")
+        ));
+
+        let cli = AsyncClient::new("tcp://localhost:1883").unwrap();
+        assert!(matches!(
+            cli.subscribe_many(&["a", "b"], &[QoS::QoS1]).wait(),
+            Err(Error::InvalidArgument(_))
+        ));
     }
 
     #[test]

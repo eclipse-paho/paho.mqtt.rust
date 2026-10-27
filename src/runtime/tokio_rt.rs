@@ -299,14 +299,16 @@ async fn tcp_maybe_proxied(proxy_uri: &str, host: &str, port: u16) -> Result<Tcp
     loop {
         let n = tcp.read(&mut tmp).await?;
         if n == 0 {
-            return Err(Error::General("proxy closed the connection"));
+            return Err(Error::Proxy("the proxy closed the connection".into()));
         }
         buf.extend_from_slice(&tmp[..n]);
         if let Some(end) = proxy::check_response(&buf)? {
             if end != buf.len() {
                 // Nothing should arrive before we have spoken, and the extra
                 // bytes cannot be pushed back into the socket.
-                return Err(Error::General("proxy sent data before the tunnel was open"));
+                return Err(Error::Proxy(
+                    "data arrived before the tunnel was open".into(),
+                ));
             }
             return Ok(tcp);
         }
@@ -388,7 +390,7 @@ impl Backend for TokioBackend {
                 let tcp = tcp_maybe_proxied(&p.http_proxy, host.as_str(), *port).await?;
                 let (ws, _) = tokio_tungstenite::client_async(request, tcp)
                     .await
-                    .map_err(|e| Error::GeneralString(e.to_string()))?;
+                    .map_err(|e| Error::WebSocket(e.to_string()))?;
                 Box::new(WsConnection::new(ws))
             }
             #[cfg(all(feature = "websocket", feature = "tls"))]
@@ -408,7 +410,7 @@ impl Backend for TokioBackend {
                 let request = build_ws_request(&url, &p.http_headers)?;
                 let (ws, _) = tokio_tungstenite::client_async(request, tls)
                     .await
-                    .map_err(|e| Error::GeneralString(e.to_string()))?;
+                    .map_err(|e| Error::WebSocket(e.to_string()))?;
                 Box::new(WsConnection::new(ws))
             }
             #[cfg(all(feature = "websocket", not(feature = "tls"), feature = "openssl"))]
@@ -427,7 +429,7 @@ impl Backend for TokioBackend {
                 let request = build_ws_request(&url, &p.http_headers)?;
                 let (ws, _) = tokio_tungstenite::client_async(request, stream)
                     .await
-                    .map_err(|e| Error::GeneralString(e.to_string()))?;
+                    .map_err(|e| Error::WebSocket(e.to_string()))?;
                 Box::new(WsConnection::new(ws))
             }
         };

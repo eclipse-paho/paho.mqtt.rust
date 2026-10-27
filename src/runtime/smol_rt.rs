@@ -252,14 +252,16 @@ async fn tcp_maybe_proxied(proxy_uri: &str, host: &str, port: u16) -> Result<Tcp
     loop {
         let n = tcp.read(&mut tmp).await?;
         if n == 0 {
-            return Err(Error::General("proxy closed the connection"));
+            return Err(Error::Proxy("the proxy closed the connection".into()));
         }
         buf.extend_from_slice(&tmp[..n]);
         if let Some(end) = proxy::check_response(&buf)? {
             if end != buf.len() {
                 // Nothing should arrive before we have spoken, and the extra
                 // bytes cannot be pushed back into the socket.
-                return Err(Error::General("proxy sent data before the tunnel was open"));
+                return Err(Error::Proxy(
+                    "data arrived before the tunnel was open".into(),
+                ));
             }
             return Ok(tcp);
         }
@@ -296,13 +298,6 @@ impl Backend for SmolBackend {
                     .map_err(|e| Error::Tls(e.to_string()))?;
                 Box::new(TlsConnection::new(tls_stream))
             }
-            #[cfg(not(feature = "smol-tls"))]
-            #[cfg(any(feature = "tls", feature = "openssl"))]
-            ServerAddr::Tls { .. } => {
-                return Err(Error::General(
-                    "TLS is not yet supported with the smol runtime",
-                ));
-            }
             #[cfg(unix)]
             ServerAddr::Unix { path } => Box::new(UnixConnection::connect(path).await?),
             #[cfg(feature = "smol-websocket")]
@@ -312,15 +307,8 @@ impl Backend for SmolBackend {
                 let tcp = tcp_maybe_proxied(&p.http_proxy, host.as_str(), *port).await?;
                 let (ws, _) = async_tungstenite::client_async(request, tcp)
                     .await
-                    .map_err(|e| Error::GeneralString(e.to_string()))?;
+                    .map_err(|e| Error::WebSocket(e.to_string()))?;
                 Box::new(WsConnection::new(ws))
-            }
-            #[cfg(not(feature = "smol-websocket"))]
-            #[cfg(feature = "websocket")]
-            ServerAddr::Ws { .. } => {
-                return Err(Error::General(
-                    "WebSocket is not yet supported with the smol runtime",
-                ));
             }
             #[cfg(all(feature = "smol-websocket", feature = "smol-tls"))]
             ServerAddr::Wss { host, port, path } => {
@@ -339,18 +327,8 @@ impl Backend for SmolBackend {
                 let request = build_ws_request(&url, &p.http_headers)?;
                 let (ws, _) = async_tungstenite::client_async(request, tls_stream)
                     .await
-                    .map_err(|e| Error::GeneralString(e.to_string()))?;
+                    .map_err(|e| Error::WebSocket(e.to_string()))?;
                 Box::new(WsConnection::new(ws))
-            }
-            #[cfg(all(
-                feature = "smol-websocket",
-                not(feature = "smol-tls"),
-                any(feature = "tls", feature = "openssl")
-            ))]
-            ServerAddr::Wss { .. } => {
-                return Err(Error::General(
-                    "WebSocket+TLS is not yet supported with the smol runtime",
-                ));
             }
         };
         // Split with `futures::io` rather than `smol::io`: the latter's write

@@ -77,7 +77,9 @@ impl TryFrom<i32> for RetainHandling {
             0 => Ok(SendRetainedOnSubscribe),
             1 => Ok(SendRetainedOnNew),
             2 => Ok(DontSendRetained),
-            _ => Err(Error::from("Invalid value for RetainedHandling")),
+            _ => Err(Error::InvalidArgument(format!(
+                "invalid value for RetainHandling: {val}"
+            ))),
         }
     }
 }
@@ -235,6 +237,18 @@ impl SubscribeOptionsBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_retain_handling_from_int() {
+        assert_eq!(
+            RetainHandling::try_from(2).unwrap(),
+            RetainHandling::DontSendRetained
+        );
+        assert!(matches!(
+            RetainHandling::try_from(3),
+            Err(Error::InvalidArgument(msg)) if msg.contains('3')
+        ));
+    }
 
     #[test]
     fn test_with() {

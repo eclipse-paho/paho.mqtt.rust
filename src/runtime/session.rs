@@ -283,8 +283,10 @@ async fn recv_connack<B: Backend>(
                     B::write_all(writer, &out).await?;
                     B::flush(writer).await?;
                 }
-                Packet::Auth(_) => return Err(Error::General("unexpected AUTH reason code")),
-                _ => return Err(Error::General("expected CONNACK")),
+                Packet::Auth(_) => {
+                    return Err(Error::ProtocolViolation("unexpected AUTH reason code"));
+                }
+                _ => return Err(Error::ProtocolViolation("expected CONNACK")),
             }
         }
     }
@@ -299,7 +301,7 @@ fn auth_response(p: &ConnectParams, challenge_props: &Properties) -> Result<Auth
     let (Some(handler), Some(method)) = (&p.auth, crate::auth::auth_method(&p.props)) else {
         // `ConnectOptions::check` rejects this combination before we get
         // here; a broker that sends AUTH unasked reaches it.
-        return Err(Error::General(
+        return Err(Error::ProtocolViolation(
             "broker requested authentication but none was configured",
         ));
     };
@@ -1779,8 +1781,8 @@ impl<B: Backend> Session<B> {
                 // answer this loop gives a broker that stops responding:
                 // the connection goes, and auto-reconnect tries again.
                 LoopEvent::PersistStalled => {
-                    return Err(Error::GeneralString(format!(
-                        "the persistence store has not responded in {} s",
+                    return Err(Error::Persistence(format!(
+                        "the store has not responded in {} s",
                         persist_timeout.as_secs()
                     )));
                 }
@@ -3156,9 +3158,9 @@ pub(crate) async fn run_event_loop<B: Backend>(
                 }
                 match result {
                     Some(c) => Attempt::Connected(c),
-                    None => {
-                        Attempt::Failed(last_err.unwrap_or(Error::General("no servers configured")))
-                    }
+                    None => Attempt::Failed(
+                        last_err.unwrap_or(Error::InvalidArgument("no servers configured".into())),
+                    ),
                 }
             } else {
                 match reconnect_wait::<B>(retry_delay, &cmd_rx, &mut buf, &buf_cfg, &mut sinks)
@@ -5060,8 +5062,8 @@ mod tests {
         let run = pin!(h.session.run(&mut reader, &h.cmd_rx));
         let out = poll_until(run, Duration::from_secs(2));
         match out {
-            Some(Err(Error::GeneralString(msg))) => {
-                assert!(msg.contains("persistence"), "unexpected message: {msg}");
+            Some(Err(Error::Persistence(msg))) => {
+                assert!(msg.contains("not responded"), "unexpected message: {msg}");
             }
             other => panic!("the session did not end: {other:?}"),
         }
