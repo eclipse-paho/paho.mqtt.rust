@@ -25,9 +25,10 @@
 //! the MQTT broker/server.
 
 use crate::{Properties, ReasonCode};
+use std::time::Duration;
+
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
 
 /// The collection of options for disconnecting from the client.
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]

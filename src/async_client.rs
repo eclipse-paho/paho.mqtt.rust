@@ -63,6 +63,7 @@ use std::{
         Arc, Mutex, RwLock,
         atomic::{AtomicBool, AtomicU32, Ordering},
     },
+    thread,
     time::Duration,
 };
 
@@ -85,54 +86,6 @@ fn make_persistence(
     Some(Arc::new(Mutex::new(store)))
 }
 
-/////////////////////////////////////////////////////////////////////////////
-// AsyncClient
-
-/// An asynchronous MQTT connection client.
-#[derive(Clone)]
-pub struct AsyncClient {
-    pub(crate) inner: Arc<InnerAsyncClient>,
-}
-
-/// Implementation details for the asynchronous MQTT connection client.
-pub(crate) struct InnerAsyncClient {
-    /// Command sender to the internal event loop.
-    cmd_tx: async_channel::Sender<Command>,
-    /// Whether the client is currently connected.
-    /// Wrapped in Arc so the event-loop thread can set it before the token
-    /// resolves, eliminating any race between `wait()` and `is_connected()`.
-    connected: Arc<AtomicBool>,
-    /// The MQTT version of the connection.
-    mqtt_version: AtomicU32,
-    /// The identifier the server assigned, when the client connected with an
-    /// empty one. Set by the event loop before the connect token resolves.
-    assigned_id: Arc<RwLock<Option<String>>>,
-    /// The options used to create the client.
-    opts: CreateOptions,
-    /// The options for the most recent connection attempt.
-    conn_opts: RwLock<ConnectOptions>,
-    /// User-registered event callbacks.
-    callback_context: Mutex<CallbackContext>,
-    /// The synchronous consumers: `start_consuming` and
-    /// `start_consuming_events`. Fed by the dispatcher thread, because a
-    /// `crossbeam` receiver cannot be awaited.
-    sync_sinks: RwLock<Arc<SyncSinks>>,
-    /// Whether `sync_sinks` holds anything, so that the dispatcher can skip
-    /// the lock — and the `Arc` clone it takes out of it — for every
-    /// message when there is no synchronous consumer.
-    has_sync_sinks: AtomicBool,
-    /// What this client shares with its event loop: the gate the dispatcher
-    /// reports consumed messages to, and whether anything on this side
-    /// wants messages at all.
-    dispatch: Dispatch,
-    /// Persistence store, if any.
-    persist: Option<Arc<Mutex<Box<dyn ClientPersistence>>>>,
-    /// Keeps the async runtime alive for the lifetime of this client.
-    /// Declared last so it is dropped after `cmd_tx`, ensuring the event-loop
-    /// task sees the closed channel before the runtime shuts down.
-    _rt_ownership: RtOwnership,
-}
-
 // The client is safe to send or share between threads.
 
 /// User callback type for when the client is connected.
@@ -149,6 +102,8 @@ pub type MessageArrivedCallback = dyn FnMut(&AsyncClient, Option<Message>) + Sen
 
 /// User callback type for a TLS error
 pub type TlsErrorCallback = dyn Fn(&AsyncClient, &str) + Send + Sync + 'static;
+
+/////////////////////////////////////////////////////////////////////////////
 
 /// One callback slot, and the bookkeeping that lets it be removed from
 /// inside itself.
@@ -323,6 +278,88 @@ struct CallbackContext {
 }
 
 /////////////////////////////////////////////////////////////////////////////
+// AsyncClient
+
+/// An asynchronous MQTT connection client.
+#[derive(Clone)]
+pub struct AsyncClient {
+    pub(crate) inner: Arc<InnerAsyncClient>,
+}
+
+/// Implementation details for the asynchronous MQTT connection client.
+pub(crate) struct InnerAsyncClient {
+    /// Command sender to the internal event loop.
+    cmd_tx: async_channel::Sender<Command>,
+    /// Whether the client is currently connected.
+    /// Wrapped in Arc so the event-loop thread can set it before the token
+    /// resolves, eliminating any race between `wait()` and `is_connected()`.
+    connected: Arc<AtomicBool>,
+    /// The MQTT version of the connection.
+    mqtt_version: AtomicU32,
+    /// The identifier the server assigned, when the client connected with an
+    /// empty one. Set by the event loop before the connect token resolves.
+    assigned_id: Arc<RwLock<Option<String>>>,
+    /// The options used to create the client.
+    opts: CreateOptions,
+    /// The options for the most recent connection attempt.
+    conn_opts: RwLock<ConnectOptions>,
+    /// User-registered event callbacks.
+    callback_context: Mutex<CallbackContext>,
+    /// The synchronous consumers: `start_consuming` and
+    /// `start_consuming_events`. Fed by the dispatcher thread, because a
+    /// `crossbeam` receiver cannot be awaited.
+    sync_sinks: RwLock<Arc<SyncSinks>>,
+    /// Whether `sync_sinks` holds anything, so that the dispatcher can skip
+    /// the lock — and the `Arc` clone it takes out of it — for every
+    /// message when there is no synchronous consumer.
+    has_sync_sinks: AtomicBool,
+    /// What this client shares with its event loop: the gate the dispatcher
+    /// reports consumed messages to, and whether anything on this side
+    /// wants messages at all.
+    dispatch: Dispatch,
+    /// Persistence store, if any.
+    persist: Option<Arc<Mutex<Box<dyn ClientPersistence>>>>,
+    /// Keeps the async runtime alive for the lifetime of this client.
+    /// Declared last so it is dropped after `cmd_tx`, ensuring the event-loop
+    /// task sees the closed channel before the runtime shuts down.
+    _rt_ownership: RtOwnership,
+}
+
+impl InnerAsyncClient {
+    /// Creates the client state around a running event loop, reached through
+    /// `cmd_tx` and `dispatch`.
+    ///
+    /// Everything else starts out at its default: not connected, no assigned
+    /// identifier, no callbacks or consumers, and connect options that carry
+    /// only the MQTT version from `opts`, so that `reconnect()` and sends
+    /// before the first connect use the right one.
+    fn new(
+        cmd_tx: async_channel::Sender<Command>,
+        opts: CreateOptions,
+        dispatch: Dispatch,
+        persist: Option<Arc<Mutex<Box<dyn ClientPersistence>>>>,
+        rt_ownership: RtOwnership,
+    ) -> Self {
+        let ver = opts.mqtt_version;
+        Self {
+            cmd_tx,
+            connected: Arc::new(AtomicBool::new(false)),
+            mqtt_version: AtomicU32::new(ver as u32),
+            assigned_id: Arc::new(RwLock::new(None)),
+            opts,
+            conn_opts: RwLock::new(ConnectOptions {
+                mqtt_version: ver,
+                ..ConnectOptions::default()
+            }),
+            callback_context: Mutex::new(CallbackContext::default()),
+            sync_sinks: RwLock::new(Arc::new(SyncSinks::default())),
+            has_sync_sinks: AtomicBool::new(false),
+            dispatch,
+            persist,
+            _rt_ownership: rt_ownership,
+        }
+    }
+}
 
 impl AsyncClient {
     /// Creates a new MQTT client which can connect to an MQTT broker.
@@ -364,36 +401,21 @@ impl AsyncClient {
         };
         let (cmd_tx, event_rx, dispatch) = rt.into_parts();
 
-        // Seed the stored connect opts with the client's initial MQTT version
-        // so that reconnect() and pre-connect sends use the right version.
-        let create_ver = opts.mqtt_version;
-        let initial_conn_opts = ConnectOptions {
-            mqtt_version: create_ver,
-            ..ConnectOptions::default()
-        };
-
         // Extract persistence before moving opts into inner, so we can consume
         // PersistenceType::User without cloning the trait object.
         let persist_type = std::mem::replace(&mut opts.persistence, PersistenceType::None);
         let persist = make_persistence(persist_type, opts.persistence_sync);
 
-        let inner = Arc::new(InnerAsyncClient {
+        let inner = Arc::new(InnerAsyncClient::new(
             cmd_tx,
-            connected: Arc::new(AtomicBool::new(false)),
-            mqtt_version: AtomicU32::new(create_ver as u32),
-            assigned_id: Arc::new(RwLock::new(None)),
             opts,
-            conn_opts: RwLock::new(initial_conn_opts),
-            callback_context: Mutex::new(CallbackContext::default()),
-            sync_sinks: RwLock::new(Arc::new(SyncSinks::default())),
-            has_sync_sinks: AtomicBool::new(false),
-            dispatch: dispatch.clone(),
+            dispatch.clone(),
             persist,
-            _rt_ownership: rt_ownership,
-        });
+            rt_ownership,
+        ));
 
         let weak = Arc::downgrade(&inner);
-        std::thread::Builder::new()
+        thread::Builder::new()
             .name("mqtt-events".into())
             .spawn(move || {
                 while let Ok(ev) = event_rx.recv_blocking() {
@@ -1627,8 +1649,6 @@ impl AsyncClient {
     }
 }
 
-// The client is safe to send or share between threads.
-
 /// Extracts `(host, port, path)` from the authority+path portion of a URI.
 ///
 /// `rest` is the URI with its scheme prefix stripped (e.g. `"broker:1883/mqtt"`).
@@ -1749,7 +1769,6 @@ mod tests {
     use super::*;
     use crate::create_options::CreateOptionsBuilder;
     use std::sync::{Arc, Mutex, RwLock};
-    use std::thread;
 
     // Makes sure than when a client is moved, the inner struct stays at
     // the same address (on the heap) since that inner struct is used as
@@ -2424,7 +2443,7 @@ mod tests {
         assert!(sync_rx.try_recv().is_err(), "the consumer closed at once");
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while (!stream.is_closed() || !events.is_closed()) && std::time::Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(5));
+            thread::sleep(Duration::from_millis(5));
         }
         assert!(stream.is_closed(), "the message stream was not closed");
         assert!(events.is_closed(), "the event stream was not closed");

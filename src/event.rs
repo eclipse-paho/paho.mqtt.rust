@@ -37,9 +37,9 @@ pub enum Event {
     ConnectionLost,
     /// Received a disconnect message from the broker.
     Disconnected {
-        /// The message properties from the disconnect message.
-        props: Properties,
         /// The reason code from the disconnect message.
         reason_code: ReasonCode,
+        /// The message properties from the disconnect message.
+        props: Properties,
     },
 }

@@ -357,9 +357,18 @@ fn disconnect_reason(err: &Error) -> Option<ReasonCode> {
 /// started fresh, and anything else is assumed to have continued — the
 /// forgiving reading, since treating a live session as lost would throw away
 /// messages the server is still waiting to have completed.
+///
+/// A clean start is never a resumption, whatever the CONNACK says: we asked
+/// for the previous session to be discarded, and the specification requires
+/// both sides to do so (§3.1.2.4). A server that sets Session Present anyway
+/// is in error — it must be 0 on a clean start (§3.2.2.2 in v3.1.1 and v5) —
+/// and believing it would re-send state from a session that no longer exists.
 fn session_resumed(params: &ConnectParams, connack: &ConnAck) -> bool {
+    if params.clean_start {
+        return false;
+    }
     match params.ver {
-        MqttVersion::V3_1 => !params.clean_start,
+        MqttVersion::V3_1 => true,
         _ => connack.session_present,
     }
 }
@@ -611,17 +620,6 @@ struct InflightPublish {
     seq: u64,
 }
 
-impl InflightPublish {
-    /// The QoS of the underlying message, or `None` once only a PUBREL is
-    /// outstanding.
-    fn qos(&self) -> Option<QoS> {
-        match &self.phase {
-            PublishPhase::AwaitingAck(p) => Some(p.qos),
-            PublishPhase::AwaitingPubComp => None,
-        }
-    }
-}
-
 /// A SUBSCRIBE or UNSUBSCRIBE awaiting its acknowledgement.
 ///
 /// Kept with the session rather than the connection, so that one sent just
@@ -775,22 +773,6 @@ impl SessionState {
         let mut all: Vec<_> = publishes.chain(subs).chain(unsubs).collect();
         all.sort_unstable_by_key(|(seq, _)| *seq);
         all.into_iter().map(|(_, r)| r).collect()
-    }
-
-    /// Moves the (un)subscribes awaiting acknowledgement into a fresh state,
-    /// dropping everything else.
-    ///
-    /// For a clean start that discards a persisted session: the messages go,
-    /// since the server has discarded its half of them, but an (un)subscribe
-    /// is not part of what the server discards — it is re-sent as it would
-    /// be on any new connection (see [`PendingAck`]).
-    fn restart_keeping_subscribes(&mut self) {
-        *self = Self {
-            pending_sub: std::mem::take(&mut self.pending_sub),
-            pending_unsub: std::mem::take(&mut self.pending_unsub),
-            next_seq: self.next_seq,
-            ..Self::default()
-        };
     }
 }
 
@@ -1482,23 +1464,29 @@ impl<B: Backend> Session<B> {
         Ok(())
     }
 
-    /// Drops the state a server that did not resume our session cannot
-    /// honour, failing the tokens that can no longer be completed.
+    /// Discards the session state when the server did not resume our
+    /// session, failing the tokens that can no longer be completed.
+    ///
+    /// The specification requires it: a clean start discards any previous
+    /// session on both sides (§3.1.2.4 in v3.1.1 and v5), and a v5 client
+    /// that holds session state but is told Session Present = 0 must discard
+    /// that state if it carries on (§3.2.2.2). The client's half of a session
+    /// is exactly its unacknowledged QoS 1 and QoS 2 messages, in both
+    /// directions, so every one of them goes — QoS 1 included. Re-sending one
+    /// with DUP and its old identifier would treat it as part of a session
+    /// the server has said no longer exists. Whether it reached the server
+    /// is unknown, so its token fails with [`Error::SessionNotResumed`],
+    /// which the application can act on by publishing it again.
+    ///
+    /// (Un)subscribes awaiting acknowledgement are not session state — the
+    /// subscriptions are the server's — and stay, to be re-sent.
     fn discard_unresumable(&mut self) {
-        let abandon: Vec<u16> = self
-            .state
-            .inflight
-            .iter()
-            .filter(|(_, r)| r.qos() != Some(QoS::QoS1))
-            .map(|(id, _)| *id)
-            .collect();
+        let abandon: Vec<u16> = self.state.inflight.keys().copied().collect();
 
         for id in abandon {
             if let Some(rec) = self.state.remove(id) {
                 self.persist_remove(b's', id);
-                rec.tx.complete(Err(Error::General(
-                    "server did not resume the session; QoS 2 delivery abandoned",
-                )));
+                rec.tx.complete(Err(Error::SessionNotResumed));
             }
         }
 
@@ -3049,14 +3037,16 @@ pub(crate) async fn run_event_loop<B: Backend>(
 
             // A clean start throws away whatever the previous session left
             // behind: the server has already discarded its half, so the
-            // store holds nothing that can still be completed. An
-            // (un)subscribe awaiting its acknowledgement is kept and sent
-            // again, as on any reconnect.
+            // store holds nothing that can still be completed. The
+            // in-memory state is discarded with it — tokens failed, the
+            // (un)subscribes kept — by `discard_unresumable` once the session
+            // starts, since a clean start is never a resumption; that is the
+            // same path a session the server lost takes, with or without a
+            // store.
             if job.params.clean_start
                 && let Some(p) = &job.persist
             {
                 let _ = p.lock().unwrap().clear();
-                state.restart_keeping_subscribes();
             }
 
             // Read a store written by an earlier run of the program into the
@@ -3752,6 +3742,11 @@ mod tests {
             &params(MqttVersion::V3_1, true),
             &ack(false)
         ));
+
+        // A clean start is never resumed, even if a server wrongly says so.
+        for ver in [MqttVersion::V3_1, MqttVersion::V3_1_1, MqttVersion::V5] {
+            assert!(!session_resumed(&params(ver, true), &ack(true)), "{ver}");
+        }
     }
 
     /// Re-transmission follows the order the messages were published, not
@@ -4026,7 +4021,8 @@ mod tests {
     /// connection ends is sent again on the next one — whether or not the
     /// server resumed the session — under the identifier it already holds
     /// and in its place among the publishes around it, and its token then
-    /// resolves with the new connection's answer.
+    /// resolves with the new connection's answer. The publishes are session
+    /// state: re-sent with DUP on a resumed session, abandoned otherwise.
     #[test]
     fn test_pending_subscribes_are_resent_on_the_next_connection() {
         for resumed in [true, false] {
@@ -4034,13 +4030,13 @@ mod tests {
             // publish, and no acknowledgement for any of them.
             let mut first = harness(BytesMut::new(), Duration::ZERO, SessionState::default());
             let s = &mut first.session;
-            let (_p1, c) = publish_cmd("p1", QoS::QoS1, Bytes::from_static(b"1"));
+            let (mut p1, c) = publish_cmd("p1", QoS::QoS1, Bytes::from_static(b"1"));
             s.handle_command(c).unwrap();
             let (mut sub_tok, c) = subscribe_cmd("a/#");
             s.handle_command(c).unwrap();
             let (mut unsub_tok, c) = unsubscribe_cmd("b");
             s.handle_command(c).unwrap();
-            let (_p2, c) = publish_cmd("p2", QoS::QoS1, Bytes::from_static(b"2"));
+            let (mut p2, c) = publish_cmd("p2", QoS::QoS1, Bytes::from_static(b"2"));
             s.handle_command(c).unwrap();
             let original: Vec<String> = sent_packets(&mut first).iter().map(describe).collect();
 
@@ -4054,12 +4050,22 @@ mod tests {
             second.session.resume(resumed).unwrap();
             let resent: Vec<String> = sent_packets(&mut second).iter().map(describe).collect();
 
-            // The same packets in the same order; the publishes now DUP.
+            // Resumed: the same packets in the same order, the publishes now
+            // DUP. Not resumed: the (un)subscribes alone, and the publishes'
+            // tokens fail.
             let expected: Vec<String> = original
                 .iter()
+                .filter(|d| resumed || !d.starts_with("PUBLISH"))
                 .map(|d| d.replace("dup=false", "dup=true"))
                 .collect();
             assert_eq!(resent, expected, "resumed = {resumed}");
+            for tok in [&mut p1, &mut p2] {
+                match tok.try_wait() {
+                    None => assert!(resumed, "still in flight on a resumed session"),
+                    Some(Err(Error::SessionNotResumed)) => assert!(!resumed),
+                    other => panic!("resumed = {resumed}: {other:?}"),
+                }
+            }
 
             // The new connection's acknowledgements resolve the tokens.
             let s = &mut second.session;
@@ -4084,37 +4090,86 @@ mod tests {
         }
     }
 
-    /// The clean start that discards a persisted session drops its messages
-    /// but keeps the (un)subscribes awaiting an acknowledgement, and the
-    /// ordering counter, so they are still re-sent in their places.
+    /// When the server does not resume the session — which includes every
+    /// clean start — the client discards its half of it (§3.1.2.4, v5
+    /// §3.2.2.2): every outbound publish, QoS 1 included and one already
+    /// past PUBREC, and the inbound QoS 2 state, each with its persisted
+    /// entry. Their tokens fail with the reason and nothing of them is sent
+    /// again; a pending subscribe, which is not session state, still is.
     #[test]
-    fn test_clean_start_restart_keeps_pending_subscribes() {
-        let mut h = harness(BytesMut::new(), Duration::ZERO, SessionState::default());
-        let s = &mut h.session;
-        let (mut pub_tok, c) = publish_cmd("p", QoS::QoS1, Bytes::from_static(b"1"));
+    fn test_unresumed_session_discards_all_message_state() {
+        let store = store_with(&[]);
+        let mut first = harness(BytesMut::new(), Duration::ZERO, SessionState::default());
+        first.session.persist = Persist::Inline(store.clone());
+        let s = &mut first.session;
+        let body = || Bytes::from_static(b"x");
+
+        let (mut q1, c) = publish_cmd("q1", QoS::QoS1, body());
+        s.handle_command(c).unwrap();
+        let (mut q2, c) = publish_cmd("q2", QoS::QoS2, body());
+        s.handle_command(c).unwrap();
+        let (mut q2r, c) = publish_cmd("q2r", QoS::QoS2, body());
         s.handle_command(c).unwrap();
         let (mut sub_tok, c) = subscribe_cmd("a/#");
         s.handle_command(c).unwrap();
-        let (_u, c) = unsubscribe_cmd("b");
-        s.handle_command(c).unwrap();
-        let next_seq = s.state.next_seq;
 
-        let mut state = std::mem::take(&mut s.state);
-        state.restart_keeping_subscribes();
-
-        assert!(state.inflight.is_empty());
-        assert!(matches!(pub_tok.try_wait(), Some(Err(Error::Disconnected))));
-        assert_eq!(state.pending_sub.len(), 1);
-        assert_eq!(state.pending_unsub.len(), 1);
-        assert!(sub_tok.try_wait().is_none());
-        assert_eq!(state.next_seq, next_seq);
+        // Move one QoS 2 exchange past PUBREC, and take in an inbound one.
+        let rec_id = s
+            .state
+            .inflight
+            .iter()
+            .find_map(|(id, r)| match &r.phase {
+                PublishPhase::AwaitingAck(p) if p.topic == "q2r" => Some(*id),
+                _ => None,
+            })
+            .unwrap();
+        s.handle_packet(Packet::PubRec(PubAck::new(rec_id)))
+            .unwrap();
+        s.handle_packet(Packet::Publish(paho_mqtt_codec::Publish {
+            dup: false,
+            qos: QoS::QoS2,
+            retain: false,
+            topic: "in".into(),
+            packet_id: Some(50),
+            payload: body(),
+            properties: Properties::new(),
+        }))
+        .unwrap();
+        sent_packets(&mut first);
         assert_eq!(
-            state
-                .resend_order()
-                .iter()
-                .map(|r| matches!(r, Resend::Subscribe(_)))
-                .collect::<Vec<_>>(),
-            [true, false]
+            store.lock().unwrap().keys().unwrap().len(),
+            4,
+            "s × 3, r × 1"
+        );
+
+        // The connection drops; the server does not resume the session.
+        let state = std::mem::take(&mut first.session.state);
+        drop(first);
+        let mut second = harness(BytesMut::new(), Duration::ZERO, state);
+        second.session.persist = Persist::Inline(store.clone());
+        second.session.resume(false).unwrap();
+
+        let sent: Vec<String> = sent_packets(&mut second).iter().map(describe).collect();
+        assert_eq!(sent.len(), 1, "only the subscribe goes out: {sent:?}");
+        assert!(sent[0].starts_with("SUBSCRIBE"), "{sent:?}");
+
+        for (name, tok) in [("QoS 1", &mut q1), ("QoS 2", &mut q2), ("PUBREL", &mut q2r)] {
+            match tok.try_wait() {
+                Some(Err(Error::SessionNotResumed)) => {}
+                other => panic!("{name} should have been abandoned: {other:?}"),
+            }
+        }
+        assert!(
+            sub_tok.try_wait().is_none(),
+            "the subscribe still awaits its SUBACK"
+        );
+
+        let s = &second.session;
+        assert!(s.state.inflight.is_empty() && s.state.pending_pub2_in.is_empty());
+        assert_eq!(s.state.pending_sub.len(), 1);
+        assert!(
+            store.lock().unwrap().keys().unwrap().is_empty(),
+            "the persisted session state goes with it"
         );
     }
 

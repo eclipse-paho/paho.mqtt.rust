@@ -2231,11 +2231,13 @@ fn test_inflight_qos2_resends_pubrel_across_reconnect() {
     broker.join();
 }
 
-/// When the server does not resume the session, a QoS 1 message is re-sent
-/// but a QoS 2 exchange cannot be completed, so its token fails rather than
-/// waiting for a PUBCOMP that will never come.
+/// When the server does not resume the session, the client discards its
+/// half of it too (v5 §3.2.2.2): neither the unacknowledged QoS 1 message nor
+/// the QoS 2 exchange parked at PUBREC is sent again, and both tokens fail
+/// with a reason, rather than one being re-sent into a session the server
+/// says does not exist and the other waiting for a PUBCOMP that cannot come.
 #[test]
-fn test_unresumed_session_discards_qos2_and_resends_qos1() {
+fn test_unresumed_session_discards_qos1_and_qos2() {
     use mqtt::paho_mqtt_codec::{ConnAck, Packet, PubAck, ReasonCode};
     use std::sync::{
         Arc,
@@ -2262,10 +2264,6 @@ fn test_unresumed_session_discards_qos2_and_resends_qos1() {
         (Packet::Connect(_), _) => {
             vec![Packet::ConnAck(ConnAck::new(false, ReasonCode::Success))].into()
         }
-        (Packet::Publish(p), _) => match p.packet_id {
-            Some(id) => vec![Packet::PubAck(PubAck::new(id))].into(),
-            None => common::Reply::none(),
-        },
         _ => common::Reply::none(),
     });
 
@@ -2275,24 +2273,30 @@ fn test_unresumed_session_discards_qos2_and_resends_qos1() {
     let qos1 = cli.publish(mqtt::Message::new(topic!("unresumed-1"), "a", mqtt::QOS_1));
     let qos2 = cli.publish(mqtt::Message::new(topic!("unresumed-2"), "b", mqtt::QOS_2));
 
-    // The QoS 1 message survives the reconnect and is acknowledged.
-    qos1.wait_for(Duration::from_secs(10))
-        .expect("QoS 1 should be re-sent to a server with no session");
-
-    // The QoS 2 exchange cannot be completed, and says so.
-    let res = qos2.wait_for(Duration::from_secs(10));
+    // Neither can be completed, and each says why.
+    for (qos, tok) in [(1, qos1), (2, qos2)] {
+        match tok.wait_for(Duration::from_secs(10)) {
+            Err(mqtt::Error::SessionNotResumed) => {}
+            other => panic!("QoS {qos} should have been abandoned, got {other:?}"),
+        }
+    }
     assert!(
         seen_qos2.load(Ordering::SeqCst),
         "QoS 2 never reached PUBREC"
     );
-    assert!(
-        res.is_err(),
-        "QoS 2 should have been abandoned, got {res:?}"
-    );
 
-    // No PUBREL was offered for a session the server does not have.
-    let pubrels = broker
-        .received()
+    // Nothing was offered to a session the server does not have: each
+    // PUBLISH went out once, on the first connection, and no PUBREL at all.
+    // The tokens fail before anything is written on the new connection, so
+    // give a re-send that should not happen the time to arrive if it does.
+    std::thread::sleep(Duration::from_millis(300));
+    let received = broker.received();
+    let publishes = received
+        .iter()
+        .filter(|p| matches!(p, Packet::Publish(_)))
+        .count();
+    assert_eq!(publishes, 2, "must not re-send into a session-less server");
+    let pubrels = received
         .iter()
         .filter(|p| matches!(p, Packet::PubRel(_)))
         .count();

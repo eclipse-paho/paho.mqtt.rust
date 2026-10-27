@@ -38,8 +38,8 @@ use paho_mqtt_codec::{
 
 use super::sinks::Sink;
 use crate::{
-    ClientPersistence, ConnectResponse, Error, Message, PublishResponse, SubscribeOptions,
-    SubscribeResponse, UnsubscribeResponse, token::Completer,
+    AuthHandler, ClientPersistence, ConnectResponse, Error, Message, PublishResponse,
+    SubscribeOptions, SubscribeResponse, UnsubscribeResponse, token::Completer,
 };
 
 /////////////////////////////////////////////////////////////////////////////
@@ -78,7 +78,7 @@ pub(crate) struct BufConfig {
 
 /// The resolved transport address for a connection attempt.
 pub(crate) enum ServerAddr {
-    /// Plain TCP connection.
+    /// Plain (unencrypted) TCP connection.
     Tcp {
         /// Broker hostname or IP address.
         host: String,
@@ -99,7 +99,9 @@ pub(crate) enum ServerAddr {
         /// Filesystem path to the socket.
         path: String,
     },
-    /// Plain WebSocket connection (requires the `websocket` or `smol-websocket` feature).
+    /// Plain (unencrypted) WebSocket connection.
+    ///
+    /// Requires the `websocket` or `smol-websocket` feature.
     #[cfg(any(feature = "websocket", feature = "smol-websocket"))]
     Ws {
         /// Broker hostname or IP address.
@@ -151,6 +153,11 @@ impl ServerAddr {
 /////////////////////////////////////////////////////////////////////////////
 
 /// Connection parameters grouped for reuse across reconnect attempts.
+///
+/// This is verified version of the user's [`ConnectOptions`] with some
+/// additional and converted fields for internal use.
+///
+/// [`ConnectOptions`]: crate::ConnectOptions
 pub(crate) struct ConnectParams {
     /// Ordered list of `(transport address, URI string)` pairs.
     ///
@@ -175,7 +182,7 @@ pub(crate) struct ConnectParams {
     pub props: CodecProperties,
     /// Handler for the v5 enhanced-authentication exchange, when the connect
     /// properties name an `AuthenticationMethod`.
-    pub auth: Option<crate::AuthHandler>,
+    pub auth: Option<AuthHandler>,
     /// TLS options; `Some` only when using a TLS transport.
     #[cfg(any(feature = "tls", feature = "openssl", feature = "smol-tls"))]
     pub tls: Option<crate::TlsOptions>,

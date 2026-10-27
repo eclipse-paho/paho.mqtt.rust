@@ -40,6 +40,19 @@ pub enum Error {
     /// The client is disconnected.
     #[error("Client disconnected")]
     Disconnected,
+    /// A QoS 1 or QoS 2 publish was abandoned because the server did not
+    /// resume the session it belonged to.
+    ///
+    /// When the connection drops with a publish still unacknowledged and
+    /// the next connection does not continue the session — the server
+    /// reports Session Present = 0, or the client asked for a clean start —
+    /// the client discards its half of the session, as the specification
+    /// requires. Whether the message reached the server is unknown, so its
+    /// token fails with this rather than being re-sent into a session the
+    /// server says no longer exists. Publish it again if it must be
+    /// delivered.
+    #[error("The server did not resume the session; the publish was abandoned")]
+    SessionNotResumed,
     /// Attempting a TLS connection when the TLS feature is not enabled.
     #[error("TLS not supported by library")]
     TlsNotSupported,
@@ -132,6 +145,7 @@ impl Clone for Error {
         match self {
             Failure => Failure,
             Disconnected => Disconnected,
+            SessionNotResumed => SessionNotResumed,
             TlsNotSupported => TlsNotSupported,
             WebSocketNotSupported => WebSocketNotSupported,
             Tls(s) => Tls(s.clone()),
@@ -221,6 +235,13 @@ mod tests {
     }
 
     // The replacement for v1.x's payload-free `PersistenceError`.
+    #[test]
+    fn test_session_not_resumed() {
+        let err = Error::SessionNotResumed;
+        assert!(matches!(err.clone(), Error::SessionNotResumed));
+        assert!(err.to_string().contains("did not resume the session"));
+    }
+
     #[test]
     fn test_persistence_error() {
         let err = Error::Persistence("disk full".into());
