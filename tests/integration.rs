@@ -3842,3 +3842,169 @@ fn test_subscribe_in_flight_is_resent_after_reconnect() {
     assert_eq!(subs[0].packet_id, subs[1].packet_id);
     assert_eq!(subs[1].subscriptions[0].topic_filter, "test/resend");
 }
+
+/// `is_connected()` stays true across an automatic reconnect even when the
+/// callback thread is still working through the old connection's events.
+///
+/// The `connected` flag this replaced was also cleared by the callback
+/// thread when it reached `ConnectionLost`. Held up here by a slow message
+/// callback, it got there after the event loop had already reconnected, and
+/// left a connected client reporting itself disconnected.
+#[test]
+fn test_is_connected_survives_a_late_connection_lost() {
+    use mqtt::paho_mqtt_codec::{ConnAck, Packet, Publish, ReasonCode, SubAck};
+
+    let broker = common::spawn_broker_seq(2, |pkt, conn| match pkt {
+        Packet::Connect(_) => {
+            vec![Packet::ConnAck(ConnAck::new(false, ReasonCode::Success))].into()
+        }
+        // Answer, deliver a message, and drop the connection.
+        Packet::Subscribe(sub) if conn == 0 => common::Reply::close_after(vec![
+            Packet::SubAck(SubAck {
+                packet_id: sub.packet_id,
+                reason_codes: vec![ReasonCode::GrantedQos0],
+                properties: Default::default(),
+            }),
+            Packet::Publish(Publish {
+                dup: false,
+                qos: mqtt::QoS::QoS0,
+                retain: false,
+                topic: "race/t".into(),
+                packet_id: None,
+                payload: "x".into(),
+                properties: Default::default(),
+            }),
+        ]),
+        _ => common::Reply::none(),
+    });
+
+    let cli = mqtt::AsyncClient::new(broker.uri.clone()).unwrap();
+    // Keeps the callback thread busy until well after the reconnect.
+    cli.set_message_callback(|_, msg| {
+        if msg.is_some() {
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    });
+    let opts = mqtt::ConnectOptionsBuilder::new_v5()
+        .automatic_reconnect(Duration::from_millis(10), Duration::from_millis(100))
+        .finalize();
+    cli.connect(opts).wait().expect("connect failed");
+    cli.subscribe("race/t", 0).wait().expect("subscribe failed");
+
+    assert!(
+        broker.wait_until(TIMEOUT, |pkts| {
+            pkts.iter()
+                .filter(|p| matches!(p, Packet::Connect(_)))
+                .count()
+                == 2
+        }),
+        "the client should have reconnected"
+    );
+    // Long enough for the callback thread to reach the `ConnectionLost`.
+    std::thread::sleep(Duration::from_millis(1000));
+
+    assert_eq!(cli.state(), mqtt::ConnectionState::Connected);
+    assert!(cli.is_connected());
+}
+
+/// The state has already moved on when the `connection_lost` callback runs:
+/// `Disconnected` without automatic reconnect, `Retrying` with it.
+#[test]
+fn test_connection_lost_callback_sees_the_new_state() {
+    use mqtt::paho_mqtt_codec::{ConnAck, Packet, ReasonCode};
+    use std::sync::{Arc, Mutex};
+
+    for auto_reconnect in [false, true] {
+        // Drops the first connection on the SUBSCRIBE; accepts the second.
+        let broker = common::spawn_broker_seq(2, |pkt, conn| match pkt {
+            Packet::Connect(_) => {
+                vec![Packet::ConnAck(ConnAck::new(false, ReasonCode::Success))].into()
+            }
+            Packet::Subscribe(_) if conn == 0 => common::Reply::close_after(Vec::new()),
+            _ => common::Reply::none(),
+        });
+
+        let cli = mqtt::AsyncClient::new(broker.uri.clone()).unwrap();
+        let seen: Arc<Mutex<Option<mqtt::ConnectionState>>> = Arc::default();
+        let s = Arc::clone(&seen);
+        cli.set_connection_lost_callback(move |cli| *s.lock().unwrap() = Some(cli.state()));
+
+        let mut opts = mqtt::ConnectOptionsBuilder::new_v5();
+        if auto_reconnect {
+            // Long enough that the client is still waiting when it is seen.
+            opts.automatic_reconnect(Duration::from_secs(2), Duration::from_secs(2));
+        }
+        cli.connect(opts.finalize()).wait().expect("connect failed");
+        assert_eq!(cli.state(), mqtt::ConnectionState::Connected);
+        let _sub = cli.subscribe("lost/t", 0);
+
+        let deadline = std::time::Instant::now() + TIMEOUT;
+        while seen.lock().unwrap().is_none() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let expected = if auto_reconnect {
+            mqtt::ConnectionState::Retrying
+        } else {
+            mqtt::ConnectionState::Disconnected
+        };
+        assert_eq!(
+            *seen.lock().unwrap(),
+            Some(expected),
+            "auto_reconnect = {auto_reconnect}"
+        );
+        if !auto_reconnect {
+            assert!(!cli.is_connected());
+        }
+        cli.disconnect(None).wait().ok();
+        assert_eq!(cli.state(), mqtt::ConnectionState::Disconnected);
+    }
+}
+
+/// While a disconnect waits for in-flight work, new operations are answered
+/// at once instead of waiting for it to finish: the client reports
+/// `Disconnecting`, and a publish (with no offline buffering) and a
+/// subscribe fail straight away with `Disconnected`.
+#[test]
+fn test_operations_during_disconnect_fail_at_once() {
+    use mqtt::paho_mqtt_codec::{ConnAck, Packet, ReasonCode};
+    use std::time::Instant;
+
+    // Acknowledges nothing after the CONNACK, so the drain runs its course.
+    let broker = common::spawn_broker(|pkt| match pkt {
+        Packet::Connect(_) => vec![Packet::ConnAck(ConnAck::new(false, ReasonCode::Success))],
+        _ => Vec::new(),
+    });
+
+    let cli = mqtt::AsyncClient::new(broker.uri.clone()).unwrap();
+    cli.connect(mqtt::ConnectOptionsBuilder::new_v5().finalize())
+        .wait()
+        .expect("connect failed");
+    let _in_flight = cli.publish(mqtt::Message::new("drain/t", "1", mqtt::QOS_1));
+
+    let drain = Duration::from_secs(2);
+    let disc = cli.disconnect(mqtt::DisconnectOptions::with_timeout(drain));
+    let start = Instant::now();
+    while cli.state() != mqtt::ConnectionState::Disconnecting {
+        assert!(start.elapsed() < TIMEOUT, "never started disconnecting");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(!cli.is_connected());
+
+    let t = Instant::now();
+    let res = cli
+        .publish(mqtt::Message::new("drain/t", "2", mqtt::QOS_1))
+        .wait_for(Duration::from_millis(500));
+    assert!(matches!(res, Err(mqtt::Error::Disconnected)), "{res:?}");
+    let res = cli
+        .subscribe("drain/#", 1)
+        .wait_for(Duration::from_millis(500));
+    assert!(matches!(res, Err(mqtt::Error::Disconnected)), "{res:?}");
+    assert!(
+        t.elapsed() < Duration::from_secs(1),
+        "answered during the drain"
+    );
+
+    disc.wait_for(TIMEOUT).expect("disconnect failed");
+    assert!(start.elapsed() >= drain - Duration::from_millis(100));
+    assert_eq!(cli.state(), mqtt::ConnectionState::Disconnected);
+}

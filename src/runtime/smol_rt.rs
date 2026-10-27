@@ -397,6 +397,7 @@ mod tests {
     use super::*;
     use crate::runtime::{
         Command, Event,
+        commands::StateCell,
         session::{Dispatch, run_event_loop},
     };
 
@@ -420,6 +421,7 @@ mod tests {
                 persist_qos0: true,
                 persist_timeout: std::time::Duration::from_secs(30),
             },
+            StateCell::new(),
         ));
     }
 }

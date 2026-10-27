@@ -29,9 +29,10 @@
 //! The synchronous calls use a default timeout
 
 use crate::{
-    AsyncClient, AsyncReceiver, ConnectOptions, ConnectResponse, CreateOptions, DeliveryToken,
-    DisconnectOptions, Error, Event, Message, MqttVersion, Properties, PublishResponse, QoS,
-    ReasonCode, Result, SubscribeOptions, SubscribeResponse, SyncReceiver, UserData,
+    AsyncClient, AsyncReceiver, ConnectOptions, ConnectResponse, ConnectionState, CreateOptions,
+    DeliveryToken, DisconnectOptions, Error, Event, Message, MqttVersion, Properties,
+    PublishResponse, QoS, ReasonCode, Result, SubscribeOptions, SubscribeResponse, SyncReceiver,
+    UserData,
 };
 use std::time::Duration;
 
@@ -154,6 +155,12 @@ impl Client {
     /// Determines if this client is currently connected to an MQTT broker.
     pub fn is_connected(&self) -> bool {
         self.cli.is_connected()
+    }
+
+    /// Where the client's connection to the broker stands; see
+    /// [`AsyncClient::state`].
+    pub fn state(&self) -> ConnectionState {
+        self.cli.state()
     }
 
     /// Publishes a message to an MQTT broker

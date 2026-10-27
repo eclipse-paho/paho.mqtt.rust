@@ -233,6 +233,7 @@ pub use crate::client::Client;
 
 pub use crate::{
     connect_options::{ConnectOptions, ConnectOptionsBuilder},
+    connection_state::ConnectionState,
     create_options::{CreateOptions, CreateOptionsBuilder, RuntimeMode},
     disconnect_options::{DisconnectOptions, DisconnectOptionsBuilder},
     error::{Error, Result},
@@ -269,6 +270,9 @@ pub mod create_options;
 
 /// Options for connecting to the server.
 pub mod connect_options;
+
+/// The state of the client's connection to the server.
+pub mod connection_state;
 
 /// Options for creating secure connections to the server.
 pub mod tls_options;

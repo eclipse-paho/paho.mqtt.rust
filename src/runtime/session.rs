@@ -60,15 +60,15 @@ use paho_mqtt_codec::{
 use super::{
     backend::{Backend, READ_CHUNK, Sleep},
     commands::{
-        BufConfig, Command, ConnectParams, Event, MAX_PACKET_IDS, SessionLimits,
-        assigned_client_id, negotiated_keep_alive,
+        BufConfig, Command, ConnectParams, Event, MAX_PACKET_IDS, SessionLimits, StateCell,
+        StateView, assigned_client_id, negotiated_keep_alive,
     },
     outbox::Outbox,
     persist::{PersistWorker, Store},
     sinks::{Parked, Sinks, chain},
 };
 use crate::{
-    Error, Message, Result,
+    ConnectionState, Error, Message, Result,
     persistence::ClientPersistence,
     responses::{ConnectResponse, PublishResponse, SubscribeResponse, UnsubscribeResponse},
     token::Completer,
@@ -86,6 +86,7 @@ pub(crate) struct RuntimeHandle {
     cmd_tx: async_channel::Sender<Command>,
     event_rx: async_channel::Receiver<Event>,
     dispatch: Dispatch,
+    state: StateView,
 }
 
 /// What the event-dispatcher thread and the event loop share.
@@ -133,27 +134,33 @@ impl RuntimeHandle {
         let (cmd_tx, cmd_rx) = async_channel::unbounded::<Command>();
         let (event_tx, event_rx) = async_channel::unbounded::<Event>();
         let dispatch = Dispatch::new();
-        let task = run_event_loop::<B>(cmd_rx, event_tx, dispatch.clone(), buf_cfg);
+        // The loop keeps the only writable handle on the state.
+        let state = StateCell::new();
+        let view = state.view();
+        let task = run_event_loop::<B>(cmd_rx, event_tx, dispatch.clone(), buf_cfg, state);
         (
             Self {
                 cmd_tx,
                 event_rx,
                 dispatch,
+                state: view,
             },
             task,
         )
     }
 
     /// Consumes the handle, returning the command sender, the event
-    /// receiver, and the link the event dispatcher shares with the loop.
+    /// receiver, the link the event dispatcher shares with the loop, and a
+    /// read-only view of the connection state the loop keeps.
     pub(crate) fn into_parts(
         self,
     ) -> (
         async_channel::Sender<Command>,
         async_channel::Receiver<Event>,
         Dispatch,
+        StateView,
     ) {
-        (self.cmd_tx, self.event_rx, self.dispatch)
+        (self.cmd_tx, self.event_rx, self.dispatch, self.state)
     }
 }
 
@@ -918,7 +925,8 @@ struct Negotiated {
     limits: SessionLimits,
 }
 
-/// Where inbound messages go, and how many may be outstanding there.
+/// Where inbound messages and news of the connection go, and how many
+/// messages may be outstanding there.
 ///
 /// The channel carries every event to the dispatcher; the gate counts only
 /// the messages among them, so that a slow consumer holds the session back
@@ -930,6 +938,29 @@ struct Delivery {
     /// The application's own streams, lent to the session for the life of
     /// the connection and taken back when it ends.
     sinks: Sinks,
+    /// The client's connection state, which the session moves on for the
+    /// two endings it sees first: a `disconnect()` and a server DISCONNECT.
+    conn_state: StateCell,
+    /// What a lost connection becomes: [`Retrying`] with automatic
+    /// reconnect, [`Disconnected`] without.
+    ///
+    /// [`Retrying`]: ConnectionState::Retrying
+    /// [`Disconnected`]: ConnectionState::Disconnected
+    after_loss: ConnectionState,
+}
+
+/// What the event loop lends a session for the life of a connection and
+/// takes back when it ends, because it belongs to the client rather than to
+/// one connection.
+struct Lent {
+    /// Where in-flight QoS 1/2 messages are stored, if anywhere.
+    persist: Persist,
+    /// The send-while-disconnected buffer: publishes made while there was no
+    /// connection, which the session sends first, and those made while a
+    /// disconnect is in progress, which it adds for the next connection.
+    buf: VecDeque<Command>,
+    /// The buffer's configuration.
+    buf_cfg: BufConfig,
 }
 
 /// Holds all mutable state for a connected MQTT session.
@@ -994,6 +1025,19 @@ struct Session<B: Backend> {
     /// re-transmission alike, and (un)subscribes. Drained in order as
     /// acknowledgements free slots and identifiers.
     inflight_deferred: VecDeque<Deferred>,
+    /// The client's connection state; see [`Delivery::conn_state`].
+    conn_state: StateCell,
+    /// See [`Delivery::after_loss`].
+    after_loss: ConnectionState,
+    /// The send-while-disconnected buffer; see [`Lent::buf`].
+    buf: VecDeque<Command>,
+    buf_cfg: BufConfig,
+    /// A `connect()` that arrived while a disconnect was in progress, for the
+    /// event loop to run once it has completed.
+    held_connect: Option<Command>,
+    /// Further `disconnect()` calls made while one was in progress, resolved
+    /// when it completes.
+    held_disconnects: Vec<Completer<()>>,
 }
 
 impl<B: Backend> Session<B> {
@@ -1007,7 +1051,7 @@ impl<B: Backend> Session<B> {
         read_buf: BytesMut,
         negotiated: Negotiated,
         delivery: Delivery,
-        persist: Persist,
+        lent: Lent,
         state: SessionState,
     ) -> Self {
         let Negotiated {
@@ -1019,7 +1063,14 @@ impl<B: Backend> Session<B> {
             event_tx,
             dispatch,
             sinks,
+            conn_state,
+            after_loss,
         } = delivery;
+        let Lent {
+            persist,
+            buf,
+            buf_cfg,
+        } = lent;
         Self {
             writer,
             ver,
@@ -1041,6 +1092,12 @@ impl<B: Backend> Session<B> {
             limits,
             topic_aliases: HashMap::new(),
             inflight_deferred: VecDeque::new(),
+            conn_state,
+            after_loss,
+            buf,
+            buf_cfg,
+            held_connect: None,
+            held_disconnects: Vec::new(),
         }
     }
 
@@ -1509,15 +1566,15 @@ impl<B: Backend> Session<B> {
     ///
     /// Any failure — resume, flush, or run — surfaces as one `Err`, so the
     /// caller tears the session down the same way in every case. Commands
-    /// still in `buf` when a flush fails stay there for the next connection.
+    /// still in the buffer when a flush fails stay there for the next
+    /// connection.
     async fn serve(
         &mut self,
         reader: &mut B::Reader,
         cmd_rx: &async_channel::Receiver<Command>,
-        buf: &mut VecDeque<Command>,
         resumed: bool,
     ) -> Result<()> {
-        let res = self.serve_inner(reader, cmd_rx, buf, resumed).await;
+        let res = self.serve_inner(reader, cmd_rx, resumed).await;
 
         // A v5 receiver that rejects a packet must say why before closing
         // (§4.13). Best-effort, and bounded: the connection may already be
@@ -1529,7 +1586,7 @@ impl<B: Backend> Session<B> {
                 .queue(&Packet::Disconnect(Disconnect::with_properties(rc, None)))
                 .is_ok()
         {
-            self.drain_outbox(reader, CLOSE_CAP).await;
+            self.drain_outbox(reader, CLOSE_CAP, None).await;
         }
         res
     }
@@ -1538,14 +1595,13 @@ impl<B: Backend> Session<B> {
         &mut self,
         reader: &mut B::Reader,
         cmd_rx: &async_channel::Receiver<Command>,
-        buf: &mut VecDeque<Command>,
         resumed: bool,
     ) -> Result<()> {
         // Both only queue: the run loop's first pass writes the result. A
         // long outage can leave a lot here, well past `HIGH_WATER`; the loop
         // then takes no new commands until it has drained.
         self.resume(resumed)?;
-        while let Some(cmd) = buf.pop_front() {
+        while let Some(cmd) = self.buf.pop_front() {
             // Only publishes are ever buffered.
             self.handle_command(cmd)?;
         }
@@ -1744,7 +1800,7 @@ impl<B: Backend> Session<B> {
                 }
                 // The API was dropped: send what is already queued, then stop.
                 LoopEvent::Command(Err(_)) => {
-                    self.drain_outbox(reader, CLOSE_CAP).await;
+                    self.drain_outbox(reader, CLOSE_CAP, None).await;
                     return Ok(());
                 }
                 LoopEvent::Command(Ok(cmd)) => {
@@ -1764,7 +1820,7 @@ impl<B: Backend> Session<B> {
                         n += 1;
                     }
                     if let Flow::Disconnect(req) = flow {
-                        self.disconnect(req, reader).await;
+                        self.disconnect(req, reader, cmd_rx).await;
                         return Ok(());
                     }
                     if self.write_now()? && ka_enabled {
@@ -1855,19 +1911,96 @@ impl<B: Backend> Session<B> {
 
     /// Performs an orderly disconnect, then resolves its token.
     ///
-    /// With a timeout, in-flight operations get up to that long to be
-    /// acknowledged first. The DISCONNECT then goes out behind everything
-    /// already queued, given up to [`CLOSE_CAP`] to be written.
-    async fn disconnect(&mut self, req: DisconnectReq, reader: &mut B::Reader) {
+    /// The client is [`Disconnecting`] from here until the DISCONNECT has
+    /// gone: with a timeout, in-flight operations get up to that long to be
+    /// acknowledged first, and the DISCONNECT then goes out behind
+    /// everything already queued, given up to [`CLOSE_CAP`] to be written.
+    ///
+    /// Commands keep being answered meanwhile, by
+    /// [`handle_while_disconnecting`], so that nothing the application does
+    /// waits for the drain to finish; see there for what each one gets.
+    ///
+    /// [`Disconnecting`]: ConnectionState::Disconnecting
+    /// [`handle_while_disconnecting`]: Self::handle_while_disconnecting
+    async fn disconnect(
+        &mut self,
+        req: DisconnectReq,
+        reader: &mut B::Reader,
+        cmd_rx: &async_channel::Receiver<Command>,
+    ) {
+        self.conn_state.set(ConnectionState::Disconnecting);
+        let mut cmds = Some(cmd_rx);
         if !req.timeout.is_zero() && self.has_pending() {
-            self.drain_pending(reader, req.timeout).await;
+            self.drain_pending(reader, req.timeout, &mut cmds).await;
         }
         let disc = Disconnect::with_properties(req.reason_code, req.props);
         if self.queue(&Packet::Disconnect(disc)).is_ok() {
-            self.drain_outbox(reader, CLOSE_CAP).await;
+            self.drain_outbox(reader, CLOSE_CAP, cmds).await;
         }
-        req.connected_flag.store(false, Ordering::SeqCst);
+        self.conn_state.set(ConnectionState::Disconnected);
         req.tx.complete(Ok(()));
+        for tx in self.held_disconnects.drain(..) {
+            tx.complete(Ok(()));
+        }
+    }
+
+    /// Answers a command that arrives while a disconnect is in progress.
+    ///
+    /// Each gets what the event loop would give it a moment later, once the
+    /// connection is gone, rather than waiting in the channel until then —
+    /// the drain can last as long as the disconnect's timeout. New work is
+    /// not started on the closing connection: the drain exists to finish
+    /// what was already under way, and work added to it could keep it going
+    /// indefinitely.
+    ///
+    /// - `publish()` follows the send-while-disconnected rules for a client
+    ///   that has been connected: buffered for the next connection, or
+    ///   failed with [`Error::Disconnected`].
+    /// - `subscribe()` and `unsubscribe()` fail with [`Error::Disconnected`].
+    /// - `connect()` is held, and run by the event loop once the disconnect
+    ///   completes, so `disconnect()` followed by `connect()` reconnects. A
+    ///   second one fails, as a second connect during an attempt does.
+    /// - A further `disconnect()` is resolved when this one completes.
+    fn handle_while_disconnecting(&mut self, cmd: Command) {
+        match cmd {
+            Command::Disconnect { tx, .. } => self.held_disconnects.push(tx),
+            cmd @ Command::Connect { .. } if self.held_connect.is_none() => {
+                self.held_connect = Some(cmd);
+            }
+            Command::Connect { tx, .. } => {
+                tx.complete(Err(Error::General("connect already in progress")));
+            }
+            cmd => {
+                // This client has been connected, so the rule is the one
+                // `run_event_loop` applies after a connection.
+                let should_buf =
+                    self.buf_cfg.allow_send_any_time || self.buf_cfg.send_while_disconnected;
+                let handled = handle_offline_command(
+                    cmd,
+                    &mut self.buf,
+                    &self.buf_cfg,
+                    should_buf,
+                    &mut self.sinks,
+                );
+                debug_assert!(matches!(handled, Offline::Handled));
+            }
+        }
+    }
+
+    /// Takes the next command for [`handle_while_disconnecting`], or pends
+    /// forever when `cmds` is `None`. The channel closing — the API was
+    /// dropped — sets `cmds` to `None`, so it is not polled again.
+    ///
+    /// [`handle_while_disconnecting`]: Self::handle_while_disconnecting
+    fn command_while_disconnecting(
+        &mut self,
+        cmds: &mut Option<&async_channel::Receiver<Command>>,
+        cmd: std::result::Result<Command, async_channel::RecvError>,
+    ) {
+        match cmd {
+            Ok(cmd) => self.handle_while_disconnecting(cmd),
+            Err(_) => *cmds = None,
+        }
     }
 
     /// Writes and flushes what the outbox holds, for up to `cap`, as the
@@ -1876,7 +2009,17 @@ impl<B: Backend> Session<B> {
     /// It keeps reading, since a peer that is itself blocked writing to us
     /// could otherwise deadlock the two of us, but discards what it reads:
     /// anything that came of handling it would be queued behind a DISCONNECT.
-    async fn drain_outbox(&mut self, reader: &mut B::Reader, cap: Duration) {
+    ///
+    /// With `cmds`, during an orderly disconnect, it also answers commands
+    /// as they arrive; see [`handle_while_disconnecting`].
+    ///
+    /// [`handle_while_disconnecting`]: Self::handle_while_disconnecting
+    async fn drain_outbox(
+        &mut self,
+        reader: &mut B::Reader,
+        cap: Duration,
+        mut cmds: Option<&async_channel::Receiver<Command>>,
+    ) {
         let mut deadline = B::Sleep::new(cap);
         loop {
             self.out.prepare_write();
@@ -1894,6 +2037,7 @@ impl<B: Backend> Session<B> {
                 }
                 res = B::read_buf(reader, &mut self.read_buf).fuse() => LoopEvent::Read(res),
                 _ = persist_when(&self.persist, awaited).fuse() => LoopEvent::Persisted,
+                cmd = recv_opt(cmds).fuse() => LoopEvent::Command(cmd),
                 _ = deadline => return,
             };
             match ev {
@@ -1904,6 +2048,7 @@ impl<B: Backend> Session<B> {
                 }
                 LoopEvent::Persisted => self.release_persisted(),
                 LoopEvent::Read(Ok(n)) if n > 0 => self.read_buf.clear(),
+                LoopEvent::Command(cmd) => self.command_while_disconnecting(&mut cmds, cmd),
                 _ => return,
             }
         }
@@ -1917,8 +2062,17 @@ impl<B: Backend> Session<B> {
     /// too: the packets awaiting those ACKs, and what handling them queues,
     /// may not have gone out yet. A closed connection, I/O error, or
     /// undecodable packet ends the drain early; the caller sends DISCONNECT
-    /// regardless.
-    async fn drain_pending(&mut self, reader: &mut B::Reader, timeout: Duration) {
+    /// regardless. Commands that arrive meanwhile are answered, not left
+    /// waiting; see [`handle_while_disconnecting`]. `cmds` is left `None` if
+    /// the channel closed.
+    ///
+    /// [`handle_while_disconnecting`]: Self::handle_while_disconnecting
+    async fn drain_pending(
+        &mut self,
+        reader: &mut B::Reader,
+        timeout: Duration,
+        cmds: &mut Option<&async_channel::Receiver<Command>>,
+    ) {
         let mut deadline = B::Sleep::new(timeout);
 
         let mut passes = 0u32;
@@ -1933,6 +2087,7 @@ impl<B: Backend> Session<B> {
                     LoopEvent::Writer(res)
                 }
                 res = B::read_buf(reader, &mut self.read_buf).fuse() => LoopEvent::Read(res),
+                cmd = recv_opt(*cmds).fuse() => LoopEvent::Command(cmd),
                 _ = deadline => return,
             };
             match ev {
@@ -1954,6 +2109,7 @@ impl<B: Backend> Session<B> {
                     }
                     let _ = self.release_held();
                 }
+                LoopEvent::Command(cmd) => self.command_while_disconnecting(cmds, cmd),
                 _ => return,
             }
         }
@@ -2137,6 +2293,9 @@ impl<B: Backend> Session<B> {
                 // before it.
                 let flushed = self.flush_held();
                 let (reason_code, props) = (disc.reason_code, disc.properties);
+                // The state moves on before anyone hears of the disconnect,
+                // so a callback or stream reading it sees where things stand.
+                self.conn_state.set(self.after_loss);
                 self.deliver(Event::Disconnected {
                     reason_code,
                     props: props.clone(),
@@ -2354,14 +2513,12 @@ impl<B: Backend> Session<B> {
                 reason_code,
                 props,
                 tx,
-                connected_flag,
             } => {
                 return Ok(Flow::Disconnect(DisconnectReq {
                     timeout,
                     reason_code,
                     props,
                     tx,
-                    connected_flag,
                 }));
             }
         }
@@ -2508,6 +2665,17 @@ async fn recv_when(
     }
 }
 
+/// Receives the next command, or pends forever when there is no channel to
+/// receive from.
+async fn recv_opt(
+    rx: Option<&async_channel::Receiver<Command>>,
+) -> std::result::Result<Command, async_channel::RecvError> {
+    match rx {
+        Some(rx) => rx.recv().await,
+        None => pending().await,
+    }
+}
+
 /// What the run loop should do after a command.
 enum Flow {
     Continue,
@@ -2522,7 +2690,6 @@ struct DisconnectReq {
     reason_code: ReasonCode,
     props: Properties,
     tx: Completer<()>,
-    connected_flag: Arc<AtomicBool>,
 }
 
 /////////////////////////////////////////////////////////////////////////////
@@ -2536,7 +2703,6 @@ struct ConnectJob {
     params: Box<ConnectParams>,
     /// Index into `params.servers` for the current connection attempt.
     server_idx: usize,
-    connected_flag: Arc<AtomicBool>,
     assigned_id: Arc<RwLock<Option<String>>>,
     persist: Option<Arc<Mutex<Box<dyn ClientPersistence>>>>,
 }
@@ -2618,10 +2784,10 @@ fn buf_push(buf: &mut VecDeque<Command>, cmd: Command, cfg: &BufConfig) {
 enum Offline {
     /// Buffered, or its token was resolved; nothing else to do.
     Handled,
-    /// `disconnect()` was called. Its token is resolved and the connected
-    /// flag cleared; whatever the caller was doing (waiting, connecting,
-    /// backing off) should stop.
-    Disconnect,
+    /// `disconnect()` was called. Whatever the caller was doing (waiting,
+    /// connecting, backing off) should stop; the token is resolved by
+    /// [`finish_disconnect`] once it has.
+    Disconnect(Completer<()>),
     /// `connect()` was called: new parameters and the token to resolve.
     Connect(Box<ConnectJob>, Completer<ConnectResponse>),
 }
@@ -2630,8 +2796,12 @@ enum Offline {
 ///
 /// `Publish` is buffered when `should_buf` allows it (QoS 0 is dropped as
 /// `Ok` when `persist_qos0` is off); otherwise it, `Subscribe`, and
-/// `Unsubscribe` fail with [`Error::Disconnected`]. `Disconnect` is satisfied
-/// on the spot. `Connect` is handed back to the caller.
+/// `Unsubscribe` fail with [`Error::Disconnected`]. `Connect` and
+/// `Disconnect` are handed back to the caller: a disconnect stops whatever
+/// the caller was doing, and the caller resolves its token once it has
+/// recorded the client as [`Disconnected`] — see [`finish_disconnect`].
+///
+/// [`Disconnected`]: ConnectionState::Disconnected
 fn handle_offline_command(
     cmd: Command,
     buf: &mut VecDeque<Command>,
@@ -2653,26 +2823,18 @@ fn handle_offline_command(
         Command::Connect {
             params,
             tx,
-            connected_flag,
             assigned_id,
             persist,
         } => Offline::Connect(
             Box::new(ConnectJob {
                 params,
                 server_idx: 0,
-                connected_flag,
                 assigned_id,
                 persist,
             }),
             tx,
         ),
-        Command::Disconnect {
-            tx, connected_flag, ..
-        } => {
-            connected_flag.store(false, Ordering::SeqCst);
-            tx.complete(Ok(()));
-            Offline::Disconnect
-        }
+        Command::Disconnect { tx, .. } => Offline::Disconnect(tx),
         Command::Publish {
             qos: QoS::QoS0, tx, ..
         } if should_buf && !cfg.persist_qos0 => {
@@ -2704,9 +2866,9 @@ enum Attempt<B: Backend> {
     Connected(Connected<B>),
     /// The attempt failed or timed out.
     Failed(Error),
-    /// `disconnect()` was called mid-attempt (or the API was dropped); the
-    /// half-open connection was discarded.
-    Aborted,
+    /// `disconnect()` was called mid-attempt, with its token, or the API was
+    /// dropped; the half-open connection was discarded.
+    Aborted(Option<Completer<()>>),
 }
 
 /// Runs [`do_connect`] for `job.server_idx` under the job's connect timeout
@@ -2744,13 +2906,13 @@ async fn attempt_connect<B: Backend>(
         };
         match cmd {
             // API dropped: nothing will ever use the connection.
-            Err(_) => return Attempt::Aborted,
+            Err(_) => return Attempt::Aborted(None),
             Ok(Command::Connect { tx, .. }) => {
                 tx.complete(Err(Error::General("connect already in progress")));
             }
             Ok(cmd) => match handle_offline_command(cmd, buf, buf_cfg, should_buf, sinks) {
                 Offline::Handled => {}
-                Offline::Disconnect => return Attempt::Aborted,
+                Offline::Disconnect(tx) => return Attempt::Aborted(Some(tx)),
                 Offline::Connect(..) => unreachable!("Connect is matched above"),
             },
         }
@@ -2769,13 +2931,24 @@ async fn report_tls_error(event_tx: &async_channel::Sender<Event>, err: &Error) 
     }
 }
 
+/// Ends a `disconnect()` made while there was no session: records the
+/// client as [`Disconnected`](ConnectionState::Disconnected), then resolves
+/// the token, so that the state has changed by the time the caller sees it
+/// complete. `tx` is `None` when the API was dropped instead.
+fn finish_disconnect(conn_state: &StateCell, tx: Option<Completer<()>>) {
+    conn_state.set(ConnectionState::Disconnected);
+    if let Some(tx) = tx {
+        tx.complete(Ok(()));
+    }
+}
+
 /// Result of waiting for the reconnect timer to fire.
 enum WaitOutcome {
     /// Timer expired — proceed with the current [`ConnectJob`].
     Retry,
-    /// A `Disconnect` command arrived (or the API was dropped); abandon the
-    /// reconnect loop.
-    Abort,
+    /// A `Disconnect` command arrived, with its token, or the API was
+    /// dropped; abandon the reconnect loop.
+    Abort(Option<Completer<()>>),
     /// A new `Connect` command arrived with updated parameters; use these
     /// for the next attempt and resolve the supplied token with the result.
     Replace(Box<ConnectJob>, Completer<ConnectResponse>),
@@ -2799,7 +2972,7 @@ async fn reconnect_wait<B: Backend>(
             res = cmd_rx.recv().fuse() => res,
         };
         match result {
-            Err(_) => return WaitOutcome::Abort,
+            Err(_) => return WaitOutcome::Abort(None),
             Ok(cmd) => {
                 match handle_offline_command(
                     cmd,
@@ -2809,7 +2982,7 @@ async fn reconnect_wait<B: Backend>(
                     sinks,
                 ) {
                     Offline::Handled => {}
-                    Offline::Disconnect => return WaitOutcome::Abort,
+                    Offline::Disconnect(tx) => return WaitOutcome::Abort(Some(tx)),
                     Offline::Connect(job, tx) => return WaitOutcome::Replace(job, tx),
                 }
             }
@@ -2879,6 +3052,7 @@ pub(crate) async fn run_event_loop<B: Backend>(
     event_tx: async_channel::Sender<Event>,
     dispatch: Dispatch,
     buf_cfg: BufConfig,
+    conn_state: StateCell,
 ) {
     // Buffer for Publish commands received while disconnected.
     let mut buf: VecDeque<Command> = VecDeque::new();
@@ -2892,6 +3066,9 @@ pub(crate) async fn run_event_loop<B: Backend>(
     // one: built when the first connection brings a store, kept for as
     // long as the client, and lent to each session the same way.
     let mut persist = Persist::None;
+    // A `connect()` made while a disconnect was in progress, run as soon as
+    // it has completed.
+    let mut held_connect: Option<Command> = None;
 
     'outer: loop {
         // Message state belongs to the session, not the connection, so it is
@@ -2900,17 +3077,22 @@ pub(crate) async fn run_event_loop<B: Backend>(
 
         // ---- Wait for a Connect command ----
         let (mut job, mut tx_opt) = loop {
-            let cmd = match cmd_rx.recv().await {
-                Ok(cmd) => cmd,
-                Err(_) => return,
+            let cmd = match held_connect.take() {
+                Some(cmd) => cmd,
+                None => match cmd_rx.recv().await {
+                    Ok(cmd) => cmd,
+                    Err(_) => return,
+                },
             };
             let should_buf =
                 buf_cfg.allow_send_any_time || (ever_connected && buf_cfg.send_while_disconnected);
             match handle_offline_command(cmd, &mut buf, &buf_cfg, should_buf, &mut sinks) {
-                Offline::Handled | Offline::Disconnect => {}
+                Offline::Handled => {}
+                Offline::Disconnect(tx) => finish_disconnect(&conn_state, Some(tx)),
                 Offline::Connect(job, tx) => break (job, Some(tx)),
             }
         };
+        conn_state.set(ConnectionState::Connecting);
 
         // `false` for the initial connect (each server tried once, then the
         // caller is told); `true` once a session has been lost and
@@ -2966,7 +3148,10 @@ pub(crate) async fn run_event_loop<B: Backend>(
                             report_tls_error(&event_tx, &e).await;
                             last_err = Some(e);
                         }
-                        Attempt::Aborted => continue 'outer,
+                        Attempt::Aborted(tx) => {
+                            finish_disconnect(&conn_state, tx);
+                            continue 'outer;
+                        }
                     }
                 }
                 match result {
@@ -2979,15 +3164,20 @@ pub(crate) async fn run_event_loop<B: Backend>(
                 match reconnect_wait::<B>(retry_delay, &cmd_rx, &mut buf, &buf_cfg, &mut sinks)
                     .await
                 {
-                    WaitOutcome::Abort => break 'retry,
+                    WaitOutcome::Abort(tx) => {
+                        finish_disconnect(&conn_state, tx);
+                        break 'retry;
+                    }
                     WaitOutcome::Retry => {
                         // Advance to the next server in round-robin order.
                         let n = job.params.servers.len();
                         job.server_idx = (job.server_idx + 1) % n;
+                        conn_state.set(ConnectionState::Reconnecting);
                     }
                     WaitOutcome::Replace(new_job, new_tx) => {
                         // Explicit reconnect/connect: use the new params and
                         // reset the backoff.
+                        conn_state.set(ConnectionState::Connecting);
                         job = new_job;
                         retry_delay = job.params.min_retry_interval;
                         tx_opt = Some(new_tx);
@@ -3015,9 +3205,19 @@ pub(crate) async fn run_event_loop<B: Backend>(
                 connack,
                 read_buf,
             } = match attempt {
-                Attempt::Aborted => break 'retry,
-                // A TLS failure was reported as it happened, above.
+                Attempt::Aborted(tx) => {
+                    finish_disconnect(&conn_state, tx);
+                    break 'retry;
+                }
+                // A TLS failure was reported as it happened, above. A failed
+                // first connect is not retried; a failed reconnect waits for
+                // the next attempt.
                 Attempt::Failed(err) => {
+                    conn_state.set(if reconnecting {
+                        ConnectionState::Retrying
+                    } else {
+                        ConnectionState::Disconnected
+                    });
                     if let Some(tx) = tx_opt.take() {
                         tx.complete(Err(err));
                     }
@@ -3067,9 +3267,9 @@ pub(crate) async fn run_event_loop<B: Backend>(
             }
 
             let response = build_connect_response(&job, connack);
-            // Set the flag before resolving the token so `is_connected()` is
+            // Set the state before resolving the token so `is_connected()` is
             // true as soon as `wait()` / `.await` returns in the caller.
-            job.connected_flag.store(true, Ordering::SeqCst);
+            conn_state.set(ConnectionState::Connected);
             ever_connected = true;
             let _ = event_tx.send(Event::Connected(response.clone())).await;
             // Event streams see the connection come up before any of its
@@ -3082,6 +3282,11 @@ pub(crate) async fn run_event_loop<B: Backend>(
             }
 
             let flush_needed = job.params.servers[job.server_idx].0.buffers_writes();
+            let after_loss = if job.params.auto_reconnect {
+                ConnectionState::Retrying
+            } else {
+                ConnectionState::Disconnected
+            };
             let mut session = Session::<B>::new(
                 writer,
                 flush_needed,
@@ -3095,11 +3300,17 @@ pub(crate) async fn run_event_loop<B: Backend>(
                     event_tx: event_tx.clone(),
                     dispatch: dispatch.clone(),
                     sinks,
+                    conn_state: conn_state.clone(),
+                    after_loss,
                 },
-                persist,
+                Lent {
+                    persist,
+                    buf: std::mem::take(&mut buf),
+                    buf_cfg,
+                },
                 state,
             );
-            let result = session.serve(&mut reader, &cmd_rx, &mut buf, resumed).await;
+            let result = session.serve(&mut reader, &cmd_rx, resumed).await;
             // A server DISCONNECT has reported itself already, reason code
             // and all, and ended the streams with it; the loop adds nothing.
             let server_disconnect = session.server_disconnect;
@@ -3110,16 +3321,21 @@ pub(crate) async fn run_event_loop<B: Backend>(
             // Carry what is still in flight into the next connection of this
             // session; a clean disconnect below drops it.
             state = session.state;
-            // Take the streams and the store back for the next connection.
+            // Take the streams, the store and the buffer back for the next
+            // connection, and any `connect()` made during a disconnect.
             sinks = session.sinks;
             persist = session.persist;
+            buf = session.buf;
+            held_connect = session.held_connect;
             deliver_offline::<B>(flushed).await;
 
             match result {
                 // Clean disconnect: back to waiting for a Connect.
                 Ok(()) => continue 'outer,
                 Err(e) => {
-                    job.connected_flag.store(false, Ordering::SeqCst);
+                    // Before anyone hears of it. A server DISCONNECT has
+                    // already set this, before reporting itself.
+                    conn_state.set(after_loss);
                     // `ConnectionLost` means the connection was lost
                     // *unexpectedly*. A server DISCONNECT is not that: it
                     // reported itself as `Disconnected`, with the reason,
@@ -3398,6 +3614,22 @@ mod tests {
         dispatch: Dispatch,
         cmd_tx: async_channel::Sender<Command>,
         cmd_rx: async_channel::Receiver<Command>,
+        /// The connection state the session reports.
+        conn: StateView,
+    }
+
+    /// The send-while-disconnected configuration the tests use unless they
+    /// say otherwise: no buffering.
+    fn test_buf_cfg() -> BufConfig {
+        BufConfig {
+            send_while_disconnected: false,
+            max_buffered_msgs: 0,
+            allow_send_any_time: false,
+            delete_oldest: false,
+            restore_msgs: false,
+            persist_qos0: true,
+            persist_timeout: Duration::ZERO,
+        }
     }
 
     /// A session over [`MockBackend`]. The mock transport is treated as one
@@ -3421,6 +3653,9 @@ mod tests {
             wants_messages: Arc::new(AtomicBool::new(true)),
         };
         let gate = dispatch.gate.clone();
+        // As the event loop would leave it for a running session.
+        let conn_state = StateCell::new();
+        conn_state.set(ConnectionState::Connected);
         let session = Session::<MockBackend>::new(
             wire.clone(),
             flush_needed,
@@ -3434,8 +3669,14 @@ mod tests {
                 event_tx,
                 dispatch: dispatch.clone(),
                 sinks: Sinks::default(),
+                conn_state: conn_state.clone(),
+                after_loss: ConnectionState::Disconnected,
             },
-            Persist::None,
+            Lent {
+                persist: Persist::None,
+                buf: VecDeque::new(),
+                buf_cfg: test_buf_cfg(),
+            },
             state,
         );
         Harness {
@@ -3446,6 +3687,7 @@ mod tests {
             dispatch,
             cmd_tx,
             cmd_rx,
+            conn: conn_state.view(),
         }
     }
 
@@ -3490,7 +3732,6 @@ mod tests {
             reason_code: ReasonCode::Success,
             props: Properties::new(),
             tx,
-            connected_flag: Arc::new(AtomicBool::new(true)),
         };
         (tok, cmd)
     }
@@ -3664,20 +3905,14 @@ mod tests {
     fn test_tls_error_reported_for_every_server() {
         let (cmd_tx, cmd_rx) = async_channel::unbounded();
         let (event_tx, event_rx) = async_channel::unbounded();
-        let buf_cfg = BufConfig {
-            send_while_disconnected: false,
-            max_buffered_msgs: 0,
-            allow_send_any_time: false,
-            delete_oldest: false,
-            restore_msgs: false,
-            persist_qos0: true,
-            persist_timeout: Duration::ZERO,
-        };
+        let conn_state = StateCell::new();
+        let conn = conn_state.view();
         let mut task = pin!(run_event_loop::<FailingBackend>(
             cmd_rx,
             event_tx,
             Dispatch::new(),
-            buf_cfg
+            test_buf_cfg(),
+            conn_state,
         ));
 
         let server = |host: &str| {
@@ -3694,7 +3929,6 @@ mod tests {
             .send_blocking(Command::Connect {
                 params: Box::new(p),
                 tx,
-                connected_flag: Arc::new(AtomicBool::new(false)),
                 assigned_id: Arc::new(RwLock::new(None)),
                 persist: None,
             })
@@ -3705,6 +3939,8 @@ mod tests {
         assert!(poll_until(task.as_mut(), Duration::from_millis(100)).is_none());
 
         let res = tok.try_wait().expect("the connect has finished");
+        // A failed first connect is not retried.
+        assert_eq!(conn.get(), ConnectionState::Disconnected);
         assert!(
             matches!(res, Err(Error::Io(ref e)) if e.kind() == io::ErrorKind::ConnectionRefused),
             "the token carries the last server's error: {res:?}"
@@ -4171,6 +4407,132 @@ mod tests {
             store.lock().unwrap().keys().unwrap().is_empty(),
             "the persisted session state goes with it"
         );
+    }
+
+    fn connect_cmd() -> (Token<ConnectResponse>, Command) {
+        let (tok, tx) = Token::new();
+        let cmd = Command::Connect {
+            params: Box::new(params(MqttVersion::V5, true)),
+            tx,
+            assigned_id: Arc::new(RwLock::new(None)),
+            persist: None,
+        };
+        (tok, cmd)
+    }
+
+    fn disconnect_cmd_after(timeout: Duration) -> (Token<()>, Command) {
+        let (tok, tx) = Token::new();
+        let cmd = Command::Disconnect {
+            timeout,
+            reason_code: ReasonCode::Success,
+            props: Properties::new(),
+            tx,
+        };
+        (tok, cmd)
+    }
+
+    /// While a disconnect drains in-flight work, commands are answered at
+    /// once rather than left in the channel until the drain ends: a publish
+    /// as the offline rules say (buffered, or failed), a subscribe failed,
+    /// the first `connect()` held to run afterwards and a second refused, a
+    /// further `disconnect()` resolved together with the first. The state is
+    /// `Disconnecting` throughout, and `Disconnected` by the time the
+    /// disconnect's token resolves.
+    #[test]
+    fn test_commands_during_disconnect_are_answered_at_once() {
+        for buffering in [false, true] {
+            let mut h = harness(BytesMut::new(), Duration::ZERO, SessionState::default());
+            h.session.buf_cfg.send_while_disconnected = buffering;
+            h.session.buf_cfg.max_buffered_msgs = 10;
+
+            // In flight and never acknowledged, so the drain runs its course.
+            let (mut first, c) = publish_cmd("first", QoS::QoS1, Bytes::from_static(b"1"));
+            h.cmd_tx.try_send(c).unwrap();
+            let (mut disc, c) = disconnect_cmd_after(Duration::from_millis(300));
+            h.cmd_tx.try_send(c).unwrap();
+            // All behind the disconnect, so the drain is what takes them.
+            let (mut late_pub, c) = publish_cmd("late", QoS::QoS1, Bytes::from_static(b"2"));
+            h.cmd_tx.try_send(c).unwrap();
+            let (mut late_sub, c) = subscribe_cmd("s/#");
+            h.cmd_tx.try_send(c).unwrap();
+            let (mut conn1, c) = connect_cmd();
+            h.cmd_tx.try_send(c).unwrap();
+            let (mut conn2, c) = connect_cmd();
+            h.cmd_tx.try_send(c).unwrap();
+            let (mut disc2, c) = disconnect_cmd_after(Duration::ZERO);
+            h.cmd_tx.try_send(c).unwrap();
+
+            let mut reader = MockReader::open_with([]);
+            let res = {
+                let mut run = pin!(h.session.run(&mut reader, &h.cmd_rx));
+
+                // Part way through the drain.
+                assert!(poll_until(run.as_mut(), Duration::from_millis(100)).is_none());
+                assert_eq!(h.conn.get(), ConnectionState::Disconnecting);
+                if buffering {
+                    assert!(
+                        late_pub.try_wait().is_none(),
+                        "buffered for the next connection"
+                    );
+                } else {
+                    assert!(matches!(
+                        late_pub.try_wait(),
+                        Some(Err(Error::Disconnected))
+                    ));
+                }
+                assert!(matches!(
+                    late_sub.try_wait(),
+                    Some(Err(Error::Disconnected))
+                ));
+                assert!(
+                    conn1.try_wait().is_none(),
+                    "held until the disconnect completes"
+                );
+                match conn2.try_wait() {
+                    Some(Err(Error::General(why))) => assert!(why.contains("in progress"), "{why}"),
+                    other => panic!("a second connect is refused: {other:?}"),
+                }
+                assert!(disc.try_wait().is_none());
+                assert!(
+                    disc2.try_wait().is_none(),
+                    "resolved with the first, not before"
+                );
+
+                // The drain times out; the DISCONNECT goes; all resolves.
+                poll_until(run.as_mut(), Duration::from_secs(5)).expect("disconnected")
+            };
+            assert!(res.is_ok(), "{res:?}");
+            assert_eq!(h.conn.get(), ConnectionState::Disconnected);
+            assert!(matches!(disc.try_wait(), Some(Ok(()))));
+            assert!(matches!(disc2.try_wait(), Some(Ok(()))));
+            assert!(
+                first.try_wait().is_none(),
+                "in flight; the loop decides its fate"
+            );
+            assert!(h.session.held_connect.is_some(), "for the loop to run next");
+            assert_eq!(h.session.buf.len(), usize::from(buffering));
+        }
+    }
+
+    /// A server DISCONNECT moves the state on before the `Disconnected`
+    /// event goes out, so whoever handles the event reads the new state.
+    #[test]
+    fn test_server_disconnect_sets_state_before_reporting() {
+        for after_loss in [ConnectionState::Disconnected, ConnectionState::Retrying] {
+            let mut h = harness(BytesMut::new(), Duration::ZERO, SessionState::default());
+            h.session.after_loss = after_loss;
+            assert_eq!(h.conn.get(), ConnectionState::Connected);
+
+            let res = h
+                .session
+                .handle_packet(Packet::Disconnect(Disconnect::new()));
+            assert!(matches!(res, Err(Error::Disconnected)));
+            assert!(matches!(
+                h.event_rx.try_recv(),
+                Ok(Event::Disconnected { .. })
+            ));
+            assert_eq!(h.conn.get(), after_loss);
+        }
     }
 
     /// A clean disconnect ends the session: an (un)subscribe still awaiting

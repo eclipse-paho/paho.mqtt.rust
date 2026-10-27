@@ -26,7 +26,10 @@
 #[cfg(any(feature = "websocket", feature = "smol-websocket"))]
 use std::collections::HashMap;
 use std::{
-    sync::{Arc, Mutex, RwLock, atomic::AtomicBool},
+    sync::{
+        Arc, Mutex, RwLock,
+        atomic::{AtomicU8, Ordering},
+    },
     time::Duration,
 };
 
@@ -38,9 +41,54 @@ use paho_mqtt_codec::{
 
 use super::sinks::Sink;
 use crate::{
-    AuthHandler, ClientPersistence, ConnectResponse, Error, Message, PublishResponse,
-    SubscribeOptions, SubscribeResponse, UnsubscribeResponse, token::Completer,
+    AuthHandler, ClientPersistence, ConnectResponse, ConnectionState, Error, Message,
+    PublishResponse, SubscribeOptions, SubscribeResponse, UnsubscribeResponse, token::Completer,
 };
+
+/////////////////////////////////////////////////////////////////////////////
+
+/// The client's [`ConnectionState`], as the event loop sets it.
+///
+/// Created with the event loop (`RuntimeHandle::new`) and held only by it and
+/// the session it is running, so the loop is the one writer. That is the
+/// point: the `connected` flag this replaced was also cleared by the
+/// dispatcher thread when it got round to a `ConnectionLost`, by which time
+/// an automatic reconnect could already have set it again — leaving a
+/// connected client reporting itself disconnected. The API reads the state
+/// through a [`StateView`], which cannot write.
+///
+/// Every change is made before the token or event that reveals it.
+#[derive(Clone)]
+pub(crate) struct StateCell(Arc<AtomicU8>);
+
+impl StateCell {
+    /// A new cell, [`Disconnected`](ConnectionState::Disconnected).
+    pub(crate) fn new() -> Self {
+        Self(Arc::new(AtomicU8::new(
+            ConnectionState::Disconnected.as_u8(),
+        )))
+    }
+
+    /// Records the state the event loop has moved to.
+    pub(crate) fn set(&self, state: ConnectionState) {
+        self.0.store(state.as_u8(), Ordering::SeqCst);
+    }
+
+    /// A read-only handle on the same state, for the API.
+    pub(crate) fn view(&self) -> StateView {
+        StateView(Arc::clone(&self.0))
+    }
+}
+
+/// A read-only handle on the client's [`ConnectionState`]; see [`StateCell`].
+pub(crate) struct StateView(Arc<AtomicU8>);
+
+impl StateView {
+    /// The current state.
+    pub(crate) fn get(&self) -> ConnectionState {
+        ConnectionState::from_u8(self.0.load(Ordering::SeqCst))
+    }
+}
 
 /////////////////////////////////////////////////////////////////////////////
 
@@ -49,6 +97,7 @@ use crate::{
 /// Passed to the event loop at spawn time; derived from [`CreateOptions`].
 ///
 /// [`CreateOptions`]: crate::CreateOptions
+#[derive(Clone, Copy)]
 pub(crate) struct BufConfig {
     /// Buffer publish commands when the client is disconnected after a prior
     /// successful connection.
@@ -351,8 +400,6 @@ pub(crate) enum Command {
         params: Box<ConnectParams>,
         /// Completer resolved with the CONNACK result.
         tx: Completer<ConnectResponse>,
-        /// Set to `true` before resolving `tx` on success; cleared on failure.
-        connected_flag: Arc<AtomicBool>,
         /// Receives the identifier the server assigned when the client
         /// connected with an empty one, written before `tx` resolves so
         /// `client_id()` is correct as soon as `connect()` returns.
@@ -424,8 +471,6 @@ pub(crate) enum Command {
         props: CodecProperties,
         /// Completer signalled when the disconnect is complete.
         tx: Completer<()>,
-        /// Cleared to `false` before resolving `tx`.
-        connected_flag: Arc<AtomicBool>,
     },
 }
 

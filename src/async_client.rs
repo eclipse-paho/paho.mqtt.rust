@@ -44,14 +44,15 @@
 //! ```
 
 use crate::{
-    AsyncReceiver, ConnectOptions, ConnectResponse, ConnectToken, CreateOptions, DeliveryToken,
-    DisconnectOptions, Event, FilePersistence, Message, PersistenceType, Properties, ReasonCode,
-    SubscribeManyToken, SubscribeOptions, SubscribeToken, SyncReceiver, UnsubscribeManyToken,
-    UnsubscribeToken, UserData,
+    AsyncReceiver, ConnectOptions, ConnectResponse, ConnectToken, ConnectionState, CreateOptions,
+    DeliveryToken, DisconnectOptions, Event, FilePersistence, Message, PersistenceType, Properties,
+    ReasonCode, SubscribeManyToken, SubscribeOptions, SubscribeToken, SyncReceiver,
+    UnsubscribeManyToken, UnsubscribeToken, UserData,
     error::{Error, Result},
     persistence::ClientPersistence,
     runtime::{
-        BufConfig, Command, ConnectParams, RtOwnership, ServerAddr, Sink, session::Dispatch,
+        BufConfig, Command, ConnectParams, RtOwnership, ServerAddr, Sink, StateView,
+        session::Dispatch,
     },
     token::Token,
 };
@@ -290,10 +291,11 @@ pub struct AsyncClient {
 pub(crate) struct InnerAsyncClient {
     /// Command sender to the internal event loop.
     cmd_tx: async_channel::Sender<Command>,
-    /// Whether the client is currently connected.
-    /// Wrapped in Arc so the event-loop thread can set it before the token
-    /// resolves, eliminating any race between `wait()` and `is_connected()`.
-    connected: Arc<AtomicBool>,
+    /// The connection state, as the event loop keeps it. Read-only here: the
+    /// loop is its only writer, and sets it before the token or event that
+    /// reveals a change, so `is_connected()` agrees with a `wait()` that has
+    /// just returned.
+    state: StateView,
     /// The MQTT version of the connection.
     mqtt_version: AtomicU32,
     /// The identifier the server assigned, when the client connected with an
@@ -327,9 +329,9 @@ pub(crate) struct InnerAsyncClient {
 
 impl InnerAsyncClient {
     /// Creates the client state around a running event loop, reached through
-    /// `cmd_tx` and `dispatch`.
+    /// `cmd_tx` and `dispatch`, whose connection state is read through `state`.
     ///
-    /// Everything else starts out at its default: not connected, no assigned
+    /// Everything else starts out at its default: no assigned
     /// identifier, no callbacks or consumers, and connect options that carry
     /// only the MQTT version from `opts`, so that `reconnect()` and sends
     /// before the first connect use the right one.
@@ -337,13 +339,14 @@ impl InnerAsyncClient {
         cmd_tx: async_channel::Sender<Command>,
         opts: CreateOptions,
         dispatch: Dispatch,
+        state: StateView,
         persist: Option<Arc<Mutex<Box<dyn ClientPersistence>>>>,
         rt_ownership: RtOwnership,
     ) -> Self {
         let ver = opts.mqtt_version;
         Self {
             cmd_tx,
-            connected: Arc::new(AtomicBool::new(false)),
+            state,
             mqtt_version: AtomicU32::new(ver as u32),
             assigned_id: Arc::new(RwLock::new(None)),
             opts,
@@ -399,7 +402,7 @@ impl AsyncClient {
             let rt = RuntimeHandle::spawn(&executor, buf_cfg);
             (rt, SmolOwnership::Shared(executor))
         };
-        let (cmd_tx, event_rx, dispatch) = rt.into_parts();
+        let (cmd_tx, event_rx, dispatch, state) = rt.into_parts();
 
         // Extract persistence before moving opts into inner, so we can consume
         // PersistenceType::User without cloning the trait object.
@@ -410,6 +413,7 @@ impl AsyncClient {
             cmd_tx,
             opts,
             dispatch.clone(),
+            state,
             persist,
             rt_ownership,
         ));
@@ -530,7 +534,6 @@ impl AsyncClient {
         let cmd = Command::Connect {
             params: Box::new(params),
             tx: comp,
-            connected_flag: Arc::clone(&self.inner.connected),
             assigned_id: Arc::clone(&self.inner.assigned_id),
             persist: self.inner.persist.as_ref().map(Arc::clone),
         };
@@ -573,7 +576,6 @@ impl AsyncClient {
             reason_code: opts.reason_code,
             props: opts.props,
             tx: comp,
-            connected_flag: Arc::clone(&self.inner.connected),
         };
 
         if self.inner.cmd_tx.send_blocking(cmd).is_err() {
@@ -1029,8 +1031,24 @@ impl AsyncClient {
     }
 
     /// Determines if this client is currently connected to an MQTT broker.
+    ///
+    /// The same as `state() == ConnectionState::Connected`; see
+    /// [`state`](Self::state).
     pub fn is_connected(&self) -> bool {
-        self.inner.connected.load(Ordering::SeqCst)
+        self.state() == ConnectionState::Connected
+    }
+
+    /// Where the client's connection to the broker stands: connected,
+    /// connecting, disconnecting, retrying after a lost connection, and so on.
+    ///
+    /// The state is kept by the client's event loop and changes as it works,
+    /// so it can lag a call that has just been made — straight after
+    /// `connect()` returns it may still read
+    /// [`Disconnected`](ConnectionState::Disconnected) for a moment. What is
+    /// guaranteed is that it has changed by the time the operation's token
+    /// resolves, and before the callback or event announcing the change runs.
+    pub fn state(&self) -> ConnectionState {
+        self.inner.state.get()
     }
 
     /// Returns `Err(WrongMqttVersion)` if v5 properties are non-empty but the
@@ -1131,7 +1149,6 @@ impl AsyncClient {
                 }
             }
             Ev::ConnectionLost(_err) => {
-                self.inner.connected.store(false, Ordering::SeqCst);
                 self.to_sync_sinks(|sinks| sinks.send_session_end(&Event::ConnectionLost));
                 let (msg_cb, lost_cb) = {
                     let mut cbctx = self.inner.callback_context.lock().unwrap();
@@ -1160,7 +1177,6 @@ impl AsyncClient {
                 }
             }
             Ev::Disconnected { reason_code, props } => {
-                self.inner.connected.store(false, Ordering::SeqCst);
                 // The server closing the connection ends it just as surely
                 // as losing it does, so the message consumers get their
                 // `None` here too — this is the end of their connection,
