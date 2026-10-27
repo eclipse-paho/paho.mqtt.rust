@@ -365,6 +365,8 @@ impl InnerAsyncClient {
 }
 
 impl AsyncClient {
+    // ----- Creation -----
+
     /// Creates a new MQTT client which can connect to an MQTT broker.
     ///
     /// # Arguments
@@ -441,6 +443,8 @@ impl AsyncClient {
 
         Ok(AsyncClient { inner })
     }
+
+    // ----- Connecting -----
 
     /// Connects to an MQTT broker using the specified connect options.
     ///
@@ -545,6 +549,14 @@ impl AsyncClient {
         tok
     }
 
+    /// Attempts to reconnect to the broker.
+    /// This can only be called after a connection was initially made or
+    /// attempted. It will retry with the same connect options.
+    pub fn reconnect(&self) -> ConnectToken {
+        let connopts = self.inner.conn_opts.read().unwrap().clone();
+        self.connect(connopts)
+    }
+
     /// Disconnects from the MQTT broker.
     ///
     /// # Arguments
@@ -604,6 +616,22 @@ impl AsyncClient {
 
         tok
     }
+
+    /// Disconnect from the MQTT broker with a timeout.
+    ///
+    /// This will delay the disconnect for up to the specified timeout to
+    /// allow in-flight messages to complete.
+    ///
+    /// # Arguments
+    ///
+    /// * `timeout` The amount of time to wait for the disconnect. This has
+    ///   a resolution in milliseconds.
+    ///
+    pub fn disconnect_after(&self, timeout: Duration) -> Token<()> {
+        self.disconnect(DisconnectOptions::with_timeout(timeout))
+    }
+
+    // ----- Publishing -----
 
     /// Attempts to publish a message to the MQTT broker, but returns an
     /// error immediately if there's a problem creating or queuing the
@@ -711,6 +739,8 @@ impl AsyncClient {
             Ok(tok) => tok,
         }
     }
+
+    // ----- Subscribing -----
 
     /// Subscribes to a single topic.
     ///
@@ -1030,6 +1060,8 @@ impl AsyncClient {
         tok
     }
 
+    // ----- State and identity -----
+
     /// Determines if this client is currently connected to an MQTT broker.
     ///
     /// The same as `state() == ConnectionState::Connected`; see
@@ -1050,6 +1082,379 @@ impl AsyncClient {
     pub fn state(&self) -> ConnectionState {
         self.inner.state.get()
     }
+
+    /// Returns the client ID used for the client instance.
+    ///
+    /// Normally the identifier given at creation. A client that connects
+    /// with an empty ID is assigned one by the server (MQTT v5 Assigned
+    /// Client Identifier); from the moment that connection completes, this
+    /// returns the assigned identifier, which is also what a reconnect uses.
+    pub fn client_id(&self) -> String {
+        match self.inner.assigned_id.read().unwrap().as_ref() {
+            Some(id) => id.clone(),
+            None => self.inner.opts.client_id.clone(),
+        }
+    }
+
+    /// Returns the server URI used for connection.
+    pub fn server_uri(&self) -> &str {
+        &self.inner.opts.server_uri
+    }
+
+    /// Gets the most recent MQTT version for the client.
+    pub fn mqtt_version(&self) -> MqttVersion {
+        MqttVersion::try_from(self.mqtt_version_raw())
+            .expect("stored MQTT version always originates from a valid MqttVersion")
+    }
+
+    /// The raw, integer value of the MQTT version.
+    pub fn mqtt_version_raw(&self) -> u32 {
+        self.inner.mqtt_version.load(Ordering::SeqCst)
+    }
+
+    /// Sets the current MQTT version.
+    pub(crate) fn set_mqtt_version<V>(&self, ver: V)
+    where
+        V: Into<MqttVersion>,
+    {
+        let ver = ver.into() as u32;
+        trace!("Updating client MQTT version: {}", ver);
+        self.inner.mqtt_version.store(ver, Ordering::SeqCst);
+    }
+
+    /// Get access to the user-defined data in the client.
+    pub fn user_data(&self) -> Option<&UserData> {
+        self.inner.opts.user_data.as_ref()
+    }
+
+    /// Gets a copy of the options used in the last connection attempt.
+    pub fn connect_options(&self) -> ConnectOptions {
+        self.inner.conn_opts.read().unwrap().clone()
+    }
+
+    // ----- Callbacks -----
+
+    /// Sets the callback for when the connection is established with the broker.
+    ///
+    /// # Arguments
+    ///
+    /// * `cb` The callback to register with the library. This can be a
+    ///   function or a closure.
+    ///
+    /// The callback runs outside the lock on its slot, so it may call back
+    /// into the client — including registering a different callback, or
+    /// removing itself. Either sticks.
+    pub fn set_connected_callback<F>(&self, cb: F)
+    where
+        F: FnMut(&AsyncClient, &crate::ConnectResponse) + Send + 'static,
+    {
+        self.inner
+            .callback_context
+            .lock()
+            .unwrap()
+            .on_connected
+            .set(Box::new(cb));
+    }
+
+    /// Removes the callback for when the connection is established.
+    pub fn remove_connected_callback(&self) {
+        self.inner
+            .callback_context
+            .lock()
+            .unwrap()
+            .on_connected
+            .clear();
+    }
+
+    /// Sets the callback for when the connection is lost with the broker.
+    ///
+    /// # Arguments
+    ///
+    /// * `cb` The callback to register with the library. This can be a
+    ///   function or a closure.
+    ///
+    /// The callback runs outside the lock on its slot, so it may call back
+    /// into the client — including registering a different callback, or
+    /// removing itself. Either sticks.
+    pub fn set_connection_lost_callback<F>(&self, cb: F)
+    where
+        F: FnMut(&AsyncClient) + Send + 'static,
+    {
+        self.inner
+            .callback_context
+            .lock()
+            .unwrap()
+            .on_connection_lost
+            .set(Box::new(cb));
+    }
+
+    /// Removes the callback for when the connection is lost.
+    pub fn remove_connection_lost_callback(&self) {
+        self.inner
+            .callback_context
+            .lock()
+            .unwrap()
+            .on_connection_lost
+            .clear();
+    }
+
+    /// Sets the callback for when a disconnect message arrives from the broker.
+    ///
+    /// # Arguments
+    ///
+    /// * `cb` The callback to register with the library. This can be a
+    ///   function or a closure.
+    ///
+    /// The callback runs outside the lock on its slot, so it may call back
+    /// into the client — including registering a different callback, or
+    /// removing itself. Either sticks.
+    pub fn set_disconnected_callback<F>(&self, cb: F)
+    where
+        F: FnMut(&AsyncClient, Properties, ReasonCode) + Send + 'static,
+    {
+        self.inner
+            .callback_context
+            .lock()
+            .unwrap()
+            .on_disconnected
+            .set(Box::new(cb));
+    }
+
+    /// Removes the callback for when a disconnect message is received.
+    pub fn remove_disconnected_callback(&self) {
+        self.inner
+            .callback_context
+            .lock()
+            .unwrap()
+            .on_disconnected
+            .clear();
+    }
+
+    /// Sets the callback for when a message arrives from the broker.
+    ///
+    /// # Arguments
+    ///
+    /// * `cb` The callback to register with the library. This can be a
+    ///   function or a closure.
+    ///
+    /// The callback runs outside the lock on its slot, so it may call back
+    /// into the client — including registering a different callback, or
+    /// removing itself. Either sticks.
+    pub fn set_message_callback<F>(&self, cb: F)
+    where
+        F: FnMut(&AsyncClient, Option<Message>) + Send + 'static,
+    {
+        {
+            let mut cbctx = self.inner.callback_context.lock().unwrap();
+            cbctx.on_message_arrived.set(Box::new(cb));
+            cbctx.msg_cb_installed = true;
+        }
+        self.refresh_wants_messages(None);
+    }
+
+    /// Removes the callback for when a message arrives from the broker.
+    ///
+    /// The application's streams and consumers are unaffected: they are not
+    /// callbacks, and never were.
+    pub fn remove_message_callback(&self) {
+        {
+            let mut cbctx = self.inner.callback_context.lock().unwrap();
+            cbctx.on_message_arrived.clear();
+            cbctx.msg_cb_installed = false;
+        }
+        self.refresh_wants_messages(None);
+    }
+
+    /// Removes all registered callbacks atomically under a single lock.
+    ///
+    /// A callback may call this from inside itself; it is not reinstated when
+    /// it returns.
+    pub fn remove_callbacks(&self) {
+        {
+            let mut cbctx = self.inner.callback_context.lock().unwrap();
+            cbctx.on_connected.clear();
+            cbctx.on_connection_lost.clear();
+            cbctx.on_disconnected.clear();
+            cbctx.on_message_arrived.clear();
+            cbctx.msg_cb_installed = false;
+        }
+        self.refresh_wants_messages(None);
+    }
+
+    // ----- Consumers and streams -----
+
+    /// Starts the client consuming messages for a blocking (non-async) app.
+    ///
+    /// Returns the receiving-end of the channel for the application to
+    /// get the messages. The channel is unbounded, so nothing is dropped
+    /// and nothing is held back; a consumer that falls behind grows it.
+    ///
+    /// This is independent of [`set_message_callback`] and of the async
+    /// streams: each receives every message. Consuming stops when the
+    /// receiver is dropped, or on [`stop_consuming`].
+    ///
+    /// [`set_message_callback`]: AsyncClient::set_message_callback
+    /// [`stop_consuming`]: AsyncClient::stop_consuming
+    pub fn start_consuming(&self) -> SyncReceiver<Option<Message>> {
+        let (tx, rx) = sync_channel::unbounded();
+        self.update_sync_sinks(|sinks| sinks.msgs.push(tx));
+        rx
+    }
+
+    /// Stops the client from consuming messages.
+    ///
+    /// Closes the channels handed out by [`start_consuming`], and nothing
+    /// else: an application message callback, the async streams and the
+    /// event consumers are left as they are.
+    ///
+    /// [`start_consuming`]: AsyncClient::start_consuming
+    pub fn stop_consuming(&self) {
+        self.update_sync_sinks(|sinks| sinks.msgs.clear());
+    }
+
+    /// Creates a synchronous event stream.
+    ///
+    /// Returns the receive end of a channel that receives [`Event`] values:
+    /// the messages and the connection events, in one sequence.
+    ///
+    /// The stream will rely on a bounded channel with the given buffer
+    /// capacity if `buffer_lim` is `Some`, or an unbounded channel if
+    /// `None`. A full bounded channel is **not** dropped into: the client
+    /// waits for room, and stops reading from the broker until it has it.
+    pub fn start_consuming_events<L>(&self, buffer_lim: L) -> SyncReceiver<Event>
+    where
+        L: Into<Option<usize>>,
+    {
+        let (tx, rx) = match buffer_lim.into() {
+            Some(lim) => sync_channel::bounded(lim),
+            None => sync_channel::unbounded(),
+        };
+        self.update_sync_sinks(|sinks| sinks.events.push(tx));
+        rx
+    }
+
+    /// Creates an async message stream.
+    ///
+    /// The event loop delivers into it directly, so a message reaches an
+    /// application waiting on the stream without passing through the
+    /// callback dispatcher first.
+    ///
+    /// The stream will rely on a bounded channel with the given buffer
+    /// capacity if `buffer_lim` is `Some`, or an unbounded channel if
+    /// `None`. A full bounded stream is **not** dropped into: the client
+    /// stops reading from the broker until the application takes what is
+    /// there, and an unacknowledged QoS 1 or 2 message stays unacknowledged
+    /// meanwhile. An unbounded stream never blocks the client but grows
+    /// without limit behind a consumer that falls behind.
+    ///
+    /// Several streams may be live at once, and each receives every
+    /// message; so does a message callback, if one is registered. A stream
+    /// ends when its receiver is dropped, or on [`stop_stream`].
+    ///
+    /// [`stop_stream`]: AsyncClient::stop_stream
+    pub fn get_stream<L>(&mut self, buffer_lim: L) -> AsyncReceiver<Option<Message>>
+    where
+        L: Into<Option<usize>>,
+    {
+        let (tx, rx) = match buffer_lim.into() {
+            Some(lim) => async_channel::bounded(lim),
+            None => async_channel::unbounded(),
+        };
+        self.add_sink(Sink::Messages(tx));
+        rx
+    }
+
+    /// Creates an async event stream.
+    ///
+    /// Receives the messages *and* the connection events, in one sequence,
+    /// delivered by the event loop itself. The capacity and backpressure
+    /// are as for [`get_stream`].
+    ///
+    /// [`get_stream`]: AsyncClient::get_stream
+    pub fn get_event_stream<L>(&self, buffer_lim: L) -> AsyncReceiver<Event>
+    where
+        L: Into<Option<usize>>,
+    {
+        let (tx, rx) = match buffer_lim.into() {
+            Some(lim) => async_channel::bounded(lim),
+            None => async_channel::unbounded(),
+        };
+        self.add_sink(Sink::Events(tx));
+        rx
+    }
+
+    /// Stops every stream and consumer this client feeds, closing their
+    /// channels: those from [`get_stream`], [`get_event_stream`],
+    /// [`start_consuming`] and [`start_consuming_events`].
+    ///
+    /// Callbacks the application registered are left alone — they are the
+    /// application's, and nothing the library does displaces them. Use
+    /// [`remove_callbacks`] to clear those.
+    ///
+    /// A stream also ends simply by being dropped, which needs no call at
+    /// all; this is for closing one whose receiver is held elsewhere.
+    ///
+    /// [`get_stream`]: AsyncClient::get_stream
+    /// [`get_event_stream`]: AsyncClient::get_event_stream
+    /// [`start_consuming`]: AsyncClient::start_consuming
+    /// [`start_consuming_events`]: AsyncClient::start_consuming_events
+    /// [`remove_callbacks`]: AsyncClient::remove_callbacks
+    pub fn stop_stream(&self) {
+        let _ = self.inner.cmd_tx.try_send(Command::ClearSinks);
+        self.update_sync_sinks(|sinks| {
+            sinks.msgs.clear();
+            sinks.events.clear();
+        });
+    }
+
+    /// Registers an async delivery sink with the event loop, which feeds it
+    /// directly — no callback, and no dispatcher thread in the way.
+    fn add_sink(&self, sink: Sink) {
+        if self.inner.cmd_tx.try_send(Command::AddSink(sink)).is_err() {
+            warn!("Client is closed; the stream will receive nothing");
+        }
+    }
+
+    /// Applies `f` to the synchronous consumers and republishes them.
+    ///
+    /// The list is copy-on-write: the dispatcher thread clones the `Arc`
+    /// out and sends from that, so it never holds the lock while a full
+    /// consumer blocks it.
+    fn update_sync_sinks<F>(&self, f: F)
+    where
+        F: FnOnce(&mut SyncSinks),
+    {
+        let mut guard = self.inner.sync_sinks.write().unwrap();
+        let mut next = SyncSinks {
+            msgs: guard.msgs.clone(),
+            events: guard.events.clone(),
+        };
+        f(&mut next);
+        let any = !next.is_empty();
+        *guard = Arc::new(next);
+        self.inner.has_sync_sinks.store(any, Ordering::Release);
+        drop(guard);
+        // Messages reach the callbacks and these consumers through the
+        // dispatcher thread; while neither exists the event loop skips it
+        // and feeds the streams alone.
+        self.refresh_wants_messages(Some(any));
+    }
+
+    /// Tells the event loop whether anything on this side still wants
+    /// messages: a message callback, or a synchronous consumer.
+    ///
+    /// `sync` saves re-reading the consumer list when the caller has just
+    /// rebuilt it.
+    fn refresh_wants_messages(&self, sync: Option<bool>) {
+        let cb = self.inner.callback_context.lock().unwrap().msg_cb_installed;
+        let sync = sync.unwrap_or_else(|| !self.inner.sync_sinks.read().unwrap().is_empty());
+        self.inner
+            .dispatch
+            .wants_messages
+            .store(cb || sync, Ordering::SeqCst);
+    }
+
+    // ----- Internal helpers -----
 
     /// Returns `Err(WrongMqttVersion)` if v5 properties are non-empty but the
     /// current connection is not MQTT v5.
@@ -1267,401 +1672,6 @@ impl AsyncClient {
                 }
             }
         }
-    }
-}
-
-/////////////////////////////////////////////////////////////////////////////
-// Common API
-/////////////////////////////////////////////////////////////////////////////
-
-impl AsyncClient {
-    /// Gets the most recent MQTT version for the client.
-    pub fn mqtt_version(&self) -> MqttVersion {
-        MqttVersion::try_from(self.mqtt_version_raw())
-            .expect("stored MQTT version always originates from a valid MqttVersion")
-    }
-
-    /// The raw, integer value of the MQTT version.
-    pub fn mqtt_version_raw(&self) -> u32 {
-        self.inner.mqtt_version.load(Ordering::SeqCst)
-    }
-
-    /// Sets the current MQTT version.
-    pub(crate) fn set_mqtt_version<V>(&self, ver: V)
-    where
-        V: Into<MqttVersion>,
-    {
-        let ver = ver.into() as u32;
-        trace!("Updating client MQTT version: {}", ver);
-        self.inner.mqtt_version.store(ver, Ordering::SeqCst);
-    }
-
-    /// Get access to the user-defined data in the client.
-    pub fn user_data(&self) -> Option<&UserData> {
-        self.inner.opts.user_data.as_ref()
-    }
-
-    /// Gets a copy of the options used in the last connection attempt.
-    pub fn connect_options(&self) -> ConnectOptions {
-        self.inner.conn_opts.read().unwrap().clone()
-    }
-
-    /// Attempts to reconnect to the broker.
-    /// This can only be called after a connection was initially made or
-    /// attempted. It will retry with the same connect options.
-    pub fn reconnect(&self) -> ConnectToken {
-        let connopts = self.inner.conn_opts.read().unwrap().clone();
-        self.connect(connopts)
-    }
-
-    /// Disconnect from the MQTT broker with a timeout.
-    ///
-    /// This will delay the disconnect for up to the specified timeout to
-    /// allow in-flight messages to complete.
-    ///
-    /// # Arguments
-    ///
-    /// * `timeout` The amount of time to wait for the disconnect. This has
-    ///   a resolution in milliseconds.
-    ///
-    pub fn disconnect_after(&self, timeout: Duration) -> Token<()> {
-        self.disconnect(DisconnectOptions::with_timeout(timeout))
-    }
-
-    /// Sets the callback for when the connection is established with the broker.
-    ///
-    /// # Arguments
-    ///
-    /// * `cb` The callback to register with the library. This can be a
-    ///   function or a closure.
-    ///
-    /// The callback runs outside the lock on its slot, so it may call back
-    /// into the client — including registering a different callback, or
-    /// removing itself. Either sticks.
-    pub fn set_connected_callback<F>(&self, cb: F)
-    where
-        F: FnMut(&AsyncClient, &crate::ConnectResponse) + Send + 'static,
-    {
-        self.inner
-            .callback_context
-            .lock()
-            .unwrap()
-            .on_connected
-            .set(Box::new(cb));
-    }
-
-    /// Removes the callback for when the connection is established.
-    pub fn remove_connected_callback(&self) {
-        self.inner
-            .callback_context
-            .lock()
-            .unwrap()
-            .on_connected
-            .clear();
-    }
-
-    /// Sets the callback for when the connection is lost with the broker.
-    ///
-    /// # Arguments
-    ///
-    /// * `cb` The callback to register with the library. This can be a
-    ///   function or a closure.
-    ///
-    /// The callback runs outside the lock on its slot, so it may call back
-    /// into the client — including registering a different callback, or
-    /// removing itself. Either sticks.
-    pub fn set_connection_lost_callback<F>(&self, cb: F)
-    where
-        F: FnMut(&AsyncClient) + Send + 'static,
-    {
-        self.inner
-            .callback_context
-            .lock()
-            .unwrap()
-            .on_connection_lost
-            .set(Box::new(cb));
-    }
-
-    /// Removes the callback for when the connection is lost.
-    pub fn remove_connection_lost_callback(&self) {
-        self.inner
-            .callback_context
-            .lock()
-            .unwrap()
-            .on_connection_lost
-            .clear();
-    }
-
-    /// Sets the callback for when a disconnect message arrives from the broker.
-    ///
-    /// # Arguments
-    ///
-    /// * `cb` The callback to register with the library. This can be a
-    ///   function or a closure.
-    ///
-    /// The callback runs outside the lock on its slot, so it may call back
-    /// into the client — including registering a different callback, or
-    /// removing itself. Either sticks.
-    pub fn set_disconnected_callback<F>(&self, cb: F)
-    where
-        F: FnMut(&AsyncClient, Properties, ReasonCode) + Send + 'static,
-    {
-        self.inner
-            .callback_context
-            .lock()
-            .unwrap()
-            .on_disconnected
-            .set(Box::new(cb));
-    }
-
-    /// Removes the callback for when a disconnect message is received.
-    pub fn remove_disconnected_callback(&self) {
-        self.inner
-            .callback_context
-            .lock()
-            .unwrap()
-            .on_disconnected
-            .clear();
-    }
-
-    /// Sets the callback for when a message arrives from the broker.
-    ///
-    /// # Arguments
-    ///
-    /// * `cb` The callback to register with the library. This can be a
-    ///   function or a closure.
-    ///
-    /// The callback runs outside the lock on its slot, so it may call back
-    /// into the client — including registering a different callback, or
-    /// removing itself. Either sticks.
-    pub fn set_message_callback<F>(&self, cb: F)
-    where
-        F: FnMut(&AsyncClient, Option<Message>) + Send + 'static,
-    {
-        {
-            let mut cbctx = self.inner.callback_context.lock().unwrap();
-            cbctx.on_message_arrived.set(Box::new(cb));
-            cbctx.msg_cb_installed = true;
-        }
-        self.refresh_wants_messages(None);
-    }
-
-    /// Removes the callback for when a message arrives from the broker.
-    ///
-    /// The application's streams and consumers are unaffected: they are not
-    /// callbacks, and never were.
-    pub fn remove_message_callback(&self) {
-        {
-            let mut cbctx = self.inner.callback_context.lock().unwrap();
-            cbctx.on_message_arrived.clear();
-            cbctx.msg_cb_installed = false;
-        }
-        self.refresh_wants_messages(None);
-    }
-
-    /// Removes all registered callbacks atomically under a single lock.
-    ///
-    /// A callback may call this from inside itself; it is not reinstated when
-    /// it returns.
-    pub fn remove_callbacks(&self) {
-        {
-            let mut cbctx = self.inner.callback_context.lock().unwrap();
-            cbctx.on_connected.clear();
-            cbctx.on_connection_lost.clear();
-            cbctx.on_disconnected.clear();
-            cbctx.on_message_arrived.clear();
-            cbctx.msg_cb_installed = false;
-        }
-        self.refresh_wants_messages(None);
-    }
-
-    /// Starts the client consuming messages for a blocking (non-async) app.
-    ///
-    /// Returns the receiving-end of the channel for the application to
-    /// get the messages. The channel is unbounded, so nothing is dropped
-    /// and nothing is held back; a consumer that falls behind grows it.
-    ///
-    /// This is independent of [`set_message_callback`] and of the async
-    /// streams: each receives every message. Consuming stops when the
-    /// receiver is dropped, or on [`stop_consuming`].
-    ///
-    /// [`set_message_callback`]: AsyncClient::set_message_callback
-    /// [`stop_consuming`]: AsyncClient::stop_consuming
-    pub fn start_consuming(&self) -> SyncReceiver<Option<Message>> {
-        let (tx, rx) = sync_channel::unbounded();
-        self.update_sync_sinks(|sinks| sinks.msgs.push(tx));
-        rx
-    }
-
-    /// Stops the client from consuming messages.
-    ///
-    /// Closes the channels handed out by [`start_consuming`], and nothing
-    /// else: an application message callback, the async streams and the
-    /// event consumers are left as they are.
-    ///
-    /// [`start_consuming`]: AsyncClient::start_consuming
-    pub fn stop_consuming(&self) {
-        self.update_sync_sinks(|sinks| sinks.msgs.clear());
-    }
-
-    /// Creates a synchronous event stream.
-    ///
-    /// Returns the receive end of a channel that receives [`Event`] values:
-    /// the messages and the connection events, in one sequence.
-    ///
-    /// The stream will rely on a bounded channel with the given buffer
-    /// capacity if `buffer_lim` is `Some`, or an unbounded channel if
-    /// `None`. A full bounded channel is **not** dropped into: the client
-    /// waits for room, and stops reading from the broker until it has it.
-    pub fn start_consuming_events<L>(&self, buffer_lim: L) -> SyncReceiver<Event>
-    where
-        L: Into<Option<usize>>,
-    {
-        let (tx, rx) = match buffer_lim.into() {
-            Some(lim) => sync_channel::bounded(lim),
-            None => sync_channel::unbounded(),
-        };
-        self.update_sync_sinks(|sinks| sinks.events.push(tx));
-        rx
-    }
-
-    /// Registers an async delivery sink with the event loop, which feeds it
-    /// directly — no callback, and no dispatcher thread in the way.
-    fn add_sink(&self, sink: Sink) {
-        if self.inner.cmd_tx.try_send(Command::AddSink(sink)).is_err() {
-            warn!("Client is closed; the stream will receive nothing");
-        }
-    }
-
-    /// Applies `f` to the synchronous consumers and republishes them.
-    ///
-    /// The list is copy-on-write: the dispatcher thread clones the `Arc`
-    /// out and sends from that, so it never holds the lock while a full
-    /// consumer blocks it.
-    fn update_sync_sinks<F>(&self, f: F)
-    where
-        F: FnOnce(&mut SyncSinks),
-    {
-        let mut guard = self.inner.sync_sinks.write().unwrap();
-        let mut next = SyncSinks {
-            msgs: guard.msgs.clone(),
-            events: guard.events.clone(),
-        };
-        f(&mut next);
-        let any = !next.is_empty();
-        *guard = Arc::new(next);
-        self.inner.has_sync_sinks.store(any, Ordering::Release);
-        drop(guard);
-        // Messages reach the callbacks and these consumers through the
-        // dispatcher thread; while neither exists the event loop skips it
-        // and feeds the streams alone.
-        self.refresh_wants_messages(Some(any));
-    }
-
-    /// Tells the event loop whether anything on this side still wants
-    /// messages: a message callback, or a synchronous consumer.
-    ///
-    /// `sync` saves re-reading the consumer list when the caller has just
-    /// rebuilt it.
-    fn refresh_wants_messages(&self, sync: Option<bool>) {
-        let cb = self.inner.callback_context.lock().unwrap().msg_cb_installed;
-        let sync = sync.unwrap_or_else(|| !self.inner.sync_sinks.read().unwrap().is_empty());
-        self.inner
-            .dispatch
-            .wants_messages
-            .store(cb || sync, Ordering::SeqCst);
-    }
-
-    /// Creates an async message stream.
-    ///
-    /// The event loop delivers into it directly, so a message reaches an
-    /// application waiting on the stream without passing through the
-    /// callback dispatcher first.
-    ///
-    /// The stream will rely on a bounded channel with the given buffer
-    /// capacity if `buffer_lim` is `Some`, or an unbounded channel if
-    /// `None`. A full bounded stream is **not** dropped into: the client
-    /// stops reading from the broker until the application takes what is
-    /// there, and an unacknowledged QoS 1 or 2 message stays unacknowledged
-    /// meanwhile. An unbounded stream never blocks the client but grows
-    /// without limit behind a consumer that falls behind.
-    ///
-    /// Several streams may be live at once, and each receives every
-    /// message; so does a message callback, if one is registered. A stream
-    /// ends when its receiver is dropped, or on [`stop_stream`].
-    ///
-    /// [`stop_stream`]: AsyncClient::stop_stream
-    pub fn get_stream<L>(&mut self, buffer_lim: L) -> AsyncReceiver<Option<Message>>
-    where
-        L: Into<Option<usize>>,
-    {
-        let (tx, rx) = match buffer_lim.into() {
-            Some(lim) => async_channel::bounded(lim),
-            None => async_channel::unbounded(),
-        };
-        self.add_sink(Sink::Messages(tx));
-        rx
-    }
-
-    /// Creates an async event stream.
-    ///
-    /// Receives the messages *and* the connection events, in one sequence,
-    /// delivered by the event loop itself. The capacity and backpressure
-    /// are as for [`get_stream`].
-    ///
-    /// [`get_stream`]: AsyncClient::get_stream
-    pub fn get_event_stream<L>(&self, buffer_lim: L) -> AsyncReceiver<Event>
-    where
-        L: Into<Option<usize>>,
-    {
-        let (tx, rx) = match buffer_lim.into() {
-            Some(lim) => async_channel::bounded(lim),
-            None => async_channel::unbounded(),
-        };
-        self.add_sink(Sink::Events(tx));
-        rx
-    }
-
-    /// Stops every stream and consumer this client feeds, closing their
-    /// channels: those from [`get_stream`], [`get_event_stream`],
-    /// [`start_consuming`] and [`start_consuming_events`].
-    ///
-    /// Callbacks the application registered are left alone — they are the
-    /// application's, and nothing the library does displaces them. Use
-    /// [`remove_callbacks`] to clear those.
-    ///
-    /// A stream also ends simply by being dropped, which needs no call at
-    /// all; this is for closing one whose receiver is held elsewhere.
-    ///
-    /// [`get_stream`]: AsyncClient::get_stream
-    /// [`get_event_stream`]: AsyncClient::get_event_stream
-    /// [`start_consuming`]: AsyncClient::start_consuming
-    /// [`start_consuming_events`]: AsyncClient::start_consuming_events
-    /// [`remove_callbacks`]: AsyncClient::remove_callbacks
-    pub fn stop_stream(&self) {
-        let _ = self.inner.cmd_tx.try_send(Command::ClearSinks);
-        self.update_sync_sinks(|sinks| {
-            sinks.msgs.clear();
-            sinks.events.clear();
-        });
-    }
-
-    /// Returns the client ID used for the client instance.
-    ///
-    /// Normally the identifier given at creation. A client that connects
-    /// with an empty ID is assigned one by the server (MQTT v5 Assigned
-    /// Client Identifier); from the moment that connection completes, this
-    /// returns the assigned identifier, which is also what a reconnect uses.
-    pub fn client_id(&self) -> String {
-        match self.inner.assigned_id.read().unwrap().as_ref() {
-            Some(id) => id.clone(),
-            None => self.inner.opts.client_id.clone(),
-        }
-    }
-
-    /// Returns the server URI used for connection.
-    pub fn server_uri(&self) -> &str {
-        &self.inner.opts.server_uri
     }
 }
 
