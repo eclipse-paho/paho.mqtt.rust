@@ -63,6 +63,24 @@ fn test_connect_disconnect_v3() {
     cli.disconnect(None).wait().expect("disconnect failed");
 }
 
+/// A second `connect()` on a connected client is refused with its own error
+/// and leaves the connection up.
+#[test]
+fn test_connect_while_connected_fails() {
+    let cli = mqtt::AsyncClient::new(HOST).unwrap();
+    cli.connect(None).wait_for(TIMEOUT).expect("connect failed");
+
+    assert!(matches!(
+        cli.connect(None).wait_for(TIMEOUT),
+        Err(mqtt::Error::AlreadyConnected)
+    ));
+    assert!(cli.is_connected());
+
+    cli.disconnect(None)
+        .wait_for(TIMEOUT)
+        .expect("disconnect failed");
+}
+
 // MQTT v3.1 requires a client ID of 1-23 characters (no empty ID with clean
 // session as in v3.1.1), so these tests set one explicitly.
 fn v3_1_client(id: &str) -> mqtt::AsyncClient {
@@ -997,7 +1015,7 @@ fn test_second_connect_while_connecting_is_rejected() {
 
     assert!(matches!(
         second.wait_for(Duration::from_secs(2)),
-        Err(mqtt::Error::General("connect already in progress"))
+        Err(mqtt::Error::ConnectInProgress)
     ));
     assert!(matches!(
         first.wait_for(Duration::from_secs(5)),

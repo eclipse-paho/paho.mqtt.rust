@@ -1968,7 +1968,7 @@ impl<B: Backend> Session<B> {
                 self.held_connect = Some(cmd);
             }
             Command::Connect { tx, .. } => {
-                tx.complete(Err(Error::General("connect already in progress")));
+                tx.complete(Err(Error::ConnectInProgress));
             }
             cmd => {
                 // This client has been connected, so the rule is the one
@@ -2341,7 +2341,7 @@ impl<B: Backend> Session<B> {
         match cmd {
             Command::Connect { tx, .. } => {
                 // Already connected; reject duplicate connect.
-                tx.complete(Err(Error::General("already connected")));
+                tx.complete(Err(Error::AlreadyConnected));
             }
 
             Command::Publish {
@@ -2908,7 +2908,7 @@ async fn attempt_connect<B: Backend>(
             // API dropped: nothing will ever use the connection.
             Err(_) => return Attempt::Aborted(None),
             Ok(Command::Connect { tx, .. }) => {
-                tx.complete(Err(Error::General("connect already in progress")));
+                tx.complete(Err(Error::ConnectInProgress));
             }
             Ok(cmd) => match handle_offline_command(cmd, buf, buf_cfg, should_buf, sinks) {
                 Offline::Handled => {}
@@ -4489,10 +4489,10 @@ mod tests {
                     conn1.try_wait().is_none(),
                     "held until the disconnect completes"
                 );
-                match conn2.try_wait() {
-                    Some(Err(Error::General(why))) => assert!(why.contains("in progress"), "{why}"),
-                    other => panic!("a second connect is refused: {other:?}"),
-                }
+                assert!(
+                    matches!(conn2.try_wait(), Some(Err(Error::ConnectInProgress))),
+                    "a second connect is refused"
+                );
                 assert!(disc.try_wait().is_none());
                 assert!(
                     disc2.try_wait().is_none(),

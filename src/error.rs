@@ -40,6 +40,20 @@ pub enum Error {
     /// The client is disconnected.
     #[error("Client disconnected")]
     Disconnected,
+    /// A `connect()` was made while the client was already connected.
+    ///
+    /// The existing connection is unaffected. To connect with other options,
+    /// disconnect first.
+    #[error("Client already connected")]
+    AlreadyConnected,
+    /// A `connect()` was made while another was still in progress.
+    ///
+    /// The connect already under way is unaffected; its token reports how it
+    /// ends. This includes a `connect()` made during a `disconnect()` when
+    /// an earlier `connect()` is already waiting for the disconnect to
+    /// finish.
+    #[error("A connect is already in progress")]
+    ConnectInProgress,
     /// A QoS 1 or QoS 2 publish was abandoned because the server did not
     /// resume the session it belonged to.
     ///
@@ -145,6 +159,8 @@ impl Clone for Error {
         match self {
             Failure => Failure,
             Disconnected => Disconnected,
+            AlreadyConnected => AlreadyConnected,
+            ConnectInProgress => ConnectInProgress,
             SessionNotResumed => SessionNotResumed,
             TlsNotSupported => TlsNotSupported,
             WebSocketNotSupported => WebSocketNotSupported,
@@ -234,7 +250,26 @@ mod tests {
         }
     }
 
-    // The replacement for v1.x's payload-free `PersistenceError`.
+    #[test]
+    fn test_connect_state_errors() {
+        assert!(matches!(
+            Error::AlreadyConnected.clone(),
+            Error::AlreadyConnected
+        ));
+        assert!(matches!(
+            Error::ConnectInProgress.clone(),
+            Error::ConnectInProgress
+        ));
+        assert_eq!(
+            Error::AlreadyConnected.to_string(),
+            "Client already connected"
+        );
+        assert_eq!(
+            Error::ConnectInProgress.to_string(),
+            "A connect is already in progress"
+        );
+    }
+
     #[test]
     fn test_session_not_resumed() {
         let err = Error::SessionNotResumed;
@@ -242,6 +277,7 @@ mod tests {
         assert!(err.to_string().contains("did not resume the session"));
     }
 
+    // The replacement for v1.x's payload-free `PersistenceError`.
     #[test]
     fn test_persistence_error() {
         let err = Error::Persistence("disk full".into());
