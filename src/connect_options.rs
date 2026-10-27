@@ -753,6 +753,9 @@ impl ConnectOptionsBuilder {
     ///
     /// `proxy` The HTTP proxy
     ///
+    /// `connect()` fails with [`Error::InvalidArgument`]
+    /// if this cannot be parsed as a proxy URI.
+    ///
     pub fn http_proxy<S>(&mut self, proxy: S) -> &mut Self
     where
         S: Into<String>,
@@ -766,6 +769,9 @@ impl ConnectOptionsBuilder {
     /// # Arguments
     ///
     /// `proxy` The HTTPS proxy
+    ///
+    /// `connect()` fails with [`Error::InvalidArgument`]
+    /// if this cannot be parsed as a proxy URI.
     ///
     pub fn https_proxy<S>(&mut self, proxy: S) -> &mut Self
     where

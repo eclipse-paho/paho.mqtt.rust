@@ -493,6 +493,18 @@ impl AsyncClient {
             }
         }
 
+        // A proxy URI is otherwise read only when a WebSocket connection is
+        // opened, so a bad one would fail every attempt — auto-reconnect's
+        // included — rather than this call.
+        #[cfg(any(feature = "websocket", feature = "smol-websocket"))]
+        for uri in [&opts.http_proxy, &opts.https_proxy] {
+            if !uri.is_empty()
+                && let Err(err) = crate::runtime::proxy::parse(uri)
+            {
+                return ConnectToken::from(err);
+            }
+        }
+
         let keep_alive_secs = opts.keep_alive_secs();
 
         let will = opts.will.as_ref().map(|msg| paho_mqtt_codec::Will {
@@ -2000,6 +2012,28 @@ mod tests {
             cli.subscribe_many(&["a", "b"], &[QoS::QoS1]).wait(),
             Err(Error::InvalidArgument(_))
         ));
+    }
+
+    // Checked by `connect()` itself. The server is plain TCP, whose transport
+    // never reads the proxy options, so without that check this would fail
+    // only as a refused connection.
+    #[cfg(any(feature = "websocket", feature = "smol-websocket"))]
+    #[test]
+    fn test_connect_rejects_a_bad_proxy_uri() {
+        let cli = AsyncClient::new("tcp://localhost:1").unwrap();
+        for opts in [
+            crate::ConnectOptionsBuilder::new_ws()
+                .http_proxy("http://proxy:notaport")
+                .finalize(),
+            crate::ConnectOptionsBuilder::new_ws()
+                .https_proxy("http://")
+                .finalize(),
+        ] {
+            assert!(matches!(
+                cli.connect(opts).wait_for(Duration::from_secs(1)),
+                Err(Error::InvalidArgument(msg)) if msg.contains("proxy")
+            ));
+        }
     }
 
     #[test]

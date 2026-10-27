@@ -164,6 +164,13 @@
 // innards — has no caller inside the crate. It stays as it is, rather than
 // being cfg-ed away piece by piece and changing shape between builds.
 #![cfg_attr(not(any(feature = "tokio", feature = "smol")), allow(dead_code))]
+// The same build has no `AsyncClient`, `Client`, `Topic` or `SyncTopic`, so
+// the documentation's links to them cannot resolve. They are checked in every
+// build with a backend, which is the one that documents the client.
+#![cfg_attr(
+    not(any(feature = "tokio", feature = "smol")),
+    allow(rustdoc::broken_intra_doc_links)
+)]
 
 // One backend at a time: the client would otherwise be driven by a runtime
 // the application did not choose, with no way to tell which from the API.
