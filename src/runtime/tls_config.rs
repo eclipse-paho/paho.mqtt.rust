@@ -190,7 +190,7 @@ fn filter_cipher_suites(spec: &str) -> Result<Vec<rustls::SupportedCipherSuite>>
         .collect();
 
     if filtered.is_empty() {
-        return Err(Error::GeneralString(format!(
+        return Err(Error::Tls(format!(
             "no recognized cipher suites in '{spec}'; \
             use rustls names such as TLS13_AES_256_GCM_SHA384"
         )));
@@ -223,8 +223,8 @@ pub(crate) fn make_tls_config(tls: &crate::TlsOptions) -> Result<StdArc<rustls::
     // Encrypted private keys require out-of-band decryption not supported by
     // the rustls backend.
     if !tls.private_key_password.is_empty() {
-        return Err(Error::General(
-            "encrypted private keys are not supported with the rustls TLS backend",
+        return Err(Error::Tls(
+            "encrypted private keys are not supported with the rustls TLS backend".into(),
         ));
     }
 
@@ -244,7 +244,7 @@ pub(crate) fn make_tls_config(tls: &crate::TlsOptions) -> Result<StdArc<rustls::
         for cert in rustls_pemfile::certs(&mut r) {
             root_store
                 .add(cert.map_err(Error::Io)?)
-                .map_err(|e| Error::GeneralString(e.to_string()))?;
+                .map_err(|e| Error::Tls(e.to_string()))?;
         }
     }
 
@@ -288,7 +288,7 @@ pub(crate) fn make_tls_config(tls: &crate::TlsOptions) -> Result<StdArc<rustls::
     let provider_arc = StdArc::new(provider);
     let builder = rustls::ClientConfig::builder_with_provider(provider_arc.clone())
         .with_protocol_versions(versions)
-        .map_err(|e| Error::GeneralString(e.to_string()))?;
+        .map_err(|e| Error::Tls(e.to_string()))?;
 
     // ---- Certificate verification ----
     //
@@ -307,7 +307,7 @@ pub(crate) fn make_tls_config(tls: &crate::TlsOptions) -> Result<StdArc<rustls::
                 provider_arc.clone(),
             )
             .build()
-            .map_err(|e| Error::GeneralString(e.to_string()))?;
+            .map_err(|e| Error::Tls(e.to_string()))?;
             builder
                 .dangerous()
                 .with_custom_certificate_verifier(StdArc::new(NoHostnameVerifier(inner)))
@@ -330,11 +330,11 @@ pub(crate) fn make_tls_config(tls: &crate::TlsOptions) -> Result<StdArc<rustls::
         let key_f = std::fs::File::open(key_path).map_err(Error::Io)?;
         let key = rustls_pemfile::private_key(&mut BufReader::new(key_f))
             .map_err(Error::Io)?
-            .ok_or_else(|| Error::General("no private key found in key store"))?;
+            .ok_or_else(|| Error::Tls("no private key found in key store".into()))?;
 
         wants_client
             .with_client_auth_cert(certs, key)
-            .map_err(|e| Error::GeneralString(e.to_string()))?
+            .map_err(|e| Error::Tls(e.to_string()))?
     } else {
         wants_client.with_no_client_auth()
     };
@@ -362,8 +362,8 @@ pub(crate) fn make_tls_config(tls: &crate::TlsOptions) -> Result<StdArc<rustls::
 /// * `disable_default_trust_store` — when `true`, skips loading system CA.
 #[cfg(all(feature = "openssl", not(feature = "tls")))]
 pub(crate) fn make_openssl_config(tls: &crate::TlsOptions) -> Result<openssl::ssl::SslConnector> {
-    let mut builder = SslConnector::builder(SslMethod::tls_client())
-        .map_err(|e| Error::GeneralString(e.to_string()))?;
+    let mut builder =
+        SslConnector::builder(SslMethod::tls_client()).map_err(|e| Error::Tls(e.to_string()))?;
 
     // Server certificate verification
     builder.set_verify(if tls.enable_server_cert_auth {
@@ -376,14 +376,14 @@ pub(crate) fn make_openssl_config(tls: &crate::TlsOptions) -> Result<openssl::ss
     if !tls.disable_default_trust_store {
         builder
             .set_default_verify_paths()
-            .map_err(|e| Error::GeneralString(e.to_string()))?;
+            .map_err(|e| Error::Tls(e.to_string()))?;
     }
 
     // Explicit CA certificate file
     if !tls.trust_store.as_os_str().is_empty() {
         builder
             .set_ca_file(&tls.trust_store)
-            .map_err(|e| Error::GeneralString(e.to_string()))?;
+            .map_err(|e| Error::Tls(e.to_string()))?;
     }
 
     // CA certificate directory — load each PEM file; silently skip non-PEM files.
@@ -403,7 +403,7 @@ pub(crate) fn make_openssl_config(tls: &crate::TlsOptions) -> Result<openssl::ss
     if !tls.enabled_cipher_suites.is_empty() {
         builder
             .set_cipher_list(&tls.enabled_cipher_suites)
-            .map_err(|e| Error::GeneralString(e.to_string()))?;
+            .map_err(|e| Error::Tls(e.to_string()))?;
     }
 
     // Minimum TLS protocol version
@@ -414,13 +414,13 @@ pub(crate) fn make_openssl_config(tls: &crate::TlsOptions) -> Result<openssl::ss
     };
     builder
         .set_min_proto_version(min_ver)
-        .map_err(|e| Error::GeneralString(e.to_string()))?;
+        .map_err(|e| Error::Tls(e.to_string()))?;
 
     // Client certificate and private key
     if !tls.key_store.as_os_str().is_empty() {
         builder
             .set_certificate_file(&tls.key_store, SslFiletype::PEM)
-            .map_err(|e| Error::GeneralString(e.to_string()))?;
+            .map_err(|e| Error::Tls(e.to_string()))?;
         let key_path = if !tls.private_key.as_os_str().is_empty() {
             &tls.private_key
         } else {
@@ -433,14 +433,14 @@ pub(crate) fn make_openssl_config(tls: &crate::TlsOptions) -> Result<openssl::ss
                 &pem,
                 tls.private_key_password.as_bytes(),
             )
-            .map_err(|e| Error::GeneralString(e.to_string()))?;
+            .map_err(|e| Error::Tls(e.to_string()))?;
             builder
                 .set_private_key(&key)
-                .map_err(|e| Error::GeneralString(e.to_string()))?;
+                .map_err(|e| Error::Tls(e.to_string()))?;
         } else {
             builder
                 .set_private_key_file(key_path, SslFiletype::PEM)
-                .map_err(|e| Error::GeneralString(e.to_string()))?;
+                .map_err(|e| Error::Tls(e.to_string()))?;
         }
     }
 
@@ -453,7 +453,7 @@ pub(crate) fn make_openssl_config(tls: &crate::TlsOptions) -> Result<openssl::ss
         }
         builder
             .set_alpn_protos(&wire)
-            .map_err(|e| Error::GeneralString(e.to_string()))?;
+            .map_err(|e| Error::Tls(e.to_string()))?;
     }
 
     Ok(builder.build())
@@ -473,9 +473,7 @@ pub(crate) fn openssl_ssl_for(
 ) -> Result<openssl::ssl::Ssl> {
     let mut config = connector
         .configure()
-        .map_err(|e| Error::GeneralString(e.to_string()))?;
+        .map_err(|e| Error::Tls(e.to_string()))?;
     config.set_verify_hostname(tls.enable_server_cert_auth && tls.verify);
-    config
-        .into_ssl(host)
-        .map_err(|e| Error::GeneralString(e.to_string()))
+    config.into_ssl(host).map_err(|e| Error::Tls(e.to_string()))
 }

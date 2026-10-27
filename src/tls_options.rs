@@ -92,6 +92,11 @@ pub struct TlsOptions {
     pub ca_path: PathBuf,
     /// The TLS error callback.
     ///
+    /// Called with the error's message whenever a connection attempt fails
+    /// with [`Error::Tls`](crate::Error::Tls): a refused handshake, or TLS
+    /// options that could not be turned into a configuration. A connect to a
+    /// list of servers calls it once for each server that fails this way.
+    ///
     /// Skipped by `serde`: a callback is code, not configuration, so it is
     /// absent from a deserialized value and must be set again.
     ///
@@ -343,6 +348,8 @@ impl TlsOptionsBuilder {
     }
 
     /// Sets the TLS error callback.
+    ///
+    /// See [`on_tls_error`](TlsOptions::on_tls_error) for when it is called.
     ///
     /// Available with a runtime feature (`tokio` or `smol`), the callback
     /// taking the client that failed to connect.

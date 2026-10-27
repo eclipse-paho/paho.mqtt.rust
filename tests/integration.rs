@@ -1977,6 +1977,44 @@ mod tls_verify {
         );
     }
 
+    /// TLS options that cannot be made into a configuration fail the connect
+    /// with `Error::Tls` and reach the TLS error callback, like a refused
+    /// handshake. Both rustls and OpenSSL reject an unknown cipher suite.
+    #[test]
+    fn test_tls_bad_options_are_tls_errors() {
+        use std::sync::{Arc, Mutex};
+
+        let certs = common::TestCerts::new("localhost");
+        let broker = common::spawn_tls_broker(&certs, accepting);
+
+        let reported = Arc::new(Mutex::new(Vec::<String>::new()));
+        let reported_cb = Arc::clone(&reported);
+        let tls = mqtt::TlsOptionsBuilder::new()
+            .trust_store(certs.ca_path())
+            .enabled_cipher_suites("NOT_A_CIPHER_SUITE")
+            .error_callback(move |_, msg| reported_cb.lock().unwrap().push(msg.to_string()))
+            .finalize();
+        let opts = mqtt::ConnectOptionsBuilder::new()
+            .tls_options(tls)
+            .connect_timeout(Duration::from_secs(5))
+            .finalize();
+        // Kept alive until the callback has run: dropping the client stops
+        // the dispatcher that runs it.
+        let cli = mqtt::AsyncClient::new(broker.uri.clone()).unwrap();
+        let res = cli.connect(opts).wait_for(Duration::from_secs(10));
+        assert!(
+            matches!(res, Err(mqtt::Error::Tls(_))),
+            "an unknown cipher suite is a TLS error, got {res:?}"
+        );
+
+        // The callback runs on the dispatcher thread.
+        let deadline = std::time::Instant::now() + TIMEOUT;
+        while reported.lock().unwrap().is_empty() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(reported.lock().unwrap().len(), 1);
+    }
+
     /// Turning off certificate authentication altogether accepts anything,
     /// name and chain alike.
     #[test]

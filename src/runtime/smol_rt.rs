@@ -286,9 +286,7 @@ impl Backend for SmolBackend {
                 let config = make_tls_config(tls)?;
                 let connector = futures_rustls::TlsConnector::from(config);
                 let server_name = rustls::pki_types::ServerName::try_from(host.as_str())
-                    .map_err(|_| {
-                        Error::GeneralString(format!("invalid TLS server name: {}", host))
-                    })?
+                    .map_err(|_| Error::Tls(format!("invalid TLS server name: {}", host)))?
                     .to_owned();
                 let tcp = TcpStream::connect((host.as_str(), *port)).await?;
                 tcp.set_nodelay(true)?;
@@ -330,9 +328,7 @@ impl Backend for SmolBackend {
                 let config = make_tls_config(tls)?;
                 let connector = futures_rustls::TlsConnector::from(config);
                 let server_name = rustls::pki_types::ServerName::try_from(host.as_str())
-                    .map_err(|_| {
-                        Error::GeneralString(format!("invalid TLS server name: {}", host))
-                    })?
+                    .map_err(|_| Error::Tls(format!("invalid TLS server name: {}", host)))?
                     .to_owned();
                 let tcp = tcp_maybe_proxied(&p.https_proxy, host.as_str(), *port).await?;
                 let tls_stream = connector

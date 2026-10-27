@@ -74,7 +74,16 @@ pub enum Error {
     /// WebSocket feature is not enabled.
     #[error("WebSocket not supported by library")]
     WebSocketNotSupported,
-    /// A TLS handshake failure.
+    /// A TLS failure: the handshake was refused, or the [`TlsOptions`] could
+    /// not be turned into a TLS configuration — an unreadable certificate
+    /// or key, no usable cipher suite, an option the TLS backend does not
+    /// support.
+    ///
+    /// A connect that fails with this also reports it to the
+    /// `TlsOptions::on_tls_error` callback. A certificate or key file that
+    /// cannot be opened or read is an [`Io`](Self::Io) error instead.
+    ///
+    /// [`TlsOptions`]: crate::TlsOptions
     #[error("TLS error: {0}")]
     Tls(String),
     /// Call not applicable to the client's version of MQTT.

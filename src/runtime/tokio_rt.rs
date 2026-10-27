@@ -354,9 +354,7 @@ impl Backend for TokioBackend {
                 let config = make_tls_config(tls)?;
                 let connector = TlsConnector::from(config);
                 let server_name = rustls::pki_types::ServerName::try_from(host.as_str())
-                    .map_err(|_| {
-                        Error::GeneralString(format!("invalid TLS server name: {}", host))
-                    })?
+                    .map_err(|_| Error::Tls(format!("invalid TLS server name: {}", host)))?
                     .to_owned();
                 let tcp = TcpStream::connect((host.as_str(), *port)).await?;
                 tcp.set_nodelay(true)?;
@@ -374,7 +372,7 @@ impl Backend for TokioBackend {
                 let tcp = TcpStream::connect((host.as_str(), *port)).await?;
                 tcp.set_nodelay(true)?;
                 let mut stream = tokio_openssl::SslStream::new(ssl, tcp)
-                    .map_err(|e| Error::GeneralString(e.to_string()))?;
+                    .map_err(|e| Error::Tls(e.to_string()))?;
                 Pin::new(&mut stream)
                     .connect()
                     .await
@@ -399,9 +397,7 @@ impl Backend for TokioBackend {
                 let config = make_tls_config(tls)?;
                 let connector = TlsConnector::from(config);
                 let server_name = rustls::pki_types::ServerName::try_from(host.as_str())
-                    .map_err(|_| {
-                        Error::GeneralString(format!("invalid TLS server name: {}", host))
-                    })?
+                    .map_err(|_| Error::Tls(format!("invalid TLS server name: {}", host)))?
                     .to_owned();
                 let tcp = tcp_maybe_proxied(&p.https_proxy, host.as_str(), *port).await?;
                 let tls = connector
@@ -422,7 +418,7 @@ impl Backend for TokioBackend {
                 let ssl = openssl_ssl_for(&connector, tls_opts, host.as_str())?;
                 let tcp = tcp_maybe_proxied(&p.https_proxy, host.as_str(), *port).await?;
                 let mut stream = tokio_openssl::SslStream::new(ssl, tcp)
-                    .map_err(|e| Error::GeneralString(e.to_string()))?;
+                    .map_err(|e| Error::Tls(e.to_string()))?;
                 Pin::new(&mut stream)
                     .connect()
                     .await
