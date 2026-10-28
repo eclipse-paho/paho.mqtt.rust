@@ -246,8 +246,11 @@ impl Message {
         self.retain
     }
 
-    // TODO: Mark as deprecated?
-    /// Gets the retain flag of the message
+    /// Gets the retain flag of the message.
+    ///
+    /// An alias of [`retain`](Self::retain), the name the specification uses
+    /// for the flag. `retained` is kept from v1.x and matches the other Paho
+    /// clients (C, C++, Java, Go).
     #[inline]
     pub fn retained(&self) -> bool {
         self.retain()
@@ -356,8 +359,11 @@ impl MessageBuilder {
         self
     }
 
-    // TODO: Mark deprecated?
-    /// Obsolete method for `retain`
+    /// Sets whether the message should be retained by the broker.
+    ///
+    /// An alias of [`retain`](Self::retain), the name the specification uses
+    /// for the flag. `retained` is kept from v1.x and matches the other Paho
+    /// clients (C, C++, Java, Go).
     pub fn retained(self, retain: bool) -> Self {
         self.retain(retain)
     }

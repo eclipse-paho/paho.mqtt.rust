@@ -115,7 +115,7 @@ impl<'a> Topic<'a> {
         let mut bld = MessageBuilder::new()
             .payload(payload)
             .qos(self.qos)
-            .retained(self.retained);
+            .retain(self.retained);
 
         if self.alias == 0 || inc_topic {
             bld = bld.topic(&self.topic);

@@ -116,7 +116,7 @@ async fn main() {
             match evt {
                 Event::Connected(rsp) => println!("Connected (v{})", rsp.mqtt_version),
                 Event::Message(msg) => {
-                    if msg.retained() {
+                    if msg.retain() {
                         print!("(R) ");
                     }
                     println!("{}", msg);

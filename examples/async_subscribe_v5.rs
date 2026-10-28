@@ -129,7 +129,7 @@ fn main() {
 
         while let Ok(msg_opt) = strm.recv().await {
             if let Some(msg) = msg_opt {
-                if msg.retained() {
+                if msg.retain() {
                     print!("(R) ");
                 }
                 println!("{}", msg);

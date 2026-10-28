@@ -766,7 +766,7 @@ fn test_retained_message() {
         .topic(topic)
         .payload("retained-value")
         .qos(mqtt::QOS_1)
-        .retained(true)
+        .retain(true)
         .finalize();
     pub_cli
         .publish(msg)
@@ -795,7 +795,7 @@ fn test_retained_message() {
         .topic(topic)
         .payload("")
         .qos(mqtt::QOS_1)
-        .retained(true)
+        .retain(true)
         .finalize();
     sub.publish(clear).wait().ok();
     sub.disconnect(None).wait().ok();
@@ -2770,7 +2770,7 @@ fn test_v5_retain_handling_do_not_send() {
         .topic(topic)
         .payload("retained")
         .qos(mqtt::QOS_1)
-        .retained(true)
+        .retain(true)
         .finalize();
     seed.publish(retained_msg)
         .wait()
@@ -2803,7 +2803,7 @@ fn test_v5_retain_handling_do_not_send() {
         .topic(topic)
         .payload("")
         .qos(mqtt::QOS_1)
-        .retained(true)
+        .retain(true)
         .finalize();
     sub.publish(clear).wait().ok();
     sub.disconnect(None).wait().ok();

@@ -721,7 +721,6 @@ impl ConnectOptionsBuilder {
     ///
     /// `props` The collection of properties to include with the connect message.
     pub fn properties(&mut self, props: Properties) -> &mut Self {
-        // TODO: Error on version mismatch
         self.0.props = props;
         self
     }
