@@ -3633,20 +3633,6 @@ mod tests {
         conn: StateView,
     }
 
-    /// The send-while-disconnected configuration the tests use unless they
-    /// say otherwise: no buffering.
-    fn test_offline_cfg() -> OfflineConfig {
-        OfflineConfig {
-            send_while_disconnected: false,
-            max_buffered_msgs: 0,
-            allow_send_any_time: false,
-            delete_oldest: false,
-            restore_msgs: false,
-            persist_qos0: true,
-            persist_timeout: Duration::ZERO,
-        }
-    }
-
     /// A session over [`MockBackend`]. The mock transport is treated as one
     /// that buffers until flushed, like TLS, unless `flush_needed` is false.
     /// `msg_cap` is how many messages may wait for the (simulated)
@@ -3690,7 +3676,7 @@ mod tests {
             Lent {
                 persist: Persist::None,
                 buf: VecDeque::new(),
-                offline_cfg: test_offline_cfg(),
+                offline_cfg: OfflineConfig::default(),
             },
             state,
         );
@@ -3926,7 +3912,7 @@ mod tests {
             cmd_rx,
             event_tx,
             Dispatch::new(),
-            test_offline_cfg(),
+            OfflineConfig::default(),
             conn_state,
         ));
 
@@ -4457,7 +4443,7 @@ mod tests {
         let cfg = OfflineConfig {
             allow_send_any_time: true,
             max_buffered_msgs: 10,
-            ..test_offline_cfg()
+            ..OfflineConfig::default()
         };
 
         let (mut tok, c) = publish_cmd("t", QoS::QoS1, Bytes::from_static(b"x"));

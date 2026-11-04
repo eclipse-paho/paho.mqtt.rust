@@ -403,15 +403,7 @@ impl AsyncClient {
             ));
         }
 
-        let offline_cfg = OfflineConfig {
-            send_while_disconnected: opts.send_while_disconnected,
-            max_buffered_msgs: opts.max_buffered_msgs,
-            allow_send_any_time: opts.allow_send_any_time,
-            delete_oldest: opts.delete_oldest,
-            restore_msgs: opts.restore_msgs,
-            persist_qos0: opts.persist_qos0,
-            persist_timeout: opts.persist_timeout,
-        };
+        let offline_cfg = OfflineConfig::from(&opts);
 
         #[cfg(feature = "tokio")]
         let (rt, rt_ownership) = {

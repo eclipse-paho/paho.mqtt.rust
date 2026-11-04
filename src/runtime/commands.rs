@@ -41,8 +41,9 @@ use paho_mqtt_codec::{
 
 use super::sinks::Sink;
 use crate::{
-    AuthHandler, ClientPersistence, ConnectResponse, ConnectionState, Error, Message,
-    PublishResponse, SubscribeOptions, SubscribeResponse, UnsubscribeResponse, token::Completer,
+    AuthHandler, ClientPersistence, ConnectResponse, ConnectionState, CreateOptions, Error,
+    Message, PublishResponse, SubscribeOptions, SubscribeResponse, UnsubscribeResponse,
+    token::Completer,
 };
 
 /////////////////////////////////////////////////////////////////////////////
@@ -134,7 +135,7 @@ impl StateView {
 /// Passed to the event loop at spawn time; fixed for the life of the client.
 ///
 /// [`CreateOptions`]: crate::CreateOptions
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 pub(crate) struct OfflineConfig {
     /// Buffer publish commands when the client is disconnected after a prior
     /// successful connection.
@@ -166,6 +167,20 @@ impl OfflineConfig {
     /// whether this client has ever been connected.
     pub fn buffers(&self, ever_connected: bool) -> bool {
         self.allow_send_any_time || (ever_connected && self.send_while_disconnected)
+    }
+}
+
+impl From<&CreateOptions> for OfflineConfig {
+    fn from(opts: &CreateOptions) -> Self {
+        Self {
+            send_while_disconnected: opts.send_while_disconnected,
+            max_buffered_msgs: opts.max_buffered_msgs,
+            allow_send_any_time: opts.allow_send_any_time,
+            delete_oldest: opts.delete_oldest,
+            restore_msgs: opts.restore_msgs,
+            persist_qos0: opts.persist_qos0,
+            persist_timeout: opts.persist_timeout,
+        }
     }
 }
 
