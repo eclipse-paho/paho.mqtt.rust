@@ -23,8 +23,6 @@
 //! [`Command`] values flow from the public API to the event loop.
 //! [`Event`] values flow back from the event loop to the public layer.
 
-#[cfg(any(feature = "websocket", feature = "smol-websocket"))]
-use std::collections::HashMap;
 use std::{
     sync::{
         Arc, Mutex, RwLock,
@@ -45,6 +43,9 @@ use crate::{
     Message, PublishResponse, SubscribeOptions, SubscribeResponse, UnsubscribeResponse,
     token::Completer,
 };
+
+#[cfg(any(feature = "websocket", feature = "smol-websocket"))]
+use std::collections::HashMap;
 
 /////////////////////////////////////////////////////////////////////////////
 

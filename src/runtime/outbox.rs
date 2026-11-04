@@ -20,8 +20,8 @@
 
 //! The session's outbound byte queue.
 //!
-//! The session encodes packets into an [`Outbox`] and never writes to the
-//! transport itself; the run loop's writer branch drains the outbox with
+//! The session encodes packets into an [`Outbox`] but never writes to the
+//! transport itself. The run loop's writer branch drains the outbox with
 //! vectored writes whenever the transport will take more. Packets that pile
 //! up while a write is in progress therefore go out together in the next
 //! one, while a packet queued on an idle connection goes out on the very next
@@ -46,19 +46,21 @@ pub(crate) const INLINE_PAYLOAD_MAX: usize = 16 * 1024;
 const TAIL_CAPACITY: usize = 16 * 1024;
 
 /// Where the most recently pushed frame lies, for [`Outbox::last_frame`].
-#[derive(Clone, Copy)]
+#[derive(Default, Clone, Copy)]
 enum LastFrame {
     /// Nothing to report: no push yet, or the frame has been handed to the
     /// writer since.
+    #[default]
     None,
     /// Header and body are `tail[start..]`.
     Inline(usize),
-    /// The header ends the next-to-last segment, from `start`; the payload
-    /// is the last segment.
+    /// The header ends the next-to-last segment, from `start`.
+    /// The payload is the last segment.
     Split(usize),
 }
 
 /// Outbound bytes that the transport has not yet accepted, in wire order.
+#[derive(Default)]
 pub(crate) struct Outbox {
     /// Frozen runs of small packets, and large payloads held by reference.
     segs: VecDeque<Bytes>,
@@ -96,17 +98,9 @@ impl Outbox {
     /// written bytes until a flush.
     pub fn new(flush_needed: bool) -> Self {
         Self {
-            segs: VecDeque::new(),
             tail: BytesMut::with_capacity(TAIL_CAPACITY),
-            front_off: 0,
-            queued: 0,
-            written: 0,
-            flushed: 0,
-            on_flushed: VecDeque::new(),
             flush_needed,
-            last: LastFrame::None,
-            last_start: 0,
-            gate: None,
+            ..Self::default()
         }
     }
 
