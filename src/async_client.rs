@@ -51,7 +51,7 @@ use crate::{
     error::{Error, Result},
     persistence::ClientPersistence,
     runtime::{
-        BufConfig, Command, ConnectParams, RtOwnership, ServerAddr, Sink, StateView,
+        Command, ConnectParams, OfflineConfig, RtOwnership, ServerAddr, Sink, StateView,
         session::Dispatch,
     },
     token::Token,
@@ -373,6 +373,15 @@ impl AsyncClient {
     ///
     /// * `opts` The create options for the client.
     ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidArgument`] if the options ask for file persistence
+    /// ([`PersistenceType::File`] or [`FilePath`](PersistenceType::FilePath))
+    /// with an empty client ID. A client without an ID cannot resume a
+    /// session, so there is nothing for the store to keep, and the store is
+    /// named after the ID. v1.x switched such a client to no persistence
+    /// without saying so.
+    ///
     pub fn new<T>(opts: T) -> Result<AsyncClient>
     where
         T: Into<CreateOptions>,
@@ -380,7 +389,21 @@ impl AsyncClient {
         let mut opts: CreateOptions = opts.into();
         debug!("Create options: {:?}", opts);
 
-        let buf_cfg = BufConfig {
+        // The file store is named after the client ID, and a client with no
+        // ID never resumes a session, so there would be nothing to keep and
+        // every such client would share one directory.
+        if opts.client_id.is_empty()
+            && matches!(
+                opts.persistence,
+                PersistenceType::File | PersistenceType::FilePath(_)
+            )
+        {
+            return Err(Error::InvalidArgument(
+                "file persistence needs a client ID".into(),
+            ));
+        }
+
+        let offline_cfg = OfflineConfig {
             send_while_disconnected: opts.send_while_disconnected,
             max_buffered_msgs: opts.max_buffered_msgs,
             allow_send_any_time: opts.allow_send_any_time,
@@ -394,14 +417,14 @@ impl AsyncClient {
         let (rt, rt_ownership) = {
             use crate::runtime::{RuntimeHandle, resolve_runtime};
             let (rt_handle, ownership) = resolve_runtime(&opts.runtime_mode);
-            (RuntimeHandle::spawn(&rt_handle, buf_cfg), ownership)
+            (RuntimeHandle::spawn(&rt_handle, offline_cfg), ownership)
         };
 
         #[cfg(feature = "smol")]
         let (rt, rt_ownership) = {
             use crate::runtime::{RuntimeHandle, SmolOwnership, resolve_executor};
             let executor = resolve_executor(&opts.runtime_mode);
-            let rt = RuntimeHandle::spawn(&executor, buf_cfg);
+            let rt = RuntimeHandle::spawn(&executor, offline_cfg);
             (rt, SmolOwnership::Shared(executor))
         };
         let (cmd_tx, event_rx, dispatch, state) = rt.into_parts();
@@ -1998,6 +2021,39 @@ mod tests {
         let cli = cli.unwrap();
         let retrieved = cli.server_uri();
         assert_eq!(retrieved, server_uri);
+    }
+
+    #[test]
+    fn test_file_persistence_needs_a_client_id() {
+        let create = |id: &str, persistence: PersistenceType| {
+            AsyncClient::new(
+                CreateOptionsBuilder::new()
+                    .server_uri("tcp://localhost:1883")
+                    .client_id(id)
+                    .persistence(persistence)
+                    .finalize(),
+            )
+        };
+        let dir = std::env::temp_dir().join("paho-test-no-id");
+
+        for persistence in [
+            PersistenceType::File,
+            PersistenceType::FilePath(dir.clone()),
+        ] {
+            assert!(matches!(
+                create("", persistence),
+                Err(Error::InvalidArgument(msg)) if msg.contains("client ID")
+            ));
+        }
+
+        // No store, or one of the application's own, is its business.
+        assert!(create("", PersistenceType::None).is_ok());
+        let mem: Box<dyn ClientPersistence> = Box::new(crate::MemPersistence::new());
+        assert!(create("", PersistenceType::User(mem.into())).is_ok());
+
+        // And with an ID the file store is fine. Nothing is written until a
+        // connect opens it.
+        assert!(create("an-id", PersistenceType::FilePath(dir)).is_ok());
     }
 
     #[test]

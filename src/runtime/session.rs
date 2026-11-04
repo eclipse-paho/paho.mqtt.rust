@@ -60,7 +60,7 @@ use paho_mqtt_codec::{
 use super::{
     backend::{Backend, READ_CHUNK, Sleep},
     commands::{
-        BufConfig, Command, ConnectParams, Event, MAX_PACKET_IDS, SessionLimits, StateCell,
+        Command, ConnectParams, Event, MAX_PACKET_IDS, OfflineConfig, SessionLimits, StateCell,
         StateView, assigned_client_id, negotiated_keep_alive,
     },
     outbox::Outbox,
@@ -129,7 +129,7 @@ impl RuntimeHandle {
     /// Creates the command and event channels and the event-loop future that
     /// services them.  The caller must spawn the future on its executor.
     pub(crate) fn new<B: Backend>(
-        buf_cfg: BufConfig,
+        offline_cfg: OfflineConfig,
     ) -> (Self, impl Future<Output = ()> + Send + 'static) {
         let (cmd_tx, cmd_rx) = async_channel::unbounded::<Command>();
         let (event_tx, event_rx) = async_channel::unbounded::<Event>();
@@ -137,7 +137,7 @@ impl RuntimeHandle {
         // The loop keeps the only writable handle on the state.
         let state = StateCell::new();
         let view = state.view();
-        let task = run_event_loop::<B>(cmd_rx, event_tx, dispatch.clone(), buf_cfg, state);
+        let task = run_event_loop::<B>(cmd_rx, event_tx, dispatch.clone(), offline_cfg, state);
         (
             Self {
                 cmd_tx,
@@ -962,7 +962,7 @@ struct Lent {
     /// disconnect is in progress, which it adds for the next connection.
     buf: VecDeque<Command>,
     /// The buffer's configuration.
-    buf_cfg: BufConfig,
+    offline_cfg: OfflineConfig,
 }
 
 /// Holds all mutable state for a connected MQTT session.
@@ -1033,7 +1033,7 @@ struct Session<B: Backend> {
     after_loss: ConnectionState,
     /// The send-while-disconnected buffer; see [`Lent::buf`].
     buf: VecDeque<Command>,
-    buf_cfg: BufConfig,
+    offline_cfg: OfflineConfig,
     /// A `connect()` that arrived while a disconnect was in progress, for the
     /// event loop to run once it has completed.
     held_connect: Option<Command>,
@@ -1071,7 +1071,7 @@ impl<B: Backend> Session<B> {
         let Lent {
             persist,
             buf,
-            buf_cfg,
+            offline_cfg,
         } = lent;
         Self {
             writer,
@@ -1097,7 +1097,7 @@ impl<B: Backend> Session<B> {
             conn_state,
             after_loss,
             buf,
-            buf_cfg,
+            offline_cfg,
             held_connect: None,
             held_disconnects: Vec::new(),
         }
@@ -1975,12 +1975,11 @@ impl<B: Backend> Session<B> {
             cmd => {
                 // This client has been connected, so the rule is the one
                 // `run_event_loop` applies after a connection.
-                let should_buf =
-                    self.buf_cfg.allow_send_any_time || self.buf_cfg.send_while_disconnected;
+                let should_buf = self.offline_cfg.buffers(true);
                 let handled = handle_offline_command(
                     cmd,
                     &mut self.buf,
-                    &self.buf_cfg,
+                    &self.offline_cfg,
                     should_buf,
                     &mut self.sinks,
                 );
@@ -2772,7 +2771,7 @@ async fn do_connect<B: Backend>(job: &ConnectJob) -> Result<Connected<B>> {
 /// front entry is evicted (its `Completer` drops → `Error::Disconnected`).
 /// If `delete_oldest` is not set and the buffer is full, the incoming command
 /// is dropped instead (same effect on its completer).
-fn buf_push(buf: &mut VecDeque<Command>, cmd: Command, cfg: &BufConfig) {
+fn buf_push(buf: &mut VecDeque<Command>, cmd: Command, cfg: &OfflineConfig) {
     if buf.len() < cfg.max_buffered_msgs {
         buf.push_back(cmd);
     } else if cfg.delete_oldest {
@@ -2807,7 +2806,7 @@ enum Offline {
 fn handle_offline_command(
     cmd: Command,
     buf: &mut VecDeque<Command>,
-    cfg: &BufConfig,
+    cfg: &OfflineConfig,
     should_buf: bool,
     sinks: &mut Sinks,
 ) -> Offline {
@@ -2883,7 +2882,7 @@ async fn attempt_connect<B: Backend>(
     job: &ConnectJob,
     cmd_rx: &async_channel::Receiver<Command>,
     buf: &mut VecDeque<Command>,
-    buf_cfg: &BufConfig,
+    offline_cfg: &OfflineConfig,
     should_buf: bool,
     sinks: &mut Sinks,
 ) -> Attempt<B> {
@@ -2912,7 +2911,7 @@ async fn attempt_connect<B: Backend>(
             Ok(Command::Connect { tx, .. }) => {
                 tx.complete(Err(Error::ConnectInProgress));
             }
-            Ok(cmd) => match handle_offline_command(cmd, buf, buf_cfg, should_buf, sinks) {
+            Ok(cmd) => match handle_offline_command(cmd, buf, offline_cfg, should_buf, sinks) {
                 Offline::Handled => {}
                 Offline::Disconnect(tx) => return Attempt::Aborted(Some(tx)),
                 Offline::Connect(..) => unreachable!("Connect is matched above"),
@@ -2963,7 +2962,7 @@ async fn reconnect_wait<B: Backend>(
     delay: Duration,
     cmd_rx: &async_channel::Receiver<Command>,
     buf: &mut VecDeque<Command>,
-    buf_cfg: &BufConfig,
+    offline_cfg: &OfflineConfig,
     sinks: &mut Sinks,
 ) -> WaitOutcome {
     let mut sleep = B::Sleep::new(delay);
@@ -2979,8 +2978,10 @@ async fn reconnect_wait<B: Backend>(
                 match handle_offline_command(
                     cmd,
                     buf,
-                    buf_cfg,
-                    buf_cfg.send_while_disconnected,
+                    offline_cfg,
+                    // Only a lost connection is retried, so this client has
+                    // been connected.
+                    offline_cfg.buffers(true),
                     sinks,
                 ) {
                     Offline::Handled => {}
@@ -3046,14 +3047,14 @@ fn next_retry_delay(current: Duration, max: Duration) -> Duration {
 /// `Command::Disconnect` at any point — waiting, connecting, backing off —
 /// stops the loop and returns it to waiting for a `Connect`.
 ///
-/// `buf_cfg` controls the send-while-disconnected buffer.  When enabled,
+/// `offline_cfg` controls the send-while-disconnected buffer.  When enabled,
 /// `Publish` commands received while the client is disconnected are queued
 /// and flushed into the session immediately after a successful (re)connect.
 pub(crate) async fn run_event_loop<B: Backend>(
     cmd_rx: async_channel::Receiver<Command>,
     event_tx: async_channel::Sender<Event>,
     dispatch: Dispatch,
-    buf_cfg: BufConfig,
+    offline_cfg: OfflineConfig,
     conn_state: StateCell,
 ) {
     // Buffer for Publish commands received while disconnected.
@@ -3086,9 +3087,8 @@ pub(crate) async fn run_event_loop<B: Backend>(
                     Err(_) => return,
                 },
             };
-            let should_buf =
-                buf_cfg.allow_send_any_time || (ever_connected && buf_cfg.send_while_disconnected);
-            match handle_offline_command(cmd, &mut buf, &buf_cfg, should_buf, &mut sinks) {
+            let should_buf = offline_cfg.buffers(ever_connected);
+            match handle_offline_command(cmd, &mut buf, &offline_cfg, should_buf, &mut sinks) {
                 Offline::Handled => {}
                 Offline::Disconnect(tx) => finish_disconnect(&conn_state, Some(tx)),
                 Offline::Connect(job, tx) => break (job, Some(tx)),
@@ -3103,15 +3103,17 @@ pub(crate) async fn run_event_loop<B: Backend>(
         let mut retry_delay = job.params.min_retry_interval;
 
         'retry: loop {
-            let should_buf =
-                buf_cfg.allow_send_any_time || (ever_connected && buf_cfg.send_while_disconnected);
+            let should_buf = offline_cfg.buffers(ever_connected);
 
             if !persist.is_some()
                 && let Some(store) = &job.persist
             {
                 let blocking = store.lock().unwrap().is_blocking();
                 persist = if blocking {
-                    Persist::Worker(PersistWorker::start(store.clone(), buf_cfg.persist_timeout))
+                    Persist::Worker(PersistWorker::start(
+                        store.clone(),
+                        offline_cfg.persist_timeout,
+                    ))
                 } else {
                     Persist::Inline(store.clone())
                 };
@@ -3130,7 +3132,12 @@ pub(crate) async fn run_event_loop<B: Backend>(
                 for idx in 0..n {
                     job.server_idx = idx;
                     match attempt_connect::<B>(
-                        &job, &cmd_rx, &mut buf, &buf_cfg, should_buf, &mut sinks,
+                        &job,
+                        &cmd_rx,
+                        &mut buf,
+                        &offline_cfg,
+                        should_buf,
+                        &mut sinks,
                     )
                     .await
                     {
@@ -3163,7 +3170,7 @@ pub(crate) async fn run_event_loop<B: Backend>(
                     ),
                 }
             } else {
-                match reconnect_wait::<B>(retry_delay, &cmd_rx, &mut buf, &buf_cfg, &mut sinks)
+                match reconnect_wait::<B>(retry_delay, &cmd_rx, &mut buf, &offline_cfg, &mut sinks)
                     .await
                 {
                     WaitOutcome::Abort(tx) => {
@@ -3186,7 +3193,12 @@ pub(crate) async fn run_event_loop<B: Backend>(
                     }
                 }
                 match attempt_connect::<B>(
-                    &job, &cmd_rx, &mut buf, &buf_cfg, should_buf, &mut sinks,
+                    &job,
+                    &cmd_rx,
+                    &mut buf,
+                    &offline_cfg,
+                    should_buf,
+                    &mut sinks,
                 )
                 .await
                 {
@@ -3255,7 +3267,7 @@ pub(crate) async fn run_event_loop<B: Backend>(
             // session state. Only the first connection needs to: from then
             // on the in-memory state is the authority and the store mirrors
             // it.
-            if buf_cfg.restore_msgs && !state.loaded {
+            if offline_cfg.restore_msgs && !state.loaded {
                 load_persisted(&mut state, job.persist.as_ref(), job.params.ver);
             }
             state.loaded = true;
@@ -3309,7 +3321,7 @@ pub(crate) async fn run_event_loop<B: Backend>(
                 Lent {
                     persist,
                     buf: std::mem::take(&mut buf),
-                    buf_cfg,
+                    offline_cfg,
                 },
                 state,
             );
@@ -3623,8 +3635,8 @@ mod tests {
 
     /// The send-while-disconnected configuration the tests use unless they
     /// say otherwise: no buffering.
-    fn test_buf_cfg() -> BufConfig {
-        BufConfig {
+    fn test_offline_cfg() -> OfflineConfig {
+        OfflineConfig {
             send_while_disconnected: false,
             max_buffered_msgs: 0,
             allow_send_any_time: false,
@@ -3678,7 +3690,7 @@ mod tests {
             Lent {
                 persist: Persist::None,
                 buf: VecDeque::new(),
-                buf_cfg: test_buf_cfg(),
+                offline_cfg: test_offline_cfg(),
             },
             state,
         );
@@ -3914,7 +3926,7 @@ mod tests {
             cmd_rx,
             event_tx,
             Dispatch::new(),
-            test_buf_cfg(),
+            test_offline_cfg(),
             conn_state,
         ));
 
@@ -4434,6 +4446,38 @@ mod tests {
         (tok, cmd)
     }
 
+    /// In the backoff between reconnect attempts, `allow_send_any_time` on
+    /// its own buffers a publish, as it does everywhere else. The wait used
+    /// to look only at `send_while_disconnected`, and failed the publish.
+    #[test]
+    fn test_reconnect_wait_buffers_with_allow_send_any_time() {
+        let (cmd_tx, cmd_rx) = async_channel::unbounded();
+        let mut buf = VecDeque::new();
+        let mut sinks = Sinks::default();
+        let cfg = OfflineConfig {
+            allow_send_any_time: true,
+            max_buffered_msgs: 10,
+            ..test_offline_cfg()
+        };
+
+        let (mut tok, c) = publish_cmd("t", QoS::QoS1, Bytes::from_static(b"x"));
+        cmd_tx.try_send(c).unwrap();
+        let outcome = {
+            let wait = pin!(reconnect_wait::<MockBackend>(
+                Duration::from_millis(20),
+                &cmd_rx,
+                &mut buf,
+                &cfg,
+                &mut sinks,
+            ));
+            poll_until(wait, Duration::from_secs(1))
+        };
+
+        assert!(matches!(outcome, Some(WaitOutcome::Retry)));
+        assert_eq!(buf.len(), 1);
+        assert!(tok.try_wait().is_none());
+    }
+
     /// While a disconnect drains in-flight work, commands are answered at
     /// once rather than left in the channel until the drain ends: a publish
     /// as the offline rules say (buffered, or failed), a subscribe failed,
@@ -4445,8 +4489,8 @@ mod tests {
     fn test_commands_during_disconnect_are_answered_at_once() {
         for buffering in [false, true] {
             let mut h = harness(BytesMut::new(), Duration::ZERO, SessionState::default());
-            h.session.buf_cfg.send_while_disconnected = buffering;
-            h.session.buf_cfg.max_buffered_msgs = 10;
+            h.session.offline_cfg.send_while_disconnected = buffering;
+            h.session.offline_cfg.max_buffered_msgs = 10;
 
             // In flight and never acknowledged, so the drain runs its course.
             let (mut first, c) = publish_cmd("first", QoS::QoS1, Bytes::from_static(b"1"));

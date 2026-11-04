@@ -194,12 +194,13 @@ To connect with an older protocol level, use `ConnectOptionsBuilder::new_v3()` o
 
 ## Persistence
 
-By default the client keeps in-flight QoS 1 and QoS 2 messages in files next to the working directory, so they survive a crash. The store is selectable:
+By default the client keeps in-flight QoS 1 and QoS 2 messages in memory only. A persistence store keeps them across a crash or restart; the file store needs a client ID, which names its directory:
 
 ```rust
 let cli = mqtt::CreateOptionsBuilder::new()
     .server_uri("mqtt://localhost:1883")
-    .persistence(mqtt::PersistenceType::File)   // or MemPersistence, or None
+    .client_id("my-client")
+    .persistence(mqtt::PersistenceType::File)   // or FilePath, MemPersistence, None
     .create_async_client()?;
 ```
 

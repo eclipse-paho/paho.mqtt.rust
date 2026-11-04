@@ -100,7 +100,8 @@ mod fragments {
         let _f5 = || -> mqtt::Result<()> {
             let cli = mqtt::CreateOptionsBuilder::new()
                 .server_uri("mqtt://localhost:1883")
-                .persistence(mqtt::PersistenceType::File) // or MemPersistence, or None
+                .client_id("my-client")
+                .persistence(mqtt::PersistenceType::File) // or FilePath, MemPersistence, None
                 .create_async_client()?;
             Ok(())
         };

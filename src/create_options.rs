@@ -272,6 +272,10 @@ pub struct CreateOptions {
 impl CreateOptions {
     /// Create a new set of create options with the specified URL
     /// and Client ID.
+    ///
+    /// Persistence is left at the default, [`PersistenceType::None`]. This
+    /// differs from building the options from a `(server_uri, client_id)`
+    /// tuple, which turns on file persistence as v1.x did.
     pub fn new<U, C>(server_uri: U, client_id: C) -> Self
     where
         U: Into<String>,
@@ -363,13 +367,18 @@ impl<'a> From<&'a str> for CreateOptions {
 impl From<(String, String)> for CreateOptions {
     /// Constructs the create options from two strings giving the server URI
     /// and Client ID.
+    ///
+    /// A non-empty client ID turns on [`PersistenceType::File`], as in v1.x;
+    /// [`CreateOptions::new`] does not.
     fn from((server_uri, client_id): (String, String)) -> Self {
         let mut opts = Self {
             server_uri,
             client_id,
             ..Self::default()
         };
-        // TODO: Is this confusing?
+        // Unlike `CreateOptions::new`, which leaves the default of no
+        // persistence: a client given an ID this way gets a file store, as in
+        // v1.x, whose code relies on it.
         if !opts.client_id.is_empty() {
             opts.persistence = PersistenceType::File;
         }
@@ -378,8 +387,11 @@ impl From<(String, String)> for CreateOptions {
 }
 
 impl<'a, 'b> From<(&'a str, &'b str)> for CreateOptions {
-    /// Constructs the create options from two string reference giving the server URI
-    /// and Client ID.
+    /// Constructs the create options from two string references giving the
+    /// server URI and Client ID.
+    ///
+    /// A non-empty client ID turns on [`PersistenceType::File`], as in v1.x;
+    /// [`CreateOptions::new`] does not.
     fn from((server_uri, client_id): (&'a str, &'b str)) -> Self {
         Self::from((server_uri.to_string(), client_id.to_string()))
     }
@@ -468,9 +480,10 @@ impl CreateOptionsBuilder {
     }
 
     /// Sets the type of persistence used by the client.
-    /// The default is for the library to automatically use file persistence,
-    /// although this can be turned off by specify `None` for a more
-    /// performant, though possibly less reliable system.
+    ///
+    /// The default is [`PersistenceType::None`]: in-flight messages are kept
+    /// in memory only, and are lost if the application exits. File
+    /// persistence needs a client ID; see [`PersistenceType`].
     ///
     /// # Arguments
     ///

@@ -25,9 +25,10 @@
 //! The defaults use the behavior that was present in MQTT v3.1.1.
 
 use crate::{Error, Result};
+use std::{convert::TryFrom, fmt};
+
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
-use std::{convert::TryFrom, fmt};
 
 /// Receive our own publications when subscribed to the same topics.
 /// This is the default and the same behavior as MQTT v3.x
@@ -160,7 +161,11 @@ impl SubscribeOptions {
     }
 }
 
-// TODO Does any of this still make sense?!?!
+// Shorthands for the options, in field order, for the calls that take
+// `T: Into<SubscribeOptions>` (`subscribe_with_options` and the `Topic`
+// subscribe helpers): `true` asks for no-local, `(true, true)` adds
+// retain-as-published, and a third element sets the retain handling.
+// Carried over unchanged from v1.x, so code passing them still compiles.
 
 impl From<bool> for SubscribeOptions {
     fn from(no_local: bool) -> Self {

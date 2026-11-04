@@ -76,7 +76,7 @@ pub(crate) mod smol_conn;
 pub(crate) mod smol_rt;
 
 #[cfg(any(feature = "tokio", feature = "smol"))]
-pub(crate) use commands::{BufConfig, Command, ConnectParams, Event, ServerAddr, StateView};
+pub(crate) use commands::{Command, ConnectParams, Event, OfflineConfig, ServerAddr, StateView};
 
 #[cfg(any(feature = "tokio", feature = "smol"))]
 pub(crate) use session::RuntimeHandle;

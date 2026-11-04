@@ -57,14 +57,18 @@ pub type ClientPersistenceBox = Box<dyn ClientPersistence>;
 /// and then the persistence store will be created under that directory.
 /// Each client will create a directory under that using the MQTT client
 /// ID and server URL to name the directory. Therefore, a client ID is
-/// required by the library when using persistence.
+/// required by the library when using persistence: creating a client with
+/// `File` or `FilePath` and an empty ID fails with
+/// [`Error::InvalidArgument`].
+///
+/// The default is [`None`](Self::None).
 ///
 /// The persistence type can be created from any string or path to indicate
 /// file persistence to that directory.
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Default)]
 pub enum PersistenceType {
-    /// Messages are persisted to files in a local directory (default).
+    /// Messages are persisted to files in the current working directory.
     File,
     /// Messages are persisted to files under the specified directory.
     FilePath(PathBuf),

@@ -57,7 +57,7 @@ use super::tls_config::make_tls_config;
 use super::ws_util::build_ws_request;
 use super::{
     backend::{Backend, READ_CHUNK, Sleep},
-    commands::{BufConfig, ConnectParams, ServerAddr},
+    commands::{ConnectParams, OfflineConfig, ServerAddr},
     connection::Connection,
     session::RuntimeHandle,
     smol_conn::TcpConnection,
@@ -147,8 +147,8 @@ pub(crate) fn resolve_executor(
 impl RuntimeHandle {
     /// Spawns the MQTT event loop as a detached task on `executor` and
     /// returns the channel endpoints for communicating with it.
-    pub(crate) fn spawn(executor: &smol::Executor<'static>, buf_cfg: BufConfig) -> Self {
-        let (this, task) = Self::new::<SmolBackend>(buf_cfg);
+    pub(crate) fn spawn(executor: &smol::Executor<'static>, offline_cfg: OfflineConfig) -> Self {
+        let (this, task) = Self::new::<SmolBackend>(offline_cfg);
         executor.spawn(task).detach();
         this
     }
@@ -386,7 +386,7 @@ mod tests {
             cmd_rx,
             event_tx,
             Dispatch::new(),
-            BufConfig {
+            OfflineConfig {
                 send_while_disconnected: false,
                 max_buffered_msgs: 100,
                 allow_send_any_time: false,

@@ -60,7 +60,7 @@ use super::tokio_conn::WsConnection;
 use super::ws_util::build_ws_request;
 use super::{
     backend::{Backend, READ_CHUNK, Sleep},
-    commands::{BufConfig, ConnectParams, ServerAddr},
+    commands::{ConnectParams, OfflineConfig, ServerAddr},
     connection::Connection,
     session::RuntimeHandle,
     tokio_conn::TcpConnection,
@@ -214,8 +214,8 @@ fn build_runtime(num_threads: usize) -> tokio::runtime::Runtime {
 impl RuntimeHandle {
     /// Spawns the MQTT event loop as a task on `handle` and returns the
     /// channel endpoints for communicating with it.
-    pub(crate) fn spawn(handle: &tokio::runtime::Handle, buf_cfg: BufConfig) -> Self {
-        let (this, task) = Self::new::<TokioBackend>(buf_cfg);
+    pub(crate) fn spawn(handle: &tokio::runtime::Handle, offline_cfg: OfflineConfig) -> Self {
+        let (this, task) = Self::new::<TokioBackend>(offline_cfg);
         handle.spawn(task);
         this
     }
@@ -532,7 +532,7 @@ mod tests {
             cmd_rx,
             event_tx,
             Dispatch::new(),
-            BufConfig {
+            OfflineConfig {
                 send_while_disconnected: false,
                 max_buffered_msgs: 100,
                 allow_send_any_time: false,

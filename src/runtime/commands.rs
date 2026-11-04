@@ -127,13 +127,15 @@ impl StateView {
 
 /////////////////////////////////////////////////////////////////////////////
 
-/// Configuration for the send-while-disconnected message buffer.
+/// The [`CreateOptions`] that govern the client while it has no session:
+/// the send-while-disconnected buffer, and how the persistence store is
+/// read back and waited on.
 ///
-/// Passed to the event loop at spawn time; derived from [`CreateOptions`].
+/// Passed to the event loop at spawn time; fixed for the life of the client.
 ///
 /// [`CreateOptions`]: crate::CreateOptions
 #[derive(Clone, Copy)]
-pub(crate) struct BufConfig {
+pub(crate) struct OfflineConfig {
     /// Buffer publish commands when the client is disconnected after a prior
     /// successful connection.
     pub send_while_disconnected: bool,
@@ -144,8 +146,9 @@ pub(crate) struct BufConfig {
     pub allow_send_any_time: bool,
     /// When the buffer is full, evict the oldest entry rather than the newest.
     pub delete_oldest: bool,
-    /// After a successful connect, re-transmit persisted in-flight QoS 1/2
-    /// messages with DUP=true and reload inbound QoS 2 state from persistence.
+    /// On the first connect, load the session state a previous run left in
+    /// the store: outbound QoS 1/2 messages to re-send with DUP=true, and
+    /// inbound QoS 2 state.
     pub restore_msgs: bool,
     /// Buffer QoS 0 publishes in the send-while-disconnected buffer.
     ///
@@ -156,6 +159,14 @@ pub(crate) struct BufConfig {
     /// ending the connection; zero means forever. See
     /// [`CreateOptions::persist_timeout`](crate::CreateOptions::persist_timeout).
     pub persist_timeout: Duration,
+}
+
+impl OfflineConfig {
+    /// Whether a publish made while there is no session is buffered, given
+    /// whether this client has ever been connected.
+    pub fn buffers(&self, ever_connected: bool) -> bool {
+        self.allow_send_any_time || (ever_connected && self.send_while_disconnected)
+    }
 }
 
 /////////////////////////////////////////////////////////////////////////////
