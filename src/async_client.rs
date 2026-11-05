@@ -514,7 +514,7 @@ impl AsyncClient {
         #[cfg(any(feature = "websocket", feature = "smol-websocket"))]
         for uri in [&opts.http_proxy, &opts.https_proxy] {
             if !uri.is_empty()
-                && let Err(err) = crate::runtime::proxy::parse(uri)
+                && let Err(err) = crate::runtime::proxy::Proxy::parse(uri)
             {
                 return ConnectToken::from(err);
             }

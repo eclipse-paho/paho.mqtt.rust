@@ -43,57 +43,63 @@ pub(crate) struct Proxy {
     pub auth: Option<String>,
 }
 
-/// Parses a proxy URI.
-///
-/// Accepts what the environment variables of the same name usually hold:
-/// `http://proxy:3128`, `proxy:3128`, `http://user:pass@proxy:3128`. The
-/// scheme, if any, is ignored — the connection to the proxy is plain TCP
-/// either way, and `https_proxy` names the proxy for a TLS *destination*,
-/// not a TLS proxy.
-pub(crate) fn parse(uri: &str) -> Result<Proxy> {
-    let rest = uri
-        .split_once("://")
-        .map_or(uri, |(_scheme, rest)| rest)
-        .trim_end_matches('/');
+impl Proxy {
+    /// Parses a proxy URI.
+    ///
+    /// Accepts what the environment variables of the same name usually hold:
+    /// `http://proxy:3128`, `proxy:3128`, `http://user:pass@proxy:3128`. The
+    /// scheme, if any, is ignored — the connection to the proxy is plain TCP
+    /// either way, and `https_proxy` names the proxy for a TLS *destination*,
+    /// not a TLS proxy.
+    pub fn parse(uri: &str) -> Result<Self> {
+        let rest = uri
+            .split_once("://")
+            .map_or(uri, |(_scheme, rest)| rest)
+            .trim_end_matches('/');
 
-    let (auth, authority) = match rest.rsplit_once('@') {
-        Some((creds, authority)) => (
-            Some(format!("Basic {}", base64(creds.as_bytes()))),
-            authority,
-        ),
-        None => (None, rest),
-    };
+        let (auth, authority) = match rest.rsplit_once('@') {
+            Some((creds, authority)) => (
+                Some(format!("Basic {}", base64(creds.as_bytes()))),
+                authority,
+            ),
+            None => (None, rest),
+        };
 
-    if authority.is_empty() {
-        return Err(Error::InvalidArgument(format!(
-            "proxy URI has no host: {uri}"
-        )));
+        if authority.is_empty() {
+            return Err(Error::InvalidArgument(format!(
+                "proxy URI has no host: {uri}"
+            )));
+        }
+        let (host, port) = match authority.rsplit_once(':') {
+            Some((h, p)) => (
+                h,
+                p.parse::<u16>().map_err(|_| {
+                    Error::InvalidArgument(format!("invalid port in proxy URI: {uri}"))
+                })?,
+            ),
+            None => (authority, 3128),
+        };
+
+        Ok(Self {
+            host: host.to_string(),
+            port,
+            auth,
+        })
     }
-    let (host, port) = match authority.rsplit_once(':') {
-        Some((h, p)) => (
-            h,
-            p.parse::<u16>()
-                .map_err(|_| Error::InvalidArgument(format!("invalid port in proxy URI: {uri}")))?,
-        ),
-        None => (authority, 3128),
-    };
 
-    Ok(Proxy {
-        host: host.to_string(),
-        port,
-        auth,
-    })
+    /// Builds the `CONNECT` request asking this proxy for a tunnel to
+    /// `host:port`.
+    pub fn connect_request(&self, host: &str, port: u16) -> Vec<u8> {
+        let mut req = format!("CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n");
+        if let Some(auth) = &self.auth {
+            req.push_str(&format!("Proxy-Authorization: {auth}\r\n"));
+        }
+        req.push_str("\r\n");
+        req.into_bytes()
+    }
 }
 
-/// Builds the `CONNECT` request asking `proxy` for a tunnel to `host:port`.
-pub(crate) fn connect_request(proxy: &Proxy, host: &str, port: u16) -> Vec<u8> {
-    let mut req = format!("CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n");
-    if let Some(auth) = &proxy.auth {
-        req.push_str(&format!("Proxy-Authorization: {auth}\r\n"));
-    }
-    req.push_str("\r\n");
-    req.into_bytes()
-}
+// --------------------------------------------------------------------------
 
 /// Examines the bytes read back from the proxy.
 ///
@@ -184,39 +190,42 @@ mod tests {
 
     #[test]
     fn test_parse_proxy_uri() {
-        let p = parse("http://proxy.example:8080").unwrap();
+        let p = Proxy::parse("http://proxy.example:8080").unwrap();
         assert_eq!(p.host, "proxy.example");
         assert_eq!(p.port, 8080);
         assert_eq!(p.auth, None);
 
         // No scheme, and the default port.
-        let p = parse("proxy.example").unwrap();
+        let p = Proxy::parse("proxy.example").unwrap();
         assert_eq!(p.host, "proxy.example");
         assert_eq!(p.port, 3128);
 
         // Credentials become a Basic header.
-        let p = parse("http://user:pass@proxy.example:3128").unwrap();
+        let p = Proxy::parse("http://user:pass@proxy.example:3128").unwrap();
         assert_eq!(p.host, "proxy.example");
         assert_eq!(p.auth.as_deref(), Some("Basic dXNlcjpwYXNz"));
 
         assert!(matches!(
-            parse("http://proxy:notaport"),
+            Proxy::parse("http://proxy:notaport"),
             Err(Error::InvalidArgument(_))
         ));
-        assert!(matches!(parse("http://"), Err(Error::InvalidArgument(_))));
+        assert!(matches!(
+            Proxy::parse("http://"),
+            Err(Error::InvalidArgument(_))
+        ));
     }
 
     #[test]
     fn test_connect_request() {
-        let p = parse("proxy:3128").unwrap();
-        let req = String::from_utf8(connect_request(&p, "broker.example", 8883)).unwrap();
+        let p = Proxy::parse("proxy:3128").unwrap();
+        let req = String::from_utf8(p.connect_request("broker.example", 8883)).unwrap();
         assert_eq!(
             req,
             "CONNECT broker.example:8883 HTTP/1.1\r\nHost: broker.example:8883\r\n\r\n"
         );
 
-        let p = parse("user:pass@proxy").unwrap();
-        let req = String::from_utf8(connect_request(&p, "b", 1883)).unwrap();
+        let p = Proxy::parse("user:pass@proxy").unwrap();
+        let req = String::from_utf8(p.connect_request("b", 1883)).unwrap();
         assert!(req.contains("Proxy-Authorization: Basic dXNlcjpwYXNz\r\n"));
         assert!(req.ends_with("\r\n\r\n"));
     }

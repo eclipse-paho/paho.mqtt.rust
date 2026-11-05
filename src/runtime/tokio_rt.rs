@@ -287,11 +287,10 @@ async fn tcp_maybe_proxied(proxy_uri: &str, host: &str, port: u16) -> Result<Tcp
         return Ok(tcp);
     }
 
-    let proxy = proxy::parse(proxy_uri)?;
+    let proxy = proxy::Proxy::parse(proxy_uri)?;
     let mut tcp = TcpStream::connect((proxy.host.as_str(), proxy.port)).await?;
     tcp.set_nodelay(true)?;
-    tcp.write_all(&proxy::connect_request(&proxy, host, port))
-        .await?;
+    tcp.write_all(&proxy.connect_request(host, port)).await?;
     tcp.flush().await?;
 
     let mut buf = Vec::with_capacity(256);
