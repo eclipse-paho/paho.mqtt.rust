@@ -26,15 +26,17 @@
 
 use crate::error::{Error, Result};
 use bytes::Bytes;
-#[cfg(feature = "serde")]
-use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
+    ffi::{OsStr, OsString},
     fmt,
     io::Write,
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::Mutex,
 };
+
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
 
 /// Return value for a successful persistence operation
 pub const PERSISTENCE_SUCCESS: i32 = 0;
@@ -63,8 +65,8 @@ pub type ClientPersistenceBox = Box<dyn ClientPersistence>;
 ///
 /// The default is [`None`](Self::None).
 ///
-/// The persistence type can be created from any string or path to indicate
-/// file persistence to that directory.
+/// The persistence type can be created from any string, OS string, or path,
+/// owned or by reference, to indicate file persistence to that directory.
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Default)]
 pub enum PersistenceType {
@@ -90,17 +92,18 @@ impl fmt::Debug for PersistenceType {
         use PersistenceType::*;
         match *self {
             File => write!(f, "File"),
-            FilePath(_) => write!(f, "File with Path"),
+            FilePath(ref path) => write!(f, "File with Path: {}", path.to_string_lossy()),
             None => write!(f, "None"),
             User(_) => write!(f, "User"),
         }
     }
 }
 
-impl From<&str> for PersistenceType {
-    /// A string slice can be used to create a file path persistence.
-    fn from(path: &str) -> Self {
-        PersistenceType::FilePath(PathBuf::from(path))
+impl<T: ?Sized + AsRef<OsStr>> From<&T> for PersistenceType {
+    /// A reference to any string or path can be used to create a file path
+    /// persistence.
+    fn from(path: &T) -> Self {
+        PersistenceType::FilePath(PathBuf::from(path.as_ref()))
     }
 }
 
@@ -111,10 +114,10 @@ impl From<String> for PersistenceType {
     }
 }
 
-impl From<&Path> for PersistenceType {
-    /// A path can be used to create a file path persistence.
-    fn from(path: &Path) -> Self {
-        PersistenceType::FilePath(path.into())
+impl From<OsString> for PersistenceType {
+    /// An OS string can be used to create a file path persistence.
+    fn from(path: OsString) -> Self {
+        PersistenceType::FilePath(PathBuf::from(path))
     }
 }
 
@@ -489,7 +492,7 @@ impl ClientPersistence for FilePersistence {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashSet;
+    use std::{collections::HashSet, path::Path};
 
     /// Opens a `FilePersistence` in a fresh temp directory and returns it
     /// together with the temp dir handle (dropped at end of test).
@@ -594,6 +597,27 @@ mod tests {
         p.clear().unwrap();
         assert!(p.keys().unwrap().is_empty());
         p.close().unwrap();
+    }
+
+    #[test]
+    fn test_strings_and_paths_are_file_paths() {
+        let string = String::from("some/dir");
+        let os_string = OsString::from("some/dir");
+        let path_buf = PathBuf::from("some/dir");
+
+        for ty in [
+            PersistenceType::from("some/dir"),
+            PersistenceType::from(&string),
+            PersistenceType::from(os_string.as_os_str()),
+            PersistenceType::from(&os_string),
+            PersistenceType::from(path_buf.as_path()),
+            PersistenceType::from(&path_buf),
+            PersistenceType::from(string),
+            PersistenceType::from(os_string),
+            PersistenceType::from(path_buf),
+        ] {
+            assert!(matches!(ty, PersistenceType::FilePath(p) if p == Path::new("some/dir")));
+        }
     }
 
     #[test]

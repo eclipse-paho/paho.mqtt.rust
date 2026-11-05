@@ -3034,8 +3034,8 @@ fn next_retry_delay(current: Duration, max: Duration) -> Duration {
 }
 
 /// [`Command::Connect`], tries each configured server in turn under the
-/// connect timeout, then delegates to [`Session::serve`] for the lifetime of
-/// the connection.
+/// connect timeout. Once the connection is made, it delegates to
+/// [`Session::serve`] for the lifetime of the connection.
 ///
 /// If `auto_reconnect` is set in the connect options and an established
 /// session ends unexpectedly, the loop retries with exponential backoff —
