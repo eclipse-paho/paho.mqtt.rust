@@ -195,7 +195,10 @@ pub trait ClientPersistence: Send {
     /// * `key` The key for the data to remove.
     fn remove(&mut self, key: &str) -> Result<()>;
 
-    /// Gets the keys that are currently in the persistence store
+    /// Gets the keys that are currently in the persistence store.
+    ///
+    /// An error here fails a connect that has messages to restore, since an
+    /// empty list would say that there are none.
     fn keys(&mut self) -> Result<Vec<String>>;
 
     /// Clear the persistence store so that it no longer contains any data.

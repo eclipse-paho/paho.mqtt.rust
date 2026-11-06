@@ -398,28 +398,20 @@ fn session_resumed(params: &ConnectParams, connack: &ConnAck) -> bool {
 /// one message lost, against a store that may be from an older version of
 /// the program or a different protocol level — but never silently: each
 /// one is logged with its reason, and a summary follows. A store that
-/// cannot even be listed is logged too, since otherwise it would look
-/// exactly like an empty one.
+/// cannot even be listed does fail the connection, in [`stored_keys`], since
+/// it would otherwise look exactly like an empty one.
 fn load_persisted(
     state: &mut SessionState,
     persist: Option<&Arc<Mutex<Box<dyn ClientPersistence>>>>,
+    keys: &[String],
     ver: MqttVersion,
 ) -> Restored {
     let mut restored = Restored::default();
     let Some(persist) = persist else {
         return restored;
     };
-    let keys = match persist.lock().unwrap().keys() {
-        Ok(keys) => keys,
-        Err(e) => {
-            warn!(
-                "Could not list the persistence store ({e}); no in-flight messages were restored"
-            );
-            return restored;
-        }
-    };
 
-    for key in &keys {
+    for key in keys {
         match restore_entry(state, persist, key, ver) {
             Ok(Restore::Outbound) => restored.outbound += 1,
             Ok(Restore::Inbound) => restored.inbound += 1,
@@ -446,6 +438,22 @@ fn load_persisted(
         );
     }
     restored
+}
+
+/// Lists the entries of a store that is about to be restored.
+///
+/// A failure here ends the connect. Carrying on would treat a store that
+/// holds messages as one that holds none, leaving them unsent with nothing
+/// on the token to say so. The messages are still there once the fault is
+/// fixed; an application that would rather connect without them can turn
+/// off [`restore_msgs`](crate::CreateOptions::restore_msgs).
+fn stored_keys(store: &Mutex<Box<dyn ClientPersistence>>) -> Result<Vec<String>> {
+    store.lock().unwrap().keys().map_err(|e| {
+        Error::Persistence(format!(
+            "could not list the store to restore its messages ({e}); \
+             fix the store, or turn off `restore_messages` to connect without them"
+        ))
+    })
 }
 
 /// What [`load_persisted`] made of a store.
@@ -2721,16 +2729,27 @@ struct Connected<B: Backend> {
     /// of being dropped here with the connect: whatever is in it is handled
     /// before the session waits on another read.
     read_buf: BytesMut,
+    /// The persistence entries to restore, from [`stored_keys`].
+    stored: Vec<String>,
 }
 
 /// Opens persistence and the transport, sends CONNECT, waits for CONNACK.
-async fn do_connect<B: Backend>(job: &ConnectJob) -> Result<Connected<B>> {
+///
+/// With `restore` set, the store is listed before anything goes to the
+/// server, so that one that cannot be read fails the connect while the
+/// broker has yet to hear from this client. A clean start has nothing to
+/// restore, so it never depends on the store being readable.
+async fn do_connect<B: Backend>(job: &ConnectJob, restore: bool) -> Result<Connected<B>> {
     let p = &job.params;
     let (addr, server_uri) = &p.servers[job.server_idx];
 
     // ---- Open persistence ----
+    let mut stored = Vec::new();
     if let Some(store) = &job.persist {
         store.lock().unwrap().open(&p.client_id, server_uri)?;
+        if restore && !p.clean_start {
+            stored = stored_keys(store)?;
+        }
     }
 
     // ---- Transport connect ----
@@ -2762,6 +2781,7 @@ async fn do_connect<B: Backend>(job: &ConnectJob) -> Result<Connected<B>> {
         writer,
         connack,
         read_buf,
+        stored,
     })
 }
 
@@ -2884,6 +2904,7 @@ async fn attempt_connect<B: Backend>(
     buf: &mut VecDeque<Command>,
     offline_cfg: &OfflineConfig,
     should_buf: bool,
+    restore: bool,
     sinks: &mut Sinks,
 ) -> Attempt<B> {
     let timeout = job.params.connect_timeout;
@@ -2892,7 +2913,7 @@ async fn attempt_connect<B: Backend>(
     } else {
         B::Sleep::new(timeout)
     };
-    let mut conn = pin!(do_connect::<B>(job).fuse());
+    let mut conn = pin!(do_connect::<B>(job, restore).fuse());
 
     loop {
         let cmd = select! {
@@ -3104,6 +3125,9 @@ pub(crate) async fn run_event_loop<B: Backend>(
 
         'retry: loop {
             let should_buf = offline_cfg.buffers(ever_connected);
+            // Only the first connection reads the store: from then on the
+            // in-memory state is the authority and the store mirrors it.
+            let restore = offline_cfg.restore_msgs && !state.loaded;
 
             if !persist.is_some()
                 && let Some(store) = &job.persist
@@ -3137,6 +3161,7 @@ pub(crate) async fn run_event_loop<B: Backend>(
                         &mut buf,
                         &offline_cfg,
                         should_buf,
+                        restore,
                         &mut sinks,
                     )
                     .await
@@ -3198,6 +3223,7 @@ pub(crate) async fn run_event_loop<B: Backend>(
                     &mut buf,
                     &offline_cfg,
                     should_buf,
+                    restore,
                     &mut sinks,
                 )
                 .await
@@ -3218,6 +3244,7 @@ pub(crate) async fn run_event_loop<B: Backend>(
                 writer,
                 connack,
                 read_buf,
+                stored,
             } = match attempt {
                 Attempt::Aborted(tx) => {
                     finish_disconnect(&conn_state, tx);
@@ -3264,12 +3291,8 @@ pub(crate) async fn run_event_loop<B: Backend>(
             }
 
             // Read a store written by an earlier run of the program into the
-            // session state. Only the first connection needs to: from then
-            // on the in-memory state is the authority and the store mirrors
-            // it.
-            if offline_cfg.restore_msgs && !state.loaded {
-                load_persisted(&mut state, job.persist.as_ref(), job.params.ver);
-            }
+            // session state. `stored` is empty unless there is one to read.
+            load_persisted(&mut state, job.persist.as_ref(), &stored, job.params.ver);
             state.loaded = true;
 
             // An assigned identifier replaces the empty one we sent, so that
@@ -4062,7 +4085,8 @@ mod tests {
         ]);
 
         let mut state = SessionState::default();
-        let restored = load_persisted(&mut state, Some(&store), MqttVersion::V5);
+        let keys = stored_keys(&store).unwrap();
+        let restored = load_persisted(&mut state, Some(&store), &keys, MqttVersion::V5);
 
         assert_eq!(
             restored,
@@ -4079,9 +4103,10 @@ mod tests {
         assert_eq!(state.next_id, 7, "only restored identifiers count");
     }
 
-    /// A store that fails is reported, not mistaken for an empty one.
+    /// A store that cannot be listed is an error, not an empty store, while
+    /// one that cannot give up its entries costs only those entries.
     #[test]
-    fn test_load_persisted_survives_a_failing_store() {
+    fn test_failing_store() {
         struct Broken {
             list_fails: bool,
         }
@@ -4120,11 +4145,13 @@ mod tests {
             Arc::new(Mutex::new(Box::new(Broken { list_fails })))
         };
 
-        let mut state = SessionState::default();
-        let restored = load_persisted(&mut state, Some(&store(true)), MqttVersion::V5);
-        assert_eq!(restored, Restored::default());
+        let err = stored_keys(&store(true)).unwrap_err();
+        assert!(matches!(&err, Error::Persistence(s) if s.contains("disk on fire")));
 
-        let restored = load_persisted(&mut state, Some(&store(false)), MqttVersion::V5);
+        let mut state = SessionState::default();
+        let store = store(false);
+        let keys = stored_keys(&store).unwrap();
+        let restored = load_persisted(&mut state, Some(&store), &keys, MqttVersion::V5);
         assert_eq!(
             restored,
             Restored {

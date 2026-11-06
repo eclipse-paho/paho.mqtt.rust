@@ -2415,6 +2415,162 @@ fn test_clean_start_clears_persistence() {
     broker.join();
 }
 
+/// A store that cannot be listed or cleared until `broken` is reset.
+#[derive(Clone)]
+struct UnlistableStore {
+    store: common::SpyPersistence,
+    broken: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl UnlistableStore {
+    fn new(store: common::SpyPersistence) -> Self {
+        Self {
+            store,
+            broken: std::sync::Arc::new(true.into()),
+        }
+    }
+
+    fn check(&self) -> mqtt::Result<()> {
+        if self.broken.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(mqtt::Error::Persistence("disk on fire".into()));
+        }
+        Ok(())
+    }
+}
+
+impl mqtt::ClientPersistence for UnlistableStore {
+    fn open(&mut self, client_id: &str, server_uri: &str) -> mqtt::Result<()> {
+        self.store.open(client_id, server_uri)
+    }
+    fn close(&mut self) -> mqtt::Result<()> {
+        self.store.close()
+    }
+    fn put(&mut self, key: &str, buffers: Vec<&[u8]>) -> mqtt::Result<()> {
+        self.store.put(key, buffers)
+    }
+    fn get(&mut self, key: &str) -> mqtt::Result<Vec<u8>> {
+        self.store.get(key)
+    }
+    fn remove(&mut self, key: &str) -> mqtt::Result<()> {
+        self.store.remove(key)
+    }
+    fn keys(&mut self) -> mqtt::Result<Vec<String>> {
+        self.check()?;
+        mqtt::ClientPersistence::keys(&mut self.store)
+    }
+    fn clear(&mut self) -> mqtt::Result<()> {
+        self.check()?;
+        self.store.clear()
+    }
+    fn contains_key(&mut self, key: &str) -> bool {
+        self.store.contains_key(key)
+    }
+}
+
+/// A store holding one unacknowledged QoS 1 message, as an earlier run would
+/// have left it, that cannot be listed.
+fn unlistable_store() -> UnlistableStore {
+    use mqtt::paho_mqtt_codec::{Packet, Publish, QoS};
+
+    let store = common::SpyPersistence::new();
+    let mut unacked = Publish::new(topic!("unlistable").to_string(), "a");
+    unacked.qos = QoS::AtLeastOnce;
+    unacked.packet_id = Some(4);
+    store.preload("s4", &Packet::Publish(unacked), mqtt::MqttVersion::V5);
+    UnlistableStore::new(store)
+}
+
+fn unlistable_store_client(uri: &str, store: UnlistableStore, restore: bool) -> mqtt::AsyncClient {
+    mqtt::CreateOptionsBuilder::new()
+        .server_uri(uri)
+        .mqtt_version(mqtt::MQTT_VERSION_5)
+        .restore_messages(restore)
+        .user_persistence(store)
+        .create_async_client()
+        .unwrap()
+}
+
+/// A store that cannot be listed fails the connect, rather than passing for
+/// an empty one, and does so before the broker hears anything. Its messages
+/// are not lost: once the store is fixed, the same client connects and
+/// re-sends them.
+#[test]
+fn test_unlistable_store_fails_the_connect() {
+    use mqtt::paho_mqtt_codec::{ConnAck, Packet, PubAck, ReasonCode};
+
+    let broker = common::spawn_broker(|pkt| match pkt {
+        Packet::Connect(_) => vec![Packet::ConnAck(ConnAck::new(true, ReasonCode::Success))],
+        Packet::Publish(p) => vec![Packet::PubAck(PubAck::new(p.packet_id.unwrap()))],
+        _ => vec![],
+    });
+    let store = unlistable_store();
+    let cli = unlistable_store_client(&broker.uri, store.clone(), true);
+
+    let res = cli.connect(resuming_opts()).wait_for(TIMEOUT);
+    assert!(
+        matches!(&res, Err(mqtt::Error::Persistence(s)) if s.contains("disk on fire")),
+        "got {res:?}"
+    );
+    assert_eq!(cli.state(), mqtt::ConnectionState::Disconnected);
+    assert!(broker.received().is_empty(), "the broker heard from us");
+
+    store
+        .broken
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    cli.connect(resuming_opts())
+        .wait_for(TIMEOUT)
+        .expect("connect failed");
+    let resent = broker.wait_until(TIMEOUT, |pkts| {
+        pkts.iter().any(|p| matches!(p, Packet::Publish(_)))
+    });
+    assert!(resent, "the stored message was not re-sent");
+
+    cli.disconnect(None).wait().ok();
+    broker.join();
+}
+
+/// With restoring turned off the store is not read, so one that cannot be
+/// listed does not stop the client connecting, and its entries stay put.
+#[test]
+fn test_unlistable_store_connects_without_restoring() {
+    use mqtt::paho_mqtt_codec::{ConnAck, Packet, ReasonCode};
+
+    let broker = common::spawn_broker(|pkt| match pkt {
+        Packet::Connect(_) => vec![Packet::ConnAck(ConnAck::new(true, ReasonCode::Success))],
+        _ => vec![],
+    });
+    let store = unlistable_store();
+    let cli = unlistable_store_client(&broker.uri, store.clone(), false);
+
+    cli.connect(resuming_opts())
+        .wait_for(TIMEOUT)
+        .expect("connect failed");
+    assert_eq!(store.store.keys(), vec!["s4".to_string()]);
+
+    cli.disconnect(None).wait().ok();
+    broker.join();
+}
+
+/// A clean start has nothing to restore, so it needs nothing from the store.
+#[test]
+fn test_unlistable_store_allows_a_clean_start() {
+    use mqtt::paho_mqtt_codec::{ConnAck, Packet, ReasonCode};
+
+    let broker = common::spawn_broker(|pkt| match pkt {
+        Packet::Connect(_) => vec![Packet::ConnAck(ConnAck::new(false, ReasonCode::Success))],
+        _ => vec![],
+    });
+    let cli = unlistable_store_client(&broker.uri, unlistable_store(), true);
+
+    let opts = mqtt::ConnectOptionsBuilder::new_v5()
+        .clean_start(true)
+        .finalize();
+    cli.connect(opts).wait_for(TIMEOUT).expect("connect failed");
+
+    cli.disconnect(None).wait().ok();
+    broker.join();
+}
+
 /// A store written by an earlier run is read back and its messages re-sent
 /// when the session resumes.
 #[test]

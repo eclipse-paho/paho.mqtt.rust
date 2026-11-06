@@ -204,7 +204,13 @@ pub struct CreateOptions {
     /// When the maximum number of buffered messages is reached, delete the
     /// oldest rather than discard the newest.
     pub delete_oldest: bool,
-    /// Restore messages from persistence on create - or clear it.
+    /// Whether the first connection restores the messages in the persistence
+    /// store. When `false`, the store is not read, and what it holds stays
+    /// there; only a clean start clears it. Defaults to `true`.
+    ///
+    /// With this set, a store that cannot be listed fails the connect with
+    /// [`Error::Persistence`](crate::Error::Persistence). An entry that cannot
+    /// be used does not: it is skipped and logged.
     pub restore_msgs: bool,
     /// Whether a QoS 0 publish made while disconnected is queued for the
     /// next connection. Defaults to `true`.
@@ -568,8 +574,10 @@ impl CreateOptionsBuilder {
         self
     }
 
-    /// If set, messages from persistence are restored on create. Defaults to
-    /// true.
+    /// Whether the first connection restores the messages in the persistence
+    /// store. Defaults to true.
+    ///
+    /// See [`CreateOptions::restore_msgs`].
     pub fn restore_messages(mut self, restore: bool) -> Self {
         self.opts.restore_msgs = restore;
         self

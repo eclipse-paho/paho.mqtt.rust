@@ -59,9 +59,9 @@ fn main() {
         .unwrap_or_else(|| "mqtt://localhost:1883".to_string());
 
     // Create a client with file persistence under a directory named,
-    // "persist". Any string or Path can be used to specify the directory.
-    // If the library can't find or create the path, client creation will
-    // fail with a persistence error.
+    // "persist". Any string, OS string, or path can be used to specify the
+    // directory. If the library can't find or create the path, the connect
+    // will fail with an I/O error.
     let create_opts = mqtt::CreateOptionsBuilder::new()
         .server_uri(host)
         .client_id("rust_async_pub_time")
