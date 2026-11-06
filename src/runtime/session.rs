@@ -2948,8 +2948,8 @@ async fn attempt_connect<B: Backend>(
 /// multi-server connect, and each reconnect — rather than only for the error
 /// the connect token ends up carrying, which is the last server's.
 async fn report_tls_error(event_tx: &async_channel::Sender<Event>, err: &Error) {
-    if matches!(err, Error::Tls(_)) {
-        let _ = event_tx.send(Event::TlsError(err.to_string())).await;
+    if let Error::Tls(e) = err {
+        let _ = event_tx.send(Event::TlsError(e.clone())).await;
     }
 }
 
@@ -3415,7 +3415,7 @@ mod tests {
     use bytes::Bytes;
 
     use super::{super::ServerAddr, super::sinks::Sink, *};
-    use crate::Token;
+    use crate::{TlsError, TlsErrorKind, Token};
 
     /// A timer on the wall clock. `never()` reports itself terminated, so
     /// `select!` skips its branch. The tests poll by hand with a no-op
@@ -3895,7 +3895,8 @@ mod tests {
         ) -> Result<(Self::Reader, Self::Writer)> {
             match addr {
                 ServerAddr::Tcp { host, .. } if host.starts_with("tls-") => {
-                    Err(Error::Tls(format!("handshake with {host} failed")))
+                    let msg = format!("handshake with {host} failed");
+                    Err(TlsError::new(TlsErrorKind::HandshakeFailed, msg).into())
                 }
                 _ => Err(io::Error::from(io::ErrorKind::ConnectionRefused).into()),
             }
@@ -3972,7 +3973,7 @@ mod tests {
 
         let tls: Vec<String> = std::iter::from_fn(|| event_rx.try_recv().ok())
             .filter_map(|ev| match ev {
-                Event::TlsError(s) => Some(s),
+                Event::TlsError(e) => Some(e.to_string()),
                 _ => None,
             })
             .collect();

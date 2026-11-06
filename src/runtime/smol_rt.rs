@@ -52,7 +52,7 @@ use super::smol_conn::UnixConnection;
 #[cfg(feature = "smol-websocket")]
 use super::smol_conn::WsConnection;
 #[cfg(feature = "smol-tls")]
-use super::tls_config::make_tls_config;
+use super::tls_config::{invalid_server_name, make_tls_config, rustls_handshake_err};
 #[cfg(feature = "smol-websocket")]
 use super::ws_util::build_ws_request;
 use super::{
@@ -285,14 +285,14 @@ impl Backend for SmolBackend {
                 let config = make_tls_config(tls)?;
                 let connector = futures_rustls::TlsConnector::from(config);
                 let server_name = rustls::pki_types::ServerName::try_from(host.as_str())
-                    .map_err(|_| Error::Tls(format!("invalid TLS server name: {}", host)))?
+                    .map_err(|_| invalid_server_name(host))?
                     .to_owned();
                 let tcp = TcpStream::connect((host.as_str(), *port)).await?;
                 tcp.set_nodelay(true)?;
                 let tls_stream = connector
                     .connect(server_name, tcp)
                     .await
-                    .map_err(|e| Error::Tls(e.to_string()))?;
+                    .map_err(rustls_handshake_err)?;
                 Box::new(TlsConnection::new(tls_stream))
             }
             #[cfg(unix)]
@@ -313,13 +313,13 @@ impl Backend for SmolBackend {
                 let config = make_tls_config(tls)?;
                 let connector = futures_rustls::TlsConnector::from(config);
                 let server_name = rustls::pki_types::ServerName::try_from(host.as_str())
-                    .map_err(|_| Error::Tls(format!("invalid TLS server name: {}", host)))?
+                    .map_err(|_| invalid_server_name(host))?
                     .to_owned();
                 let tcp = tcp_maybe_proxied(&p.https_proxy, host.as_str(), *port).await?;
                 let tls_stream = connector
                     .connect(server_name, tcp)
                     .await
-                    .map_err(|e| Error::Tls(e.to_string()))?;
+                    .map_err(rustls_handshake_err)?;
                 let url = format!("wss://{}:{}{}", host, port, path);
                 let request = build_ws_request(&url, &p.http_headers)?;
                 let (ws, _) = async_tungstenite::client_async(request, tls_stream)

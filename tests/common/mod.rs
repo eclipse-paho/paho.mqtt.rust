@@ -303,6 +303,28 @@ pub struct TestCerts {
 impl TestCerts {
     /// Creates a CA and a server certificate valid for `server_name` only.
     pub fn new(server_name: &str) -> Self {
+        Self::with_server_params(server_name, |_| {})
+    }
+
+    /// As [`new`](Self::new), with a server certificate that has expired.
+    pub fn expired(server_name: &str) -> Self {
+        Self::with_server_params(server_name, |params| {
+            params.not_before = rcgen::date_time_ymd(2000, 1, 1);
+            params.not_after = rcgen::date_time_ymd(2001, 1, 1);
+        })
+    }
+
+    /// As [`new`](Self::new), with a server certificate that is not valid yet.
+    pub fn not_yet_valid(server_name: &str) -> Self {
+        Self::with_server_params(server_name, |params| {
+            params.not_before = rcgen::date_time_ymd(2900, 1, 1);
+        })
+    }
+
+    fn with_server_params(
+        server_name: &str,
+        adjust: impl FnOnce(&mut rcgen::CertificateParams),
+    ) -> Self {
         use rcgen::{
             BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair, KeyUsagePurpose,
         };
@@ -326,6 +348,7 @@ impl TestCerts {
         params
             .distinguished_name
             .push(DnType::CommonName, server_name);
+        adjust(&mut params);
         let key = KeyPair::generate().unwrap();
         let cert = params.signed_by(&key, &issuer).unwrap();
 

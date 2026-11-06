@@ -1939,6 +1939,14 @@ mod tls_verify {
             .wait_for(Duration::from_secs(10))
     }
 
+    /// The category of a failed connect, if it failed with a TLS error.
+    fn tls_kind(res: &mqtt::Result<mqtt::ConnectResponse>) -> Option<mqtt::TlsErrorKind> {
+        match res {
+            Err(mqtt::Error::Tls(e)) => Some(e.kind()),
+            _ => None,
+        }
+    }
+
     /// With verification on, a certificate that does not name the host is
     /// refused — the default, and the safe one.
     #[test]
@@ -1946,8 +1954,9 @@ mod tls_verify {
         let certs = common::TestCerts::new("broker.invalid");
         let broker = common::spawn_tls_broker(&certs, accepting);
         let res = connect_with(&certs, &broker.uri, true, true, true);
-        assert!(
-            matches!(res, Err(mqtt::Error::Tls(_))),
+        assert_eq!(
+            tls_kind(&res),
+            Some(mqtt::TlsErrorKind::HostnameMismatch),
             "a mismatched name must fail the handshake, got {res:?}"
         );
     }
@@ -1971,9 +1980,60 @@ mod tls_verify {
         let broker = common::spawn_tls_broker(&certs, accepting);
         // No trust store, so the system roots are used and this CA is unknown.
         let res = connect_with(&certs, &broker.uri, false, true, false);
-        assert!(
-            matches!(res, Err(mqtt::Error::Tls(_))),
+        assert_eq!(
+            tls_kind(&res),
+            Some(mqtt::TlsErrorKind::UntrustedCertificate),
             "an untrusted CA must still fail, got {res:?}"
+        );
+    }
+
+    /// A certificate outside its validity period is refused and reported as
+    /// such. The name check is waived because OpenSSL makes it first, and
+    /// these certificates name some other host.
+    #[test]
+    fn test_tls_certificate_dates_refused() {
+        use mqtt::TlsErrorKind::{CertificateExpired, CertificateNotYetValid};
+
+        let certs = common::TestCerts::expired("broker.invalid");
+        let broker = common::spawn_tls_broker(&certs, accepting);
+        let res = connect_with(&certs, &broker.uri, true, true, false);
+        assert_eq!(tls_kind(&res), Some(CertificateExpired), "got {res:?}");
+
+        let certs = common::TestCerts::not_yet_valid("broker.invalid");
+        let broker = common::spawn_tls_broker(&certs, accepting);
+        let res = connect_with(&certs, &broker.uri, true, true, false);
+        assert_eq!(tls_kind(&res), Some(CertificateNotYetValid), "got {res:?}");
+    }
+
+    /// Two refusals particular to rustls, both before any connection is made.
+    #[cfg(any(feature = "tls", feature = "smol-tls"))]
+    #[test]
+    fn test_tls_rustls_refusals() {
+        let connect = |uri: &str, tls| {
+            let opts = mqtt::ConnectOptionsBuilder::new()
+                .tls_options(tls)
+                .finalize();
+            mqtt::AsyncClient::new(uri.to_string())
+                .unwrap()
+                .connect(opts)
+                .wait_for(TIMEOUT)
+        };
+
+        let tls = mqtt::TlsOptionsBuilder::new()
+            .private_key_password("secret")
+            .finalize();
+        let res = connect("ssl://127.0.0.1:1", tls);
+        assert_eq!(
+            tls_kind(&res),
+            Some(mqtt::TlsErrorKind::Unsupported),
+            "got {res:?}"
+        );
+
+        let res = connect("ssl://a..b:8883", mqtt::TlsOptionsBuilder::new().finalize());
+        assert_eq!(
+            tls_kind(&res),
+            Some(mqtt::TlsErrorKind::InvalidServerName),
+            "got {res:?}"
         );
     }
 
@@ -1987,12 +2047,12 @@ mod tls_verify {
         let certs = common::TestCerts::new("localhost");
         let broker = common::spawn_tls_broker(&certs, accepting);
 
-        let reported = Arc::new(Mutex::new(Vec::<String>::new()));
+        let reported = Arc::new(Mutex::new(Vec::new()));
         let reported_cb = Arc::clone(&reported);
         let tls = mqtt::TlsOptionsBuilder::new()
             .trust_store(certs.ca_path())
             .enabled_cipher_suites("NOT_A_CIPHER_SUITE")
-            .error_callback(move |_, msg| reported_cb.lock().unwrap().push(msg.to_string()))
+            .error_callback(move |_, err| reported_cb.lock().unwrap().push(err.kind()))
             .finalize();
         let opts = mqtt::ConnectOptionsBuilder::new()
             .tls_options(tls)
@@ -2002,8 +2062,9 @@ mod tls_verify {
         // the dispatcher that runs it.
         let cli = mqtt::AsyncClient::new(broker.uri.clone()).unwrap();
         let res = cli.connect(opts).wait_for(Duration::from_secs(10));
-        assert!(
-            matches!(res, Err(mqtt::Error::Tls(_))),
+        assert_eq!(
+            tls_kind(&res),
+            Some(mqtt::TlsErrorKind::Config),
             "an unknown cipher suite is a TLS error, got {res:?}"
         );
 
@@ -2012,7 +2073,7 @@ mod tls_verify {
         while reported.lock().unwrap().is_empty() && std::time::Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
         }
-        assert_eq!(reported.lock().unwrap().len(), 1);
+        assert_eq!(*reported.lock().unwrap(), [mqtt::TlsErrorKind::Config]);
     }
 
     /// Turning off certificate authentication altogether accepts anything,

@@ -31,15 +31,81 @@
 
 #[cfg(all(feature = "openssl", not(feature = "tls")))]
 use openssl::ssl::{
-    SslConnector, SslFiletype, SslMethod, SslVerifyMode, SslVersion as OpenSslProtoVersion,
+    SslConnector, SslFiletype, SslMethod, SslRef, SslVerifyMode, SslVersion as OpenSslProtoVersion,
 };
 #[cfg(any(feature = "tls", feature = "smol-tls"))]
 use std::sync::Arc as StdArc;
 
-use crate::{Error, Result};
+use crate::{Error, Result, TlsError, TlsErrorKind};
 
 #[cfg(any(feature = "tls", feature = "smol-tls"))]
 type TlsResult<T> = std::result::Result<T, rustls::Error>;
+
+/// An error for `TlsOptions` that cannot be turned into a configuration.
+pub(crate) fn config_err(msg: impl ToString) -> Error {
+    TlsError::new(TlsErrorKind::Config, msg.to_string()).into()
+}
+
+/// An error for a host that rustls will not take as a server name.
+#[cfg(any(feature = "tls", feature = "smol-tls"))]
+pub(crate) fn invalid_server_name(host: &str) -> Error {
+    TlsError::new(
+        TlsErrorKind::InvalidServerName,
+        format!("invalid TLS server name: {host}"),
+    )
+    .into()
+}
+
+/// Classifies a failed rustls handshake.
+///
+/// The async connectors report it as an I/O error wrapping the
+/// [`rustls::Error`]. One that wraps nothing failed in the transport, part
+/// way through the handshake.
+#[cfg(any(feature = "tls", feature = "smol-tls"))]
+pub(crate) fn rustls_handshake_err(err: std::io::Error) -> Error {
+    use rustls::CertificateError::*;
+
+    let cause = err.get_ref().and_then(|e| e.downcast_ref());
+    let kind = match cause {
+        Some(rustls::Error::InvalidCertificate(cert_err)) => match cert_err {
+            UnknownIssuer => TlsErrorKind::UntrustedCertificate,
+            NotValidForName | NotValidForNameContext { .. } => TlsErrorKind::HostnameMismatch,
+            Expired | ExpiredContext { .. } => TlsErrorKind::CertificateExpired,
+            NotValidYet | NotValidYetContext { .. } => TlsErrorKind::CertificateNotYetValid,
+            _ => TlsErrorKind::HandshakeFailed,
+        },
+        _ => TlsErrorKind::HandshakeFailed,
+    };
+    TlsError::new(kind, err.to_string()).into()
+}
+
+/// Classifies a failed OpenSSL handshake on `ssl`.
+///
+/// The handshake error only says that verification failed; the reason is in
+/// the verify result. These are the `X509_V_ERR_*` values, which the
+/// `openssl` crate does not name.
+#[cfg(all(feature = "openssl", not(feature = "tls")))]
+pub(crate) fn openssl_handshake_err(ssl: &SslRef, err: openssl::ssl::Error) -> Error {
+    let result = ssl.verify_result();
+    let kind = match result.as_raw() {
+        // UNABLE_TO_GET_ISSUER_CERT, DEPTH_ZERO_SELF_SIGNED_CERT,
+        // SELF_SIGNED_CERT_IN_CHAIN, UNABLE_TO_GET_ISSUER_CERT_LOCALLY,
+        // UNABLE_TO_VERIFY_LEAF_SIGNATURE, CERT_UNTRUSTED
+        2 | 18 | 19 | 20 | 21 | 27 => TlsErrorKind::UntrustedCertificate,
+        // HOSTNAME_MISMATCH, IP_ADDRESS_MISMATCH
+        62 | 64 => TlsErrorKind::HostnameMismatch,
+        // CERT_HAS_EXPIRED
+        10 => TlsErrorKind::CertificateExpired,
+        // CERT_NOT_YET_VALID
+        9 => TlsErrorKind::CertificateNotYetValid,
+        _ => TlsErrorKind::HandshakeFailed,
+    };
+    let message = match kind {
+        TlsErrorKind::HandshakeFailed => err.to_string(),
+        _ => format!("{err}: {}", result.error_string()),
+    };
+    TlsError::new(kind, message).into()
+}
 
 /// A [`rustls::client::danger::ServerCertVerifier`] that accepts any certificate.
 ///
@@ -190,7 +256,7 @@ fn filter_cipher_suites(spec: &str) -> Result<Vec<rustls::SupportedCipherSuite>>
         .collect();
 
     if filtered.is_empty() {
-        return Err(Error::Tls(format!(
+        return Err(config_err(format!(
             "no recognized cipher suites in '{spec}'; \
             use rustls names such as TLS13_AES_256_GCM_SHA384"
         )));
@@ -223,9 +289,11 @@ pub(crate) fn make_tls_config(tls: &crate::TlsOptions) -> Result<StdArc<rustls::
     // Encrypted private keys require out-of-band decryption not supported by
     // the rustls backend.
     if !tls.private_key_password.is_empty() {
-        return Err(Error::Tls(
-            "encrypted private keys are not supported with the rustls TLS backend".into(),
-        ));
+        return Err(TlsError::new(
+            TlsErrorKind::Unsupported,
+            "encrypted private keys are not supported with the rustls TLS backend",
+        )
+        .into());
     }
 
     // ---- Root certificate store ----
@@ -244,7 +312,7 @@ pub(crate) fn make_tls_config(tls: &crate::TlsOptions) -> Result<StdArc<rustls::
         for cert in rustls_pemfile::certs(&mut r) {
             root_store
                 .add(cert.map_err(Error::Io)?)
-                .map_err(|e| Error::Tls(e.to_string()))?;
+                .map_err(config_err)?;
         }
     }
 
@@ -288,7 +356,7 @@ pub(crate) fn make_tls_config(tls: &crate::TlsOptions) -> Result<StdArc<rustls::
     let provider_arc = StdArc::new(provider);
     let builder = rustls::ClientConfig::builder_with_provider(provider_arc.clone())
         .with_protocol_versions(versions)
-        .map_err(|e| Error::Tls(e.to_string()))?;
+        .map_err(config_err)?;
 
     // ---- Certificate verification ----
     //
@@ -307,7 +375,7 @@ pub(crate) fn make_tls_config(tls: &crate::TlsOptions) -> Result<StdArc<rustls::
                 provider_arc.clone(),
             )
             .build()
-            .map_err(|e| Error::Tls(e.to_string()))?;
+            .map_err(config_err)?;
             builder
                 .dangerous()
                 .with_custom_certificate_verifier(StdArc::new(NoHostnameVerifier(inner)))
@@ -330,11 +398,11 @@ pub(crate) fn make_tls_config(tls: &crate::TlsOptions) -> Result<StdArc<rustls::
         let key_f = std::fs::File::open(key_path).map_err(Error::Io)?;
         let key = rustls_pemfile::private_key(&mut BufReader::new(key_f))
             .map_err(Error::Io)?
-            .ok_or_else(|| Error::Tls("no private key found in key store".into()))?;
+            .ok_or_else(|| config_err("no private key found in key store"))?;
 
         wants_client
             .with_client_auth_cert(certs, key)
-            .map_err(|e| Error::Tls(e.to_string()))?
+            .map_err(config_err)?
     } else {
         wants_client.with_no_client_auth()
     };
@@ -362,8 +430,7 @@ pub(crate) fn make_tls_config(tls: &crate::TlsOptions) -> Result<StdArc<rustls::
 /// * `disable_default_trust_store` — when `true`, skips loading system CA.
 #[cfg(all(feature = "openssl", not(feature = "tls")))]
 pub(crate) fn make_openssl_config(tls: &crate::TlsOptions) -> Result<openssl::ssl::SslConnector> {
-    let mut builder =
-        SslConnector::builder(SslMethod::tls_client()).map_err(|e| Error::Tls(e.to_string()))?;
+    let mut builder = SslConnector::builder(SslMethod::tls_client()).map_err(config_err)?;
 
     // Server certificate verification
     builder.set_verify(if tls.enable_server_cert_auth {
@@ -374,16 +441,12 @@ pub(crate) fn make_openssl_config(tls: &crate::TlsOptions) -> Result<openssl::ss
 
     // System CA certificates
     if !tls.disable_default_trust_store {
-        builder
-            .set_default_verify_paths()
-            .map_err(|e| Error::Tls(e.to_string()))?;
+        builder.set_default_verify_paths().map_err(config_err)?;
     }
 
     // Explicit CA certificate file
     if !tls.trust_store.as_os_str().is_empty() {
-        builder
-            .set_ca_file(&tls.trust_store)
-            .map_err(|e| Error::Tls(e.to_string()))?;
+        builder.set_ca_file(&tls.trust_store).map_err(config_err)?;
     }
 
     // CA certificate directory — load each PEM file; silently skip non-PEM files.
@@ -403,7 +466,7 @@ pub(crate) fn make_openssl_config(tls: &crate::TlsOptions) -> Result<openssl::ss
     if !tls.enabled_cipher_suites.is_empty() {
         builder
             .set_cipher_list(&tls.enabled_cipher_suites)
-            .map_err(|e| Error::Tls(e.to_string()))?;
+            .map_err(config_err)?;
     }
 
     // Minimum TLS protocol version
@@ -412,15 +475,13 @@ pub(crate) fn make_openssl_config(tls: &crate::TlsOptions) -> Result<openssl::ss
         crate::TlsVersion::Tls1_0 => Some(OpenSslProtoVersion::TLS1),
         crate::TlsVersion::Tls1_1 => Some(OpenSslProtoVersion::TLS1_1),
     };
-    builder
-        .set_min_proto_version(min_ver)
-        .map_err(|e| Error::Tls(e.to_string()))?;
+    builder.set_min_proto_version(min_ver).map_err(config_err)?;
 
     // Client certificate and private key
     if !tls.key_store.as_os_str().is_empty() {
         builder
             .set_certificate_file(&tls.key_store, SslFiletype::PEM)
-            .map_err(|e| Error::Tls(e.to_string()))?;
+            .map_err(config_err)?;
         let key_path = if !tls.private_key.as_os_str().is_empty() {
             &tls.private_key
         } else {
@@ -433,14 +494,12 @@ pub(crate) fn make_openssl_config(tls: &crate::TlsOptions) -> Result<openssl::ss
                 &pem,
                 tls.private_key_password.as_bytes(),
             )
-            .map_err(|e| Error::Tls(e.to_string()))?;
-            builder
-                .set_private_key(&key)
-                .map_err(|e| Error::Tls(e.to_string()))?;
+            .map_err(config_err)?;
+            builder.set_private_key(&key).map_err(config_err)?;
         } else {
             builder
                 .set_private_key_file(key_path, SslFiletype::PEM)
-                .map_err(|e| Error::Tls(e.to_string()))?;
+                .map_err(config_err)?;
         }
     }
 
@@ -451,9 +510,7 @@ pub(crate) fn make_openssl_config(tls: &crate::TlsOptions) -> Result<openssl::ss
             wire.push(proto.len() as u8);
             wire.extend_from_slice(proto.as_bytes());
         }
-        builder
-            .set_alpn_protos(&wire)
-            .map_err(|e| Error::Tls(e.to_string()))?;
+        builder.set_alpn_protos(&wire).map_err(config_err)?;
     }
 
     Ok(builder.build())
@@ -471,9 +528,63 @@ pub(crate) fn openssl_ssl_for(
     tls: &crate::TlsOptions,
     host: &str,
 ) -> Result<openssl::ssl::Ssl> {
-    let mut config = connector
-        .configure()
-        .map_err(|e| Error::Tls(e.to_string()))?;
+    let mut config = connector.configure().map_err(config_err)?;
     config.set_verify_hostname(tls.enable_server_cert_auth && tls.verify);
-    config.into_ssl(host).map_err(|e| Error::Tls(e.to_string()))
+    config.into_ssl(host).map_err(|e| {
+        let msg = format!("invalid TLS server name: {host} ({e})");
+        TlsError::new(TlsErrorKind::InvalidServerName, msg).into()
+    })
+}
+
+/////////////////////////////////////////////////////////////////////////////
+//                              Unit Tests
+/////////////////////////////////////////////////////////////////////////////
+
+#[cfg(all(test, any(feature = "tls", feature = "smol-tls")))]
+mod tests {
+    use super::*;
+    use rustls::CertificateError;
+    use std::io;
+
+    fn kind_of(err: io::Error) -> TlsErrorKind {
+        match rustls_handshake_err(err) {
+            Error::Tls(e) => e.kind(),
+            other => panic!("expected a TLS error, got {other:?}"),
+        }
+    }
+
+    fn cert_err(err: CertificateError) -> io::Error {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            rustls::Error::InvalidCertificate(err),
+        )
+    }
+
+    #[test]
+    fn test_rustls_handshake_err() {
+        use TlsErrorKind::*;
+
+        let cases = [
+            (CertificateError::UnknownIssuer, UntrustedCertificate),
+            (CertificateError::NotValidForName, HostnameMismatch),
+            (CertificateError::Expired, CertificateExpired),
+            (CertificateError::NotValidYet, CertificateNotYetValid),
+            (CertificateError::Revoked, HandshakeFailed),
+        ];
+        for (err, kind) in cases {
+            assert_eq!(kind_of(cert_err(err)), kind);
+        }
+
+        // A rustls error that is not about the certificate, and a transport
+        // failure with no rustls error in it.
+        let alert = rustls::Error::AlertReceived(rustls::AlertDescription::HandshakeFailure);
+        assert_eq!(
+            kind_of(io::Error::new(io::ErrorKind::InvalidData, alert)),
+            HandshakeFailed
+        );
+        assert_eq!(
+            kind_of(io::ErrorKind::ConnectionReset.into()),
+            HandshakeFailed
+        );
+    }
 }

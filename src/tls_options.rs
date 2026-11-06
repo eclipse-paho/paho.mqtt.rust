@@ -27,7 +27,7 @@ use std::{
 };
 
 #[cfg(any(feature = "tokio", feature = "smol"))]
-use crate::{AsyncClient, TlsErrorCallback};
+use crate::{AsyncClient, TlsError, TlsErrorCallback};
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
@@ -92,8 +92,8 @@ pub struct TlsOptions {
     pub ca_path: PathBuf,
     /// The TLS error callback.
     ///
-    /// Called with the error's message whenever a connection attempt fails
-    /// with [`Error::Tls`](crate::Error::Tls): a refused handshake, or TLS
+    /// Called with the error whenever a connection attempt fails with
+    /// [`Error::Tls`](crate::Error::Tls): a refused handshake, or TLS
     /// options that could not be turned into a configuration. A connect to a
     /// list of servers calls it once for each server that fails this way.
     ///
@@ -356,7 +356,7 @@ impl TlsOptionsBuilder {
     #[cfg(any(feature = "tokio", feature = "smol"))]
     pub fn error_callback<F>(&mut self, cb: F) -> &mut Self
     where
-        F: Fn(&AsyncClient, &str) + Send + Sync + 'static,
+        F: Fn(&AsyncClient, &TlsError) + Send + Sync + 'static,
     {
         self.0.on_tls_error = Some(Arc::new(cb));
         self

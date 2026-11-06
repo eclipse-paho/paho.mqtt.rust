@@ -44,10 +44,10 @@ use tokio::{
 #[cfg(feature = "tls")]
 use tokio_rustls::TlsConnector;
 
-#[cfg(feature = "tls")]
-use super::tls_config::make_tls_config;
 #[cfg(all(feature = "openssl", not(feature = "tls")))]
-use super::tls_config::{make_openssl_config, openssl_ssl_for};
+use super::tls_config::{config_err, make_openssl_config, openssl_handshake_err, openssl_ssl_for};
+#[cfg(feature = "tls")]
+use super::tls_config::{invalid_server_name, make_tls_config, rustls_handshake_err};
 #[cfg(all(feature = "openssl", not(feature = "tls")))]
 use super::tokio_conn::OpenSslConnection;
 #[cfg(feature = "tls")]
@@ -353,14 +353,14 @@ impl Backend for TokioBackend {
                 let config = make_tls_config(tls)?;
                 let connector = TlsConnector::from(config);
                 let server_name = rustls::pki_types::ServerName::try_from(host.as_str())
-                    .map_err(|_| Error::Tls(format!("invalid TLS server name: {}", host)))?
+                    .map_err(|_| invalid_server_name(host))?
                     .to_owned();
                 let tcp = TcpStream::connect((host.as_str(), *port)).await?;
                 tcp.set_nodelay(true)?;
                 let tls = connector
                     .connect(server_name, tcp)
                     .await
-                    .map_err(|e| Error::Tls(e.to_string()))?;
+                    .map_err(rustls_handshake_err)?;
                 Box::new(TlsConnection::new(tls))
             }
             #[cfg(all(not(feature = "tls"), feature = "openssl"))]
@@ -370,12 +370,11 @@ impl Backend for TokioBackend {
                 let ssl = openssl_ssl_for(&connector, tls_opts, host.as_str())?;
                 let tcp = TcpStream::connect((host.as_str(), *port)).await?;
                 tcp.set_nodelay(true)?;
-                let mut stream = tokio_openssl::SslStream::new(ssl, tcp)
-                    .map_err(|e| Error::Tls(e.to_string()))?;
+                let mut stream = tokio_openssl::SslStream::new(ssl, tcp).map_err(config_err)?;
                 Pin::new(&mut stream)
                     .connect()
                     .await
-                    .map_err(|e| Error::Tls(e.to_string()))?;
+                    .map_err(|e| openssl_handshake_err(stream.ssl(), e))?;
                 Box::new(OpenSslConnection::new(stream))
             }
             #[cfg(unix)]
@@ -396,13 +395,13 @@ impl Backend for TokioBackend {
                 let config = make_tls_config(tls)?;
                 let connector = TlsConnector::from(config);
                 let server_name = rustls::pki_types::ServerName::try_from(host.as_str())
-                    .map_err(|_| Error::Tls(format!("invalid TLS server name: {}", host)))?
+                    .map_err(|_| invalid_server_name(host))?
                     .to_owned();
                 let tcp = tcp_maybe_proxied(&p.https_proxy, host.as_str(), *port).await?;
                 let tls = connector
                     .connect(server_name, tcp)
                     .await
-                    .map_err(|e| Error::Tls(e.to_string()))?;
+                    .map_err(rustls_handshake_err)?;
                 let url = format!("wss://{}:{}{}", host, port, path);
                 let request = build_ws_request(&url, &p.http_headers)?;
                 let (ws, _) = tokio_tungstenite::client_async(request, tls)
@@ -416,12 +415,11 @@ impl Backend for TokioBackend {
                 let connector = make_openssl_config(tls_opts)?;
                 let ssl = openssl_ssl_for(&connector, tls_opts, host.as_str())?;
                 let tcp = tcp_maybe_proxied(&p.https_proxy, host.as_str(), *port).await?;
-                let mut stream = tokio_openssl::SslStream::new(ssl, tcp)
-                    .map_err(|e| Error::Tls(e.to_string()))?;
+                let mut stream = tokio_openssl::SslStream::new(ssl, tcp).map_err(config_err)?;
                 Pin::new(&mut stream)
                     .connect()
                     .await
-                    .map_err(|e| Error::Tls(e.to_string()))?;
+                    .map_err(|e| openssl_handshake_err(stream.ssl(), e))?;
                 let url = format!("wss://{}:{}{}", host, port, path);
                 let request = build_ws_request(&url, &p.http_headers)?;
                 let (ws, _) = tokio_tungstenite::client_async(request, stream)

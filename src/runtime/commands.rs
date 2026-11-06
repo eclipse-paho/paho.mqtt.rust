@@ -555,7 +555,7 @@ pub(crate) enum Event {
     },
     /// A TLS error occurred during connection setup (only when the `tls`
     /// feature is enabled and TLS is configured).
-    TlsError(String),
+    TlsError(crate::TlsError),
 }
 
 /////////////////////////////////////////////////////////////////////////////

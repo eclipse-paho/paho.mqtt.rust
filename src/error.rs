@@ -78,9 +78,8 @@ pub enum Error {
     #[error("WebSocket not supported by library")]
     WebSocketNotSupported,
     /// A TLS failure: the handshake was refused, or the [`TlsOptions`] could
-    /// not be turned into a TLS configuration — an unreadable certificate
-    /// or key, no usable cipher suite, an option the TLS backend does not
-    /// support.
+    /// not be turned into a TLS configuration. [`TlsError::kind`] says which,
+    /// in the same terms for every TLS backend.
     ///
     /// A connect that fails with this also reports it to the
     /// `TlsOptions::on_tls_error` callback. A certificate or key file that
@@ -88,7 +87,7 @@ pub enum Error {
     ///
     /// [`TlsOptions`]: crate::TlsOptions
     #[error("TLS error: {0}")]
-    Tls(String),
+    Tls(#[from] TlsError),
     /// The WebSocket upgrade of a `ws://` or `wss://` connection failed, or
     /// its request could not be built from the server URI and headers.
     #[error("WebSocket error: {0}")]
@@ -199,6 +198,67 @@ pub enum Error {
     GeneralString(String),
 }
 
+/// A TLS failure, classified the same way for every TLS backend, with the
+/// backend's own description of it.
+///
+/// Carried by [`Error::Tls`] and given to the `TlsOptions::on_tls_error`
+/// callback. It displays as the backend's message.
+#[derive(Error, Debug, Clone, PartialEq, Eq)]
+#[error("{message}")]
+pub struct TlsError {
+    kind: TlsErrorKind,
+    message: String,
+}
+
+impl TlsError {
+    /// Creates an error of the given kind with a description of it.
+    pub fn new(kind: TlsErrorKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+        }
+    }
+
+    /// The category of the failure.
+    pub fn kind(&self) -> TlsErrorKind {
+        self.kind
+    }
+
+    /// The TLS backend's description of the failure.
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+/// The category of a [`TlsError`].
+///
+/// `#[non_exhaustive]`, as [`enum@Error`] is: a `match` on this from outside
+/// the crate needs a wildcard arm, and a category may be split later.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TlsErrorKind {
+    /// The server's certificate chain does not lead to a trusted CA.
+    UntrustedCertificate,
+    /// The server's certificate does not name the host connected to.
+    HostnameMismatch,
+    /// The server's certificate has expired.
+    CertificateExpired,
+    /// The server's certificate is not valid yet.
+    CertificateNotYetValid,
+    /// Any other handshake failure, such as no common protocol version or
+    /// cipher suite, or the server refusing the client's certificate.
+    HandshakeFailed,
+    /// The host is not a valid TLS server name.
+    InvalidServerName,
+    /// The `TlsOptions` could not be turned into a configuration: a
+    /// certificate or key the backend rejects, no recognized cipher suite, or
+    /// a missing private key.
+    Config,
+    /// An option the TLS backend does not support, such as an encrypted
+    /// private key with rustls.
+    Unsupported,
+}
+
 /// The ways that opening a tunnel through an HTTP proxy can fail.
 ///
 /// Carried by [`Error::Proxy`]. `#[non_exhaustive]`, as [`enum@Error`] is: a
@@ -252,7 +312,7 @@ impl Clone for Error {
             SessionNotResumed => SessionNotResumed,
             TlsNotSupported => TlsNotSupported,
             WebSocketNotSupported => WebSocketNotSupported,
-            Tls(s) => Tls(s.clone()),
+            Tls(e) => Tls(e.clone()),
             WebSocket(s) => WebSocket(s.clone()),
             Proxy(e) => Proxy(e.clone()),
             WrongMqttVersion => WrongMqttVersion,
@@ -340,6 +400,18 @@ mod tests {
             }
             _ => panic!("clone changed variant"),
         }
+    }
+
+    #[test]
+    fn test_tls_error() {
+        let tls = TlsError::new(TlsErrorKind::CertificateExpired, "certificate expired");
+        assert_eq!(tls.kind(), TlsErrorKind::CertificateExpired);
+        assert_eq!(tls.message(), "certificate expired");
+        assert_eq!(tls.to_string(), "certificate expired");
+
+        let err = Error::from(tls.clone());
+        assert_eq!(err.to_string(), "TLS error: certificate expired");
+        assert!(matches!(err.clone(), Error::Tls(e) if e == tls));
     }
 
     #[test]

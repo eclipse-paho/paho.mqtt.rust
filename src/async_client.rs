@@ -48,7 +48,7 @@ use crate::{
     DeliveryToken, DisconnectOptions, Event, FilePersistence, Message, PersistenceType, Properties,
     ReasonCode, SubscribeManyToken, SubscribeOptions, SubscribeToken, SyncReceiver,
     UnsubscribeManyToken, UnsubscribeToken, UserData,
-    error::{Error, Result},
+    error::{Error, Result, TlsError},
     persistence::ClientPersistence,
     runtime::{
         Command, ConnectParams, OfflineConfig, RtOwnership, ServerAddr, Sink, StateView,
@@ -102,7 +102,7 @@ pub type DisconnectedCallback = dyn FnMut(&AsyncClient, Properties, ReasonCode) 
 pub type MessageArrivedCallback = dyn FnMut(&AsyncClient, Option<Message>) + Send + 'static;
 
 /// User callback type for a TLS error
-pub type TlsErrorCallback = dyn Fn(&AsyncClient, &str) + Send + Sync + 'static;
+pub type TlsErrorCallback = dyn Fn(&AsyncClient, &TlsError) + Send + Sync + 'static;
 
 /////////////////////////////////////////////////////////////////////////////
 
@@ -1710,7 +1710,7 @@ impl AsyncClient {
                         .restore(cb, generation);
                 }
             }
-            Ev::TlsError(msg) => {
+            Ev::TlsError(err) => {
                 // Clone the Arc out of the RwLock before invoking so we don't
                 // hold the lock across the (potentially blocking) callback.
                 let cb = self
@@ -1722,7 +1722,7 @@ impl AsyncClient {
                     .as_ref()
                     .and_then(|tls| tls.on_tls_error.clone());
                 if let Some(cb) = cb {
-                    cb(self, &msg);
+                    cb(self, &err);
                 }
             }
         }
