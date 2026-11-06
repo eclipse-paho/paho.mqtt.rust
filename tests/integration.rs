@@ -2089,11 +2089,14 @@ fn test_ws_proxy_refusal_is_reported() {
     let cli = mqtt::AsyncClient::new(WS_HOST).unwrap();
     let res = cli.connect(opts).wait_for(Duration::from_secs(10));
 
-    let msg = match res {
-        Err(e) => e.to_string(),
-        Ok(_) => panic!("connect should have failed"),
-    };
-    assert!(msg.contains("407"), "error should name the refusal: {msg}");
+    assert!(
+        matches!(
+            &res,
+            Err(mqtt::Error::Proxy(mqtt::ProxyError::Refused { status: 407, status_line }))
+                if status_line.contains("Proxy Authentication Required")
+        ),
+        "error should name the refusal: {res:?}"
+    );
     assert!(!cli.is_connected());
 }
 

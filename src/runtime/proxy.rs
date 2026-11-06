@@ -30,7 +30,7 @@
 //! request, reading the reply. The socket work belongs to whichever backend
 //! is in use.
 
-use crate::{Error, Result};
+use crate::{Error, ProxyError, Result};
 
 /// A proxy to tunnel through.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -111,17 +111,16 @@ impl Proxy {
 /// A status other than 2xx means the proxy refused, and its reason is worth
 /// repeating: `407` in particular means the credentials were missing or
 /// wrong, which is otherwise a puzzling failure.
-pub(crate) fn check_response(buf: &[u8]) -> Result<Option<usize>> {
+pub(crate) fn check_response(buf: &[u8]) -> core::result::Result<Option<usize>, ProxyError> {
     let Some(end) = find_header_end(buf) else {
         // A proxy that says nothing at all is more likely broken than slow.
         if buf.len() > 8192 {
-            return Err(Error::Proxy("the response is over-long".into()));
+            return Err(ProxyError::OverlongResponse);
         }
         return Ok(None);
     };
 
-    let head = core::str::from_utf8(&buf[..end])
-        .map_err(|_| Error::Proxy("the response is not valid UTF-8".into()))?;
+    let head = core::str::from_utf8(&buf[..end]).map_err(|_| ProxyError::NotUtf8)?;
     let status_line = head.lines().next().unwrap_or_default();
 
     // "HTTP/1.1 200 Connection established"
@@ -130,12 +129,15 @@ pub(crate) fn check_response(buf: &[u8]) -> Result<Option<usize>> {
     let code = parts
         .next()
         .and_then(|c| c.parse::<u16>().ok())
-        .ok_or_else(|| Error::Proxy(format!("malformed status line: {}", status_line.trim())))?;
+        .ok_or_else(|| ProxyError::MalformedStatusLine(status_line.trim().to_string()))?;
 
     if (200..300).contains(&code) {
         Ok(Some(end))
     } else {
-        Err(Error::ProxyRefused(code, status_line.trim().to_string()))
+        Err(ProxyError::Refused {
+            status: code,
+            status_line: status_line.trim().to_string(),
+        })
     }
 }
 
@@ -248,16 +250,26 @@ mod tests {
         );
 
         // A refusal carries the status code and the proxy's own words.
-        let err =
-            check_response(b"HTTP/1.1 407 Proxy Authentication Required\r\n\r\n").unwrap_err();
-        assert!(
-            matches!(&err, Error::ProxyRefused(407, line) if line.ends_with("Required")),
-            "{err:?}"
+        assert_eq!(
+            check_response(b"HTTP/1.1 407 Proxy Authentication Required\r\n\r\n"),
+            Err(ProxyError::Refused {
+                status: 407,
+                status_line: "HTTP/1.1 407 Proxy Authentication Required".into(),
+            })
         );
 
-        assert!(matches!(
+        // Responses that are not well-formed HTTP.
+        assert_eq!(
             check_response(b"garbage\r\n\r\n"),
-            Err(Error::Proxy(_))
-        ));
+            Err(ProxyError::MalformedStatusLine("garbage".into()))
+        );
+        assert_eq!(
+            check_response(b"HTTP/1.1 200 \xFF\r\n\r\n"),
+            Err(ProxyError::NotUtf8)
+        );
+        assert_eq!(
+            check_response(&[b'x'; 8193]),
+            Err(ProxyError::OverlongResponse)
+        );
     }
 }

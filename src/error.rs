@@ -93,17 +93,13 @@ pub enum Error {
     /// its request could not be built from the server URI and headers.
     #[error("WebSocket error: {0}")]
     WebSocket(String),
-    /// The exchange with an HTTP proxy broke down: it closed the connection,
-    /// or sent something other than a well-formed HTTP response.
-    #[error("HTTP proxy error: {0}")]
-    Proxy(String),
-    /// An HTTP proxy refused to open the tunnel, with this HTTP status code
-    /// and status line.
+    /// An HTTP proxy refused to open the tunnel, or the exchange with it
+    /// broke down; the [`ProxyError`] says which.
     ///
-    /// `407` means the proxy wants credentials, or did not accept the ones
-    /// given in the proxy URI.
-    #[error("HTTP proxy refused the tunnel: {1}")]
-    ProxyRefused(u16, String),
+    /// A proxy URI that cannot be parsed is an
+    /// [`InvalidArgument`](Self::InvalidArgument) error instead.
+    #[error("HTTP proxy error: {0}")]
+    Proxy(#[from] ProxyError),
     /// Call not applicable to the client's version of MQTT.
     #[error("Wrong MQTT version")]
     WrongMqttVersion,
@@ -203,6 +199,43 @@ pub enum Error {
     GeneralString(String),
 }
 
+/// The ways that opening a tunnel through an HTTP proxy can fail.
+///
+/// Carried by [`Error::Proxy`]. `#[non_exhaustive]`, as [`enum@Error`] is: a
+/// `match` on this from outside the crate needs a wildcard arm.
+#[non_exhaustive]
+#[derive(Error, Debug, Clone, PartialEq, Eq)]
+pub enum ProxyError {
+    /// The proxy refused to open the tunnel, with this HTTP status code and
+    /// status line.
+    ///
+    /// `407` means the proxy wants credentials, or did not accept the ones
+    /// given in the proxy URI.
+    #[error("the proxy refused the tunnel: {status_line}")]
+    Refused {
+        /// The HTTP status code.
+        status: u16,
+        /// The whole status line, in the proxy's own words.
+        status_line: String,
+    },
+    /// The proxy closed the connection before the tunnel was open.
+    #[error("the proxy closed the connection")]
+    Closed,
+    /// Data arrived behind the proxy's response, before the tunnel was open.
+    #[error("data arrived before the tunnel was open")]
+    EarlyData,
+    /// The response headers went on for longer than any proxy's should.
+    #[error("the response is over-long")]
+    OverlongResponse,
+    /// The response headers are not valid UTF-8.
+    #[error("the response is not valid UTF-8")]
+    NotUtf8,
+    /// The response does not start with an HTTP status line. This holds the
+    /// line that was received.
+    #[error("malformed status line: {0}")]
+    MalformedStatusLine(String),
+}
+
 /// `io::Error` is not `Clone`, so the I/O variant is cloned by re-creating an
 /// error of the same kind carrying the original's message. The `source()`
 /// chain of the original is not preserved. Every other variant clones its
@@ -221,8 +254,7 @@ impl Clone for Error {
             WebSocketNotSupported => WebSocketNotSupported,
             Tls(s) => Tls(s.clone()),
             WebSocket(s) => WebSocket(s.clone()),
-            Proxy(s) => Proxy(s.clone()),
-            ProxyRefused(code, s) => ProxyRefused(*code, s.clone()),
+            Proxy(e) => Proxy(e.clone()),
             WrongMqttVersion => WrongMqttVersion,
             Protocol(e) => Protocol(*e),
             ProtocolViolation(s) => ProtocolViolation(s),
@@ -314,15 +346,19 @@ mod tests {
     fn test_new_variants_clone_and_display() {
         let errs = [
             Error::WebSocket("upgrade failed".into()),
-            Error::Proxy("the proxy closed the connection".into()),
-            Error::ProxyRefused(407, "HTTP/1.1 407 Proxy Authentication Required".into()),
+            Error::Proxy(ProxyError::Closed),
+            Error::Proxy(ProxyError::Refused {
+                status: 407,
+                status_line: "HTTP/1.1 407 Proxy Authentication Required".into(),
+            }),
             Error::ProtocolViolation("expected CONNACK"),
             Error::InvalidArgument("topics/qos length mismatch".into()),
         ];
         let shown = [
             "WebSocket error: upgrade failed",
             "HTTP proxy error: the proxy closed the connection",
-            "HTTP proxy refused the tunnel: HTTP/1.1 407 Proxy Authentication Required",
+            "HTTP proxy error: the proxy refused the tunnel: \
+             HTTP/1.1 407 Proxy Authentication Required",
             "Protocol violation by the server: expected CONNACK",
             "Invalid argument: topics/qos length mismatch",
         ];
@@ -330,7 +366,10 @@ mod tests {
             assert_eq!(err.to_string(), shown);
             assert_eq!(err.clone().to_string(), shown);
         }
-        assert!(matches!(errs[2].clone(), Error::ProxyRefused(407, _)));
+        assert!(matches!(
+            errs[2].clone(),
+            Error::Proxy(ProxyError::Refused { status: 407, .. })
+        ));
     }
 
     #[test]

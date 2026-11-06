@@ -251,16 +251,14 @@ async fn tcp_maybe_proxied(proxy_uri: &str, host: &str, port: u16) -> Result<Tcp
     loop {
         let n = tcp.read(&mut tmp).await?;
         if n == 0 {
-            return Err(Error::Proxy("the proxy closed the connection".into()));
+            return Err(crate::ProxyError::Closed.into());
         }
         buf.extend_from_slice(&tmp[..n]);
         if let Some(end) = proxy::check_response(&buf)? {
             if end != buf.len() {
                 // Nothing should arrive before we have spoken, and the extra
                 // bytes cannot be pushed back into the socket.
-                return Err(Error::Proxy(
-                    "data arrived before the tunnel was open".into(),
-                ));
+                return Err(crate::ProxyError::EarlyData.into());
             }
             return Ok(tcp);
         }

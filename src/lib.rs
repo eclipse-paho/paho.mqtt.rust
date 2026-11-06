@@ -243,7 +243,7 @@ pub use crate::{
     connection_state::ConnectionState,
     create_options::{CreateOptions, CreateOptionsBuilder, RuntimeMode},
     disconnect_options::{DisconnectOptions, DisconnectOptionsBuilder},
-    error::{Error, Result},
+    error::{Error, ProxyError, Result},
     event::Event,
     message::{IntoPayload, Message, MessageBuilder},
     persistence::{
