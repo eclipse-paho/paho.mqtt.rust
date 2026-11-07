@@ -22,7 +22,7 @@
  *******************************************************************************/
 
 use crate::{Message, Properties, ReasonCode};
-use std::{io, result, str};
+use std::{fmt, io, result, str};
 use thiserror::Error;
 
 /// The errors from an MQTT operation.
@@ -259,6 +259,22 @@ pub enum TlsErrorKind {
     Unsupported,
 }
 
+impl fmt::Display for TlsErrorKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        use TlsErrorKind::*;
+        f.pad(match self {
+            UntrustedCertificate => "untrusted certificate",
+            HostnameMismatch => "hostname mismatch",
+            CertificateExpired => "certificate expired",
+            CertificateNotYetValid => "certificate not yet valid",
+            HandshakeFailed => "handshake failed",
+            InvalidServerName => "invalid server name",
+            Config => "invalid TLS configuration",
+            Unsupported => "unsupported TLS option",
+        })
+    }
+}
+
 /// The ways that opening a tunnel through an HTTP proxy can fail.
 ///
 /// Carried by [`Error::Proxy`]. `#[non_exhaustive]`, as [`enum@Error`] is: a
@@ -412,6 +428,18 @@ mod tests {
         let err = Error::from(tls.clone());
         assert_eq!(err.to_string(), "TLS error: certificate expired");
         assert!(matches!(err.clone(), Error::Tls(e) if e == tls));
+    }
+
+    #[test]
+    fn test_tls_error_kind_display() {
+        assert_eq!(
+            TlsErrorKind::CertificateNotYetValid.to_string(),
+            "certificate not yet valid"
+        );
+        assert_eq!(
+            format!("{:>20}", TlsErrorKind::HostnameMismatch),
+            "   hostname mismatch"
+        );
     }
 
     #[test]
