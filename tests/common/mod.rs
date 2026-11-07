@@ -492,6 +492,38 @@ impl TestProxy {
     }
 }
 
+/// Reads a `CONNECT` request up to the blank line that ends its headers.
+fn read_proxy_request(client: &mut std::net::TcpStream) -> Option<String> {
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        match client.read(&mut byte) {
+            Ok(1) => head.push(byte[0]),
+            _ => return None,
+        }
+    }
+    Some(String::from_utf8_lossy(&head).to_string())
+}
+
+/// Starts a proxy that answers one `CONNECT` with exactly `reply`, in a single
+/// write, then closes the connection.
+pub fn spawn_raw_proxy(reply: &'static [u8]) -> TestProxy {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let uri = format!("http://{}", listener.local_addr().unwrap());
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let seen = Arc::clone(&requests);
+
+    std::thread::spawn(move || {
+        let (mut client, _) = listener.accept().unwrap();
+        if let Some(head) = read_proxy_request(&mut client) {
+            seen.lock().unwrap().push(head);
+            let _ = client.write_all(reply);
+        }
+    });
+
+    TestProxy { uri, requests }
+}
+
 /// Starts a proxy that answers `CONNECT` with `status`, and — for a 2xx
 /// status — then pipes bytes to and from `target` so the tunnel really works.
 ///
@@ -508,17 +540,10 @@ pub fn spawn_proxy(status: &'static str, target: Option<String>) -> TestProxy {
             let seen = Arc::clone(&seen);
             let target = target.clone();
             std::thread::spawn(move || {
-                // Read up to the blank line that ends the request headers.
-                let mut head = Vec::new();
-                let mut byte = [0u8; 1];
-                while !head.ends_with(b"\r\n\r\n") {
-                    match client.read(&mut byte) {
-                        Ok(1) => head.push(byte[0]),
-                        _ => return,
-                    }
-                }
-                let head = String::from_utf8_lossy(&head).to_string();
-                seen.lock().unwrap().push(head.clone());
+                let Some(head) = read_proxy_request(&mut client) else {
+                    return;
+                };
+                seen.lock().unwrap().push(head);
 
                 let resp = format!("HTTP/1.1 {status}\r\n\r\n");
                 if client.write_all(resp.as_bytes()).is_err() {

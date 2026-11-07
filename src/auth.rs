@@ -34,6 +34,10 @@ use crate::{Properties, PropertyId, Result};
 /// One step of an authentication exchange, as sent by the broker.
 ///
 /// The data is method-specific and opaque to this library.
+///
+/// `#[non_exhaustive]`, so that re-authentication can add to what a handler
+/// is told: a pattern on this from outside the crate needs a `..`.
+#[non_exhaustive]
 #[derive(Debug)]
 pub struct AuthChallenge<'a> {
     /// The authentication method named in the CONNECT properties, echoed by

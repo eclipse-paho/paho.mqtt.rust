@@ -2161,6 +2161,45 @@ fn test_ws_proxy_refusal_is_reported() {
     assert!(!cli.is_connected());
 }
 
+/// Connects through `proxy`, which is expected to fail, and returns the result.
+#[cfg(any(feature = "websocket", feature = "smol-websocket"))]
+fn connect_through_proxy(proxy: &common::TestProxy) -> mqtt::Result<mqtt::ConnectResponse> {
+    let opts = mqtt::ConnectOptionsBuilder::new_ws()
+        .http_proxy(proxy.uri.clone())
+        .connect_timeout(Duration::from_secs(5))
+        .finalize();
+    let cli = mqtt::AsyncClient::new(WS_HOST).unwrap();
+    let res = cli.connect(opts).wait_for(Duration::from_secs(10));
+    assert!(!cli.is_connected());
+    res
+}
+
+/// A proxy that hangs up without answering is reported as having done so.
+#[cfg(any(feature = "websocket", feature = "smol-websocket"))]
+#[test]
+fn test_ws_proxy_closing_is_reported() {
+    let proxy = common::spawn_raw_proxy(b"");
+    let res = connect_through_proxy(&proxy);
+    assert!(
+        matches!(res, Err(mqtt::Error::Proxy(mqtt::ProxyError::Closed))),
+        "got {res:?}"
+    );
+    assert_eq!(proxy.requests().len(), 1);
+}
+
+/// Bytes behind the proxy's response cannot be pushed back into the socket,
+/// so they fail the connect rather than being lost.
+#[cfg(any(feature = "websocket", feature = "smol-websocket"))]
+#[test]
+fn test_ws_proxy_early_data_is_reported() {
+    let proxy = common::spawn_raw_proxy(b"HTTP/1.1 200 Connection established\r\n\r\nEARLY");
+    let res = connect_through_proxy(&proxy);
+    assert!(
+        matches!(res, Err(mqtt::Error::Proxy(mqtt::ProxyError::EarlyData))),
+        "got {res:?}"
+    );
+}
+
 /// Credentials in the proxy URI become a `Proxy-Authorization` header.
 #[cfg(any(feature = "websocket", feature = "smol-websocket"))]
 #[test]
