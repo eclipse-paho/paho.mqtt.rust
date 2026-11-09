@@ -461,14 +461,22 @@ impl AsyncClient {
 
     // ----- Connecting -----
 
-    /// Connects to an MQTT broker using the specified connect options.
+    /// Attempts to connect to an MQTT broker using the specified connect
+    /// options, but returns an error immediately if the request can't be
+    /// started.
+    ///
+    /// That is a failure found before anything goes on the wire: invalid
+    /// connect options, a server or proxy URI that can't be parsed, or a
+    /// client whose background session has shut down
+    /// ([`Error::Disconnected`]). On success the returned token tracks the
+    /// connection attempt itself.
     ///
     /// # Arguments
     ///
     /// * `opts` The connect options. This can be `None`, in which case the
     ///   default options are used.
     ///
-    pub fn connect<T>(&self, opts: T) -> ConnectToken
+    pub fn try_connect<T>(&self, opts: T) -> Result<ConnectToken>
     where
         T: Into<Option<ConnectOptions>>,
     {
@@ -476,22 +484,18 @@ impl AsyncClient {
         debug!("Connecting with opts: {:?}", explicit);
 
         // None: keep the client's current version unchanged.
-        // Some(opts): use opts.mqtt_version and update the stored version.
+        // Some(opts): use opts.mqtt_version, and once the options are known
+        // to be good, make it the client's version.
         let ver = match &explicit {
             None => self.mqtt_version(),
-            Some(o) => {
-                self.set_mqtt_version(o.mqtt_version);
-                o.mqtt_version
-            }
+            Some(o) => o.mqtt_version,
         };
 
         // Normalize: ensure the opts we store and send have the resolved version.
         let mut opts = explicit.unwrap_or_default();
         opts.mqtt_version = ver;
 
-        if let Err(err) = opts.check() {
-            return ConnectToken::from(err);
-        }
+        opts.check()?;
 
         // Build the ordered server list: explicit list from connect opts, or
         // fall back to the URI given at client creation time.
@@ -502,10 +506,7 @@ impl AsyncClient {
         };
         let mut servers: Vec<(ServerAddr, String)> = Vec::with_capacity(uris.len());
         for uri in uris {
-            match parse_server_uri(&uri) {
-                Ok(addr) => servers.push((addr, uri)),
-                Err(err) => return ConnectToken::from(err),
-            }
+            servers.push((parse_server_uri(&uri)?, uri));
         }
 
         // A proxy URI is otherwise read only when a WebSocket connection is
@@ -513,10 +514,8 @@ impl AsyncClient {
         // included — rather than this call.
         #[cfg(any(feature = "websocket", feature = "smol-websocket"))]
         for uri in [&opts.http_proxy, &opts.https_proxy] {
-            if !uri.is_empty()
-                && let Err(err) = crate::runtime::proxy::Proxy::parse(uri)
-            {
-                return ConnectToken::from(err);
+            if !uri.is_empty() {
+                crate::runtime::proxy::Proxy::parse(uri)?;
             }
         }
 
@@ -530,6 +529,9 @@ impl AsyncClient {
             properties: msg.props.clone(),
         });
 
+        // Everything that can be checked here has been: a connect refused
+        // above leaves the client's version and options as they were.
+        self.set_mqtt_version(ver);
         let (tok, comp) = ConnectToken::new();
         *self.inner.conn_opts.write().unwrap() = opts.clone();
 
@@ -570,18 +572,45 @@ impl AsyncClient {
         };
 
         if self.inner.cmd_tx.send_blocking(cmd).is_err() {
-            return ConnectToken::from(Error::Disconnected);
+            return Err(Error::Disconnected);
         }
 
-        tok
+        Ok(tok)
+    }
+
+    /// Connects to an MQTT broker using the specified connect options.
+    ///
+    /// Returns a Connect Token to track the progress of the operation.
+    /// A failure found before the request is sent — see
+    /// [`try_connect`](Self::try_connect) — fails the token instead.
+    ///
+    /// # Arguments
+    ///
+    /// * `opts` The connect options. This can be `None`, in which case the
+    ///   default options are used.
+    ///
+    pub fn connect<T>(&self, opts: T) -> ConnectToken
+    where
+        T: Into<Option<ConnectOptions>>,
+    {
+        self.try_connect(opts).unwrap_or_else(ConnectToken::from)
     }
 
     /// Attempts to reconnect to the broker.
     /// This can only be called after a connection was initially made or
     /// attempted. It will retry with the same connect options.
     pub fn reconnect(&self) -> ConnectToken {
+        self.try_reconnect().unwrap_or_else(ConnectToken::from)
+    }
+
+    /// Attempts to reconnect to the broker with the same connect options,
+    /// but returns an error immediately if the request can't be started.
+    ///
+    /// See [`try_connect`](Self::try_connect) for the failures reported this
+    /// way, and [`reconnect`](Self::reconnect) for the rest.
+    pub fn try_reconnect(&self) -> Result<ConnectToken> {
         let connopts = self.inner.conn_opts.read().unwrap().clone();
-        self.connect(connopts)
+        self.try_connect(connopts)
     }
 
     /// Disconnects from the MQTT broker.
@@ -2318,6 +2347,66 @@ mod tests {
 
         let _tok = cli.disconnect(None);
         assert_eq!(*calls.lock().unwrap(), 1);
+    }
+
+    // ----------------------------------------------------------------------
+    // try_connect reports a failure to start the connect synchronously
+    // ----------------------------------------------------------------------
+
+    /// A server URI that can't be parsed is caught before anything is sent.
+    #[test]
+    fn test_try_connect_rejects_a_bad_server_uri() {
+        let cli = test_client();
+        let opts = crate::ConnectOptionsBuilder::new()
+            .server_uris(&["tcp://localhost:notaport"])
+            .finalize();
+        assert!(matches!(
+            cli.try_connect(opts),
+            Err(Error::InvalidArgument(msg)) if msg.contains("notaport")
+        ));
+    }
+
+    /// With the command channel closed the connect can't be queued.
+    #[test]
+    fn test_try_connect_fails_when_disconnected() {
+        let cli = test_client();
+        assert!(cli.inner.cmd_tx.close(), "the channel was already closed");
+        assert!(matches!(cli.try_connect(None), Err(Error::Disconnected)));
+    }
+
+    /// A refused connect leaves the client's version as it was, rather than
+    /// switching it to the version of options that were never used.
+    #[test]
+    fn test_try_connect_failure_keeps_the_mqtt_version() {
+        let cli = test_client();
+        let before = cli.mqtt_version();
+        let other = if before == MqttVersion::V5 {
+            MqttVersion::V3_1_1
+        } else {
+            MqttVersion::V5
+        };
+        let opts = crate::ConnectOptionsBuilder::with_mqtt_version(other)
+            .server_uris(&["tcp://localhost:notaport"])
+            .finalize();
+        assert!(cli.try_connect(opts).is_err());
+        assert_eq!(cli.mqtt_version(), before);
+    }
+
+    /// `try_reconnect` reports the same synchronous failures.
+    #[test]
+    fn test_try_reconnect_fails_when_disconnected() {
+        let cli = test_client();
+        assert!(cli.inner.cmd_tx.close());
+        assert!(matches!(cli.try_reconnect(), Err(Error::Disconnected)));
+    }
+
+    /// `connect` reports the same failure through its token.
+    #[test]
+    fn test_connect_token_reports_a_synchronous_failure() {
+        let cli = test_client();
+        assert!(cli.inner.cmd_tx.close());
+        let err = cli.connect(None).wait().unwrap_err();
+        assert!(matches!(err, Error::Disconnected), "{err}");
     }
 
     // ----------------------------------------------------------------------
