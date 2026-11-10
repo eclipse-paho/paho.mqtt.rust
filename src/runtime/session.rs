@@ -2786,12 +2786,15 @@ struct Connected<B: Backend> {
 /// restore, so it never depends on the store being readable.
 async fn do_connect<B: Backend>(job: &ConnectJob, restore: bool) -> Result<Connected<B>> {
     let p = &job.params;
-    let (addr, server_uri) = &p.servers[job.server_idx];
+    let (addr, _) = &p.servers[job.server_idx];
 
     // ---- Open persistence ----
+    // Always under the same name, whichever server this is: the session
+    // state carried over from the last connection, which may have been to
+    // another of them, was stored there.
     let mut stored = Vec::new();
     if let Some(store) = &job.persist {
-        store.lock().unwrap().open(&p.client_id, server_uri)?;
+        store.lock().unwrap().open(&p.client_id, &p.persist_uri)?;
         if restore && !p.clean_start {
             stored = stored_keys(store)?;
         }
@@ -3897,6 +3900,7 @@ mod tests {
     fn params(ver: MqttVersion, clean_start: bool) -> ConnectParams {
         ConnectParams {
             servers: Vec::new(),
+            persist_uri: String::new(),
             client_id: String::new(),
             clean_start,
             keep_alive_secs: 0,
@@ -4027,6 +4031,89 @@ mod tests {
             tls[0].contains("tls-a") && tls[1].contains("tls-b"),
             "{tls:?}"
         );
+    }
+
+    /// The store is opened under the client's creation URI for every server
+    /// in the list. It used to be opened under each server's own URI, while
+    /// the session state went from one server to the next: a message stored
+    /// under one and acknowledged by another stayed in the first store, to
+    /// be published again by the next process to reach it.
+    #[test]
+    fn test_store_is_opened_under_one_uri_for_every_server() {
+        type Opens = Arc<Mutex<Vec<(String, String)>>>;
+        struct Recording(Opens);
+
+        impl ClientPersistence for Recording {
+            fn open(&mut self, id: &str, uri: &str) -> Result<()> {
+                self.0.lock().unwrap().push((id.into(), uri.into()));
+                Ok(())
+            }
+            fn close(&mut self) -> Result<()> {
+                Ok(())
+            }
+            fn put(&mut self, _: &str, _: Vec<&[u8]>) -> Result<()> {
+                Ok(())
+            }
+            fn get(&mut self, _: &str) -> Result<Vec<u8>> {
+                Err(Error::Persistence("empty".into()))
+            }
+            fn remove(&mut self, _: &str) -> Result<()> {
+                Ok(())
+            }
+            fn keys(&mut self) -> Result<Vec<String>> {
+                Ok(Vec::new())
+            }
+            fn clear(&mut self) -> Result<()> {
+                Ok(())
+            }
+            fn contains_key(&mut self, _: &str) -> bool {
+                false
+            }
+        }
+
+        let opens = Opens::default();
+        let store: Arc<Mutex<Box<dyn ClientPersistence>>> =
+            Arc::new(Mutex::new(Box::new(Recording(opens.clone()))));
+
+        let (cmd_tx, cmd_rx) = async_channel::unbounded();
+        let (event_tx, _event_rx) = async_channel::unbounded();
+        let mut task = pin!(run_event_loop::<FailingBackend>(
+            cmd_rx,
+            event_tx,
+            Dispatch::new(),
+            OfflineConfig::default(),
+            StateCell::new(),
+        ));
+
+        let server = |host: &str| {
+            let addr = ServerAddr::Tcp {
+                host: host.into(),
+                port: 1883,
+            };
+            (addr, format!("tcp://{host}:1883"))
+        };
+        let mut p = params(MqttVersion::V5, false);
+        p.client_id = "me".into();
+        p.persist_uri = "tcp://created:1883".into();
+        p.servers = vec![server("a"), server("b"), server("c")];
+        let (mut tok, tx) = Token::new();
+        cmd_tx
+            .send_blocking(Command::Connect {
+                params: Box::new(p),
+                tx,
+                assigned_id: Arc::new(RwLock::new(None)),
+                persist: Some(store),
+            })
+            .unwrap();
+
+        assert!(poll_until(task.as_mut(), Duration::from_millis(100)).is_none());
+        assert!(tok.try_wait().expect("the connect has finished").is_err());
+
+        let opens = opens.lock().unwrap();
+        assert_eq!(opens.len(), 3, "one open per server tried: {opens:?}");
+        for (id, uri) in opens.iter() {
+            assert_eq!((id.as_str(), uri.as_str()), ("me", "tcp://created:1883"));
+        }
     }
 
     /// v3.1.1 and v5 are told by the CONNACK; v3.1 has no such flag, so the

@@ -275,6 +275,11 @@ pub(crate) struct ConnectParams {
     /// The event loop tries them left-to-right on the initial connect and
     /// cycles round-robin on each auto-reconnect attempt.
     pub servers: Vec<(ServerAddr, String)>,
+    /// The server URI the persistence store is opened with: the one the
+    /// client was created with, whichever of `servers` a connection is
+    /// made to. The session — and so its stored messages — goes with the
+    /// client from one server to the next, so the store must too.
+    pub persist_uri: String,
     /// Client identifier.
     pub client_id: String,
     /// Whether to request a clean session / discard existing state.
@@ -570,6 +575,7 @@ mod tests {
     fn params_with(props: CodecProperties) -> ConnectParams {
         ConnectParams {
             servers: Vec::new(),
+            persist_uri: String::new(),
             client_id: String::new(),
             clean_start: true,
             keep_alive_secs: 0,

@@ -564,6 +564,7 @@ impl AsyncClient {
 
         let params = ConnectParams {
             servers,
+            persist_uri: self.inner.opts.server_uri.clone(),
             client_id: self.inner.opts.client_id.clone(),
             clean_start: opts.clean_start,
             keep_alive_secs,

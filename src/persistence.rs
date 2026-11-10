@@ -144,9 +144,18 @@ impl From<Option<PersistenceType>> for PersistenceType {
 /// Trait to implement custom persistence in the client.
 pub trait ClientPersistence: Send {
     /// Open and initialize the persistent store.
+    ///
+    /// Called at the start of every connection attempt, always with the
+    /// same arguments for a given client, so it must be safe to call again
+    /// on a store that is already open.
+    ///
     /// * `client_id` The unique client identifier.
-    /// * `server_uri` The address of the server to which the client is
-    ///   connected.
+    /// * `server_uri` The server URI the client was created with
+    ///   ([`CreateOptionsBuilder::server_uri`](crate::CreateOptionsBuilder::server_uri)).
+    ///   When the connect options list several servers, this is not the
+    ///   server being connected to: the session, and so the stored
+    ///   messages, goes with the client from one server to the next, so the
+    ///   store must be the same for all of them.
     fn open(&mut self, client_id: &str, server_uri: &str) -> Result<()>;
 
     /// Close the persistence store.
@@ -351,8 +360,10 @@ fn sanitize_path_component(s: &str) -> String {
 /// Stores each entry as a separate file under a subdirectory of the given
 /// base directory. The subdirectory is named
 /// `<client_id>-<server_uri>` (with characters invalid in path names
-/// replaced by underscores), so a separate store is maintained for each
-/// unique client/server pair.
+/// replaced by underscores), where `server_uri` is the one the client was
+/// created with, so a separate store is maintained for each client. A
+/// client that connects to several servers keeps one store for all of
+/// them; see [`ClientPersistence::open`].
 pub struct FilePersistence {
     /// Root directory supplied at construction time.
     base_dir: PathBuf,

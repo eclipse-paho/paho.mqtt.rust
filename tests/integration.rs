@@ -2342,6 +2342,77 @@ fn test_qos2_persists_pubrel_after_pubrec() {
     broker.join();
 }
 
+/// A client with several servers keeps one file store for all of them,
+/// named after the URI it was created with. A message stored while
+/// connected to one server and acknowledged by another is removed from the
+/// store; it used to be removed from the second server's directory, where
+/// it had never been, leaving the first server's copy to be published again
+/// by the next process to connect there.
+#[test]
+fn test_one_file_store_for_every_server() {
+    use mqtt::paho_mqtt_codec::{ConnAck, Packet, PubAck, ReasonCode};
+
+    // The first server drops the connection as soon as the message arrives;
+    // the second resumes the session and acknowledges the re-send.
+    let first = common::spawn_broker_seq(1, |pkt, _| match pkt {
+        Packet::Connect(_) => {
+            vec![Packet::ConnAck(ConnAck::new(false, ReasonCode::Success))].into()
+        }
+        Packet::Publish(_) => common::Reply::close_after(vec![]),
+        _ => common::Reply::none(),
+    });
+    let second = common::spawn_broker(|pkt| match pkt {
+        Packet::Connect(_) => vec![Packet::ConnAck(ConnAck::new(true, ReasonCode::Success))],
+        Packet::Publish(p) => p
+            .packet_id
+            .map(|id| vec![Packet::PubAck(PubAck::new(id))])
+            .unwrap_or_default(),
+        _ => vec![],
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let cli = mqtt::CreateOptionsBuilder::new()
+        .server_uri(first.uri.clone())
+        .client_id("one-store")
+        .persistence(dir.path())
+        .create_async_client()
+        .unwrap();
+    let opts = mqtt::ConnectOptionsBuilder::new_v5()
+        .server_uris(&[&first.uri, &second.uri])
+        .clean_start(false)
+        .automatic_reconnect(Duration::from_millis(50), Duration::from_millis(100))
+        .finalize();
+    cli.connect(opts).wait().expect("connect failed");
+
+    let tok = cli.publish(mqtt::Message::new(topic!("one-store"), "x", mqtt::QOS_1));
+    tok.wait_for(Duration::from_secs(10))
+        .expect("publish never completed on the second server");
+    assert_eq!(
+        second
+            .received_matching(|p| matches!(p, Packet::Publish(_)).then_some(()))
+            .len(),
+        1
+    );
+    cli.disconnect(None).wait().ok();
+
+    let stores: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    assert_eq!(stores.len(), 1, "one store for both servers: {stores:?}");
+    let left: Vec<_> = std::fs::read_dir(&stores[0])
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert!(
+        left.is_empty(),
+        "the acknowledged message is still stored: {left:?}"
+    );
+
+    first.join();
+    second.join();
+}
+
 /// A QoS 1 publish left unacknowledged when the connection drops is re-sent,
 /// with DUP set, on the reconnect that resumes the session — with no
 /// persistence store involved.
