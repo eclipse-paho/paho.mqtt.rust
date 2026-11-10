@@ -2126,11 +2126,18 @@ impl<B: Backend> Session<B> {
                 yield_now().await;
             }
             self.out.prepare_write();
+            // As in the run loop, a frame held back for the store goes out
+            // only once the store reports it written, so its progress is
+            // waited on here too. Without it the writer stays blocked, the
+            // message never leaves, and the drain sits out its whole timeout
+            // waiting for an acknowledgement that cannot come.
+            let awaited = self.awaited_seq();
             let ev = select_biased! {
                 res = writer_step::<B>(&mut self.writer, &self.out).fuse() => {
                     LoopEvent::Writer(res)
                 }
                 res = B::read_buf(reader, &mut self.read_buf).fuse() => LoopEvent::Read(res),
+                _ = persist_when(&self.persist, awaited).fuse() => LoopEvent::Persisted,
                 cmd = recv_opt(*cmds).fuse() => LoopEvent::Command(cmd),
                 _ = deadline => return,
             };
@@ -2140,6 +2147,7 @@ impl<B: Backend> Session<B> {
                         return;
                     }
                 }
+                LoopEvent::Persisted => self.release_persisted(),
                 LoopEvent::Read(Ok(n)) if n > 0 => {
                     while let Ok(Some(raw)) =
                         RawPacket::decode_max(&mut self.read_buf, self.limits.max_packet_size)
@@ -5367,6 +5375,64 @@ mod tests {
             "the payload went out"
         );
         assert_eq!(writes.load(Ordering::SeqCst), 1, "and was stored first");
+    }
+
+    /// A disconnect that waits for in-flight messages lets the store release
+    /// them. The drain used not to watch the store, so with a store on its
+    /// own thread a publish made just before `disconnect_after` never left
+    /// the outbox: the drain sat out its whole timeout waiting for an
+    /// acknowledgement that could not come, and the token failed.
+    #[test]
+    fn test_disconnect_drain_waits_for_the_store() {
+        use super::super::persist::testing::HeldStore;
+
+        let (store, released, writes) = HeldStore::held();
+        released.store(true, Ordering::SeqCst);
+        let mut h = gated(Duration::ZERO, SessionState::default(), INBOUND_MSG_CAP);
+        h.session.persist = Persist::Worker(PersistWorker::start(store, Duration::ZERO));
+
+        let (mut tok, cmd) = publish_cmd("drained", QoS::QoS1, Bytes::from_static(b"payload"));
+        h.session.handle_command(cmd).unwrap();
+        let id = *h.session.state.inflight.keys().next().unwrap();
+        assert!(h.session.awaited_seq().is_some(), "held for the store");
+
+        // The drain sends the message once it is stored, then waits for
+        // its acknowledgement.
+        let mut reader = MockReader::open_with([]);
+        let mut cmds = None;
+        {
+            let drain = pin!(h.session.drain_pending(
+                &mut reader,
+                Duration::from_secs(10),
+                &mut cmds
+            ));
+            assert!(
+                poll_until(drain, SETTLE).is_none(),
+                "still awaiting the PUBACK"
+            );
+        }
+        assert_eq!(writes.load(Ordering::SeqCst), 1);
+        let sent = h.wire.wire().bytes.clone();
+        assert_eq!(
+            sent.first().map(|b| b >> 4),
+            Some(3),
+            "the PUBLISH went out: {sent:?}"
+        );
+        assert!(tok.try_wait().is_none());
+
+        // The acknowledgement ends the drain at once.
+        reader
+            .chunks
+            .push_back(wire_packet(Packet::PubAck(PubAck::new(id))));
+        {
+            let drain = pin!(h.session.drain_pending(
+                &mut reader,
+                Duration::from_secs(10),
+                &mut cmds
+            ));
+            assert!(poll_until(drain, SETTLE).is_some(), "the drain finished");
+        }
+        assert!(matches!(tok.try_wait(), Some(Ok(_))));
     }
 
     /// A store that stops answering ends the session rather than stopping

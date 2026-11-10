@@ -960,6 +960,39 @@ fn test_lwt_props_need_v5() {
     assert!(!cli.is_connected());
 }
 
+/// A disconnect that waits for in-flight messages works with a file store.
+/// The store runs on a thread of its own and a message goes out only once
+/// it is stored; the disconnect's drain used not to notice the store
+/// catching up, so the message never left, the disconnect took its full
+/// timeout, and the publish failed.
+#[test]
+fn test_disconnect_after_with_a_file_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let cli = mqtt::CreateOptionsBuilder::new()
+        .server_uri(HOST)
+        .client_id("disconnect-after-file-store")
+        .persistence(dir.path())
+        .create_async_client()
+        .unwrap();
+    cli.connect(mqtt::ConnectOptions::new_v5())
+        .wait_for(TIMEOUT)
+        .expect("connect failed");
+
+    let tok = cli.publish(mqtt::Message::new(topic!("drain-store"), "x", mqtt::QOS_1));
+    let start = std::time::Instant::now();
+    cli.disconnect_after(Duration::from_secs(5))
+        .wait_for(TIMEOUT)
+        .expect("disconnect failed");
+    let took = start.elapsed();
+
+    tok.wait_for(TIMEOUT)
+        .expect("the publish was acknowledged before the disconnect");
+    assert!(
+        took < Duration::from_secs(2),
+        "the disconnect waited out its timeout: {took:?}"
+    );
+}
+
 /// A DISCONNECT reason code is a v5-only field; a v3 DISCONNECT has no body to
 /// carry one, so asking for one is rejected up front rather than sending a
 /// DISCONNECT that silently says nothing.
