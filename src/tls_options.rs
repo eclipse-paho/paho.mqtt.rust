@@ -216,6 +216,32 @@ impl TlsOptions {
     pub fn alpn_protos(&self) -> &[String] {
         &self.protos
     }
+
+    /// Checks for options that cannot work, so that `connect()` reports them
+    /// rather than each connection attempt failing, or the option being
+    /// ignored:
+    ///
+    /// - a `private_key` without the `key_store` holding the certificate it
+    ///   belongs to, which the TLS backends would otherwise pass over in
+    ///   silence and connect without a client certificate;
+    /// - an ALPN protocol name that is empty or longer than 255 bytes, which
+    ///   the wire format cannot carry (RFC 7301 §3.1).
+    pub(crate) fn check(&self) -> crate::Result<()> {
+        use crate::Error;
+        if !self.private_key.as_os_str().is_empty() && self.key_store.as_os_str().is_empty() {
+            return Err(Error::InvalidArgument(
+                "TLS options name a private key but no key store (client certificate) for it"
+                    .into(),
+            ));
+        }
+        if let Some(p) = self.protos.iter().find(|p| p.is_empty() || p.len() > 255) {
+            return Err(Error::InvalidArgument(format!(
+                "ALPN protocol names must be 1 to 255 bytes; one is {}",
+                p.len()
+            )));
+        }
+        Ok(())
+    }
 }
 
 // We manually define a Debug implementation to get around
@@ -283,6 +309,10 @@ impl TlsOptionsBuilder {
 
     /// If not included in the Key Store, this setting points to the file
     /// in PEM format containing the client's private key.
+    ///
+    /// It needs a [`key_store`](Self::key_store) holding the certificate it
+    /// goes with; without one, `connect()` fails with
+    /// [`Error::InvalidArgument`](crate::Error).
     pub fn private_key<P>(&mut self, private_key: P) -> &mut Self
     where
         P: AsRef<Path>,
@@ -338,7 +368,8 @@ impl TlsOptionsBuilder {
     }
 
     /// If set, this points to a directory containing CA certificates
-    /// in PEM format.
+    /// in PEM format. Every certificate in each file is used, so a file may
+    /// be a bundle; files that are not PEM are passed over.
     pub fn ca_path<P>(&mut self, ca_path: P) -> &mut Self
     where
         P: AsRef<Path>,
@@ -373,6 +404,10 @@ impl TlsOptionsBuilder {
     }
 
     /// If set, only these protocols are used during negotiation.
+    ///
+    /// Each name must be 1 to 255 bytes, which is what the protocol can
+    /// carry (RFC 7301); otherwise `connect()` fails with
+    /// [`Error::InvalidArgument`](crate::Error).
     pub fn alpn_protos(&mut self, protos: &[&str]) -> &mut Self {
         self.0.protos = protos.iter().map(|s| String::from(*s)).collect();
         self
@@ -391,6 +426,46 @@ impl TlsOptionsBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Options that cannot work are refused when connecting: a private key
+    /// without the certificate it goes with, which both backends would
+    /// otherwise ignore, and ALPN names the wire format cannot carry.
+    #[test]
+    fn test_check() {
+        assert!(TlsOptions::default().check().is_ok());
+
+        let opts = TlsOptionsBuilder::new().private_key("key.pem").finalize();
+        assert!(
+            matches!(opts.check(), Err(crate::Error::InvalidArgument(m)) if m.contains("key store"))
+        );
+        let opts = TlsOptionsBuilder::new()
+            .key_store("cert.pem")
+            .private_key("key.pem")
+            .finalize();
+        assert!(opts.check().is_ok());
+
+        let long = "x".repeat(256);
+        for bad in [&["mqtt", ""][..], &[long.as_str()][..]] {
+            let opts = TlsOptionsBuilder::new().alpn_protos(bad).finalize();
+            assert!(
+                matches!(opts.check(), Err(crate::Error::InvalidArgument(m)) if m.contains("ALPN"))
+            );
+        }
+        let max = "x".repeat(255);
+        let opts = TlsOptionsBuilder::new()
+            .alpn_protos(&["mqtt", &max])
+            .finalize();
+        assert!(opts.check().is_ok());
+
+        // `ConnectOptions::check`, which `connect()` runs, applies it.
+        let opts = crate::ConnectOptionsBuilder::new()
+            .tls_options(TlsOptionsBuilder::new().private_key("key.pem").finalize())
+            .finalize();
+        assert!(matches!(
+            opts.check(),
+            Err(crate::Error::InvalidArgument(_))
+        ));
+    }
 
     /// Verification is on unless the application turns it off. A derived
     /// `Default` made both switches `false`, which silently accepted any

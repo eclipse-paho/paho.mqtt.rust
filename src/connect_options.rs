@@ -183,6 +183,8 @@ impl ConnectOptions {
     /// - Advanced auth must be configured for both client and server.
     /// - With auto-reconnect on, `max_retry_interval` must be at least
     ///   `min_retry_interval`.
+    /// - TLS options must be usable: a private key needs its key store, and
+    ///   ALPN protocol names must be 1 to 255 bytes.
     pub fn check(&self) -> Result<()> {
         if !self.server_uris.is_empty() {
             let uris = &self.server_uris;
@@ -191,6 +193,9 @@ impl ConnectOptions {
             if any_secure && !self.has_tls_options() {
                 return Err(Error::MissingTlsOptions);
             }
+        }
+        if let Some(tls) = &self.tls {
+            tls.check()?;
         }
 
         // No properties allowed with MQTT v3

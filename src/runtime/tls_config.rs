@@ -449,15 +449,19 @@ pub(crate) fn make_openssl_config(tls: &crate::TlsOptions) -> Result<openssl::ss
         builder.set_ca_file(&tls.trust_store).map_err(config_err)?;
     }
 
-    // CA certificate directory — load each PEM file; silently skip non-PEM files.
+    // CA certificate directory — load every certificate in each PEM file,
+    // as the rustls backend does (a bundle holds several); silently skip
+    // non-PEM files.
     if !tls.ca_path.as_os_str().is_empty() {
         for entry in std::fs::read_dir(&tls.ca_path).map_err(Error::Io)? {
             let path = entry.map_err(Error::Io)?.path();
             if path.is_file()
                 && let Ok(pem) = std::fs::read(&path)
-                && let Ok(cert) = openssl::x509::X509::from_pem(&pem)
+                && let Ok(certs) = openssl::x509::X509::stack_from_pem(&pem)
             {
-                let _ = builder.cert_store_mut().add_cert(cert);
+                for cert in certs {
+                    let _ = builder.cert_store_mut().add_cert(cert);
+                }
             }
         }
     }
@@ -507,7 +511,14 @@ pub(crate) fn make_openssl_config(tls: &crate::TlsOptions) -> Result<openssl::ss
     if !tls.protos.is_empty() {
         let mut wire = Vec::new();
         for proto in &tls.protos {
-            wire.push(proto.len() as u8);
+            // One length byte each (RFC 7301 §3.1). `TlsOptions::check`
+            // refuses longer names at connect; this keeps a malformed list
+            // from ever being built regardless.
+            let len = u8::try_from(proto.len())
+                .ok()
+                .filter(|&n| n > 0)
+                .ok_or_else(|| config_err("an ALPN protocol name must be 1 to 255 bytes"))?;
+            wire.push(len);
             wire.extend_from_slice(proto.as_bytes());
         }
         builder.set_alpn_protos(&wire).map_err(config_err)?;

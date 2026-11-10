@@ -2149,6 +2149,41 @@ mod tls_verify {
             .wait_for(Duration::from_secs(10))
     }
 
+    /// A CA directory may hold bundles, several certificates to a file; each
+    /// one counts. Here the broker's CA is second in its file, after an
+    /// unrelated certificate. The OpenSSL backend used to read only the
+    /// first certificate of each file, so it could not verify this broker.
+    ///
+    /// (The unrelated certificate is another set's client certificate, not
+    /// its CA: every test CA has the same subject name, and OpenSSL, which
+    /// looks an issuer up by name, would take whichever came first.)
+    #[test]
+    fn test_tls_ca_path_reads_whole_bundles() {
+        let certs = common::TestCerts::new("broker.invalid");
+        let other = common::TestCerts::new("other.invalid");
+        let dir = tempfile::tempdir().unwrap();
+        let mut bundle = std::fs::read(&other.client_cert_file).unwrap();
+        bundle.extend(std::fs::read(certs.ca_path()).unwrap());
+        std::fs::write(dir.path().join("bundle.pem"), bundle).unwrap();
+
+        let broker = common::spawn_tls_broker(&certs, accepting);
+        let tls = mqtt::TlsOptionsBuilder::new()
+            .ca_path(dir.path())
+            .disable_default_trust_store(true)
+            .verify(false) // the certificate names broker.invalid, we dial 127.0.0.1
+            .finalize();
+        let opts = mqtt::ConnectOptionsBuilder::new()
+            .tls_options(tls)
+            .connect_timeout(Duration::from_secs(5))
+            .finalize();
+        mqtt::AsyncClient::new(broker.uri.clone())
+            .unwrap()
+            .connect(opts)
+            .wait_for(Duration::from_secs(10))
+            .expect("the CA second in the bundle should be trusted");
+        broker.join();
+    }
+
     /// The category of a failed connect, if it failed with a TLS error.
     fn tls_kind(res: &mqtt::Result<mqtt::ConnectResponse>) -> Option<mqtt::TlsErrorKind> {
         match res {
