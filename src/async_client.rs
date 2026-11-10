@@ -2042,16 +2042,48 @@ impl AsyncClient {
 /// Extracts `(host, port, path)` from the authority+path portion of a URI.
 ///
 /// `rest` is the URI with its scheme prefix stripped (e.g. `"broker:1883/mqtt"`).
-/// `default_port` is used when no explicit port appears. `path` is `"/"` when
-/// the URI has no path component.
+/// `default_port` is used when no explicit port appears.
+///
+/// The authority ends at the first `/`, `?` or `#` (RFC 3986 §3.2). What
+/// follows it is the request target of a WebSocket connection (`http_target`):
+/// its path and query, `"/"` when there are none. A plain MQTT connection has
+/// no request to put one in, so there it must be empty or a bare `/`. A
+/// fragment is refused either way, as HTTP never sends one, and so is user
+/// information (`user@host`): MQTT credentials go in the CONNECT packet,
+/// from the connect options, and nothing reads them from the URI.
 ///
 /// The host may be an IPv6 address in brackets (`[::1]:1883`), and is
 /// returned without them; see [`split_host_port`].
-fn parse_host_port_path(rest: &str, default_port: u16) -> Result<(String, u16, String)> {
-    let (authority, path) = match rest.find('/') {
-        Some(i) => (&rest[..i], rest[i..].to_string()),
-        None => (rest, "/".to_string()),
+fn parse_host_port_path(
+    rest: &str,
+    default_port: u16,
+    http_target: bool,
+) -> Result<(String, u16, String)> {
+    let bad = |why: &str| Error::InvalidArgument(format!("{why} (server URI: {rest})"));
+
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(end);
+    if authority.contains('@') {
+        return Err(bad(
+            "credentials in a server URI are not used; set the user name and password \
+             in the connect options",
+        ));
+    }
+    if tail.contains('#') {
+        return Err(bad("a server URI cannot have a fragment ('#')"));
+    }
+    let path = match tail {
+        "" => "/".to_string(),
+        t if t.starts_with('?') => format!("/{t}"),
+        t => t.to_string(),
     };
+    if !http_target && path != "/" {
+        return Err(bad(
+            "only a WebSocket server URI can have a path or query; \
+             an MQTT connection has nowhere to send one",
+        ));
+    }
+
     let (host, port) = split_host_port(authority, default_port)
         .map_err(|e| Error::InvalidArgument(format!("{e} (server URI: {rest})")))?;
     Ok((host, port, path))
@@ -2088,7 +2120,7 @@ fn parse_server_uri(uri: &str) -> Result<ServerAddr> {
     if let Some(rest) = uri.strip_prefix("ws://") {
         // A WebSocket URI is an HTTP one (RFC 6455 §3), so its default
         // port is HTTP's, as it was in v1.x.
-        let (host, port, path) = parse_host_port_path(rest, 80)?;
+        let (host, port, path) = parse_host_port_path(rest, 80, true)?;
         return Ok(ServerAddr::Ws { host, port, path });
     }
 
@@ -2097,7 +2129,7 @@ fn parse_server_uri(uri: &str) -> Result<ServerAddr> {
         all(feature = "smol-websocket", feature = "smol-tls")
     ))]
     if let Some(rest) = uri.strip_prefix("wss://") {
-        let (host, port, path) = parse_host_port_path(rest, 443)?;
+        let (host, port, path) = parse_host_port_path(rest, 443, true)?;
         return Ok(ServerAddr::Wss { host, port, path });
     }
 
@@ -2134,7 +2166,7 @@ fn parse_server_uri(uri: &str) -> Result<ServerAddr> {
         (1883u16, false, uri)
     };
 
-    let (host, port, _) = parse_host_port_path(rest, default_port)?;
+    let (host, port, _) = parse_host_port_path(rest, default_port, false)?;
 
     if is_tls {
         #[cfg(any(feature = "tls", feature = "openssl", feature = "smol-tls"))]
@@ -2442,6 +2474,45 @@ mod tests {
             parse_server_uri("ws://[::1]:9001/mqtt").unwrap(),
             ServerAddr::Ws { host, port, path } if host == "::1" && port == 9001 && path == "/mqtt"
         ));
+        // Where the authority ends, and what may follow it.
+        let invalid = |uri: &str, why: &str| {
+            assert!(
+                matches!(parse_server_uri(uri), Err(Error::InvalidArgument(ref m)) if m.contains(why)),
+                "{uri}: {:?}",
+                parse_server_uri(uri).err()
+            );
+        };
+        assert!(matches!(
+            parse_server_uri("tcp://broker:1883/").unwrap(),
+            ServerAddr::Tcp { port: 1883, .. }
+        ));
+        invalid("tcp://broker:1883?x", "WebSocket");
+        invalid("tcp://broker/mqtt", "WebSocket");
+        invalid("tcp://broker#frag", "fragment");
+        invalid("tcp://user@broker", "credentials");
+        invalid("mqtt://user:pass@broker:1883", "credentials");
+        #[cfg(any(feature = "websocket", feature = "smol-websocket"))]
+        {
+            let ws_path = |uri: &str| match parse_server_uri(uri).unwrap() {
+                ServerAddr::Ws { host, port, path } => (host, port, path),
+                _ => panic!("{uri}"),
+            };
+            assert_eq!(
+                ws_path("ws://broker:9001?x"),
+                ("broker".into(), 9001, "/?x".into())
+            );
+            assert_eq!(
+                ws_path("ws://broker/mqtt?a=1&b=2"),
+                ("broker".into(), 80, "/mqtt?a=1&b=2".into())
+            );
+            assert_eq!(ws_path("ws://[::1]?x"), ("::1".into(), 80, "/?x".into()));
+            assert_eq!(
+                ws_path("ws://broker/a@b"),
+                ("broker".into(), 80, "/a@b".into())
+            );
+            invalid("ws://broker/mqtt#frag", "fragment");
+            invalid("ws://user@broker/mqtt", "credentials");
+        }
         for bad in ["tcp://::1:1883", "tcp://[::1", "tcp://", "tcp://:1883"] {
             assert!(
                 matches!(parse_server_uri(bad), Err(Error::InvalidArgument(_))),

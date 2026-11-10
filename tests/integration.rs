@@ -188,6 +188,24 @@ fn test_ipv6_literal_uri() {
     }
 }
 
+/// A WebSocket URI may carry a query, which goes in the HTTP request with
+/// its path. One with a query and no path used to be refused, the query
+/// taken for part of the port.
+#[cfg(any(feature = "websocket", feature = "smol-websocket"))]
+#[test]
+fn test_ws_uri_with_a_query() {
+    for uri in [
+        "ws://localhost:9001?from=paho",
+        "ws://localhost:9001/mqtt?from=paho",
+    ] {
+        let cli = mqtt::AsyncClient::new(uri).unwrap();
+        cli.connect(mqtt::ConnectOptions::new_ws())
+            .wait_for(TIMEOUT)
+            .unwrap_or_else(|e| panic!("{uri}: {e}"));
+        cli.disconnect(None).wait().unwrap();
+    }
+}
+
 /// The same over WebSocket: `ws://[::1]:9001`, where the brackets must go
 /// back on for the URL and the HTTP `Host` header.
 #[cfg(any(feature = "websocket", feature = "smol-websocket"))]

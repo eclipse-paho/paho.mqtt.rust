@@ -479,7 +479,11 @@ impl CreateOptionsBuilder {
     ///              _protocol://host:port_, where the protocol can be
     ///              _tcp_ or _ssl_, and the host can be an IP address
     ///              or domain name. An IPv6 address goes in brackets, as
-    ///              in any URI: `tcp://[::1]:1883`.
+    ///              in any URI: `tcp://[::1]:1883`. A WebSocket URI may go
+    ///              on with a path and query (`ws://host/mqtt?a=1`), which
+    ///              are sent in its HTTP request; any other may not. The
+    ///              user name and password go in the connect options, not
+    ///              in the URI (`user@host` is refused).
     pub fn server_uri<S: Into<String>>(mut self, server_uri: S) -> Self {
         self.opts.server_uri = server_uri.into();
         self
