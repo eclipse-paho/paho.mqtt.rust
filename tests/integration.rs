@@ -2636,10 +2636,19 @@ fn test_one_file_store_for_every_server() {
         .map(|e| e.unwrap().path())
         .collect();
     assert_eq!(stores.len(), 1, "one store for both servers: {stores:?}");
-    let left: Vec<_> = std::fs::read_dir(&stores[0])
-        .unwrap()
-        .map(|e| e.unwrap().file_name())
-        .collect();
+    // The store's own thread removes the entry, and nothing waits for a
+    // removal, so give it a moment.
+    let entries = |dir: &std::path::Path| -> Vec<_> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect()
+    };
+    let deadline = std::time::Instant::now() + TIMEOUT;
+    while !entries(&stores[0]).is_empty() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let left = entries(&stores[0]);
     assert!(
         left.is_empty(),
         "the acknowledged message is still stored: {left:?}"

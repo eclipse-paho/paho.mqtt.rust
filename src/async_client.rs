@@ -502,8 +502,10 @@ impl AsyncClient {
     /// started.
     ///
     /// That is a failure found before anything goes on the wire: invalid
-    /// connect options, a server or proxy URI that can't be parsed, or a
-    /// client whose background session has shut down
+    /// connect options, a server or proxy URI that can't be parsed, a
+    /// secure server URI — in the connect options, or the one the client
+    /// was created with — and no TLS options ([`Error::MissingTlsOptions`]),
+    /// or a client whose background session has shut down
     /// ([`Error::Disconnected`]).
     ///
     /// On success the returned token tracks the connection attempt itself.
@@ -544,6 +546,14 @@ impl AsyncClient {
         let mut servers: Vec<(ServerAddr, String)> = Vec::with_capacity(uris.len());
         for uri in uris {
             servers.push((parse_server_uri(&uri)?, uri));
+        }
+        // `check` above looks at the connect options' own list; the
+        // creation URI, used when that is empty, needs the same rule. Without
+        // it every attempt, auto-reconnect's included, would fail at the
+        // transport instead of this call failing once. (After parsing, so
+        // that a build with no TLS backend says that instead.)
+        if !opts.has_tls_options() && servers.iter().any(|(_, u)| crate::is_secure_uri(u)) {
+            return Err(Error::MissingTlsOptions);
         }
 
         // A proxy URI is otherwise read only when a WebSocket connection is
@@ -2411,6 +2421,49 @@ mod tests {
             .block_on(async {
                 AsyncClient::new(opts()).expect("borrows the current runtime");
             });
+    }
+
+    /// A client created with a secure URI needs TLS options to connect, as
+    /// one given secure URIs in its connect options already did. It used
+    /// to get no further than the transport, on every attempt.
+    #[test]
+    fn test_secure_creation_uri_needs_tls_options() {
+        for uri in [
+            "ssl://localhost:8883",
+            "mqtts://localhost",
+            "tls://localhost",
+        ] {
+            let cli = AsyncClient::new(uri).unwrap();
+            let res = cli.try_connect(None);
+            #[cfg(any(feature = "tls", feature = "openssl", feature = "smol-tls"))]
+            assert!(matches!(res, Err(Error::MissingTlsOptions)), "{uri}");
+            // Without a TLS backend, that is the problem to report.
+            #[cfg(not(any(feature = "tls", feature = "openssl", feature = "smol-tls")))]
+            assert!(matches!(res, Err(Error::TlsNotSupported)), "{uri}");
+            // Refused before anything changed.
+            assert!(!cli.connect_options().has_tls_options());
+        }
+
+        // The connect options' own list takes the creation URI's place.
+        let cli = AsyncClient::new("ssl://localhost:8883").unwrap();
+        let opts = crate::ConnectOptionsBuilder::new()
+            .server_uris(&["tcp://localhost:1"])
+            .connect_timeout(Duration::from_millis(100))
+            .finalize();
+        assert!(cli.try_connect(opts).is_ok());
+
+        #[cfg(any(feature = "tls", feature = "openssl", feature = "smol-tls"))]
+        {
+            let cli = AsyncClient::new("ssl://localhost:1").unwrap();
+            let opts = crate::ConnectOptionsBuilder::new()
+                .tls_options(crate::TlsOptions::default())
+                .connect_timeout(Duration::from_millis(100))
+                .finalize();
+            assert!(
+                cli.try_connect(opts).is_ok(),
+                "with TLS options it goes ahead"
+            );
+        }
     }
 
     #[test]
