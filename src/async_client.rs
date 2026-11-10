@@ -49,6 +49,7 @@ use crate::{
     ReasonCode, SubscribeManyToken, SubscribeOptions, SubscribeToken, SyncReceiver,
     UnsubscribeManyToken, UnsubscribeToken, UserData,
     error::{Error, Result, TlsError},
+    is_topic_filter_valid,
     persistence::ClientPersistence,
     runtime::{
         Command, ConnectParams, OfflineConfig, RtOwnership, ServerAddr, Sink, StateView,
@@ -74,6 +75,29 @@ use std::{
 /// Constructs a boxed, mutex-wrapped persistence store from a `PersistenceType`.
 ///
 /// Returns `None` when `typ` is `PersistenceType::None`.
+/// Checks the topic filters of a SUBSCRIBE or UNSUBSCRIBE before it is sent.
+///
+/// The codec would refuse to encode either packet with no filters, or with
+/// one that breaks the rules of §4.7, so this reports it to the caller
+/// instead of leaving it to fail on the token.
+fn check_filters<I, S>(filters: I) -> Result<()>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut any = false;
+    for f in filters {
+        if !is_topic_filter_valid(f.as_ref()) {
+            return Err(Error::BadTopicFilter);
+        }
+        any = true;
+    }
+    if !any {
+        return Err(Error::InvalidArgument("no topic filters".into()));
+    }
+    Ok(())
+}
+
 fn make_persistence(
     typ: PersistenceType,
     sync: bool,
@@ -827,9 +851,10 @@ impl AsyncClient {
     /// Attempts to subscribe to a single topic, but returns an error
     /// immediately if the request can't be started.
     ///
-    /// That is a failure found before anything goes on the wire: a QoS
-    /// value that isn't valid, or a client whose background session has
-    /// shut down ([`Error::Disconnected`]).
+    /// That is a failure found before anything goes on the wire: a topic
+    /// filter that isn't valid ([`Error::BadTopicFilter`]), a QoS value that
+    /// isn't valid, or a client whose background session has shut down
+    /// ([`Error::Disconnected`]).
     ///
     /// On success the returned token tracks the subscription itself.
     ///
@@ -896,6 +921,8 @@ impl AsyncClient {
         T: Into<SubscribeOptions>,
         P: Into<Option<Properties>>,
     {
+        let topic = topic.into();
+        check_filters([&topic])?;
         let qos = qos.try_into().map_err(Into::into)?;
         let opts: SubscribeOptions = opts.into();
         let props = props.into().unwrap_or_default();
@@ -905,7 +932,7 @@ impl AsyncClient {
         let (tok, comp) = SubscribeToken::new();
         let cmd = Command::Subscribe {
             single: true,
-            filters: vec![(topic.into(), qos, opts)],
+            filters: vec![(topic, qos, opts)],
             props,
             tx: comp,
         };
@@ -951,7 +978,8 @@ impl AsyncClient {
     /// an error immediately if the request can't be started.
     ///
     /// The failures are those of [`try_subscribe`](Self::try_subscribe), and
-    /// [`Error::InvalidArgument`] if `topics` and `qos` differ in length.
+    /// [`Error::InvalidArgument`] if `topics` is empty or `topics` and `qos`
+    /// differ in length.
     ///
     /// # Arguments
     ///
@@ -993,7 +1021,8 @@ impl AsyncClient {
     /// same QoS for all of them, but returns an error immediately if the
     /// request can't be started.
     ///
-    /// The failures are those of [`try_subscribe`](Self::try_subscribe).
+    /// The failures are those of [`try_subscribe`](Self::try_subscribe), and
+    /// [`Error::InvalidArgument`] if `topics` is empty.
     ///
     /// # Arguments
     ///
@@ -1044,8 +1073,8 @@ impl AsyncClient {
     ///
     /// The failures are those of
     /// [`try_subscribe_with_options`](Self::try_subscribe_with_options), and
-    /// [`Error::InvalidArgument`] if `qos`, or a non-empty `opts`, differs in
-    /// length from `topics`.
+    /// [`Error::InvalidArgument`] if `topics` is empty or `qos`, or a
+    /// non-empty `opts`, differs in length from `topics`.
     ///
     /// # Arguments
     ///
@@ -1074,6 +1103,7 @@ impl AsyncClient {
         if !opts.is_empty() && opts.len() != n {
             return Err(Error::InvalidArgument("topics/opts length mismatch".into()));
         }
+        check_filters(topics)?;
 
         let props = props.into().unwrap_or_default();
         self.require_v5_for_props(&props)?;
@@ -1137,8 +1167,9 @@ impl AsyncClient {
     /// Attempts to unsubscribe from a single topic, but returns an error
     /// immediately if the request can't be started.
     ///
-    /// That is a failure found before anything goes on the wire: a client
-    /// whose background session has shut down ([`Error::Disconnected`]).
+    /// That is a failure found before anything goes on the wire: a topic
+    /// filter that isn't valid ([`Error::BadTopicFilter`]), or a client whose
+    /// background session has shut down ([`Error::Disconnected`]).
     ///
     /// On success the returned token tracks the unsubscribe itself.
     ///
@@ -1193,12 +1224,14 @@ impl AsyncClient {
     where
         S: Into<String>,
     {
+        let topic = topic.into();
+        check_filters([&topic])?;
         self.require_v5_for_props(&props)?;
 
         let (tok, comp) = UnsubscribeToken::new();
         let cmd = Command::Unsubscribe {
             single: true,
-            filters: vec![topic.into()],
+            filters: vec![topic],
             props,
             tx: comp,
         };
@@ -1231,7 +1264,8 @@ impl AsyncClient {
     /// Attempts to unsubscribe from multiple topics simultaneously, but
     /// returns an error immediately if the request can't be started.
     ///
-    /// The failures are those of [`try_unsubscribe`](Self::try_unsubscribe).
+    /// The failures are those of [`try_unsubscribe`](Self::try_unsubscribe),
+    /// and [`Error::InvalidArgument`] if `topics` is empty.
     ///
     /// # Arguments
     ///
@@ -1270,7 +1304,8 @@ impl AsyncClient {
     /// started.
     ///
     /// The failures are those of
-    /// [`try_unsubscribe_with_options`](Self::try_unsubscribe_with_options).
+    /// [`try_unsubscribe_with_options`](Self::try_unsubscribe_with_options),
+    /// and [`Error::InvalidArgument`] if `topics` is empty.
     ///
     /// # Arguments
     ///
@@ -1285,6 +1320,7 @@ impl AsyncClient {
     where
         T: AsRef<str>,
     {
+        check_filters(topics)?;
         self.require_v5_for_props(&props)?;
 
         let (tok, comp) = UnsubscribeManyToken::new();
@@ -2664,6 +2700,40 @@ mod tests {
             ),
             Err(Error::InvalidArgument(_))
         ));
+    }
+
+    /// A filter that breaks the rules, or an empty list, is refused before
+    /// anything is queued, by every (un)subscribe call. Each used to reach
+    /// the session and end the connection.
+    #[test]
+    fn test_try_subscribe_and_unsubscribe_check_filters() {
+        let cli = test_client();
+        let bad = |r: Result<_>| matches!(r, Err(Error::BadTopicFilter));
+        let empty = |r: Result<_>| matches!(r, Err(Error::InvalidArgument(_)));
+        let none: [&str; 0] = [];
+
+        for f in ["", "a/#/b", "a#", "a+/b", "$share//a", "a\0b"] {
+            assert!(bad(cli.try_subscribe(f, 1).map(drop)), "{f:?}");
+            assert!(bad(cli.try_unsubscribe(f).map(drop)), "{f:?}");
+            assert!(bad(cli.try_subscribe_many(&["ok", f], &[1, 1]).map(drop)));
+            assert!(bad(cli.try_unsubscribe_many(&["ok", f]).map(drop)));
+        }
+        assert!(empty(
+            cli.try_subscribe_many(&none, &[] as &[i32]).map(drop)
+        ));
+        assert!(empty(cli.try_subscribe_many_same_qos(&none, 1).map(drop)));
+        assert!(empty(cli.try_unsubscribe_many(&none).map(drop)));
+
+        // The token-returning calls fail their tokens the same way.
+        let err = cli.subscribe("a/#/b", 1).wait().unwrap_err();
+        assert!(matches!(err, Error::BadTopicFilter), "{err}");
+        let err = cli.unsubscribe_many(&none).wait().unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)), "{err}");
+
+        // Wildcards and shared subscriptions in their places are fine.
+        for f in ["#", "+", "a/+/b", "a/#", "$share/g/a/#", "/"] {
+            assert!(cli.try_subscribe(f, 1).is_ok(), "{f:?}");
+        }
     }
 
     /// v5 subscribe options can't go on a v3 connection.

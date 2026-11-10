@@ -1285,7 +1285,8 @@ impl<B: Backend> Session<B> {
 
     /// Takes deferred operations, in order, for as long as the one at the
     /// front can go ahead. Called whenever an acknowledgement frees a window
-    /// slot or a packet identifier. An encoding error propagates immediately.
+    /// slot or a packet identifier. An operation that cannot be encoded
+    /// fails on its own token; the others go ahead.
     fn drain_deferred(&mut self) -> Result<()> {
         while let Some(d) = self.inflight_deferred.front() {
             if !self.can_proceed(d) {
@@ -1295,7 +1296,7 @@ impl<B: Backend> Session<B> {
                 Some(Deferred::Command(cmd)) => {
                     self.handle_command(cmd)?;
                 }
-                Some(Deferred::Retransmit(id)) => self.send_inflight(id)?,
+                Some(Deferred::Retransmit(id)) => self.send_inflight(id),
                 None => break,
             }
         }
@@ -1307,7 +1308,24 @@ impl<B: Backend> Session<B> {
     /// A message still awaiting its first acknowledgement goes out as a
     /// PUBLISH with DUP set; one that has been PUBREC'd goes out as a PUBREL.
     /// Marks the record as occupying a window slot.
-    fn send_inflight(&mut self, id: u16) -> Result<()> {
+    ///
+    /// A packet that cannot be queued — one over the maximum packet size of
+    /// a server smaller than the one it was first sent to — fails that
+    /// message alone: its token gets the error and its record and store
+    /// entry go. Failing the session instead would fail every reconnect
+    /// that tried to resume it, for good.
+    fn send_inflight(&mut self, id: u16) {
+        if let Err(e) = self.try_send_inflight(id)
+            && let Some(rec) = self.state.remove(id)
+        {
+            self.persist_remove(b's', id);
+            rec.tx.complete(Err(e));
+        }
+    }
+
+    /// The body of [`send_inflight`](Self::send_inflight), which deals with
+    /// the error.
+    fn try_send_inflight(&mut self, id: u16) -> Result<()> {
         let Some(rec) = self.state.mark_sent(id) else {
             return Ok(());
         };
@@ -1501,7 +1519,7 @@ impl<B: Backend> Session<B> {
     ///   reported instead.
     /// * **Inbound QoS 2** state is dropped: the server will not re-send the
     ///   PUBRELs those messages are waiting for.
-    fn resume(&mut self, resumed: bool) -> Result<()> {
+    fn resume(&mut self, resumed: bool) {
         if !resumed {
             self.discard_unresumable();
         }
@@ -1511,24 +1529,35 @@ impl<B: Backend> Session<B> {
         // publishes do, and the (un)subscribes still awaiting an
         // acknowledgement in their places among them, under the identifiers
         // they already hold. The broker's answer resolves their tokens.
+        //
+        // One that cannot be queued again fails alone (see
+        // `send_inflight`): this server's maximum packet size may be smaller
+        // than that of the one it first went to.
         for item in self.state.resend_order() {
             match item {
-                Resend::Publish(id) if self.inflight_slot_free() => self.send_inflight(id)?,
+                Resend::Publish(id) if self.inflight_slot_free() => self.send_inflight(id),
                 Resend::Publish(id) => {
                     self.state.mark_unsent(id);
                     self.inflight_deferred.push_back(Deferred::Retransmit(id));
                 }
                 Resend::Subscribe(id) => {
                     let packet = self.state.pending_sub[&id].packet.clone();
-                    self.queue(&packet)?;
+                    if let Err(e) = self.queue(&packet)
+                        && let Some(pending) = self.state.pending_sub.remove(&id)
+                    {
+                        pending.tx.complete(Err(e));
+                    }
                 }
                 Resend::Unsubscribe(id) => {
                     let packet = self.state.pending_unsub[&id].packet.clone();
-                    self.queue(&packet)?;
+                    if let Err(e) = self.queue(&packet)
+                        && let Some(pending) = self.state.pending_unsub.remove(&id)
+                    {
+                        pending.tx.complete(Err(e));
+                    }
                 }
             }
         }
-        Ok(())
     }
 
     /// Discards the session state when the server did not resume our
@@ -1610,7 +1639,7 @@ impl<B: Backend> Session<B> {
         // Both only queue: the run loop's first pass writes the result. A
         // long outage can leave a lot here, well past `HIGH_WATER`; the loop
         // then takes no new commands until it has drained.
-        self.resume(resumed)?;
+        self.resume(resumed);
         while let Some(cmd) = self.buf.pop_front() {
             // Only publishes are ever buffered.
             self.handle_command(cmd)?;
@@ -2474,7 +2503,14 @@ impl<B: Backend> Session<B> {
                     subscriptions,
                     properties: props,
                 });
-                self.queue(&packet)?;
+                // As for a publish: a SUBSCRIBE that cannot be encoded, or
+                // that exceeds the server's maximum packet size, fails this
+                // request, not the connection. The identifier is only held
+                // once the request is recorded, so nothing leaks.
+                if let Err(e) = self.queue(&packet) {
+                    tx.complete(Err(e));
+                    return Ok(Flow::Continue);
+                }
                 let seq = self.state.take_seq();
                 self.state.pending_sub.insert(
                     id,
@@ -2499,7 +2535,10 @@ impl<B: Backend> Session<B> {
                     topic_filters: filters,
                     properties: props,
                 });
-                self.queue(&packet)?;
+                if let Err(e) = self.queue(&packet) {
+                    tx.complete(Err(e));
+                    return Ok(Flow::Continue);
+                }
                 let seq = self.state.take_seq();
                 self.state.pending_unsub.insert(
                     id,
@@ -4312,7 +4351,7 @@ mod tests {
             assert!(unsub_tok.try_wait().is_none(), "still pending, not failed");
 
             let mut second = harness(BytesMut::new(), Duration::ZERO, state);
-            second.session.resume(resumed).unwrap();
+            second.session.resume(resumed);
             let resent: Vec<String> = sent_packets(&mut second).iter().map(describe).collect();
 
             // Resumed: the same packets in the same order, the publishes now
@@ -4353,6 +4392,120 @@ mod tests {
             assert_eq!(rsp.reason_codes, [ReasonCode::NoSubscriptionFound]);
             assert!(s.state.pending_sub.is_empty() && s.state.pending_unsub.is_empty());
         }
+    }
+
+    /// A SUBSCRIBE or UNSUBSCRIBE the codec will not encode — a bad filter,
+    /// no filters at all, one over the server's maximum packet size — fails
+    /// that request's token. The session carries on: it used to end,
+    /// telling the broker in its DISCONNECT that the broker had broken the
+    /// protocol.
+    #[test]
+    fn test_bad_subscribe_fails_its_token_not_the_session() {
+        let mut h = harness(BytesMut::new(), Duration::ZERO, SessionState::default());
+        h.session.limits.server_max_packet_size = Some(64);
+        let s = &mut h.session;
+
+        let (mut bad_filter, c) = subscribe_cmd("a/#/b");
+        assert!(matches!(s.handle_command(c), Ok(Flow::Continue)));
+        let (mut too_big, c) = subscribe_cmd(&"x".repeat(100));
+        assert!(matches!(s.handle_command(c), Ok(Flow::Continue)));
+        let (mut bad_unsub, c) = unsubscribe_cmd("a#");
+        assert!(matches!(s.handle_command(c), Ok(Flow::Continue)));
+        let (mut no_filters, tx) = Token::<UnsubscribeResponse>::new();
+        let c = Command::Unsubscribe {
+            single: false,
+            filters: vec![],
+            props: Properties::new(),
+            tx,
+        };
+        assert!(matches!(s.handle_command(c), Ok(Flow::Continue)));
+
+        assert!(matches!(
+            bad_filter.try_wait(),
+            Some(Err(Error::Protocol(
+                paho_mqtt_codec::Error::TopicFilterInvalid
+            )))
+        ));
+        assert!(matches!(
+            too_big.try_wait(),
+            Some(Err(Error::Protocol(paho_mqtt_codec::Error::PacketTooLarge)))
+        ));
+        assert!(matches!(
+            bad_unsub.try_wait(),
+            Some(Err(Error::Protocol(_)))
+        ));
+        assert!(matches!(
+            no_filters.try_wait(),
+            Some(Err(Error::Protocol(_)))
+        ));
+        assert!(s.state.pending_sub.is_empty() && s.state.pending_unsub.is_empty());
+
+        // Nothing went out for them, and the next request does.
+        let (_ok, c) = subscribe_cmd("a/#");
+        s.handle_command(c).unwrap();
+        let sent: Vec<String> = sent_packets(&mut h).iter().map(describe).collect();
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].starts_with("SUBSCRIBE") && sent[0].ends_with("a/#"));
+    }
+
+    /// The next server may take smaller packets than the last one did.
+    /// Whatever no longer fits fails on its own token, a publish taking its
+    /// store entry with it; everything else is re-sent. Ending the session
+    /// instead would end every attempt to resume it.
+    #[test]
+    fn test_resend_too_large_for_the_new_server_fails_alone() {
+        let store = store_with(&[]);
+        let mut first = harness(BytesMut::new(), Duration::ZERO, SessionState::default());
+        first.session.persist = Persist::Inline(store.clone());
+        let s = &mut first.session;
+        let (mut small_pub, c) = publish_cmd("p1", QoS::QoS1, Bytes::from_static(b"1"));
+        s.handle_command(c).unwrap();
+        let (mut big_pub, c) = publish_cmd("p2", QoS::QoS1, Bytes::from(vec![0; 100]));
+        s.handle_command(c).unwrap();
+        let (mut big_sub, c) = subscribe_cmd(&"x".repeat(100));
+        s.handle_command(c).unwrap();
+        let (mut big_unsub, c) = unsubscribe_cmd(&"y".repeat(100));
+        s.handle_command(c).unwrap();
+        let (mut small_sub, c) = subscribe_cmd("a/#");
+        s.handle_command(c).unwrap();
+        let big_id = s
+            .state
+            .inflight
+            .iter()
+            .find_map(|(id, r)| match &r.phase {
+                PublishPhase::AwaitingAck(p) if p.topic == "p2" => Some(*id),
+                _ => None,
+            })
+            .unwrap();
+        let big_key = PersistKey::new(b's', big_id);
+        assert!(store.lock().unwrap().contains_key(big_key.as_str()));
+
+        let state = std::mem::take(&mut first.session.state);
+        drop(first);
+
+        let mut second = harness(BytesMut::new(), Duration::ZERO, state);
+        second.session.persist = Persist::Inline(store.clone());
+        second.session.limits.server_max_packet_size = Some(64);
+        second.session.resume(true);
+
+        let too_large = |r: Option<Result<_>>| {
+            matches!(
+                r,
+                Some(Err(Error::Protocol(paho_mqtt_codec::Error::PacketTooLarge)))
+            )
+        };
+        assert!(too_large(big_pub.try_wait().map(|r| r.map(|_| ()))));
+        assert!(too_large(big_sub.try_wait().map(|r| r.map(|_| ()))));
+        assert!(too_large(big_unsub.try_wait().map(|r| r.map(|_| ()))));
+        assert!(small_pub.try_wait().is_none());
+        assert!(small_sub.try_wait().is_none());
+        assert!(!second.session.state.inflight.contains_key(&big_id));
+        assert!(!store.lock().unwrap().contains_key(big_key.as_str()));
+
+        let resent: Vec<String> = sent_packets(&mut second).iter().map(describe).collect();
+        assert_eq!(resent.len(), 2, "{resent:?}");
+        assert!(resent[0].starts_with("PUBLISH p1"));
+        assert!(resent[1].starts_with("SUBSCRIBE") && resent[1].ends_with("a/#"));
     }
 
     /// When the server does not resume the session — which includes every
@@ -4412,7 +4565,7 @@ mod tests {
         drop(first);
         let mut second = harness(BytesMut::new(), Duration::ZERO, state);
         second.session.persist = Persist::Inline(store.clone());
-        second.session.resume(false).unwrap();
+        second.session.resume(false);
 
         let sent: Vec<String> = sent_packets(&mut second).iter().map(describe).collect();
         assert_eq!(sent.len(), 1, "only the subscribe goes out: {sent:?}");
@@ -4766,7 +4919,7 @@ mod tests {
         assert!(t1.try_wait().is_none(), "QoS 1 is still in flight");
 
         let mut h = harness(BytesMut::new(), Duration::ZERO, state);
-        h.session.resume(true).unwrap();
+        h.session.resume(true);
         let (_td, cd) = disconnect_cmd();
         let wire = run_to_end(&mut h, vec![], vec![cd]);
 
