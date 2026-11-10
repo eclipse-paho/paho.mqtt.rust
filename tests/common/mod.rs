@@ -402,7 +402,7 @@ where
     )
     .build()
     .unwrap();
-    spawn_tls_broker_with(certs, Some(verifier), handler)
+    spawn_tls_broker_with("127.0.0.1:0", certs, Some(verifier), handler)
 }
 
 /// Starts a TLS broker presenting `certs`, answering from `handler`.
@@ -415,13 +415,24 @@ pub fn spawn_tls_broker<F>(certs: &TestCerts, handler: F) -> ScriptedBroker
 where
     F: FnMut(&Packet) -> Vec<Packet> + Send + 'static,
 {
-    spawn_tls_broker_with(certs, None, handler)
+    spawn_tls_broker_with("127.0.0.1:0", certs, None, handler)
+}
+
+/// As [`spawn_tls_broker`], listening on `bind`; `"[::1]:0"` gives a URI
+/// with an IPv6 literal, `tls://[::1]:port`.
+#[cfg(any(feature = "tls", feature = "smol-tls", feature = "openssl"))]
+pub fn spawn_tls_broker_on<F>(bind: &str, certs: &TestCerts, handler: F) -> ScriptedBroker
+where
+    F: FnMut(&Packet) -> Vec<Packet> + Send + 'static,
+{
+    spawn_tls_broker_with(bind, certs, None, handler)
 }
 
 /// Shared body of [`spawn_tls_broker`] and [`spawn_mtls_broker`]; `verifier`
 /// is `Some` when a client certificate is required.
 #[cfg(any(feature = "tls", feature = "smol-tls", feature = "openssl"))]
 fn spawn_tls_broker_with<F>(
+    bind: &str,
     certs: &TestCerts,
     verifier: Option<Arc<dyn rustls::server::danger::ClientCertVerifier>>,
     mut handler: F,
@@ -431,7 +442,7 @@ where
 {
     use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let listener = TcpListener::bind(bind).unwrap();
     let uri = format!("tls://{}", listener.local_addr().unwrap());
     let received = Arc::new(Mutex::new(Vec::new()));
     let recorded = Arc::clone(&received);

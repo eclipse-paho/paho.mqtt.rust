@@ -53,7 +53,7 @@ use crate::{
     persistence::ClientPersistence,
     runtime::{
         Command, ConnectParams, OfflineConfig, RtOwnership, ServerAddr, Sink, StateView,
-        session::Dispatch,
+        commands::split_host_port, session::Dispatch,
     },
     token::Token,
 };
@@ -2025,24 +2025,16 @@ impl AsyncClient {
 /// `rest` is the URI with its scheme prefix stripped (e.g. `"broker:1883/mqtt"`).
 /// `default_port` is used when no explicit port appears. `path` is `"/"` when
 /// the URI has no path component.
+///
+/// The host may be an IPv6 address in brackets (`[::1]:1883`), and is
+/// returned without them; see [`split_host_port`].
 fn parse_host_port_path(rest: &str, default_port: u16) -> Result<(String, u16, String)> {
-    let authority = rest.split('/').next().unwrap_or(rest);
-    let path = if authority.len() < rest.len() {
-        rest[authority.len()..].to_string()
-    } else {
-        "/".to_string()
+    let (authority, path) = match rest.find('/') {
+        Some(i) => (&rest[..i], rest[i..].to_string()),
+        None => (rest, "/".to_string()),
     };
-
-    let (host, port) = if let Some(colon) = authority.rfind(':') {
-        let host = authority[..colon].to_string();
-        let port = authority[colon + 1..]
-            .parse::<u16>()
-            .map_err(|_| Error::InvalidArgument(format!("invalid port in server URI: {rest}")))?;
-        (host, port)
-    } else {
-        (authority.to_string(), default_port)
-    };
-
+    let (host, port) = split_host_port(authority, default_port)
+        .map_err(|e| Error::InvalidArgument(format!("{e} (server URI: {rest})")))?;
     Ok((host, port, path))
 }
 
@@ -2057,7 +2049,9 @@ fn parse_host_port_path(rest: &str, default_port: u16) -> Result<(String, u16, S
 /// - `wss://` — WebSocket over TLS (default port 8883); [`ServerAddr::Wss`]
 ///   when both `websocket` and `tls` features are enabled, TLS TCP otherwise
 ///
-/// If no explicit port is present the default for the scheme is used.
+/// If no explicit port is present the default for the scheme is used. An
+/// IPv6 host is written in brackets (`tcp://[::1]:1883`) and held without
+/// them.
 fn parse_server_uri(uri: &str) -> Result<ServerAddr> {
     // Unix-domain socket: unix:///path/to/sock or unix:/path/to/sock
     #[cfg(unix)]
@@ -2381,6 +2375,31 @@ mod tests {
             parse_server_uri("mqtt://localhost:1883").unwrap(),
             ServerAddr::Tcp { host, port } if host == "localhost" && port == 1883
         ));
+        // IPv6 literals, held without their brackets.
+        assert!(matches!(
+            parse_server_uri("tcp://[::1]:1884").unwrap(),
+            ServerAddr::Tcp { host, port } if host == "::1" && port == 1884
+        ));
+        assert!(matches!(
+            parse_server_uri("tcp://[2001:db8::7]").unwrap(),
+            ServerAddr::Tcp { host, port } if host == "2001:db8::7" && port == 1883
+        ));
+        #[cfg(any(feature = "tls", feature = "openssl", feature = "smol-tls"))]
+        assert!(matches!(
+            parse_server_uri("ssl://[::1]").unwrap(),
+            ServerAddr::Tls { host, port } if host == "::1" && port == 8883
+        ));
+        #[cfg(any(feature = "websocket", feature = "smol-websocket"))]
+        assert!(matches!(
+            parse_server_uri("ws://[::1]:9001/mqtt").unwrap(),
+            ServerAddr::Ws { host, port, path } if host == "::1" && port == 9001 && path == "/mqtt"
+        ));
+        for bad in ["tcp://::1:1883", "tcp://[::1", "tcp://", "tcp://:1883"] {
+            assert!(
+                matches!(parse_server_uri(bad), Err(Error::InvalidArgument(_))),
+                "{bad}"
+            );
+        }
         assert!(matches!(
             parse_server_uri("tcp://broker.example.com:1883").unwrap(),
             ServerAddr::Tcp { host, port } if host == "broker.example.com" && port == 1883

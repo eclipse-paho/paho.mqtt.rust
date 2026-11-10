@@ -30,6 +30,7 @@
 //! request, reading the reply. The socket work belongs to whichever backend
 //! is in use.
 
+use super::commands::{host_port, split_host_port};
 use crate::{Error, ProxyError, Result};
 
 /// A proxy to tunnel through.
@@ -70,27 +71,17 @@ impl Proxy {
                 "proxy URI has no host: {uri}"
             )));
         }
-        let (host, port) = match authority.rsplit_once(':') {
-            Some((h, p)) => (
-                h,
-                p.parse::<u16>().map_err(|_| {
-                    Error::InvalidArgument(format!("invalid port in proxy URI: {uri}"))
-                })?,
-            ),
-            None => (authority, 3128),
-        };
+        let (host, port) = split_host_port(authority, 3128)
+            .map_err(|e| Error::InvalidArgument(format!("{e} (proxy URI: {uri})")))?;
 
-        Ok(Self {
-            host: host.to_string(),
-            port,
-            auth,
-        })
+        Ok(Self { host, port, auth })
     }
 
     /// Builds the `CONNECT` request asking this proxy for a tunnel to
     /// `host:port`.
     pub fn connect_request(&self, host: &str, port: u16) -> Vec<u8> {
-        let mut req = format!("CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n");
+        let target = host_port(host, port);
+        let mut req = format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n");
         if let Some(auth) = &self.auth {
             req.push_str(&format!("Proxy-Authorization: {auth}\r\n"));
         }
@@ -207,8 +198,18 @@ mod tests {
         assert_eq!(p.host, "proxy.example");
         assert_eq!(p.auth.as_deref(), Some("Basic dXNlcjpwYXNz"));
 
+        // An IPv6 proxy, held without its brackets.
+        let p = Proxy::parse("http://user:pass@[::1]:8080").unwrap();
+        assert_eq!((p.host.as_str(), p.port), ("::1", 8080));
+        let p = Proxy::parse("[2001:db8::1]").unwrap();
+        assert_eq!((p.host.as_str(), p.port), ("2001:db8::1", 3128));
+
         assert!(matches!(
             Proxy::parse("http://proxy:notaport"),
+            Err(Error::InvalidArgument(_))
+        ));
+        assert!(matches!(
+            Proxy::parse("http://::1:3128"),
             Err(Error::InvalidArgument(_))
         ));
         assert!(matches!(
@@ -224,6 +225,13 @@ mod tests {
         assert_eq!(
             req,
             "CONNECT broker.example:8883 HTTP/1.1\r\nHost: broker.example:8883\r\n\r\n"
+        );
+
+        // An IPv6 destination goes in brackets, in the request line and Host.
+        let req = String::from_utf8(p.connect_request("::1", 8883)).unwrap();
+        assert_eq!(
+            req,
+            "CONNECT [::1]:8883 HTTP/1.1\r\nHost: [::1]:8883\r\n\r\n"
         );
 
         let p = Proxy::parse("user:pass@proxy").unwrap();

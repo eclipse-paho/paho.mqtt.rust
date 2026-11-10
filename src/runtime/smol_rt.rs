@@ -299,7 +299,7 @@ impl Backend for SmolBackend {
             ServerAddr::Unix { path } => Box::new(UnixConnection::connect(path).await?),
             #[cfg(feature = "smol-websocket")]
             ServerAddr::Ws { host, port, path } => {
-                let url = format!("ws://{}:{}{}", host, port, path);
+                let url = format!("ws://{}{}", super::commands::host_port(host, *port), path);
                 let request = build_ws_request(&url, &p.http_headers)?;
                 let tcp = tcp_maybe_proxied(&p.http_proxy, host.as_str(), *port).await?;
                 let (ws, _) = async_tungstenite::client_async(request, tcp)
@@ -320,7 +320,7 @@ impl Backend for SmolBackend {
                     .connect(server_name, tcp)
                     .await
                     .map_err(rustls_handshake_err)?;
-                let url = format!("wss://{}:{}{}", host, port, path);
+                let url = format!("wss://{}{}", super::commands::host_port(host, *port), path);
                 let request = build_ws_request(&url, &p.http_headers)?;
                 let (ws, _) = async_tungstenite::client_async(request, tls_stream)
                     .await

@@ -93,6 +93,40 @@ fn v3_1_client(id: &str) -> mqtt::AsyncClient {
     .unwrap()
 }
 
+/// A broker named by an IPv6 literal, `tcp://[::1]:1883`, with and
+/// without a port. The host used to keep its brackets, failing the address
+/// lookup, and without a port the address's own colons were taken for one.
+#[test]
+fn test_ipv6_literal_uri() {
+    for uri in ["tcp://[::1]:1883", "mqtt://[::1]"] {
+        let cli = mqtt::AsyncClient::new(uri).unwrap();
+        let rx = cli.start_consuming();
+        cli.connect(None)
+            .wait_for(TIMEOUT)
+            .unwrap_or_else(|e| panic!("{uri}: connect failed: {e}"));
+        let topic = topic!("ipv6");
+        cli.subscribe(topic, mqtt::QOS_1).wait_for(TIMEOUT).unwrap();
+        cli.publish(mqtt::Message::new(topic, uri, mqtt::QOS_1))
+            .wait_for(TIMEOUT)
+            .unwrap();
+        let msg = rx.recv_timeout(TIMEOUT).unwrap().unwrap();
+        assert_eq!(msg.payload_str(), uri);
+        cli.disconnect(None).wait().unwrap();
+    }
+}
+
+/// The same over WebSocket: `ws://[::1]:9001`, where the brackets must go
+/// back on for the URL and the HTTP `Host` header.
+#[cfg(any(feature = "websocket", feature = "smol-websocket"))]
+#[test]
+fn test_ipv6_literal_ws_uri() {
+    let cli = mqtt::AsyncClient::new("ws://[::1]:9001").unwrap();
+    cli.connect(mqtt::ConnectOptions::new_ws())
+        .wait_for(TIMEOUT)
+        .expect("ws connect over IPv6 failed");
+    cli.disconnect(None).wait().unwrap();
+}
+
 #[test]
 fn test_connect_disconnect_v3_1() {
     // MQTT v3.1: protocol name "MQIsdp", level 3. Mosquitto still speaks it.
@@ -2043,6 +2077,28 @@ mod tls_verify {
             tls_kind(&res),
             Some(mqtt::TlsErrorKind::HostnameMismatch),
             "a mismatched name must fail the handshake, got {res:?}"
+        );
+    }
+
+    /// A broker at an IPv6 address, `tls://[::1]:port`, is checked against
+    /// that address — an IP-address name in its certificate — with the
+    /// brackets off. A certificate naming another address is refused.
+    #[test]
+    fn test_tls_ipv6_address_verified() {
+        let certs = common::TestCerts::new("::1");
+        let broker = common::spawn_tls_broker_on("[::1]:0", &certs, accepting);
+        assert!(broker.uri.starts_with("tls://[::1]:"), "{}", broker.uri);
+        connect_with(&certs, &broker.uri, true, true, true)
+            .expect("a certificate naming ::1 should be accepted for [::1]");
+        broker.join();
+
+        let certs = common::TestCerts::new("127.0.0.1");
+        let broker = common::spawn_tls_broker_on("[::1]:0", &certs, accepting);
+        let res = connect_with(&certs, &broker.uri, true, true, true);
+        assert_eq!(
+            tls_kind(&res),
+            Some(mqtt::TlsErrorKind::HostnameMismatch),
+            "{res:?}"
         );
     }
 

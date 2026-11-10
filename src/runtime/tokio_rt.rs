@@ -381,7 +381,7 @@ impl Backend for TokioBackend {
             ServerAddr::Unix { path } => Box::new(UnixConnection::connect(path).await?),
             #[cfg(feature = "websocket")]
             ServerAddr::Ws { host, port, path } => {
-                let url = format!("ws://{}:{}{}", host, port, path);
+                let url = format!("ws://{}{}", super::commands::host_port(host, *port), path);
                 let request = build_ws_request(&url, &p.http_headers)?;
                 let tcp = tcp_maybe_proxied(&p.http_proxy, host.as_str(), *port).await?;
                 let (ws, _) = tokio_tungstenite::client_async(request, tcp)
@@ -402,7 +402,7 @@ impl Backend for TokioBackend {
                     .connect(server_name, tcp)
                     .await
                     .map_err(rustls_handshake_err)?;
-                let url = format!("wss://{}:{}{}", host, port, path);
+                let url = format!("wss://{}{}", super::commands::host_port(host, *port), path);
                 let request = build_ws_request(&url, &p.http_headers)?;
                 let (ws, _) = tokio_tungstenite::client_async(request, tls)
                     .await
@@ -420,7 +420,7 @@ impl Backend for TokioBackend {
                     .connect()
                     .await
                     .map_err(|e| openssl_handshake_err(stream.ssl(), e))?;
-                let url = format!("wss://{}:{}{}", host, port, path);
+                let url = format!("wss://{}{}", super::commands::host_port(host, *port), path);
                 let request = build_ws_request(&url, &p.http_headers)?;
                 let (ws, _) = tokio_tungstenite::client_async(request, stream)
                     .await

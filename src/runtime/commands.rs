@@ -187,7 +187,56 @@ impl From<&CreateOptions> for OfflineConfig {
 
 /////////////////////////////////////////////////////////////////////////////
 
+/// Splits the authority of a URI — `host`, `host:port`, `[v6]` or
+/// `[v6]:port` — into its host and port, using `default_port` when it
+/// gives none.
+///
+/// An IPv6 address must be in brackets (RFC 3986 §3.2.2), since its own
+/// colons would otherwise be taken for the port's; the host is returned
+/// without them, which is the form a socket address or a TLS server name
+/// wants. [`host_port`] puts them back to write the two out together.
+pub(crate) fn split_host_port(authority: &str, default_port: u16) -> crate::Result<(String, u16)> {
+    let bad = |what: &str| Error::InvalidArgument(format!("{what} in address: {authority}"));
+    let port = |p: &str| p.parse::<u16>().map_err(|_| bad("invalid port"));
+
+    let (host, port) = if let Some(rest) = authority.strip_prefix('[') {
+        let (host, after) = rest.split_once(']').ok_or_else(|| bad("unclosed '['"))?;
+        let port = match after {
+            "" => default_port,
+            _ => port(after.strip_prefix(':').ok_or_else(|| bad("invalid port"))?)?,
+        };
+        (host, port)
+    } else {
+        match authority.split_once(':') {
+            None => (authority, default_port),
+            Some((_, rest)) if rest.contains(':') => {
+                return Err(bad("an IPv6 address must be in brackets"));
+            }
+            Some((host, p)) => (host, port(p)?),
+        }
+    };
+    if host.is_empty() {
+        return Err(bad("no host"));
+    }
+    Ok((host.to_string(), port))
+}
+
+/// Writes `host` and `port` as the authority of a URL or an HTTP request,
+/// putting an IPv6 address in brackets: the inverse of [`split_host_port`].
+/// Only WebSocket and proxy connections write one.
+#[cfg(any(feature = "websocket", feature = "smol-websocket"))]
+pub(crate) fn host_port(host: &str, port: u16) -> String {
+    if host.contains(':') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
 /// The resolved transport address for a connection attempt.
+///
+/// Hosts are held without the brackets an IPv6 address has in a URI; see
+/// [`split_host_port`].
 pub(crate) enum ServerAddr {
     /// Plain (unencrypted) TCP connection.
     Tcp {
@@ -634,6 +683,53 @@ pub(crate) enum Event {
 mod tests {
     use super::*;
     use paho_mqtt_codec::Property;
+
+    /// Host names, IPv4 and bracketed IPv6 addresses, with and without a
+    /// port; the IPv6 host comes back without its brackets.
+    #[test]
+    fn test_split_host_port() {
+        let ok = |a: &str| split_host_port(a, 1883).unwrap();
+        assert_eq!(ok("broker"), ("broker".into(), 1883));
+        assert_eq!(ok("broker:8883"), ("broker".into(), 8883));
+        assert_eq!(ok("10.0.0.1:1"), ("10.0.0.1".into(), 1));
+        assert_eq!(ok("[::1]"), ("::1".into(), 1883));
+        assert_eq!(ok("[::1]:8883"), ("::1".into(), 8883));
+        assert_eq!(ok("[fe80::1%eth0]:1"), ("fe80::1%eth0".into(), 1));
+
+        for bad in [
+            "",
+            ":1883",
+            "[]",
+            "[]:1",
+            "broker:",
+            "broker:x",
+            "broker:65536",
+            "[::1",
+            "[::1]x",
+            "[::1]:",
+            "[::1]:x",
+            "::1",
+            "::1:1883",
+            "fe80::1",
+        ] {
+            assert!(
+                matches!(split_host_port(bad, 1883), Err(Error::InvalidArgument(_))),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[cfg(any(feature = "websocket", feature = "smol-websocket"))]
+    #[test]
+    fn test_host_port() {
+        assert_eq!(host_port("broker", 80), "broker:80");
+        assert_eq!(host_port("10.0.0.1", 1), "10.0.0.1:1");
+        assert_eq!(host_port("::1", 9001), "[::1]:9001");
+        for a in ["broker:80", "[::1]:9001"] {
+            let (h, p) = split_host_port(a, 0).unwrap();
+            assert_eq!(host_port(&h, p), a);
+        }
+    }
 
     fn params_with(props: CodecProperties) -> ConnectParams {
         ConnectParams {

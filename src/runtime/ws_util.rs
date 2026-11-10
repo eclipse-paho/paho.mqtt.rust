@@ -68,3 +68,22 @@ pub(crate) fn build_ws_request(
 
     Ok(request)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The upgrade request for an IPv6 broker names it in brackets, in the
+    /// URI and the `Host` header.
+    #[test]
+    fn test_ws_request_for_ipv6() {
+        let url = format!(
+            "ws://{}/mqtt",
+            crate::runtime::commands::host_port("::1", 9001)
+        );
+        let req = build_ws_request(&url, &Default::default()).unwrap();
+        assert_eq!(req.uri().host(), Some("[::1]"));
+        assert_eq!(req.uri().port_u16(), Some(9001));
+        assert_eq!(req.headers()["host"], "[::1]:9001");
+    }
+}

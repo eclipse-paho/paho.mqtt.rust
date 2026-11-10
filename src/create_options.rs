@@ -457,7 +457,8 @@ impl CreateOptionsBuilder {
     /// `server_uri` The URI string to specify the server in the form
     ///              _protocol://host:port_, where the protocol can be
     ///              _tcp_ or _ssl_, and the host can be an IP address
-    ///              or domain name.
+    ///              or domain name. An IPv6 address goes in brackets, as
+    ///              in any URI: `tcp://[::1]:1883`.
     pub fn server_uri<S: Into<String>>(mut self, server_uri: S) -> Self {
         self.opts.server_uri = server_uri.into();
         self
