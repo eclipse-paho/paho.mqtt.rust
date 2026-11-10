@@ -824,7 +824,34 @@ impl AsyncClient {
 
     // ----- Subscribing -----
 
+    /// Attempts to subscribe to a single topic, but returns an error
+    /// immediately if the request can't be started.
+    ///
+    /// That is a failure found before anything goes on the wire: a QoS
+    /// value that isn't valid, or a client whose background session has
+    /// shut down ([`Error::Disconnected`]).
+    ///
+    /// On success the returned token tracks the subscription itself.
+    ///
+    /// # Arguments
+    ///
+    /// * `topic` The topic name
+    /// * `qos` The quality of service requested for messages
+    ///
+    pub fn try_subscribe<S, Q>(&self, topic: S, qos: Q) -> Result<SubscribeToken>
+    where
+        S: Into<String>,
+        Q: TryInto<QoS>,
+        Q::Error: Into<Error>,
+    {
+        self.try_subscribe_with_options(topic, qos, SubscribeOptions::default(), None)
+    }
+
     /// Subscribes to a single topic.
+    ///
+    /// Returns a token to track the progress of the operation. A failure
+    /// found before the request is sent — see
+    /// [`try_subscribe`](Self::try_subscribe) — fails the token instead.
     ///
     /// # Arguments
     ///
@@ -837,24 +864,63 @@ impl AsyncClient {
         Q: TryInto<QoS>,
         Q::Error: Into<Error>,
     {
-        let qos = match qos.try_into() {
-            Ok(q) => q,
-            Err(err) => return SubscribeToken::from_err(err.into()),
-        };
+        self.try_subscribe(topic, qos)
+            .unwrap_or_else(SubscribeToken::from_err)
+    }
+
+    /// Attempts to subscribe to a single topic with v5 options, but returns
+    /// an error immediately if the request can't be started.
+    ///
+    /// The failures are those of [`try_subscribe`](Self::try_subscribe), and
+    /// [`Error::WrongMqttVersion`] for v5 subscribe options or properties on
+    /// a connection of an earlier version.
+    ///
+    /// # Arguments
+    ///
+    /// * `topic` The topic name
+    /// * `qos` The quality of service requested for messages
+    /// * `opts` Options for the subscription
+    /// * `props` MQTT v5 properties
+    ///
+    pub fn try_subscribe_with_options<S, Q, T, P>(
+        &self,
+        topic: S,
+        qos: Q,
+        opts: T,
+        props: P,
+    ) -> Result<SubscribeToken>
+    where
+        S: Into<String>,
+        Q: TryInto<QoS>,
+        Q::Error: Into<Error>,
+        T: Into<SubscribeOptions>,
+        P: Into<Option<Properties>>,
+    {
+        let qos = qos.try_into().map_err(Into::into)?;
+        let opts: SubscribeOptions = opts.into();
+        let props = props.into().unwrap_or_default();
+        self.require_v5_for_sub_opts(&opts)?;
+        self.require_v5_for_props(&props)?;
+
         let (tok, comp) = SubscribeToken::new();
         let cmd = Command::Subscribe {
             single: true,
-            filters: vec![(topic.into(), qos, SubscribeOptions::default())],
-            props: Default::default(),
+            filters: vec![(topic.into(), qos, opts)],
+            props,
             tx: comp,
         };
         if self.inner.cmd_tx.send_blocking(cmd).is_err() {
-            return SubscribeToken::from_err(Error::Disconnected);
+            return Err(Error::Disconnected);
         }
-        tok
+        Ok(tok)
     }
 
     /// Subscribes to a single topic with v5 options.
+    ///
+    /// Returns a token to track the progress of the operation. A failure
+    /// found before the request is sent — see
+    /// [`try_subscribe_with_options`](Self::try_subscribe_with_options) —
+    /// fails the token instead.
     ///
     /// # Arguments
     ///
@@ -877,32 +943,36 @@ impl AsyncClient {
         T: Into<SubscribeOptions>,
         P: Into<Option<Properties>>,
     {
-        let qos = match qos.try_into() {
-            Ok(q) => q,
-            Err(err) => return SubscribeToken::from_err(err.into()),
-        };
-        let opts: SubscribeOptions = opts.into();
-        let props = props.into().unwrap_or_default();
-        if let Err(err) = self.require_v5_for_sub_opts(&opts) {
-            return SubscribeToken::from_err(err);
-        }
-        if let Err(err) = self.require_v5_for_props(&props) {
-            return SubscribeToken::from_err(err);
-        }
-        let (tok, comp) = SubscribeToken::new();
-        let cmd = Command::Subscribe {
-            single: true,
-            filters: vec![(topic.into(), qos, opts)],
-            props,
-            tx: comp,
-        };
-        if self.inner.cmd_tx.send_blocking(cmd).is_err() {
-            return SubscribeToken::from_err(Error::Disconnected);
-        }
-        tok
+        self.try_subscribe_with_options(topic, qos, opts, props)
+            .unwrap_or_else(SubscribeToken::from_err)
+    }
+
+    /// Attempts to subscribe to multiple topics simultaneously, but returns
+    /// an error immediately if the request can't be started.
+    ///
+    /// The failures are those of [`try_subscribe`](Self::try_subscribe), and
+    /// [`Error::InvalidArgument`] if `topics` and `qos` differ in length.
+    ///
+    /// # Arguments
+    ///
+    /// * `topics` The collection of topic names
+    /// * `qos` The quality of service requested for messages
+    ///
+    pub fn try_subscribe_many<T, Q>(&self, topics: &[T], qos: &[Q]) -> Result<SubscribeManyToken>
+    where
+        T: AsRef<str>,
+        Q: TryInto<QoS> + Copy,
+        Q::Error: Into<Error>,
+    {
+        self.try_subscribe_many_with_options(topics, qos, &[], None)
     }
 
     /// Subscribes to multiple topics simultaneously.
+    ///
+    /// Returns a token to track the progress of the operation. A failure
+    /// found before the request is sent — see
+    /// [`try_subscribe_many`](Self::try_subscribe_many) — fails the token
+    /// instead.
     ///
     /// # Arguments
     ///
@@ -915,42 +985,43 @@ impl AsyncClient {
         Q: TryInto<QoS> + Copy,
         Q::Error: Into<Error>,
     {
-        let n = topics.len();
-        if n != qos.len() {
-            return SubscribeManyToken::from_err(Error::InvalidArgument(
-                "topics/qos length mismatch".into(),
-            ));
-        }
+        self.try_subscribe_many(topics, qos)
+            .unwrap_or_else(SubscribeManyToken::from_err)
+    }
 
-        let filters: Result<Vec<_>> = topics
-            .iter()
-            .zip(qos.iter())
-            .map(|(t, q)| {
-                let qos = (*q).try_into().map_err(Into::into)?;
-                Ok((t.as_ref().to_string(), qos, SubscribeOptions::default()))
-            })
-            .collect();
-        let filters = match filters {
-            Ok(f) => f,
-            Err(err) => return SubscribeManyToken::from_err(err),
-        };
-
-        let (tok, comp) = SubscribeManyToken::new();
-
-        let cmd = Command::Subscribe {
-            single: false,
-            filters,
-            props: Default::default(),
-            tx: comp,
-        };
-        if self.inner.cmd_tx.send_blocking(cmd).is_err() {
-            return SubscribeManyToken::from_err(Error::Disconnected);
-        }
-        tok
+    /// Attempts to subscribe to multiple topics simultaneously using the
+    /// same QoS for all of them, but returns an error immediately if the
+    /// request can't be started.
+    ///
+    /// The failures are those of [`try_subscribe`](Self::try_subscribe).
+    ///
+    /// # Arguments
+    ///
+    /// * `topics` The collection of topic names
+    /// * `qos` The quality of service requested for all messages
+    ///
+    pub fn try_subscribe_many_same_qos<T, Q>(
+        &self,
+        topics: &[T],
+        qos: Q,
+    ) -> Result<SubscribeManyToken>
+    where
+        T: AsRef<str>,
+        Q: TryInto<QoS>,
+        Q::Error: Into<Error>,
+    {
+        let qos = qos.try_into().map_err(Into::into)?;
+        let qos = vec![qos; topics.len()];
+        self.try_subscribe_many(topics, &qos)
     }
 
     /// Subscribes to multiple topics simultaneously using the same QoS
     /// for all of them.
+    ///
+    /// Returns a token to track the progress of the operation. A failure
+    /// found before the request is sent — see
+    /// [`try_subscribe_many_same_qos`](Self::try_subscribe_many_same_qos) —
+    /// fails the token instead.
     ///
     /// # Arguments
     ///
@@ -963,15 +1034,81 @@ impl AsyncClient {
         Q: TryInto<QoS>,
         Q::Error: Into<Error>,
     {
-        let qos = match qos.try_into() {
-            Ok(q) => q,
-            Err(err) => return SubscribeManyToken::from_err(err.into()),
+        self.try_subscribe_many_same_qos(topics, qos)
+            .unwrap_or_else(SubscribeManyToken::from_err)
+    }
+
+    /// Attempts to subscribe to multiple topics simultaneously with
+    /// options, but returns an error immediately if the request can't be
+    /// started.
+    ///
+    /// The failures are those of
+    /// [`try_subscribe_with_options`](Self::try_subscribe_with_options), and
+    /// [`Error::InvalidArgument`] if `qos`, or a non-empty `opts`, differs in
+    /// length from `topics`.
+    ///
+    /// # Arguments
+    ///
+    /// * `topics` The collection of topic names
+    /// * `qos` The quality of service requested for messages
+    /// * `opts` Subscribe options (one per topic)
+    /// * `props` MQTT v5 properties
+    ///
+    pub fn try_subscribe_many_with_options<T, Q, P>(
+        &self,
+        topics: &[T],
+        qos: &[Q],
+        opts: &[SubscribeOptions],
+        props: P,
+    ) -> Result<SubscribeManyToken>
+    where
+        T: AsRef<str>,
+        Q: TryInto<QoS> + Copy,
+        Q::Error: Into<Error>,
+        P: Into<Option<Properties>>,
+    {
+        let n = topics.len();
+        if n != qos.len() {
+            return Err(Error::InvalidArgument("topics/qos length mismatch".into()));
+        }
+        if !opts.is_empty() && opts.len() != n {
+            return Err(Error::InvalidArgument("topics/opts length mismatch".into()));
+        }
+
+        let props = props.into().unwrap_or_default();
+        self.require_v5_for_props(&props)?;
+
+        let filters = topics
+            .iter()
+            .zip(qos.iter())
+            .enumerate()
+            .map(|(i, (t, q))| {
+                let sub_opts = opts.get(i).copied().unwrap_or_default();
+                self.require_v5_for_sub_opts(&sub_opts)?;
+                let qos = (*q).try_into().map_err(Into::into)?;
+                Ok((t.as_ref().to_string(), qos, sub_opts))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let (tok, comp) = SubscribeManyToken::new();
+        let cmd = Command::Subscribe {
+            single: false,
+            filters,
+            props,
+            tx: comp,
         };
-        let qos = vec![qos; topics.len()];
-        self.subscribe_many(topics, &qos)
+        if self.inner.cmd_tx.send_blocking(cmd).is_err() {
+            return Err(Error::Disconnected);
+        }
+        Ok(tok)
     }
 
     /// Subscribes to multiple topics simultaneously with options.
+    ///
+    /// Returns a token to track the progress of the operation. A failure
+    /// found before the request is sent — see
+    /// [`try_subscribe_many_with_options`](Self::try_subscribe_many_with_options)
+    /// — fails the token instead.
     ///
     /// # Arguments
     ///
@@ -993,51 +1130,8 @@ impl AsyncClient {
         Q::Error: Into<Error>,
         P: Into<Option<Properties>>,
     {
-        let n = topics.len();
-        if n != qos.len() {
-            return SubscribeManyToken::from_err(Error::InvalidArgument(
-                "topics/qos length mismatch".into(),
-            ));
-        }
-        if !opts.is_empty() && opts.len() != n {
-            return SubscribeManyToken::from_err(Error::InvalidArgument(
-                "topics/opts length mismatch".into(),
-            ));
-        }
-
-        let props = props.into().unwrap_or_default();
-        if let Err(err) = self.require_v5_for_props(&props) {
-            return SubscribeManyToken::from_err(err);
-        }
-
-        let filters: Result<Vec<_>> = topics
-            .iter()
-            .zip(qos.iter())
-            .enumerate()
-            .map(|(i, (t, q))| {
-                let sub_opts = opts.get(i).copied().unwrap_or_default();
-                self.require_v5_for_sub_opts(&sub_opts)?;
-                let qos = (*q).try_into().map_err(Into::into)?;
-                Ok((t.as_ref().to_string(), qos, sub_opts))
-            })
-            .collect();
-
-        let filters = match filters {
-            Ok(f) => f,
-            Err(err) => return SubscribeManyToken::from_err(err),
-        };
-
-        let (tok, comp) = SubscribeManyToken::new();
-        let cmd = Command::Subscribe {
-            single: false,
-            filters,
-            props,
-            tx: comp,
-        };
-        if self.inner.cmd_tx.send_blocking(cmd).is_err() {
-            return SubscribeManyToken::from_err(Error::Disconnected);
-        }
-        tok
+        self.try_subscribe_many_with_options(topics, qos, opts, props)
+            .unwrap_or_else(SubscribeManyToken::from_err)
     }
 
     /// Unsubscribes from a single topic.
@@ -2458,6 +2552,93 @@ mod tests {
         assert!(cli.inner.cmd_tx.close());
         assert!(matches!(cli.try_disconnect(None), Err(Error::Disconnected)));
         let err = cli.disconnect(None).wait().unwrap_err();
+        assert!(matches!(err, Error::Disconnected), "{err}");
+    }
+
+    /// A QoS that isn't valid is caught before anything is queued.
+    #[test]
+    fn test_try_subscribe_rejects_a_bad_qos() {
+        let cli = test_client();
+        assert!(cli.try_subscribe("a", 3).is_err());
+        assert!(cli.try_subscribe_many_same_qos(&["a", "b"], 3).is_err());
+        assert!(cli.try_subscribe_many(&["a", "b"], &[1, 3]).is_err());
+    }
+
+    /// Mismatched slices are refused with `InvalidArgument`.
+    #[test]
+    fn test_try_subscribe_many_rejects_mismatched_lengths() {
+        let cli = test_client();
+        assert!(matches!(
+            cli.try_subscribe_many(&["a", "b"], &[QoS::QoS1]),
+            Err(Error::InvalidArgument(_))
+        ));
+        assert!(matches!(
+            cli.try_subscribe_many_with_options(
+                &["a", "b"],
+                &[QoS::QoS1, QoS::QoS1],
+                &[SubscribeOptions::default()],
+                None
+            ),
+            Err(Error::InvalidArgument(_))
+        ));
+    }
+
+    /// v5 subscribe options can't go on a v3 connection.
+    #[test]
+    fn test_try_subscribe_rejects_v5_options_on_v3() {
+        let cli = AsyncClient::new(
+            CreateOptionsBuilder::new()
+                .server_uri("mqtt://localhost:1883")
+                .mqtt_version(MqttVersion::V3_1_1)
+                .finalize(),
+        )
+        .unwrap();
+        let opts = SubscribeOptions {
+            no_local: true,
+            ..Default::default()
+        };
+        assert!(matches!(
+            cli.try_subscribe_with_options("a", QoS::QoS1, opts, None),
+            Err(Error::WrongMqttVersion)
+        ));
+        assert!(matches!(
+            cli.try_subscribe_many_with_options(&["a"], &[QoS::QoS1], &[opts], None),
+            Err(Error::WrongMqttVersion)
+        ));
+    }
+
+    /// With the command channel closed no variant can queue its subscribe,
+    /// and the token-returning ones report the same failure.
+    #[test]
+    fn test_try_subscribe_fails_when_disconnected() {
+        let cli = test_client();
+        assert!(cli.inner.cmd_tx.close());
+        let (topics, qos) = (["a", "b"], [QoS::QoS1, QoS::QoS1]);
+
+        assert!(matches!(
+            cli.try_subscribe("a", QoS::QoS1),
+            Err(Error::Disconnected)
+        ));
+        assert!(matches!(
+            cli.try_subscribe_with_options("a", QoS::QoS1, SubscribeOptions::default(), None),
+            Err(Error::Disconnected)
+        ));
+        assert!(matches!(
+            cli.try_subscribe_many(&topics, &qos),
+            Err(Error::Disconnected)
+        ));
+        assert!(matches!(
+            cli.try_subscribe_many_same_qos(&topics, QoS::QoS1),
+            Err(Error::Disconnected)
+        ));
+        assert!(matches!(
+            cli.try_subscribe_many_with_options(&topics, &qos, &[], None),
+            Err(Error::Disconnected)
+        ));
+
+        let err = cli.subscribe("a", QoS::QoS1).wait().unwrap_err();
+        assert!(matches!(err, Error::Disconnected), "{err}");
+        let err = cli.subscribe_many(&topics, &qos).wait().unwrap_err();
         assert!(matches!(err, Error::Disconnected), "{err}");
     }
 
