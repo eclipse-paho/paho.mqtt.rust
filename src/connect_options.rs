@@ -185,6 +185,7 @@ impl ConnectOptions {
     ///   `min_retry_interval`.
     /// - TLS options must be usable: a private key needs its key store, and
     ///   ALPN protocol names must be 1 to 255 bytes.
+    /// - HTTP headers for a WebSocket connection must be valid HTTP.
     pub fn check(&self) -> Result<()> {
         if !self.server_uris.is_empty() {
             let uris = &self.server_uris;
@@ -197,6 +198,9 @@ impl ConnectOptions {
         if let Some(tls) = &self.tls {
             tls.check()?;
         }
+        // Without a WebSocket transport the headers go nowhere.
+        #[cfg(any(feature = "websocket", feature = "smol-websocket"))]
+        crate::runtime::ws_util::check_headers(&self.http_headers)?;
 
         // No properties allowed with MQTT v3
         if !self.props.is_empty() && self.mqtt_version < MqttVersion::V5 {
@@ -745,6 +749,9 @@ impl ConnectOptionsBuilder {
 
     /// Sets the additional HTTP headers that will be sent in the
     /// WebSocket opening handshake.
+    ///
+    /// `connect()` fails with [`Error::InvalidArgument`] if a name or value
+    /// is not one HTTP allows (a space in a name, a line break in a value).
     pub fn http_headers(&mut self, headers: HashMap<String, String>) -> &mut Self {
         self.0.http_headers = headers;
         self
@@ -768,7 +775,10 @@ impl ConnectOptionsBuilder {
     ///
     /// # Arguments
     ///
-    /// `proxy` The HTTP proxy
+    /// `proxy` The HTTP proxy, as `http://user:password@host:port`, the
+    /// credentials and port optional. Characters the user name or password
+    /// cannot hold in a URI, such as `@` or `:`, are percent-encoded
+    /// (`%40`, `%3A`), and are decoded before they are sent to the proxy.
     ///
     /// `connect()` fails with [`Error::InvalidArgument`]
     /// if this cannot be parsed as a proxy URI.

@@ -59,10 +59,7 @@ impl Proxy {
             .trim_end_matches('/');
 
         let (auth, authority) = match rest.rsplit_once('@') {
-            Some((creds, authority)) => (
-                Some(format!("Basic {}", base64(creds.as_bytes()))),
-                authority,
-            ),
+            Some((creds, authority)) => (Some(basic_auth(creds, uri)?), authority),
             None => (None, rest),
         };
 
@@ -137,6 +134,45 @@ fn find_header_end(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4)
 }
 
+/// The `Proxy-Authorization` value for the user information of a proxy
+/// URI, `user:password`.
+///
+/// A URI percent-encodes what its user information cannot hold as is — an
+/// `@` or `:` in a password, say (RFC 3986 §3.2.1) — so the user and the
+/// password are each decoded before going into the header (RFC 7617 §2).
+/// They used to go in still encoded, and a proxy would refuse them.
+fn basic_auth(creds: &str, uri: &str) -> Result<String> {
+    let bad = || Error::InvalidArgument(format!("malformed %-escape in proxy credentials: {uri}"));
+    let (user, pass) = match creds.split_once(':') {
+        Some((u, p)) => (u, Some(p)),
+        None => (creds, None),
+    };
+    let mut plain = percent_decode(user).ok_or_else(bad)?;
+    if let Some(p) = pass {
+        plain.push(b':');
+        plain.extend(percent_decode(p).ok_or_else(bad)?);
+    }
+    Ok(format!("Basic {}", base64(&plain)))
+}
+
+/// Decodes `%XX` escapes, or `None` if one is malformed.
+fn percent_decode(s: &str) -> Option<Vec<u8>> {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let hex = s.get(i + 1..i + 3)?;
+            out.push(u8::from_str_radix(hex, 16).ok()?);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    Some(out)
+}
+
 /// Minimal base64, for the one header that needs it.
 fn base64(data: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -197,6 +233,27 @@ mod tests {
         let p = Proxy::parse("http://user:pass@proxy.example:3128").unwrap();
         assert_eq!(p.host, "proxy.example");
         assert_eq!(p.auth.as_deref(), Some("Basic dXNlcjpwYXNz"));
+
+        // Percent-escapes in them are decoded first: `u@corp:p:ss`, where
+        // the URI could not hold that `@` or the second `:` as is.
+        let p = Proxy::parse("http://u%40corp:p%3Ass@proxy").unwrap();
+        assert_eq!(
+            p.auth.as_deref(),
+            Some(&*format!("Basic {}", base64(b"u@corp:p:ss")))
+        );
+        assert_eq!(p.host, "proxy");
+        // A user alone, and non-ASCII.
+        let p = Proxy::parse("caf%C3%A9@proxy").unwrap();
+        assert_eq!(
+            p.auth.as_deref(),
+            Some(&*format!("Basic {}", base64("café".as_bytes())))
+        );
+        for bad in ["u:p%4@proxy", "u:p%zz@proxy", "u%@proxy", "u:%e9%@proxy"] {
+            assert!(
+                matches!(Proxy::parse(bad), Err(Error::InvalidArgument(m)) if m.contains("%-escape")),
+                "{bad}"
+            );
+        }
 
         // An IPv6 proxy, held without its brackets.
         let p = Proxy::parse("http://user:pass@[::1]:8080").unwrap();

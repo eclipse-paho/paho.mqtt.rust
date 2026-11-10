@@ -2494,12 +2494,25 @@ mod tests {
             crate::ConnectOptionsBuilder::new_ws()
                 .https_proxy("http://")
                 .finalize(),
+            crate::ConnectOptionsBuilder::new_ws()
+                .http_proxy("http://user:p%zz@proxy:3128")
+                .finalize(),
         ] {
             assert!(matches!(
                 cli.connect(opts).wait_for(Duration::from_secs(1)),
                 Err(Error::InvalidArgument(msg)) if msg.contains("proxy")
             ));
         }
+
+        // So is an HTTP header that HTTP does not allow, which the
+        // WebSocket request used to drop.
+        let opts = crate::ConnectOptionsBuilder::new_ws()
+            .http_headers_from_coll(&[("Bad Name", "x")])
+            .finalize();
+        assert!(matches!(
+            cli.connect(opts).wait_for(Duration::from_secs(1)),
+            Err(Error::InvalidArgument(msg)) if msg.contains("header")
+        ));
     }
 
     #[test]
