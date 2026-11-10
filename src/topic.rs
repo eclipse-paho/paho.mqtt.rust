@@ -214,8 +214,13 @@ impl<'a> Topic<'a> {
     /// is refused before the message is sent: the delivery token fails with
     /// [`Error::ReasonCode`] carrying
     /// [`ReasonCode::TopicAliasInvalid`](crate::ReasonCode),
-    /// leaving the connection intact. The alias is only valid for a single
-    /// connection. It should be reset on a reconnect.
+    /// leaving the connection intact.
+    ///
+    /// The server forgets an alias when the connection ends, but there is
+    /// no need to reset it on a reconnect: the client sends the topic name
+    /// with the next publish that uses the alias, setting it up again on
+    /// the new connection. Messages that were in flight are re-sent with
+    /// the topic name and no alias.
     ///
     /// This can be called a second time to change the alias setting.
     /// Using an alias of zero on a subsequent call instructs this object to
@@ -385,8 +390,13 @@ impl<'a> SyncTopic<'a> {
     /// is refused before the message is sent: the delivery token fails with
     /// [`Error::ReasonCode`] carrying
     /// [`ReasonCode::TopicAliasInvalid`](crate::ReasonCode),
-    /// leaving the connection intact. The alias is only valid for a single
-    /// connection. It should be reset on a reconnect.
+    /// leaving the connection intact.
+    ///
+    /// The server forgets an alias when the connection ends, but there is
+    /// no need to reset it on a reconnect: the client sends the topic name
+    /// with the next publish that uses the alias, setting it up again on
+    /// the new connection. Messages that were in flight are re-sent with
+    /// the topic name and no alias.
     ///
     /// This can be called a second time to change the alias setting.
     /// Using an alias of zero on a subsequent call instructs this object to

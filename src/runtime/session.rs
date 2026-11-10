@@ -510,8 +510,18 @@ fn restore_entry(
     };
 
     match (kind, pkt) {
-        (b's', Packet::Publish(pub_pkt)) => {
+        (b's', Packet::Publish(mut pub_pkt)) => {
             let id = check_id(pub_pkt.packet_id)?;
+            // An alias means nothing on the connection this will be re-sent
+            // on (§3.3.2.3.4). Stores written by earlier versions of the
+            // client can hold a message with only an alias, which cannot
+            // be sent anywhere.
+            if pub_pkt.topic.is_empty() {
+                return Err(
+                    "it holds a PUBLISH with a topic alias in place of its topic name".into(),
+                );
+            }
+            pub_pkt.properties.remove(PropertyId::TopicAlias);
             state.next_id = state.next_id.max(id);
             state.insert(
                 id,
@@ -701,6 +711,38 @@ struct SessionState {
     /// Whether a persistence store has already been read into this state;
     /// only the first connection of a session needs to.
     loaded: bool,
+    /// The client's own outbound topic aliases. Not session state in the
+    /// specification's sense — an alias lasts one connection — but kept
+    /// here because this, too, outlives the connection.
+    aliases: OutboundAliases,
+}
+
+/// The topic names the client's own outbound topic aliases stand for
+/// (v5 §3.3.2.3.4).
+///
+/// An alias is set up by a PUBLISH that carries it along with a topic
+/// name, and lasts only for that connection. The application need not
+/// keep track of that — [`Topic`](crate::Topic) keeps its alias across a
+/// reconnect — so the session does: a publish with only an alias that was
+/// set up on an earlier connection goes out with its topic name, which
+/// sets the alias up again on this one. And what is kept to re-send later,
+/// in memory and in the store, always has the topic name and never the
+/// alias, which would mean nothing, or something else, on the connection
+/// it is re-sent on.
+#[derive(Default)]
+struct OutboundAliases {
+    /// Every alias the client has sent along with a topic name, and the
+    /// name most recently sent with it.
+    topics: HashMap<u16, String>,
+    /// The aliases set up on the current connection.
+    live: std::collections::HashSet<u16>,
+}
+
+impl OutboundAliases {
+    /// A new connection: none of the aliases are set up on it yet.
+    fn new_connection(&mut self) {
+        self.live.clear();
+    }
 }
 
 impl SessionState {
@@ -1191,7 +1233,11 @@ impl<B: Backend> Session<B> {
             expiry,
             out: Outbox::new(flush_needed),
             read_buf,
-            state,
+            state: {
+                let mut state = state;
+                state.aliases.new_connection();
+                state
+            },
             event_tx,
             dispatch,
             sinks,
@@ -1553,6 +1599,23 @@ impl<B: Backend> Session<B> {
                     let _ = store.lock().unwrap().put(key.as_str(), parts.to_vec());
                 }
             }
+        }
+    }
+
+    /// Persists `pub_pkt`, which differs from the frame just queued for
+    /// it, as the outbound entry for `id`. The frame is held back until the
+    /// store has it, as [`persist_last_frame`](Self::persist_last_frame)
+    /// holds it.
+    fn persist_publish(&mut self, id: u16, packet: &Packet) {
+        if !self.persist.is_some() {
+            return;
+        }
+        let gate_at = self.out.last_frame_start();
+        let mut hdr = BytesMut::new();
+        match packet.encode_split(&mut hdr, self.ver) {
+            Ok(Some(payload)) => self.persist_put(b's', id, &[&hdr, &payload], gate_at),
+            Ok(None) => self.persist_put(b's', id, &[&hdr], gate_at),
+            Err(e) => warn!("Could not persist outbound message {id}: {e}"),
         }
     }
 
@@ -2538,17 +2601,44 @@ impl<B: Backend> Session<B> {
                     return Ok(Flow::Continue);
                 }
 
-                // The server states the highest alias it will accept (0, the
-                // default, means none at all); sending a larger one earns a
-                // DISCONNECT, so fail this publish instead (§3.2.2.3.8).
-                if let Some(alias) = props.get_u16(PropertyId::TopicAlias)
-                    && (alias == 0 || alias > self.limits.server_topic_alias_max)
-                {
-                    tx.complete(Err(Error::ReasonCode(
+                let alias_invalid = || {
+                    Err(Error::ReasonCode(
                         ReasonCode::TopicAliasInvalid,
                         Properties::new(),
-                    )));
-                    return Ok(Flow::Continue);
+                    ))
+                };
+
+                // The topic name the alias, if any, stands for: what is kept
+                // for re-sending carries it instead of the alias.
+                let mut topic = topic;
+                let mut aliased: Option<(u16, String)> = None;
+                if let Some(alias) = props.get_u16(PropertyId::TopicAlias) {
+                    // The server states the highest alias it will accept (0,
+                    // the default, means none at all); sending a larger one
+                    // earns a DISCONNECT, so fail this publish instead
+                    // (§3.2.2.3.8).
+                    if alias == 0 || alias > self.limits.server_topic_alias_max {
+                        tx.complete(alias_invalid());
+                        return Ok(Flow::Continue);
+                    }
+                    let name = if !topic.is_empty() {
+                        topic.clone()
+                    } else {
+                        // An alias alone must already be set up on this
+                        // connection. One set up on an earlier connection
+                        // is set up again by sending its topic name with
+                        // it; one never sent with a name at all would earn
+                        // a DISCONNECT (§3.3.2.3.4), so it fails here.
+                        let Some(name) = self.state.aliases.topics.get(&alias) else {
+                            tx.complete(alias_invalid());
+                            return Ok(Flow::Continue);
+                        };
+                        if !self.state.aliases.live.contains(&alias) {
+                            topic = name.clone();
+                        }
+                        name.clone()
+                    };
+                    aliased = Some((alias, name));
                 }
 
                 let id = match qos {
@@ -2579,15 +2669,37 @@ impl<B: Backend> Session<B> {
                     }
                 };
 
-                // Persist a QoS 1/2 PUBLISH, exactly as queued, so it can be
-                // re-sent after a crash.
-                if let Some(pid) = id {
-                    self.persist_last_frame(b's', pid);
-                }
-
-                let Packet::Publish(pub_pkt) = packet else {
+                let Packet::Publish(mut pub_pkt) = packet else {
                     unreachable!()
                 };
+
+                // It is on its way, so an alias sent with a topic name is
+                // set up from here on.
+                if let Some((alias, name)) = &aliased
+                    && !pub_pkt.topic.is_empty()
+                {
+                    self.state.aliases.topics.insert(*alias, name.clone());
+                    self.state.aliases.live.insert(*alias);
+                }
+
+                // A QoS 1/2 PUBLISH is kept for re-sending, in memory and in
+                // the store (for after a crash): exactly as queued, or, if
+                // it used an alias, with the topic name in its place.
+                if let Some(pid) = id {
+                    match aliased {
+                        None => self.persist_last_frame(b's', pid),
+                        Some((_, name)) => {
+                            pub_pkt.topic = name;
+                            pub_pkt.properties.remove(PropertyId::TopicAlias);
+                            let packet = Packet::Publish(pub_pkt);
+                            self.persist_publish(pid, &packet);
+                            let Packet::Publish(p) = packet else {
+                                unreachable!()
+                            };
+                            pub_pkt = p;
+                        }
+                    }
+                }
                 match id {
                     // QoS 0 is complete once its bytes are written and flushed.
                     None => self.out.complete_when_flushed(end, tx),
@@ -4441,6 +4553,21 @@ mod tests {
             // A stray file whose name starts with a multi-byte character
             // used to panic the event loop.
             ("é-notes", Vec::new()),
+            // Written by an earlier version: a topic alias and no topic
+            // name, which cannot be re-sent on any connection.
+            ("s15", {
+                let mut props = Properties::new();
+                props.push(paho_mqtt_codec::Property::TopicAlias(2));
+                wire_packet(Packet::Publish(paho_mqtt_codec::Publish {
+                    dup: false,
+                    qos: QoS::QoS1,
+                    retain: false,
+                    topic: String::new(),
+                    packet_id: Some(15),
+                    payload: body.clone(),
+                    properties: props,
+                }))
+            }),
         ]);
 
         let mut state = SessionState::default();
@@ -4452,7 +4579,7 @@ mod tests {
             Restored {
                 outbound: 2,
                 inbound: 1,
-                skipped: 9,
+                skipped: 10,
             }
         );
         let mut ids: Vec<u16> = state.inflight.keys().copied().collect();
@@ -5066,6 +5193,111 @@ mod tests {
             ));
             assert_eq!(h.conn.get(), after_loss);
         }
+    }
+
+    /// An outbound topic alias lasts one connection (§3.3.2.3.4). What is
+    /// kept for re-sending — in memory and in the store — has the topic
+    /// name and no alias, so a re-send on a later connection does not carry
+    /// one the server does not know, or knows as another topic; and a
+    /// publish with only an alias set up on an earlier connection goes out
+    /// with the name, setting it up again. Both used to earn a DISCONNECT
+    /// (Protocol Error), and auto-reconnect then re-sent the message into
+    /// the same error.
+    #[test]
+    fn test_topic_aliases_last_one_connection() {
+        let aliased = |topic: &str, qos, alias| {
+            let (tok, tx) = Token::<PublishResponse>::new();
+            let mut props = Properties::new();
+            props.push(paho_mqtt_codec::Property::TopicAlias(alias));
+            let cmd = Command::Publish {
+                topic: topic.into(),
+                payload: Bytes::from_static(b"x"),
+                qos,
+                retain: false,
+                props,
+                tx,
+            };
+            (tok, cmd)
+        };
+        let on_wire = |h: &mut Harness| -> Vec<(String, Option<u16>, bool)> {
+            sent_packets(h)
+                .into_iter()
+                .filter_map(|p| match p {
+                    Packet::Publish(p) => Some((
+                        p.topic.clone(),
+                        p.properties.get_u16(PropertyId::TopicAlias),
+                        p.dup,
+                    )),
+                    _ => None,
+                })
+                .collect()
+        };
+        let store = store_with(&[]);
+
+        // First connection: set alias 3 up, then use it alone.
+        let mut first = harness(BytesMut::new(), Duration::ZERO, SessionState::default());
+        first.session.limits.server_topic_alias_max = 10;
+        first.session.persist = Persist::Inline(store.clone());
+        let (_t1, c) = aliased("t/a", QoS::QoS1, 3);
+        first.session.handle_command(c).unwrap();
+        let (_t2, c) = aliased("", QoS::QoS1, 3);
+        first.session.handle_command(c).unwrap();
+        assert_eq!(
+            on_wire(&mut first),
+            [("t/a".into(), Some(3), false), ("".into(), Some(3), false)],
+            "sent as given"
+        );
+        // Kept with the name and without the alias, in memory and stored.
+        for rec in first.session.state.inflight.values() {
+            let PublishPhase::AwaitingAck(p) = &rec.phase else {
+                panic!()
+            };
+            assert_eq!(p.topic, "t/a");
+            assert_eq!(p.properties.get_u16(PropertyId::TopicAlias), None);
+        }
+        let keys = stored_keys(&store).unwrap();
+        assert_eq!(keys.len(), 2);
+        for key in keys {
+            let data = store.lock().unwrap().get(&key).unwrap();
+            let raw = RawPacket::decode(&mut BytesMut::from(&data[..]))
+                .unwrap()
+                .unwrap();
+            let Packet::Publish(p) = Packet::from_raw(raw, MqttVersion::V5).unwrap() else {
+                panic!()
+            };
+            assert_eq!(p.topic, "t/a", "{key}");
+            assert_eq!(p.properties.get_u16(PropertyId::TopicAlias), None);
+        }
+
+        // The next connection: the re-sends carry the name, not the alias.
+        let state = std::mem::take(&mut first.session.state);
+        drop(first);
+        let mut second = harness(BytesMut::new(), Duration::ZERO, state);
+        second.session.limits.server_topic_alias_max = 10;
+        second.session.resume(true);
+        assert_eq!(
+            on_wire(&mut second),
+            [("t/a".into(), None, true), ("t/a".into(), None, true)]
+        );
+
+        // Alias 3 alone is set up again with the name, then used alone.
+        let (_t3, c) = aliased("", QoS::QoS0, 3);
+        second.session.handle_command(c).unwrap();
+        let (_t4, c) = aliased("", QoS::QoS0, 3);
+        second.session.handle_command(c).unwrap();
+        assert_eq!(
+            on_wire(&mut second),
+            [("t/a".into(), Some(3), false), ("".into(), Some(3), false)]
+        );
+
+        // An alias never sent with a name fails here, not at the server.
+        let (mut t5, c) = aliased("", QoS::QoS1, 4);
+        second.session.handle_command(c).unwrap();
+        assert!(matches!(
+            t5.try_wait(),
+            Some(Err(Error::ReasonCode(ReasonCode::TopicAliasInvalid, _)))
+        ));
+        assert!(on_wire(&mut second).is_empty());
     }
 
     /// Publishes the in-flight window held back when a session ended are

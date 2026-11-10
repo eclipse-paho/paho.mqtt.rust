@@ -2699,6 +2699,77 @@ fn test_session_that_ends_with_its_connection_is_discarded() {
     }
 }
 
+/// A `Topic` keeps its alias across a reconnect, but an alias lasts only
+/// one connection (§3.3.2.3.4). Messages in flight when the connection
+/// drops are re-sent with their topic name and no alias, and the `Topic`'s
+/// next publish goes out with the name, setting the alias up again on the
+/// new connection. Both used to go out with an empty topic and the stale
+/// alias, which a broker answers with DISCONNECT (Protocol Error) — and
+/// auto-reconnect then re-sent them into the same error.
+#[test]
+fn test_topic_alias_across_reconnect() {
+    use mqtt::paho_mqtt_codec::{ConnAck, Packet, Property, PropertyId, PubAck, ReasonCode};
+
+    let connack = |present| {
+        let mut ack = ConnAck::new(present, ReasonCode::Success);
+        ack.properties.push(Property::TopicAliasMaximum(10));
+        Packet::ConnAck(ack)
+    };
+    // The first connection drops on the first publish that has only an
+    // alias, leaving both messages unacknowledged.
+    let broker = common::spawn_broker_seq(2, move |pkt, conn| match (pkt, conn) {
+        (Packet::Connect(_), 0) => vec![connack(false)].into(),
+        (Packet::Publish(p), 0) if p.topic.is_empty() => common::Reply::close_after(vec![]),
+        (Packet::Connect(_), _) => vec![connack(true)].into(),
+        (Packet::Publish(p), 1) => match p.packet_id {
+            Some(id) => vec![Packet::PubAck(PubAck::new(id))].into(),
+            None => common::Reply::none(),
+        },
+        _ => common::Reply::none(),
+    });
+
+    let cli = mqtt::AsyncClient::new(broker.uri.clone()).unwrap();
+    cli.connect(resuming_opts()).wait().expect("connect failed");
+
+    let mut topic = mqtt::Topic::new(&cli, "t/alias", mqtt::QOS_1);
+    let t1 = topic.publish_with_alias(3, "m1");
+    let t2 = topic.publish("m2");
+    t1.wait_for(TIMEOUT).expect("m1 failed");
+    t2.wait_for(TIMEOUT).expect("m2 failed");
+    // On the new connection, with the alias still set on the `Topic`.
+    assert_eq!(topic.alias(), Some(3));
+    topic.publish("m3").wait_for(TIMEOUT).expect("m3 failed");
+    topic.publish("m4").wait_for(TIMEOUT).expect("m4 failed");
+
+    let sent: Vec<(String, String, Option<u16>, bool)> = broker.received_matching(|p| match p {
+        Packet::Publish(p) => Some((
+            String::from_utf8_lossy(&p.payload).into_owned(),
+            p.topic.clone(),
+            p.properties.get_u16(PropertyId::TopicAlias),
+            p.dup,
+        )),
+        _ => None,
+    });
+    let expected = [
+        // The first connection, as published.
+        ("m1", "t/alias", Some(3), false),
+        ("m2", "", Some(3), false),
+        // The next: re-sent with the name, then the alias set up again.
+        ("m1", "t/alias", None, true),
+        ("m2", "t/alias", None, true),
+        ("m3", "t/alias", Some(3), false),
+        ("m4", "", Some(3), false),
+    ];
+    let expected: Vec<_> = expected
+        .iter()
+        .map(|(m, t, a, d)| (m.to_string(), t.to_string(), *a, *d))
+        .collect();
+    assert_eq!(sent, expected);
+
+    cli.disconnect(None).wait().ok();
+    broker.join();
+}
+
 /// Publishes the in-flight window is holding back when the connection
 /// drops go out on the next connection, after the one that was in flight,
 /// in publish order. They used to fail with `Disconnected`, while
