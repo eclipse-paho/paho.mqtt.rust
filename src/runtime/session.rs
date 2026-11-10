@@ -552,10 +552,16 @@ fn restore_entry(
 /// Splits a persistence key into its kind (`b's'` or `b'r'`) and packet
 /// identifier — the inverse of [`PersistKey`] — or `None` for a key this
 /// client never writes.
+///
+/// The keys come from whatever is in the store — every file in a
+/// [`FilePersistence`](crate::FilePersistence) directory, say — so nothing
+/// about them can be assumed: the prefix is stripped as a character, never
+/// sliced off by byte offset, which panics on a key that starts with a
+/// multi-byte one.
 fn parse_persist_key(key: &str) -> Option<(u8, u16)> {
-    let kind = *key.as_bytes().first()?;
-    let digits = &key[1..];
-    if !matches!(kind, b's' | b'r') || !digits.bytes().all(|b| b.is_ascii_digit()) {
+    let digits = key.strip_prefix(['s', 'r'])?;
+    let kind = key.as_bytes()[0];
+    if !digits.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
     match digits.parse::<u16>() {
@@ -4084,7 +4090,25 @@ mod tests {
         // v0.14 (C library) keys, a zero or out-of-range identifier, leading
         // zeros or a sign, and anything else.
         for key in [
-            "s-1", "sc-1", "r-1", "s0", "s65536", "s007", "s+1", "s", "", "x1", "foo",
+            "s-1",
+            "sc-1",
+            "r-1",
+            "s0",
+            "s65536",
+            "s007",
+            "s+1",
+            "s",
+            "",
+            "x1",
+            "foo",
+            // Anything else a store directory might hold, including names
+            // that start with a multi-byte character, which used to panic.
+            "é-notes",
+            "€1",
+            "ś1",
+            "s١",
+            "s1é",
+            ".DS_Store",
         ] {
             assert_eq!(parse_persist_key(key), None, "{key:?}");
         }
@@ -4122,6 +4146,9 @@ mod tests {
             ("r14", wire_packet(Packet::PubRel(PubAck::new(14)))),
             ("s-3", wire_publish("t", QoS::QoS1, Some(3), &body)),
             ("foo", Vec::new()),
+            // A stray file whose name starts with a multi-byte character
+            // used to panic the event loop.
+            ("é-notes", Vec::new()),
         ]);
 
         let mut state = SessionState::default();
@@ -4133,7 +4160,7 @@ mod tests {
             Restored {
                 outbound: 2,
                 inbound: 1,
-                skipped: 8,
+                skipped: 9,
             }
         );
         let mut ids: Vec<u16> = state.inflight.keys().copied().collect();
