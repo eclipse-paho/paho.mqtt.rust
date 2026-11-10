@@ -45,7 +45,7 @@ use std::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     task::{Context, Poll},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use bytes::{Bytes, BytesMut};
@@ -953,6 +953,90 @@ struct Negotiated {
     expiry: SessionExpiry,
 }
 
+/// The keep-alive state of one connection (v3.1.1 §3.1.2.10, v5
+/// §3.1.2.10, §3.12.4).
+///
+/// The specification's obligation is about sending: the client must send
+/// something at least once per interval, a PINGREQ when it has nothing
+/// else to send. That alone cannot catch a half-open connection: a client
+/// that keeps writing never pings, and TCP goes on taking writes into its
+/// buffer long after the peer has gone. So, as Paho C does, a PINGREQ
+/// also goes out when nothing has been *received* for an interval; and an
+/// outstanding PINGREQ times out an interval after it was sent, whatever
+/// is written meanwhile (a client *"SHOULD close the Network Connection"*
+/// without a PINGRESP in a reasonable time, §3.1.2.10).
+///
+/// It only does arithmetic on the times it is told: the run loop's timer
+/// asks [`due`](Self::due) when to look again.
+#[derive(Debug)]
+struct KeepAlive {
+    /// The negotiated interval; never zero.
+    period: Duration,
+    last_sent: Instant,
+    last_recv: Instant,
+    /// When the PINGREQ still awaiting its PINGRESP went out.
+    ping_sent: Option<Instant>,
+}
+
+/// What [`KeepAlive::due`] says to do.
+#[derive(Debug, PartialEq, Eq)]
+enum KeepAliveDue {
+    /// Nothing yet; look again after this long.
+    Wait(Duration),
+    /// Send a PINGREQ.
+    Ping,
+    /// The PINGRESP is overdue.
+    TimedOut,
+}
+
+impl KeepAlive {
+    /// A connection that, as far as keep-alive is concerned, has just
+    /// exchanged CONNECT and CONNACK at `now`.
+    fn new(period: Duration, now: Instant) -> Self {
+        Self {
+            period,
+            last_sent: now,
+            last_recv: now,
+            ping_sent: None,
+        }
+    }
+
+    /// Bytes went out at `now`.
+    fn sent(&mut self, now: Instant) {
+        self.last_sent = now;
+    }
+
+    /// Bytes came in at `now`.
+    fn received(&mut self, now: Instant) {
+        self.last_recv = now;
+    }
+
+    /// A PINGREQ is being sent at `now`.
+    fn pinged(&mut self, now: Instant) {
+        self.ping_sent = Some(now);
+    }
+
+    /// The PINGRESP arrived.
+    fn pong(&mut self) {
+        self.ping_sent = None;
+    }
+
+    /// What is due at `now`. With a PINGREQ outstanding only its PINGRESP
+    /// matters, and sends do not put it off; otherwise a PINGREQ is due
+    /// once either direction has been quiet for an interval.
+    fn due(&self, now: Instant) -> KeepAliveDue {
+        let deadline = match self.ping_sent {
+            Some(sent) => sent + self.period,
+            None => self.last_sent.min(self.last_recv) + self.period,
+        };
+        match deadline.checked_duration_since(now) {
+            Some(d) if !d.is_zero() => KeepAliveDue::Wait(d),
+            _ if self.ping_sent.is_some() => KeepAliveDue::TimedOut,
+            _ => KeepAliveDue::Ping,
+        }
+    }
+}
+
 /// Where inbound messages and news of the connection go, and how many
 /// messages may be outstanding there.
 ///
@@ -997,8 +1081,6 @@ struct Session<B: Backend> {
     writer: B::Writer,
     /// Negotiated MQTT version.
     ver: MqttVersion,
-    /// Keep-alive interval.
-    keep_alive: Duration,
     /// How long the session outlives this connection; a DISCONNECT the
     /// client sends can change it.
     expiry: SessionExpiry,
@@ -1035,9 +1117,9 @@ struct Session<B: Backend> {
     server_disconnect: bool,
     /// When the application last stopped taking messages, so that a stall
     /// long enough to look like a hang leaves a trace in the log.
-    stalled_since: Option<std::time::Instant>,
-    /// True when a PINGREQ has been sent and PINGRESP has not yet arrived.
-    ping_outstanding: bool,
+    stalled_since: Option<Instant>,
+    /// The keep-alive state, or `None` with keep-alive disabled.
+    ka: Option<KeepAlive>,
     /// Where in-flight QoS 1/2 messages are stored, if anywhere.
     persist: Persist,
     /// Puts queued to the persistence worker and not yet stored, each with
@@ -1106,7 +1188,6 @@ impl<B: Backend> Session<B> {
         Self {
             writer,
             ver,
-            keep_alive,
             expiry,
             out: Outbox::new(flush_needed),
             read_buf,
@@ -1119,7 +1200,7 @@ impl<B: Backend> Session<B> {
             server_disconnect: false,
             pending_ack: None,
             stalled_since: None,
-            ping_outstanding: false,
+            ka: (!keep_alive.is_zero()).then(|| KeepAlive::new(keep_alive, Instant::now())),
             persist,
             pending_puts: VecDeque::new(),
             limits,
@@ -1735,17 +1816,16 @@ impl<B: Backend> Session<B> {
         reader: &mut B::Reader,
         cmd_rx: &async_channel::Receiver<Command>,
     ) -> Result<()> {
-        let keep_alive = self.keep_alive;
-        // keep_alive == ZERO means disabled: a never-firing sleep reports
-        // itself terminated, so `select!` skips that branch entirely.
-        let ka_enabled = !keep_alive.is_zero();
-
-        // Resettable sleep: the deadline advances on every write, so that
-        // PINGREQs are only sent when the connection has been truly idle.
-        let mut ka_sleep = if ka_enabled {
-            B::Sleep::new(keep_alive)
-        } else {
-            B::Sleep::never()
+        // Disabled keep-alive: a never-firing sleep reports itself
+        // terminated, so `select!` skips that branch entirely.
+        //
+        // The timer is lazy. Sends and receives only note the time (see
+        // `KeepAlive`); when the timer fires, the real deadline is worked
+        // out from those and the timer re-armed for it if it has not come.
+        // So it fires about once an interval, however busy the connection.
+        let mut ka_sleep = match &self.ka {
+            Some(ka) => B::Sleep::new(ka.period),
+            None => B::Sleep::never(),
         };
 
         // Packets the broker pipelined behind the CONNACK are in `read_buf`
@@ -1803,27 +1883,24 @@ impl<B: Backend> Session<B> {
 
             match ev {
                 LoopEvent::Writer(res) => {
-                    if self.writer_done(res)? && ka_enabled {
-                        ka_sleep.reset(keep_alive);
-                    }
+                    self.writer_done(res)?;
                 }
                 LoopEvent::Read(res) => {
                     if res? == 0 {
                         return Err(Error::Disconnected);
                     }
-                    self.handle_buffered()?;
-                    if self.write_now()? && ka_enabled {
-                        ka_sleep.reset(keep_alive);
+                    if let Some(ka) = &mut self.ka {
+                        ka.received(Instant::now());
                     }
+                    self.handle_buffered()?;
+                    self.write_now()?;
                 }
                 // The dispatcher made room: hand over what was held, then
                 // carry on with any bytes left buffered when reading paused.
                 LoopEvent::Room => {
                     self.release_held()?;
                     self.handle_buffered()?;
-                    if self.write_now()? && ka_enabled {
-                        ka_sleep.reset(keep_alive);
-                    }
+                    self.write_now()?;
                 }
                 // The store has caught up: the frames it was holding back
                 // may go out now.
@@ -1832,9 +1909,7 @@ impl<B: Backend> Session<B> {
                     if !self.pending_puts.is_empty() {
                         persist_sleep.reset(persist_timeout);
                     }
-                    if self.write_now()? && ka_enabled {
-                        ka_sleep.reset(keep_alive);
-                    }
+                    self.write_now()?;
                 }
                 // The store has not answered for `persist_timeout` while
                 // messages wait on it. Ending the session is the same
@@ -1856,9 +1931,7 @@ impl<B: Backend> Session<B> {
                     }
                     self.release_held()?;
                     self.handle_buffered()?;
-                    if self.write_now()? && ka_enabled {
-                        ka_sleep.reset(keep_alive);
-                    }
+                    self.write_now()?;
                 }
                 // The API was dropped: send what is already queued, then stop.
                 LoopEvent::Command(Err(_)) => {
@@ -1885,19 +1958,31 @@ impl<B: Backend> Session<B> {
                         self.disconnect(req, reader, cmd_rx).await;
                         return Ok(());
                     }
-                    if self.write_now()? && ka_enabled {
-                        ka_sleep.reset(keep_alive);
-                    }
+                    self.write_now()?;
                 }
                 LoopEvent::KeepAlive => {
-                    // A PINGRESP cannot be seen while reading is paused, so
-                    // its absence then proves nothing; ping again instead.
-                    if self.ping_outstanding && self.reads_allowed() {
-                        return Err(Error::Timeout);
+                    let now = Instant::now();
+                    let Some((due, period)) = self.ka.as_ref().map(|ka| (ka.due(now), ka.period))
+                    else {
+                        continue;
+                    };
+                    match due {
+                        KeepAliveDue::Wait(d) => ka_sleep.reset(d),
+                        // A PINGRESP cannot be seen while reading is paused,
+                        // so its absence then proves nothing; ping again
+                        // instead.
+                        KeepAliveDue::TimedOut if self.reads_allowed() => {
+                            return Err(Error::Timeout);
+                        }
+                        KeepAliveDue::TimedOut | KeepAliveDue::Ping => {
+                            if let Some(ka) = &mut self.ka {
+                                ka.pinged(now);
+                            }
+                            ka_sleep.reset(period);
+                            self.queue(&Packet::PingReq)?;
+                            self.write_now()?;
+                        }
                     }
-                    self.queue(&Packet::PingReq)?;
-                    self.ping_outstanding = true;
-                    ka_sleep.reset(keep_alive);
                 }
             }
         }
@@ -1916,7 +2001,7 @@ impl<B: Backend> Session<B> {
                     "Inbound paused: the application has not taken {} message(s)",
                     self.held.len() + usize::from(self.pending.is_some())
                 );
-                self.stalled_since = Some(std::time::Instant::now());
+                self.stalled_since = Some(Instant::now());
             }
             (false, Some(since)) => {
                 self.stalled_since = None;
@@ -1956,12 +2041,15 @@ impl<B: Backend> Session<B> {
     }
 
     /// Applies the outcome of a [`writer_step`] to the outbox. Returns `true`
-    /// if bytes went out, which is what restarts the keep-alive interval.
+    /// if bytes went out, which the keep-alive notes as a send.
     fn writer_done(&mut self, res: io::Result<Step>) -> Result<bool> {
         match res? {
             Step::Wrote(0) => Err(io::Error::from(io::ErrorKind::WriteZero).into()),
             Step::Wrote(n) => {
                 self.out.advance(n);
+                if let Some(ka) = &mut self.ka {
+                    ka.sent(Instant::now());
+                }
                 Ok(true)
             }
             Step::Flushed => {
@@ -2358,7 +2446,9 @@ impl<B: Backend> Session<B> {
 
             // ---- Keep-alive response ----
             Packet::PingResp => {
-                self.ping_outstanding = false;
+                if let Some(ka) = &mut self.ka {
+                    ka.pong();
+                }
             }
 
             // ---- Broker-initiated disconnect (v5) ----
@@ -5234,6 +5324,86 @@ mod tests {
         assert!(matches!(res, Err(Error::Timeout)), "{res:?}");
         assert!(start.elapsed() >= 2 * ka);
         assert_eq!(h.wire.wire().bytes, wire_packet(Packet::PingReq));
+    }
+
+    /// The keep-alive rules, on synthetic times: a PINGREQ is due once
+    /// either direction has been quiet for an interval, and an outstanding
+    /// one times out an interval after it went, however much is sent
+    /// meanwhile.
+    #[test]
+    fn test_keep_alive_rules() {
+        let p = Duration::from_secs(10);
+        let t0 = Instant::now();
+        let at = |secs: u64| t0 + Duration::from_secs(secs);
+        let mut ka = KeepAlive::new(p, t0);
+
+        assert_eq!(ka.due(t0), KeepAliveDue::Wait(p));
+        assert_eq!(ka.due(at(4)), KeepAliveDue::Wait(Duration::from_secs(6)));
+        assert_eq!(ka.due(at(10)), KeepAliveDue::Ping, "both quiet");
+
+        // Sending alone does not put off the ping: nothing has come in.
+        ka.sent(at(9));
+        assert_eq!(ka.due(at(10)), KeepAliveDue::Ping, "nothing received");
+        // Nor does receiving alone: the obligation is to send.
+        let mut rx_only = KeepAlive::new(p, t0);
+        rx_only.received(at(9));
+        assert_eq!(rx_only.due(at(10)), KeepAliveDue::Ping, "nothing sent");
+        // Both directions busy: the earlier of the two decides.
+        ka.received(at(7));
+        assert_eq!(ka.due(at(10)), KeepAliveDue::Wait(Duration::from_secs(7)));
+
+        // With a PINGREQ out, only its PINGRESP matters.
+        ka.pinged(at(17));
+        ka.sent(at(26));
+        ka.received(at(26));
+        assert_eq!(ka.due(at(26)), KeepAliveDue::Wait(Duration::from_secs(1)));
+        assert_eq!(ka.due(at(27)), KeepAliveDue::TimedOut);
+        ka.pong();
+        assert_eq!(ka.due(at(27)), KeepAliveDue::Wait(Duration::from_secs(9)));
+    }
+
+    /// A client that keeps writing still finds out that the connection is
+    /// dead. Every write used to put the keep-alive off, so it never pinged
+    /// and never timed out, while TCP took the writes into its buffer;
+    /// QoS 0 publishes reported success into a connection that had gone.
+    #[test]
+    fn test_keep_alive_times_out_while_writing() {
+        let ka = Duration::from_millis(30);
+        let mut h = harness(BytesMut::new(), ka, SessionState::default());
+        let mut reader = MockReader::open_with([]);
+
+        // Publish every 5 ms, well inside the interval, until the session
+        // stops taking commands.
+        let cmd_tx = h.cmd_tx.clone();
+        let feeder = std::thread::spawn(move || {
+            for _ in 0..1000 {
+                let (_tok, cmd) = publish_cmd("busy", QoS::QoS0, Bytes::from_static(b"x"));
+                if cmd_tx.send_blocking(cmd).is_err() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        });
+
+        let start = Instant::now();
+        let res = {
+            let run = pin!(h.session.run(&mut reader, &h.cmd_rx));
+            poll_until(run, Duration::from_secs(2)).expect("no keep-alive timeout")
+        };
+        let took = start.elapsed();
+        h.cmd_rx.close();
+        feeder.join().unwrap();
+
+        assert!(matches!(res, Err(Error::Timeout)), "{res:?}");
+        // A PINGREQ after an interval with nothing received, then a second
+        // interval for its PINGRESP.
+        assert!(took >= 2 * ka, "{took:?}");
+        assert!(took < 10 * ka, "{took:?}");
+        let wire = h.wire.wire().bytes.clone();
+        assert!(
+            wire.windows(2).any(|w| w == [0xC0, 0x00]),
+            "a PINGREQ went out"
+        );
     }
 
     // ---- Inbound backpressure ----
