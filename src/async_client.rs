@@ -57,7 +57,8 @@ use crate::{
     token::Token,
 };
 use bytes::Bytes;
-use crossbeam_channel as sync_channel;
+use crossbeam_channel::{self as sync_channel, Sender as SyncSender};
+use async_channel::Sender as AsyncSender;
 use paho_mqtt_codec::types::*;
 use std::{
     sync::{
@@ -178,8 +179,8 @@ impl<F: ?Sized> Slot<F> {
 /// [`start_consuming_events`]: AsyncClient::start_consuming_events
 #[derive(Default)]
 struct SyncSinks {
-    msgs: Vec<sync_channel::Sender<Option<Message>>>,
-    events: Vec<sync_channel::Sender<Event>>,
+    msgs: Vec<SyncSender<Option<Message>>>,
+    events: Vec<SyncSender<Event>>,
 }
 
 impl SyncSinks {
@@ -255,8 +256,8 @@ impl SyncSinks {
 /// Consumers whose receiver was dropped, found while sending to them.
 #[derive(Default)]
 struct DeadSinks {
-    msgs: Vec<sync_channel::Sender<Option<Message>>>,
-    events: Vec<sync_channel::Sender<Event>>,
+    msgs: Vec<SyncSender<Option<Message>>>,
+    events: Vec<SyncSender<Event>>,
 }
 
 impl DeadSinks {
@@ -290,7 +291,7 @@ pub struct AsyncClient {
 /// Implementation details for the asynchronous MQTT connection client.
 pub(crate) struct InnerAsyncClient {
     /// Command sender to the internal event loop.
-    cmd_tx: async_channel::Sender<Command>,
+    cmd_tx: AsyncSender<Command>,
     /// The connection state, as the event loop keeps it. Read-only here: the
     /// loop is its only writer, and sets it before the token or event that
     /// reveals a change, so `is_connected()` agrees with a `wait()` that has
@@ -298,8 +299,9 @@ pub(crate) struct InnerAsyncClient {
     state: StateView,
     /// The MQTT version of the connection.
     mqtt_version: AtomicU32,
-    /// The identifier the server assigned, when the client connected with an
-    /// empty one. Set by the event loop before the connect token resolves.
+    /// The client identifier that the server assigned, if the client
+    /// connected with an empty one. Set by the event loop before the
+    /// connect token resolves.
     assigned_id: Arc<RwLock<Option<String>>>,
     /// The options used to create the client.
     opts: CreateOptions,
@@ -336,7 +338,7 @@ impl InnerAsyncClient {
     /// only the MQTT version from `opts`, so that `reconnect()` and sends
     /// before the first connect use the right one.
     fn new(
-        cmd_tx: async_channel::Sender<Command>,
+        cmd_tx: AsyncSender<Command>,
         opts: CreateOptions,
         dispatch: Dispatch,
         state: StateView,
@@ -468,8 +470,9 @@ impl AsyncClient {
     /// That is a failure found before anything goes on the wire: invalid
     /// connect options, a server or proxy URI that can't be parsed, or a
     /// client whose background session has shut down
-    /// ([`Error::Disconnected`]). On success the returned token tracks the
-    /// connection attempt itself.
+    /// ([`Error::Disconnected`]).
+    ///
+    /// On success the returned token tracks the connection attempt itself.
     ///
     /// # Arguments
     ///
@@ -480,21 +483,21 @@ impl AsyncClient {
     where
         T: Into<Option<ConnectOptions>>,
     {
-        let explicit: Option<ConnectOptions> = opts.into();
-        debug!("Connecting with opts: {:?}", explicit);
+        let opt_opts = opts.into();
 
         // None: keep the client's current version unchanged.
         // Some(opts): use opts.mqtt_version, and once the options are known
         // to be good, make it the client's version.
-        let ver = match &explicit {
+        let ver = match &opt_opts {
+            Some(opts) => opts.mqtt_version,
             None => self.mqtt_version(),
-            Some(o) => o.mqtt_version,
         };
 
         // Normalize: ensure the opts we store and send have the resolved version.
-        let mut opts = explicit.unwrap_or_default();
+        let mut opts = opt_opts.unwrap_or_default();
         opts.mqtt_version = ver;
 
+        debug!("Connecting with opts: {:?}", opts);
         opts.check()?;
 
         // Build the ordered server list: explicit list from connect opts, or
@@ -1885,7 +1888,7 @@ mod tests {
     // GitHub Issue #17
     #[test]
     fn test_context() {
-        let cli = AsyncClient::new("tcp://localhost:1883").unwrap();
+        let cli = AsyncClient::new("mqtt://localhost:1883").unwrap();
         cli.set_message_callback(|_, _| {});
 
         let pctx = {
@@ -1904,7 +1907,7 @@ mod tests {
 
     #[test]
     fn test_create() {
-        let cli = AsyncClient::new("tcp://localhost:1883");
+        let cli = AsyncClient::new("mqtt://localhost:1883");
         assert!(cli.is_ok(), "Error creating async client");
     }
 
@@ -1924,7 +1927,7 @@ mod tests {
         const DATA_STR: &str = "Hello world!";
 
         let cli = CreateOptionsBuilder::new()
-            .server_uri("tcp://localhost:1883")
+            .server_uri("mqtt://localhost:1883")
             .user_data(Box::new(DATA_STR))
             .create_async_client()
             .unwrap();
@@ -1942,7 +1945,7 @@ mod tests {
         let data = Box::new(Mutex::new(data_vec));
 
         let cli = CreateOptionsBuilder::new()
-            .server_uri("tcp://localhost:1883")
+            .server_uri("mqtt://localhost:1883")
             .user_data(data)
             .create_async_client()
             .unwrap();
@@ -1968,7 +1971,7 @@ mod tests {
         let data = Box::new(RwLock::new(data_vec));
 
         let cli = CreateOptionsBuilder::new()
-            .server_uri("tcp://localhost:1883")
+            .server_uri("mqtt://localhost:1883")
             .user_data(data)
             .create_async_client()
             .unwrap();
@@ -1996,7 +1999,7 @@ mod tests {
     // Determine that a client can be sent across threads.
     #[test]
     fn test_send() {
-        let cli = AsyncClient::new("tcp://localhost:1883").unwrap();
+        let cli = AsyncClient::new("mqtt://localhost:1883").unwrap();
         let thr = thread::spawn(move || {
             assert!(!cli.is_connected());
         });
@@ -2006,7 +2009,7 @@ mod tests {
     // Determine that a client can be shared across threads using an Arc.
     #[test]
     fn test_send_arc() {
-        let cli = AsyncClient::new("tcp://localhost:1883").unwrap();
+        let cli = AsyncClient::new("mqtt://localhost:1883").unwrap();
 
         let cli = Arc::new(cli);
         let cli2 = cli.clone();
@@ -2031,7 +2034,7 @@ mod tests {
 
     #[test]
     fn test_get_server_uri() {
-        let server_uri = "tcp://localhost:1883";
+        let server_uri = "mqtt://localhost:1883";
         let cli = CreateOptionsBuilder::new()
             .server_uri(server_uri)
             .create_async_client();
@@ -2049,7 +2052,7 @@ mod tests {
         let create = |id: &str, persistence: PersistenceType| {
             AsyncClient::new(
                 CreateOptionsBuilder::new()
-                    .server_uri("tcp://localhost:1883")
+                    .server_uri("mqtt://localhost:1883")
                     .client_id(id)
                     .persistence(persistence)
                     .finalize(),
@@ -2084,7 +2087,7 @@ mod tests {
             Err(Error::InvalidArgument(msg)) if msg.contains("notaport")
         ));
 
-        let cli = AsyncClient::new("tcp://localhost:1883").unwrap();
+        let cli = AsyncClient::new("mqtt://localhost:1883").unwrap();
         assert!(matches!(
             cli.subscribe_many(&["a", "b"], &[QoS::QoS1]).wait(),
             Err(Error::InvalidArgument(_))
@@ -2187,7 +2190,7 @@ mod tests {
     /// A client that talks to nothing. `dispatch_event` is driven directly,
     /// so no broker, socket or event loop is involved.
     fn test_client() -> AsyncClient {
-        AsyncClient::new("tcp://localhost:1883").unwrap()
+        AsyncClient::new("mqtt://localhost:1883").unwrap()
     }
 
     fn counter() -> Arc<Mutex<u32>> {
@@ -2456,7 +2459,7 @@ mod tests {
     fn test_try_publish_returns_the_message_on_a_version_mismatch() {
         let cli = AsyncClient::new(
             CreateOptionsBuilder::new()
-                .server_uri("tcp://localhost:1883")
+                .server_uri("mqtt://localhost:1883")
                 .mqtt_version(MqttVersion::V3_1_1)
                 .finalize(),
         )
