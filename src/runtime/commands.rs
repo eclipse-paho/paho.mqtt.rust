@@ -143,6 +143,10 @@ pub(crate) struct OfflineConfig {
     pub send_while_disconnected: bool,
     /// Maximum number of commands that may be held in the buffer at once.
     pub max_buffered_msgs: usize,
+    /// See [`CreateOptions::max_held_qos0_msgs`](crate::CreateOptions).
+    pub max_held_qos0_msgs: usize,
+    /// See [`CreateOptions::max_held_qos0_bytes`](crate::CreateOptions).
+    pub max_held_qos0_bytes: usize,
     /// Buffer publishes even before the first successful connection has been
     /// made.
     pub allow_send_any_time: bool,
@@ -176,6 +180,8 @@ impl From<&CreateOptions> for OfflineConfig {
         Self {
             send_while_disconnected: opts.send_while_disconnected,
             max_buffered_msgs: opts.max_buffered_msgs,
+            max_held_qos0_msgs: opts.max_held_qos0_msgs,
+            max_held_qos0_bytes: opts.max_held_qos0_bytes,
             allow_send_any_time: opts.allow_send_any_time,
             delete_oldest: opts.delete_oldest,
             restore_msgs: opts.restore_msgs,

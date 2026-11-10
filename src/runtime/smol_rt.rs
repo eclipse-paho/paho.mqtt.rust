@@ -415,6 +415,8 @@ mod tests {
             OfflineConfig {
                 send_while_disconnected: false,
                 max_buffered_msgs: 100,
+                max_held_qos0_msgs: 1024,
+                max_held_qos0_bytes: 16 * 1024 * 1024,
                 allow_send_any_time: false,
                 delete_oldest: false,
                 restore_msgs: false,

@@ -168,6 +168,12 @@ impl RuntimeHandle {
 /// session holds further ones back.
 const INBOUND_MSG_CAP: usize = 1024;
 
+/// What a held message counts against the QoS 0 byte limit: its topic and
+/// payload, which is most of its memory.
+fn held_size(msg: &Message) -> usize {
+    msg.topic.len() + msg.payload.len()
+}
+
 /// Bounds the inbound messages waiting for the event dispatcher.
 ///
 /// The event channel itself is unbounded, so that connection events
@@ -1142,6 +1148,12 @@ struct Session<B: Backend> {
     /// once it has been (PUBACK for QoS 1, PUBCOMP for QoS 2). In arrival
     /// order.
     held: VecDeque<(Message, Option<Packet>)>,
+    /// How many of the `held` messages are QoS 0, and their size (topic and
+    /// payload), against the limits in [`OfflineConfig`].
+    held_qos0: (usize, usize),
+    /// QoS 0 messages dropped for want of room since the stall began; see
+    /// [`deliver_msg`](Self::deliver_msg).
+    qos0_dropped: u64,
     /// A fan-out that blocked on a full stream, and the acknowledgement
     /// waiting on it. Nothing else is delivered until it completes, so
     /// every destination keeps its order.
@@ -1244,6 +1256,8 @@ impl<B: Backend> Session<B> {
             dispatch,
             sinks,
             held: VecDeque::new(),
+            held_qos0: (0, 0),
+            qos0_dropped: 0,
             pending: None,
             server_disconnect: false,
             pending_ack: None,
@@ -1303,13 +1317,43 @@ impl<B: Backend> Session<B> {
 
     /// Delivers an inbound message to every destination, queuing `ack` once
     /// they all have it; or holds both, in order, until they can take it.
+    ///
+    /// A QoS 0 message that would take the held ones past their limits is
+    /// dropped, as at-most-once delivery allows: messages are held only
+    /// while reading must go on despite a consumer that is not taking them
+    /// (see [`reads_allowed`](Self::reads_allowed)), and QoS 0 ones, unlike
+    /// QoS 1/2, have no broker window to bound them.
     fn deliver_msg(&mut self, msg: Message, ack: Option<Packet>) -> Result<()> {
         if self.can_deliver() {
-            self.hand_over(msg, ack)
-        } else {
-            self.held.push_back((msg, ack));
-            Ok(())
+            return self.hand_over(msg, ack);
         }
+        if msg.qos == QoS::QoS0 {
+            let size = held_size(&msg);
+            let (n, bytes) = self.held_qos0;
+            let cfg = &self.offline_cfg;
+            let over = (cfg.max_held_qos0_msgs != 0 && n >= cfg.max_held_qos0_msgs)
+                || (cfg.max_held_qos0_bytes != 0 && bytes + size > cfg.max_held_qos0_bytes);
+            if over {
+                // This drops the *newest* message, the one just arrived:
+                // it keeps the held ones in order and costs nothing. A
+                // consumer that wants fresh data over old (telemetry, say)
+                // would rather lose the *oldest* QoS 0 message held, which
+                // means taking it from the middle of `held` (QoS 1/2 ones
+                // may be ahead of it). If that is ever wanted, make it a
+                // choice here, as `delete_oldest` is for the offline buffer.
+                if self.qos0_dropped == 0 {
+                    warn!(
+                        "The application is not taking messages and the client must keep \
+                         reading; dropping new QoS 0 messages beyond {n} held ({bytes} bytes)"
+                    );
+                }
+                self.qos0_dropped += 1;
+                return Ok(());
+            }
+            self.held_qos0 = (n + 1, bytes + size);
+        }
+        self.held.push_back((msg, ack));
+        Ok(())
     }
 
     /// Hands `msg` to the dispatcher thread, if anything there wants it, and
@@ -1353,6 +1397,10 @@ impl<B: Backend> Session<B> {
             let Some((msg, ack)) = self.held.pop_front() else {
                 break;
             };
+            if msg.qos == QoS::QoS0 {
+                let (n, bytes) = self.held_qos0;
+                self.held_qos0 = (n - 1, bytes - held_size(&msg));
+            }
             self.hand_over(msg, ack)?;
         }
         Ok(())
@@ -1367,6 +1415,8 @@ impl<B: Backend> Session<B> {
     /// await outside the session.
     fn flush_held(&mut self) -> Option<Parked> {
         let mut parked: Vec<Parked> = self.pending.take().into_iter().collect();
+        self.held_qos0 = (0, 0);
+        self.report_qos0_dropped();
         for (msg, _) in std::mem::take(&mut self.held) {
             let mut msg = Some(msg);
             if self.dispatch.wanted() {
@@ -2054,6 +2104,18 @@ impl<B: Backend> Session<B> {
         }
     }
 
+    /// Logs how many QoS 0 messages were dropped while the application was
+    /// not taking them, if any, and starts the count again.
+    fn report_qos0_dropped(&mut self) {
+        if self.qos0_dropped > 0 {
+            warn!(
+                "Dropped {} QoS 0 message(s) while the application was not taking them",
+                self.qos0_dropped
+            );
+            self.qos0_dropped = 0;
+        }
+    }
+
     /// Logs when the application stops taking messages, and how long for.
     ///
     /// Backpressure is deliberate, but from the outside a client that has
@@ -2071,6 +2133,7 @@ impl<B: Backend> Session<B> {
             }
             (false, Some(since)) => {
                 self.stalled_since = None;
+                self.report_qos0_dropped();
                 let waited = since.elapsed();
                 if waited >= STALL_WARN {
                     warn!(
@@ -6348,6 +6411,76 @@ mod tests {
             vec![1],
             "held messages are not acknowledged"
         );
+    }
+
+    /// While reading must go on with the consumer stuck, QoS 0 messages held
+    /// for it are capped, by count and by size; newer ones are dropped.
+    /// QoS 1/2 messages never are. What is held is delivered, in order,
+    /// once the consumer catches up. QoS 0 messages used to pile up without
+    /// limit.
+    #[test]
+    fn test_held_qos0_messages_are_capped() {
+        let qos0 = |ids: std::ops::RangeInclusive<u16>| -> Vec<u8> {
+            ids.flat_map(|i| {
+                wire_publish(
+                    &format!("m{i}"),
+                    QoS::QoS0,
+                    None,
+                    &Bytes::from_static(b"xxxx"),
+                )
+            })
+            .collect()
+        };
+        let run_and_drain = |h: &mut Harness, reader: &mut MockReader| -> Vec<String> {
+            let mut topics = Vec::new();
+            for _ in 0..20 {
+                {
+                    let run = pin!(h.session.run(reader, &h.cmd_rx));
+                    assert!(poll_until(run, Duration::from_millis(10)).is_none());
+                }
+                topics.extend(consume(&h.event_rx, &h.gate));
+            }
+            topics
+        };
+        // One of our own exchanges awaits its PUBCOMP, so reading goes on.
+        let awaiting = || {
+            let mut state = SessionState::default();
+            let (_tok, tx) = Token::<PublishResponse>::new();
+            state.insert(99, tx, PublishPhase::AwaitingPubComp, true);
+            state
+        };
+
+        // By count: three QoS 0 held.
+        let mut h = gated(Duration::ZERO, awaiting(), 1);
+        h.session.offline_cfg.max_held_qos0_msgs = 3;
+        let mut chunk = qos0(1..=10);
+        chunk.extend(qos1_msgs(11..=12));
+        let mut reader = MockReader::open_with([chunk]);
+        {
+            let run = pin!(h.session.run(&mut reader, &h.cmd_rx));
+            assert!(poll_until(run, SETTLE).is_none());
+        }
+        // m1 went to the dispatcher; m2–m4 held, m5–m10 dropped; the QoS 1
+        // messages held whatever the limit.
+        assert_eq!(h.session.held.len(), 5);
+        assert_eq!(h.session.held_qos0.0, 3);
+        assert_eq!(h.session.qos0_dropped, 6);
+        let delivered = run_and_drain(&mut h, &mut reader);
+        assert_eq!(delivered, ["m1", "m2", "m3", "m4", "m11", "m12"]);
+        assert_eq!(h.session.held_qos0, (0, 0));
+        assert_eq!(h.session.qos0_dropped, 0, "reported once reading resumed");
+
+        // By size: each message is "mN" + 4 bytes; room for two.
+        let mut h = gated(Duration::ZERO, awaiting(), 1);
+        h.session.offline_cfg.max_held_qos0_bytes = 12;
+        let mut reader = MockReader::open_with([qos0(1..=6)]);
+        {
+            let run = pin!(h.session.run(&mut reader, &h.cmd_rx));
+            assert!(poll_until(run, SETTLE).is_none());
+        }
+        assert_eq!(h.session.held_qos0, (2, 12));
+        assert_eq!(h.session.qos0_dropped, 3);
+        assert_eq!(run_and_drain(&mut h, &mut reader), ["m1", "m2", "m3"]);
     }
 
     /// While reading is paused a PINGRESP cannot be seen, so its absence is

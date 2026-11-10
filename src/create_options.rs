@@ -208,6 +208,15 @@ pub struct CreateOptions {
     /// When the maximum number of buffered messages is reached, delete the
     /// oldest rather than discard the newest.
     pub delete_oldest: bool,
+    /// The most inbound QoS 0 messages held for an application that is not
+    /// taking them; 0 means no limit. Defaults to 1024. See
+    /// [`CreateOptionsBuilder::max_held_qos0_messages`].
+    pub max_held_qos0_msgs: usize,
+    /// The most bytes (topics and payloads) of inbound QoS 0 messages held
+    /// for an application that is not taking them; 0 means no limit.
+    /// Defaults to 16 MiB. See
+    /// [`CreateOptionsBuilder::max_held_qos0_bytes`].
+    pub max_held_qos0_bytes: usize,
     /// Whether the first connection restores the messages in the persistence
     /// store. When `false`, the store is not read, and what it holds stays
     /// there; only a clean start clears it. Defaults to `true`.
@@ -353,6 +362,8 @@ impl Default for CreateOptions {
             max_buffered_msgs: 100,
             allow_send_any_time: false,
             delete_oldest: false,
+            max_held_qos0_msgs: 1024,
+            max_held_qos0_bytes: 16 * 1024 * 1024,
             restore_msgs: true,
             persist_qos0: true,
             persistence_sync: false,
@@ -532,6 +543,35 @@ impl CreateOptionsBuilder {
         self
     }
 
+    /// Sets the most inbound QoS 0 messages the client holds for an
+    /// application that is not taking them; 0 means no limit. The default
+    /// is 1024.
+    ///
+    /// Normally an application that falls behind makes the client stop
+    /// reading, and TCP flow control holds the broker back. But while one of
+    /// the client's own operations awaits an acknowledgement, it must keep
+    /// reading — the acknowledgement may be behind the backlog, and a
+    /// callback waiting on it would never return — so what it reads is held.
+    /// QoS 1/2 messages held are not acknowledged, and the broker's in-flight
+    /// window bounds them; QoS 0 messages have no such bound, and beyond
+    /// this limit, or [`max_held_qos0_bytes`](Self::max_held_qos0_bytes),
+    /// newly arrived ones are dropped, as at-most-once delivery allows. A
+    /// warning is logged when dropping starts, and the number dropped when
+    /// reading resumes.
+    pub fn max_held_qos0_messages(mut self, n: usize) -> Self {
+        self.opts.max_held_qos0_msgs = n;
+        self
+    }
+
+    /// Sets the most bytes, counting topics and payloads, of inbound QoS 0
+    /// messages the client holds for an application that is not taking
+    /// them; 0 means no limit. The default is 16 MiB. See
+    /// [`max_held_qos0_messages`](Self::max_held_qos0_messages).
+    pub fn max_held_qos0_bytes(mut self, n: usize) -> Self {
+        self.opts.max_held_qos0_bytes = n;
+        self
+    }
+
     /// Sets the maximum number of messages that can be buffered for delivery.
     ///
     /// When the client is off-line, this specifies the maximum number of
@@ -697,6 +737,25 @@ mod tests {
         assert!(!opts.send_while_disconnected);
         assert_eq!(100, opts.max_buffered_msgs);
         assert!(matches!(opts.persistence, PersistenceType::None));
+        assert_eq!(opts.max_held_qos0_msgs, 1024);
+        assert_eq!(opts.max_held_qos0_bytes, 16 * 1024 * 1024);
+    }
+
+    /// The held QoS 0 limits are set by the builder, zero included (no
+    /// limit), and reach the event loop's configuration.
+    #[test]
+    fn test_held_qos0_limits() {
+        let opts = CreateOptionsBuilder::new()
+            .max_held_qos0_messages(0)
+            .max_held_qos0_bytes(4096)
+            .finalize();
+        assert_eq!(opts.max_held_qos0_msgs, 0);
+        assert_eq!(opts.max_held_qos0_bytes, 4096);
+        #[cfg(any(feature = "tokio", feature = "smol"))]
+        {
+            let cfg = crate::runtime::OfflineConfig::from(&opts);
+            assert_eq!((cfg.max_held_qos0_msgs, cfg.max_held_qos0_bytes), (0, 4096));
+        }
     }
 
     #[test]
