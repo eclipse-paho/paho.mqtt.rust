@@ -712,6 +712,26 @@ impl AsyncClient {
     /// found before the request is sent — see
     /// [`try_disconnect`](Self::try_disconnect) — fails the token instead.
     ///
+    /// What is still outstanding when the connection closes (after the
+    /// timeout, if one was given) is treated differently by kind:
+    ///
+    /// * A QoS 1 or 2 publish belongs to the session, not the connection.
+    ///   If the session outlives the connection, its token stays pending:
+    ///   the next [`connect`](Self::connect) re-sends it if the server
+    ///   resumes the session, and the token completes with the server's
+    ///   answer; if the server does not, it fails with
+    ///   [`Error::SessionNotResumed`]. Inbound QoS 2 messages awaiting
+    ///   PUBREL are kept the same way.
+    /// * If the session ends with the connection — a v3 clean session, or a
+    ///   v5 one whose Session Expiry Interval is 0, the default, including
+    ///   one set to 0 by these options' properties — the publish fails at
+    ///   once with [`Error::SessionNotResumed`], and inbound QoS 2 state is
+    ///   dropped. The server has discarded its half of the session.
+    /// * A subscribe or unsubscribe fails with [`Error::Disconnected`].
+    ///
+    /// Dropping the client fails whatever is left with
+    /// [`Error::Disconnected`].
+    ///
     /// # Arguments
     ///
     /// `opts` Optional disconnect options. Specifying `None` will use
@@ -727,7 +747,9 @@ impl AsyncClient {
     /// Disconnect from the MQTT broker with a timeout.
     ///
     /// This will delay the disconnect for up to the specified timeout to
-    /// allow in-flight messages to complete.
+    /// allow in-flight messages to complete. What happens to those still
+    /// outstanding after it is described under
+    /// [`disconnect`](Self::disconnect).
     ///
     /// # Arguments
     ///

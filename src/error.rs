@@ -64,7 +64,9 @@ pub enum Error {
     /// the next connection does not continue the session — the server
     /// reports Session Present = 0, or the client asked for a clean start —
     /// the client discards its half of the session, as the specification
-    /// requires. Whether the message reached the server is unknown, so its
+    /// requires. It does so as the connection closes, without waiting for
+    /// another, when the session ends with it: a v3 clean session, or a v5
+    /// session whose Session Expiry Interval is 0. Whether the message reached the server is unknown, so its
     /// token fails with this rather than being re-sent into a session the
     /// server says no longer exists. Publish it again if it must be
     /// delivered.

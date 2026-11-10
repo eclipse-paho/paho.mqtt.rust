@@ -319,6 +319,19 @@ impl ConnectOptions {
     /// interval agreed at connect time, though it cannot revive a session
     /// that was established with an expiry of 0.
     ///
+    /// The client keeps its half of the session by the same rules. When a
+    /// connection closes with the interval at 0, its in-flight QoS 1/2
+    /// publishes fail with [`Error::SessionNotResumed`](crate::Error) and
+    /// nothing of the session is re-sent on a later connection; otherwise
+    /// they wait for the next connection to continue the session.
+    ///
+    /// One rule is deliberately not enforced: MQTT-3.2.2-4 has a client
+    /// with no session state close the connection if the server reports
+    /// Session Present = 1. Taken literally, that refuses a process that
+    /// starts again, without a persistence store, to collect the messages
+    /// the server kept for it; the client carries on instead, as Paho C
+    /// does.
+    ///
     /// The client's own persistence is independent of all this: it stores
     /// in-flight QoS 1/2 messages so they can be re-sent, but only the
     /// server decides whether the *session* (subscriptions, queued messages)

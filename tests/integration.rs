@@ -2317,11 +2317,31 @@ fn test_ws_proxy_sends_credentials() {
 // Session state across connections
 /////////////////////////////////////////////////////////////////////////////
 
+/// The connect properties of a v5 session that outlives its connection.
+/// Without a Session Expiry Interval the session ends when the connection
+/// closes (§3.1.2.11.2), and the client discards its state with it.
+#[cfg(test)]
+fn durable_props() -> mqtt::Properties {
+    let mut props = mqtt::Properties::new();
+    props.push(mqtt::Property::SessionExpiryInterval(3600));
+    props
+}
+
+/// v5 connect options for a durable session, without automatic reconnect.
+#[cfg(test)]
+fn durable_opts() -> mqtt::ConnectOptions {
+    mqtt::ConnectOptionsBuilder::new_v5()
+        .clean_start(false)
+        .properties(durable_props())
+        .finalize()
+}
+
 /// Connect options for a durable session that reconnects quickly.
 #[cfg(test)]
 fn resuming_opts() -> mqtt::ConnectOptions {
     mqtt::ConnectOptionsBuilder::new_v5()
         .clean_start(false)
+        .properties(durable_props())
         .automatic_reconnect(Duration::from_millis(100), Duration::from_millis(500))
         .finalize()
 }
@@ -2413,6 +2433,7 @@ fn test_one_file_store_for_every_server() {
     let opts = mqtt::ConnectOptionsBuilder::new_v5()
         .server_uris(&[&first.uri, &second.uri])
         .clean_start(false)
+        .properties(durable_props())
         .automatic_reconnect(Duration::from_millis(50), Duration::from_millis(100))
         .finalize();
     cli.connect(opts).wait().expect("connect failed");
@@ -2444,6 +2465,238 @@ fn test_one_file_store_for_every_server() {
 
     first.join();
     second.join();
+}
+
+/// An inbound QoS 2 message the client has PUBREC'd survives a
+/// `disconnect()` and `connect()` made by the application, without a store:
+/// the resumed session's PUBREL delivers it. The session state used to be
+/// dropped with the connection, so the PUBREL only got a PUBCOMP and the
+/// message was lost.
+#[test]
+fn test_inbound_qos2_completed_after_manual_reconnect() {
+    use mqtt::paho_mqtt_codec::{ConnAck, Packet, PubAck, Publish, ReasonCode};
+
+    let broker = common::spawn_broker_seq(2, |pkt, conn| match (pkt, conn) {
+        (Packet::Connect(_), 0) => vec![
+            Packet::ConnAck(ConnAck::new(false, ReasonCode::Success)),
+            Packet::Publish(Publish {
+                dup: false,
+                qos: mqtt::QoS::QoS2,
+                retain: false,
+                topic: "in".into(),
+                packet_id: Some(9),
+                payload: "x".into(),
+                properties: Default::default(),
+            }),
+        ]
+        .into(),
+        (Packet::Connect(_), _) => vec![
+            Packet::ConnAck(ConnAck::new(true, ReasonCode::Success)),
+            Packet::PubRel(PubAck::new(9)),
+        ]
+        .into(),
+        _ => common::Reply::none(),
+    });
+
+    let cli = mqtt::AsyncClient::new(broker.uri.clone()).unwrap();
+    let rx = cli.start_consuming();
+    let opts = durable_opts();
+    cli.connect(opts.clone()).wait().expect("connect failed");
+    assert!(broker.wait_until(TIMEOUT, |pkts| {
+        pkts.iter().any(|p| matches!(p, Packet::PubRec(_)))
+    }));
+    cli.disconnect(None).wait().expect("disconnect failed");
+
+    cli.connect(opts).wait().expect("reconnect failed");
+    let msg = loop {
+        match rx.recv_timeout(TIMEOUT) {
+            Ok(Some(msg)) => break msg,
+            Ok(None) => continue, // the end of the first connection
+            Err(e) => panic!("the message was never delivered: {e:?}"),
+        }
+    };
+    assert_eq!(msg.topic(), "in");
+    assert!(broker.wait_until(TIMEOUT, |pkts| {
+        pkts.iter().any(|p| matches!(p, Packet::PubComp(_)))
+    }));
+
+    cli.disconnect(None).wait().ok();
+    broker.join();
+}
+
+/// A publish still in flight when the application disconnects stays in the
+/// session, its token pending. The next `connect()` re-sends it if the
+/// server resumes the session, and the token completes with the answer;
+/// if the server does not, the token fails with `SessionNotResumed`. A
+/// subscribe still waiting fails at the disconnect, since it is a request,
+/// not session state. Publishes used to fail with `Disconnected` and,
+/// without a store, be dropped.
+#[test]
+fn test_inflight_publish_survives_manual_reconnect() {
+    use mqtt::paho_mqtt_codec::{ConnAck, Packet, PubAck, ReasonCode};
+
+    for resumed in [true, false] {
+        let broker = common::spawn_broker_seq(2, move |pkt, conn| match (pkt, conn) {
+            (Packet::Connect(_), 0) => {
+                vec![Packet::ConnAck(ConnAck::new(false, ReasonCode::Success))].into()
+            }
+            (Packet::Connect(_), _) => {
+                vec![Packet::ConnAck(ConnAck::new(resumed, ReasonCode::Success))].into()
+            }
+            // Only the second connection acknowledges anything.
+            (Packet::Publish(p), 1) => match p.packet_id {
+                Some(id) => vec![Packet::PubAck(PubAck::new(id))].into(),
+                None => common::Reply::none(),
+            },
+            _ => common::Reply::none(),
+        });
+
+        let cli = mqtt::AsyncClient::new(broker.uri.clone()).unwrap();
+        let opts = durable_opts();
+        cli.connect(opts.clone()).wait().expect("connect failed");
+
+        let mut tok = cli.publish(mqtt::Message::new(topic!("manual"), "x", mqtt::QOS_1));
+        let sub = cli.subscribe(topic!("manual/sub"), mqtt::QOS_1);
+        assert!(broker.wait_until(TIMEOUT, |pkts| {
+            pkts.iter().any(|p| matches!(p, Packet::Subscribe(_)))
+        }));
+        cli.disconnect_after(Duration::from_millis(50))
+            .wait()
+            .expect("disconnect failed");
+
+        let err = sub.wait_for(TIMEOUT).unwrap_err();
+        assert!(matches!(err, mqtt::Error::Disconnected), "{err}");
+        assert!(tok.try_wait().is_none(), "the publish is still in flight");
+
+        cli.connect(opts).wait().expect("reconnect failed");
+        let res = tok.wait_for(TIMEOUT);
+        if resumed {
+            res.expect("the re-sent publish was acknowledged");
+            let dups: Vec<bool> = broker.received_matching(|p| match p {
+                Packet::Publish(p) => Some(p.dup),
+                _ => None,
+            });
+            assert_eq!(dups, [false, true], "sent, then re-sent with DUP");
+        } else {
+            assert!(
+                matches!(res, Err(mqtt::Error::SessionNotResumed)),
+                "{res:?}"
+            );
+        }
+
+        cli.disconnect(None).wait().ok();
+        broker.join();
+    }
+}
+
+/// A session that ends with its connection takes the client's state with
+/// it: a v3.x clean session (v3.1.1 §3.1.2.4: its state *"MUST NOT be
+/// reused in any subsequent Session"*), or a v5 one whose Session Expiry
+/// Interval is 0 when the connection closes (§3.1.2.11.2) — the CONNECT's,
+/// or the client's DISCONNECT's, which may shorten it but not lengthen it
+/// from 0 (§3.14.2.2.2). A publish in flight fails at the disconnect with
+/// `SessionNotResumed`, and the next connection does not re-send it, even
+/// on v3.1, whose CONNACK cannot say that the session is gone. A session
+/// that outlives the connection keeps it, for the next one to complete.
+#[test]
+fn test_session_that_ends_with_its_connection_is_discarded() {
+    use mqtt::paho_mqtt_codec::{ConnAck, Packet, PubAck, ReasonCode};
+
+    let expiry = |secs: Option<u32>| {
+        let mut props = mqtt::Properties::new();
+        if let Some(secs) = secs {
+            props.push(mqtt::Property::SessionExpiryInterval(secs));
+        }
+        props
+    };
+
+    // (protocol version, first connection's clean flag, CONNECT expiry,
+    // DISCONNECT expiry, whether the session ends with the connection)
+    let cases = [
+        (mqtt::MQTT_VERSION_3_1, true, None, None, true),
+        (mqtt::MQTT_VERSION_3_1_1, true, None, None, true),
+        (mqtt::MQTT_VERSION_3_1, false, None, None, false),
+        (mqtt::MQTT_VERSION_5, false, None, None, true),
+        (mqtt::MQTT_VERSION_5, false, Some(3600), Some(0), true),
+        (mqtt::MQTT_VERSION_5, false, None, Some(3600), true),
+        (mqtt::MQTT_VERSION_5, true, Some(3600), None, false),
+    ];
+
+    for (ver, clean, connect_expiry, disconnect_expiry, ends) in cases {
+        let case = format!("{ver} clean={clean} {connect_expiry:?}/{disconnect_expiry:?}");
+        // A compliant broker: it has the session on the second connection
+        // only if the session outlived the first. A v3.1 CONNACK has no
+        // Session Present flag to say so (the bit is reserved).
+        let present = !ends && ver != mqtt::MQTT_VERSION_3_1;
+        let broker = common::spawn_broker_seq(2, move |pkt, conn| match (pkt, conn) {
+            (Packet::Connect(_), 0) => {
+                vec![Packet::ConnAck(ConnAck::new(false, ReasonCode::Success))].into()
+            }
+            (Packet::Connect(_), _) => {
+                vec![Packet::ConnAck(ConnAck::new(present, ReasonCode::Success))].into()
+            }
+            (Packet::Publish(p), 1) => match p.packet_id {
+                Some(id) => vec![Packet::PubAck(PubAck::new(id))].into(),
+                None => common::Reply::none(),
+            },
+            _ => common::Reply::none(),
+        });
+
+        let cli = mqtt::AsyncClient::new(broker.uri.clone()).unwrap();
+        let opts = |clean: bool| {
+            let mut b = mqtt::ConnectOptionsBuilder::with_mqtt_version(ver);
+            if ver == mqtt::MQTT_VERSION_5 {
+                b.clean_start(clean).properties(expiry(connect_expiry));
+            } else {
+                b.clean_session(clean);
+            }
+            b.finalize()
+        };
+        cli.connect(opts(clean)).wait().expect("connect failed");
+
+        let mut tok = cli.publish(mqtt::Message::new(topic!("ends"), "x", mqtt::QOS_1));
+        assert!(broker.wait_until(TIMEOUT, |pkts| {
+            pkts.iter().any(|p| matches!(p, Packet::Publish(_)))
+        }));
+        let mut disc = mqtt::DisconnectOptionsBuilder::new();
+        disc.timeout(Duration::from_millis(50));
+        if disconnect_expiry.is_some() {
+            disc.properties(expiry(disconnect_expiry));
+        }
+        cli.disconnect(disc.finalize())
+            .wait()
+            .expect("disconnect failed");
+
+        if ends {
+            let res = tok.try_wait();
+            assert!(
+                matches!(res, Some(Err(mqtt::Error::SessionNotResumed))),
+                "{case}: failed at the disconnect: {res:?}"
+            );
+        } else {
+            assert!(
+                tok.try_wait().is_none(),
+                "{case}: kept for the next connection"
+            );
+        }
+
+        // The next connection asks to continue the session.
+        cli.connect(opts(false))
+            .wait()
+            .unwrap_or_else(|e| panic!("{case}: reconnect failed: {e}"));
+        if !ends {
+            tok.wait_for(TIMEOUT)
+                .unwrap_or_else(|e| panic!("{case}: not completed: {e}"));
+        }
+        cli.disconnect(None).wait().ok();
+        let publishes = broker.received_matching(|p| matches!(p, Packet::Publish(_)).then_some(()));
+        assert_eq!(
+            publishes.len(),
+            if ends { 1 } else { 2 },
+            "{case}: re-sent only into a session that survived"
+        );
+        broker.join();
+    }
 }
 
 /// A QoS 1 publish left unacknowledged when the connection drops is re-sent,

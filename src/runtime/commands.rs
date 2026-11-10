@@ -433,6 +433,69 @@ pub(crate) fn negotiated_keep_alive(params: &ConnectParams, connack: &ConnAck) -
     }
 }
 
+/// How long the session outlives its network connection, which decides
+/// whether the client keeps its session state when a connection ends.
+///
+/// MQTT v3.x has no interval: a session started with Clean Session = 1
+/// *"lasts as long as the Network Connection"* and its state *"MUST NOT be
+/// reused in any subsequent Session"*; any other is kept (v3.1.1
+/// §3.1.2.4). MQTT v5 replaced the flag's second half with the Session
+/// Expiry Interval: 0, the default, means *"the Session ends when the
+/// Network Connection is closed"* (§3.1.2.11.2). The interval the client
+/// asks for in its CONNECT can be replaced by the server's in the CONNACK
+/// (§3.2.2.3.2), and by the client's own in its DISCONNECT (§3.14.2.2.2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SessionExpiry {
+    /// The interval in force, in seconds; `u32::MAX` never expires.
+    secs: u32,
+    /// Whether the CONNECT asked for 0, after which a DISCONNECT may not
+    /// ask for more.
+    connect_zero: bool,
+}
+
+impl SessionExpiry {
+    /// The interval agreed by the CONNECT and its CONNACK.
+    pub(crate) fn negotiated(params: &ConnectParams, connack: &ConnAck) -> Self {
+        if !params.ver.is_v5() {
+            let secs = if params.clean_start { 0 } else { u32::MAX };
+            return Self {
+                secs,
+                connect_zero: secs == 0,
+            };
+        }
+        let asked = params
+            .props
+            .get_u32(PropertyId::SessionExpiryInterval)
+            .unwrap_or(0);
+        let secs = connack
+            .properties
+            .get_u32(PropertyId::SessionExpiryInterval)
+            .unwrap_or(asked);
+        Self {
+            secs,
+            connect_zero: asked == 0,
+        }
+    }
+
+    /// Takes in the properties of a DISCONNECT the client has sent.
+    ///
+    /// A non-zero interval after a CONNECT that asked for 0 is a Protocol
+    /// Error, which the server does not treat as a valid DISCONNECT
+    /// (§3.14.2.2.2), so it changes nothing.
+    pub(crate) fn on_disconnect(&mut self, props: &CodecProperties) {
+        if let Some(secs) = props.get_u32(PropertyId::SessionExpiryInterval)
+            && (secs == 0 || !self.connect_zero)
+        {
+            self.secs = secs;
+        }
+    }
+
+    /// Whether the session ends with the connection, its state with it.
+    pub(crate) fn ends_with_connection(&self) -> bool {
+        self.secs == 0
+    }
+}
+
 /// The client identifier the server assigned, when the client sent an empty
 /// one (MQTT v5 §3.2.2.3.7).
 pub(crate) fn assigned_client_id(connack: &ConnAck) -> Option<String> {
@@ -634,6 +697,71 @@ mod tests {
         let mut props = CodecProperties::new();
         props.push(Property::MaximumPacketSize(0));
         assert_eq!(params_with(props).max_packet_size(), MAX_PACKET_SIZE);
+    }
+
+    /// v3.x: a clean session ends with its connection, any other is kept.
+    /// v5: the CONNECT's interval, 0 by default, replaced by the CONNACK's,
+    /// then by the client's DISCONNECT — except that one may not lengthen
+    /// an interval the CONNECT asked to be 0 (§3.14.2.2.2).
+    #[test]
+    fn test_session_expiry() {
+        let ack = connack_with(vec![]);
+        for ver in [MqttVersion::V3_1, MqttVersion::V3_1_1] {
+            for clean in [true, false] {
+                let mut p = params_with(CodecProperties::new());
+                p.ver = ver;
+                p.clean_start = clean;
+                let e = SessionExpiry::negotiated(&p, &ack);
+                assert_eq!(e.ends_with_connection(), clean, "{ver} clean={clean}");
+            }
+        }
+
+        let v5 = |connect: Option<u32>, connack: Option<u32>| {
+            let mut props = CodecProperties::new();
+            if let Some(secs) = connect {
+                props.push(Property::SessionExpiryInterval(secs));
+            }
+            let mut p = params_with(props);
+            p.ver = MqttVersion::V5;
+            // Clean Start does not decide it in v5.
+            p.clean_start = true;
+            let ack = connack_with(
+                connack
+                    .map(Property::SessionExpiryInterval)
+                    .into_iter()
+                    .collect(),
+            );
+            SessionExpiry::negotiated(&p, &ack)
+        };
+        let disconnect = |mut e: SessionExpiry, secs: u32| {
+            let mut props = CodecProperties::new();
+            props.push(Property::SessionExpiryInterval(secs));
+            e.on_disconnect(&props);
+            e.ends_with_connection()
+        };
+
+        assert!(v5(None, None).ends_with_connection(), "0 by default");
+        assert!(v5(Some(0), None).ends_with_connection());
+        assert!(!v5(Some(60), None).ends_with_connection());
+        assert!(
+            !v5(None, Some(60)).ends_with_connection(),
+            "the server's wins"
+        );
+        assert!(
+            v5(Some(60), Some(0)).ends_with_connection(),
+            "the server's wins"
+        );
+
+        assert!(disconnect(v5(Some(60), None), 0), "ended by the DISCONNECT");
+        assert!(!disconnect(v5(Some(60), None), 30));
+        assert!(disconnect(v5(None, None), 30), "not lengthened from 0");
+        // The CONNECT asked for 0, so this DISCONNECT is a Protocol Error
+        // and changes nothing: the server's 60 stands.
+        assert!(!disconnect(v5(None, Some(60)), 30));
+        assert!(disconnect(v5(None, Some(60)), 0), "shortening is allowed");
+        let mut e = v5(Some(60), None);
+        e.on_disconnect(&CodecProperties::new());
+        assert!(!e.ends_with_connection(), "no interval, no change");
     }
 
     fn connack_with(props: Vec<Property>) -> ConnAck {

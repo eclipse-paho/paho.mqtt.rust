@@ -60,8 +60,8 @@ use paho_mqtt_codec::{
 use super::{
     backend::{Backend, READ_CHUNK, Sleep},
     commands::{
-        Command, ConnectParams, Event, MAX_PACKET_IDS, OfflineConfig, SessionLimits, StateCell,
-        StateView, assigned_client_id, negotiated_keep_alive,
+        Command, ConnectParams, Event, MAX_PACKET_IDS, OfflineConfig, SessionExpiry, SessionLimits,
+        StateCell, StateView, assigned_client_id, negotiated_keep_alive,
     },
     outbox::Outbox,
     persist::{PersistWorker, Store},
@@ -745,6 +745,17 @@ impl SessionState {
         Some(rec)
     }
 
+    /// Fails the (un)subscribes still awaiting acknowledgement, with
+    /// [`Error::Disconnected`], and frees their packet identifiers.
+    fn fail_pending_acks(&mut self) {
+        for (_, p) in self.pending_sub.drain() {
+            p.tx.complete(Err(Error::Disconnected));
+        }
+        for (_, p) in self.pending_unsub.drain() {
+            p.tx.complete(Err(Error::Disconnected));
+        }
+    }
+
     /// Marks the record under `id` as waiting for a window slot.
     fn mark_unsent(&mut self, id: u16) {
         if let Some(rec) = self.inflight.get_mut(&id)
@@ -939,6 +950,7 @@ struct Negotiated {
     ver: MqttVersion,
     keep_alive: Duration,
     limits: SessionLimits,
+    expiry: SessionExpiry,
 }
 
 /// Where inbound messages and news of the connection go, and how many
@@ -987,6 +999,9 @@ struct Session<B: Backend> {
     ver: MqttVersion,
     /// Keep-alive interval.
     keep_alive: Duration,
+    /// How long the session outlives this connection; a DISCONNECT the
+    /// client sends can change it.
+    expiry: SessionExpiry,
     /// Encoded packets not yet accepted by the transport.
     out: Outbox,
     /// Inbound bytes not yet parsed into packets. Starts out holding
@@ -1074,6 +1089,7 @@ impl<B: Backend> Session<B> {
             ver,
             keep_alive,
             limits,
+            expiry,
         } = negotiated;
         let Delivery {
             event_tx,
@@ -1091,6 +1107,7 @@ impl<B: Backend> Session<B> {
             writer,
             ver,
             keep_alive,
+            expiry,
             out: Outbox::new(flush_needed),
             read_buf,
             state,
@@ -1979,8 +1996,19 @@ impl<B: Backend> Session<B> {
             self.drain_pending(reader, req.timeout, &mut cmds).await;
         }
         let disc = Disconnect::with_properties(req.reason_code, req.props);
-        if self.queue(&Packet::Disconnect(disc)).is_ok() {
+        let packet = Packet::Disconnect(disc);
+        if self.queue(&packet).is_ok() {
+            // A Session Expiry Interval in the DISCONNECT replaces the one
+            // agreed at connect time.
+            if let Packet::Disconnect(disc) = &packet {
+                self.expiry.on_disconnect(&disc.properties);
+            }
             self.drain_outbox(reader, CLOSE_CAP, cmds).await;
+        }
+        // Before the disconnect is reported done, so that a caller who
+        // waited for it sees the tokens already settled; see `run_event_loop`.
+        if self.expiry.ends_with_connection() {
+            self.discard_unresumable();
         }
         self.conn_state.set(ConnectionState::Disconnected);
         req.tx.complete(Ok(()));
@@ -3149,11 +3177,24 @@ pub(crate) async fn run_event_loop<B: Backend>(
     // A `connect()` made while a disconnect was in progress, run as soon as
     // it has completed.
     let mut held_connect: Option<Command> = None;
+    // Message state belongs to the session, not to a connection, nor to one
+    // `connect()`: it is handed from each connection to the next, whether
+    // auto-reconnect makes it or the application does after a
+    // `disconnect()` or a loss. Whether the next connection continues the
+    // session is the server's to say; when it does not — a clean start
+    // among the cases — `resume` discards the state, failing the tokens.
+    // Dropping it here instead lost inbound QoS 2 messages the server then
+    // completed with PUBREL, and outbound ones it would have acknowledged.
+    let mut state = SessionState::default();
 
     'outer: loop {
-        // Message state belongs to the session, not the connection, so it is
-        // built here and handed from one connection to the next.
-        let mut state = SessionState::default();
+        // Back to waiting for a `connect()`, by whatever path — a
+        // disconnect, a loss without auto-reconnect, a disconnect while
+        // auto-reconnect was backing off. With no connection coming that
+        // the application has not asked for, the (un)subscribes still
+        // waiting are answered now. They are requests, not session state,
+        // and re-sending them on some later `connect()` would surprise.
+        state.fail_pending_acks();
 
         // ---- Wait for a Connect command ----
         let (mut job, mut tx_opt) = loop {
@@ -3330,6 +3371,7 @@ pub(crate) async fn run_event_loop<B: Backend>(
             // ---- Connected ----
             let limits = SessionLimits::new(&job.params, &connack);
             let keep_alive = negotiated_keep_alive(&job.params, &connack);
+            let expiry = SessionExpiry::negotiated(&job.params, &connack);
             let resumed = session_resumed(&job.params, &connack);
 
             // A clean start throws away whatever the previous session left
@@ -3389,6 +3431,7 @@ pub(crate) async fn run_event_loop<B: Backend>(
                     ver: job.params.ver,
                     keep_alive,
                     limits,
+                    expiry,
                 },
                 Delivery {
                     event_tx: event_tx.clone(),
@@ -3411,9 +3454,18 @@ pub(crate) async fn run_event_loop<B: Backend>(
             // Whatever was received and held back is delivered, ahead of the
             // end-of-connection notice below.
             let flushed = session.flush_held();
+            // A session that ends with its connection takes its state with
+            // it (v3.1.1 §3.1.2.4, v5 §3.1.2.11.2): the server has
+            // discarded its half, so nothing in flight can be completed and
+            // no PUBREL will come for what was received. The tokens are
+            // told now, rather than at a next connection that may never be
+            // made, and the store entries go before the store is closed.
+            if session.expiry.ends_with_connection() {
+                session.discard_unresumable();
+            }
             session.persist.close();
             // Carry what is still in flight into the next connection of this
-            // session; a clean disconnect below drops it.
+            // session, however it is made.
             state = session.state;
             // Take the streams, the store and the buffer back for the next
             // connection, and any `connect()` made during a disconnect.
@@ -3744,6 +3796,10 @@ mod tests {
                 ver: MqttVersion::V5,
                 keep_alive,
                 limits: test_limits(),
+                expiry: SessionExpiry::negotiated(
+                    &params(MqttVersion::V3_1_1, false),
+                    &ConnAck::new(true, ReasonCode::Success),
+                ),
             },
             Delivery {
                 event_tx,
@@ -4871,17 +4927,29 @@ mod tests {
         }
     }
 
-    /// A clean disconnect ends the session: an (un)subscribe still awaiting
-    /// its acknowledgement then fails rather than waiting for a connection
-    /// that belongs to a new session.
+    /// When the event loop goes back to waiting for a `connect()`, an
+    /// (un)subscribe still awaiting its acknowledgement fails rather than
+    /// waiting for a connection the application may never make. A publish
+    /// in flight does not: it is session state, kept for that connection.
     #[test]
     fn test_pending_subscribe_fails_when_the_session_ends() {
         let mut h = harness(BytesMut::new(), Duration::ZERO, SessionState::default());
         let (mut sub_tok, c) = subscribe_cmd("a/#");
         h.session.handle_command(c).unwrap();
-        // What the event loop does after a clean disconnect: a new session.
-        h.session.state = SessionState::default();
+        let (mut unsub_tok, c) = unsubscribe_cmd("b");
+        h.session.handle_command(c).unwrap();
+        let (mut pub_tok, c) = publish_cmd("p", QoS::QoS1, Bytes::from_static(b"1"));
+        h.session.handle_command(c).unwrap();
+
+        // What the event loop does on its way back to waiting.
+        h.session.state.fail_pending_acks();
         assert!(matches!(sub_tok.try_wait(), Some(Err(Error::Disconnected))));
+        assert!(matches!(
+            unsub_tok.try_wait(),
+            Some(Err(Error::Disconnected))
+        ));
+        assert!(pub_tok.try_wait().is_none());
+        assert!(h.session.id_free() && h.session.state.pending_sub.is_empty());
     }
 
     // ---- The write pipeline ----

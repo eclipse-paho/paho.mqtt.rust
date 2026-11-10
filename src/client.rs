@@ -116,6 +116,11 @@ impl Client {
 
     /// Disconnects from the MQTT broker.
     ///
+    /// A QoS 1 or 2 publish still in flight is kept for the next
+    /// [`connect`](Self::connect) if the session outlives the connection,
+    /// so a `publish` blocked on another thread goes on waiting for its
+    /// answer, up to its timeout; see [`AsyncClient::disconnect`].
+    ///
     /// ## Arguments
     ///
     /// * `opt_opts` Optional disconnect options. Specifying `None` will use
