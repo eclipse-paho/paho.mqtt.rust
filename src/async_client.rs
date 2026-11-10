@@ -56,9 +56,9 @@ use crate::{
     },
     token::Token,
 };
+use async_channel::Sender as AsyncSender;
 use bytes::Bytes;
 use crossbeam_channel::{self as sync_channel, Sender as SyncSender};
-use async_channel::Sender as AsyncSender;
 use paho_mqtt_codec::types::*;
 use std::{
     sync::{
@@ -616,14 +616,23 @@ impl AsyncClient {
         self.try_connect(connopts)
     }
 
-    /// Disconnects from the MQTT broker.
+    /// Attempts to disconnect from the MQTT broker, but returns an error
+    /// immediately if the request can't be started.
+    ///
+    /// That is a failure found before anything goes on the wire: a v5
+    /// reason code or v5 properties on a connection of an earlier version
+    /// ([`Error::WrongMqttVersion`]), or a client whose background session
+    /// has shut down ([`Error::Disconnected`]). Either way the message
+    /// stream is left open.
+    ///
+    /// On success the returned token tracks the disconnect itself.
     ///
     /// # Arguments
     ///
     /// `opts` Optional disconnect options. Specifying `None` will use
     ///        default of immediate (zero timeout) disconnect.
     ///
-    pub fn disconnect<T>(&self, opts: T) -> Token<()>
+    pub fn try_disconnect<T>(&self, opts: T) -> Result<Token<()>>
     where
         T: Into<Option<DisconnectOptions>>,
     {
@@ -633,12 +642,8 @@ impl AsyncClient {
         // A v5 reason code and v5 properties cannot go on a v3 connection;
         // the codec refuses to encode either, and the DISCONNECT would never
         // be sent.
-        if let Err(err) = self
-            .require_v5_for_props(&opts.props)
-            .and_then(|()| self.require_v5_for_disconnect_reason(opts.reason_code))
-        {
-            return Token::<()>::from_err(err);
-        }
+        self.require_v5_for_props(&opts.props)?;
+        self.require_v5_for_disconnect_reason(opts.reason_code)?;
 
         let (tok, comp) = Token::<()>::new();
 
@@ -650,7 +655,7 @@ impl AsyncClient {
         };
 
         if self.inner.cmd_tx.send_blocking(cmd).is_err() {
-            return Token::<()>::from_err(Error::Disconnected);
+            return Err(Error::Disconnected);
         }
 
         // Signal the end of the message stream. The callback runs outside
@@ -673,7 +678,25 @@ impl AsyncClient {
                 .restore(cb, generation);
         }
 
-        tok
+        Ok(tok)
+    }
+
+    /// Disconnects from the MQTT broker.
+    ///
+    /// Returns a token to track the progress of the operation. A failure
+    /// found before the request is sent — see
+    /// [`try_disconnect`](Self::try_disconnect) — fails the token instead.
+    ///
+    /// # Arguments
+    ///
+    /// `opts` Optional disconnect options. Specifying `None` will use
+    ///        default of immediate (zero timeout) disconnect.
+    ///
+    pub fn disconnect<T>(&self, opts: T) -> Token<()>
+    where
+        T: Into<Option<DisconnectOptions>>,
+    {
+        self.try_disconnect(opts).unwrap_or_else(Token::from_err)
     }
 
     /// Disconnect from the MQTT broker with a timeout.
@@ -2401,6 +2424,41 @@ mod tests {
         let cli = test_client();
         assert!(cli.inner.cmd_tx.close());
         assert!(matches!(cli.try_reconnect(), Err(Error::Disconnected)));
+    }
+
+    /// A v5 reason code can't go on a v3 connection, so the disconnect is
+    /// refused before it is queued, and the message stream is not ended.
+    #[test]
+    fn test_try_disconnect_rejects_a_v5_reason_on_v3() {
+        let cli = AsyncClient::new(
+            CreateOptionsBuilder::new()
+                .server_uri("mqtt://localhost:1883")
+                .mqtt_version(MqttVersion::V3_1_1)
+                .finalize(),
+        )
+        .unwrap();
+        let calls = counter();
+        let c = calls.clone();
+        cli.set_message_callback(move |_, _| *c.lock().unwrap() += 1);
+
+        let opts = crate::DisconnectOptionsBuilder::new()
+            .reason_code(ReasonCode::DisconnectWithWillMessage)
+            .finalize();
+        assert!(matches!(
+            cli.try_disconnect(opts),
+            Err(Error::WrongMqttVersion)
+        ));
+        assert_eq!(*calls.lock().unwrap(), 0, "the stream was ended");
+    }
+
+    /// With the command channel closed the disconnect can't be queued.
+    #[test]
+    fn test_try_disconnect_fails_when_disconnected() {
+        let cli = test_client();
+        assert!(cli.inner.cmd_tx.close());
+        assert!(matches!(cli.try_disconnect(None), Err(Error::Disconnected)));
+        let err = cli.disconnect(None).wait().unwrap_err();
+        assert!(matches!(err, Error::Disconnected), "{err}");
     }
 
     /// `connect` reports the same failure through its token.
