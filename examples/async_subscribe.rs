@@ -102,7 +102,9 @@ fn main() {
         cli.connect(conn_opts).await?;
 
         println!("Subscribing to topics: {:?}", topics);
-        cli.subscribe_many(&topics, &qos).await?;
+        // The first `?` catches a request that can't be sent, like a bad
+        // QoS; the second, the broker's answer to the subscription.
+        cli.try_subscribe_many(&topics, &qos)?.await?;
 
         // Just loop on incoming messages.
         println!("Waiting for messages...");

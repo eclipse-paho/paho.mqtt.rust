@@ -11,7 +11,8 @@
 //! second.
 //!
 //! This sample demonstrates:
-//!   - Connecting to an MQTT broker
+//!   - Connecting to an MQTT broker, telling a bad request apart from a
+//!     failure to reach the broker
 //!   - Repeatedly publishing message asynchronously
 //
 
@@ -73,8 +74,16 @@ fn main() {
         process::exit(1);
     });
 
-    // Connect and wait for it to complete or fail
-    if let Err(err) = cli.connect(None).wait() {
+    // Connect and wait for it to complete or fail. A problem with the
+    // request itself, such as a server URI that can't be parsed, is
+    // reported right away by `try_connect()`; a failure to reach the
+    // broker comes through the token.
+    let tok = cli.try_connect(None).unwrap_or_else(|err| {
+        println!("Invalid connect request: {}", err);
+        process::exit(1);
+    });
+
+    if let Err(err) = tok.wait() {
         println!("Unable to connect: {}", err);
         process::exit(1);
     }

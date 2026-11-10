@@ -238,6 +238,58 @@ fn subscribe_and_receive(qos: mqtt::QoS) {
     sub.disconnect(None).wait().ok();
 }
 
+// The try_ calls return working tokens when the request can be sent: the
+// whole connect / subscribe / receive / unsubscribe / disconnect cycle,
+// driven through them alone.
+#[test]
+fn test_try_calls_round_trip() {
+    let topic = topic!("try_calls");
+    let topics = [topic!("try_calls/a"), topic!("try_calls/b")];
+
+    let cli = mqtt::AsyncClient::new(HOST).unwrap();
+    cli.try_connect(None)
+        .expect("try_connect refused")
+        .wait()
+        .expect("connect failed");
+    let rx = cli.start_consuming();
+
+    cli.try_subscribe(topic, mqtt::QOS_1)
+        .expect("try_subscribe refused")
+        .wait()
+        .expect("subscribe failed");
+    cli.try_subscribe_many_same_qos(&topics, mqtt::QOS_1)
+        .expect("try_subscribe_many_same_qos refused")
+        .wait()
+        .expect("subscribe many failed");
+
+    for t in [topic, topics[0], topics[1]] {
+        cli.try_publish(mqtt::Message::new(t, "try", mqtt::QOS_1))
+            .expect("try_publish refused")
+            .wait()
+            .expect("publish failed");
+        let msg = rx
+            .recv_timeout(TIMEOUT)
+            .expect("recv timed out")
+            .expect("connection lost");
+        assert_eq!(msg.topic(), t);
+    }
+
+    cli.try_unsubscribe(topic)
+        .expect("try_unsubscribe refused")
+        .wait()
+        .expect("unsubscribe failed");
+    cli.try_unsubscribe_many(&topics)
+        .expect("try_unsubscribe_many refused")
+        .wait()
+        .expect("unsubscribe many failed");
+
+    cli.try_disconnect(None)
+        .expect("try_disconnect refused")
+        .wait()
+        .expect("disconnect failed");
+    assert!(!cli.is_connected());
+}
+
 #[test]
 fn test_subscribe_receive_qos0() {
     subscribe_and_receive(mqtt::QoS::QoS0);
