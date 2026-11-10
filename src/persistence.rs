@@ -345,25 +345,81 @@ impl From<MemPersistence> for PersistenceType {
 //                          FilePersistence
 /////////////////////////////////////////////////////////////////////////////
 
-/// Sanitizes a string for use as a directory-name component.
-fn sanitize_path_component(s: &str) -> String {
-    s.chars()
-        .map(|c| match c {
-            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
-            c => c,
-        })
-        .collect()
+/// The most bytes of the readable part of a store's directory name; the
+/// name adds a `-` and 16 hex digits. Well inside the 255-byte limit of
+/// common file systems, and the 143 of eCryptfs.
+const STORE_NAME_MAX: usize = 100;
+
+/// The name of the store directory for `client_id` and `server_uri`.
+///
+/// It is `<client_id>-<server_uri>-<hash>`: the two made safe for a path,
+/// so a person can tell which store is which, and cut short if long; then
+/// a hash of the two exactly as given, which is what tells stores apart.
+/// Making a name safe loses information — `a/b` and `a_b` come out the
+/// same, and the `-` between client and server cannot be told from one
+/// within either — so without the hash two clients could share a store,
+/// each restoring and publishing the other's messages and clearing its
+/// store on a clean start.
+fn store_dir_name(client_id: &str, server_uri: &str) -> String {
+    let safe = |s: &str| -> String {
+        s.chars()
+            .map(|c| match c {
+                '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+                c if c.is_control() => '_',
+                c => c,
+            })
+            .collect()
+    };
+    let mut name = format!("{}-{}", safe(client_id), safe(server_uri));
+    if name.len() > STORE_NAME_MAX {
+        let mut end = STORE_NAME_MAX;
+        while !name.is_char_boundary(end) {
+            end -= 1;
+        }
+        name.truncate(end);
+    }
+
+    // The ID's length first, so that no pair's bytes run into another's.
+    let mut hash = Fnv1a::new();
+    hash.write(&(client_id.len() as u64).to_le_bytes());
+    hash.write(client_id.as_bytes());
+    hash.write(server_uri.as_bytes());
+    format!("{name}-{:016x}", hash.finish())
+}
+
+/// 64-bit FNV-1a. A store's name must come out the same from every build
+/// of the library that will ever open it, which `std`'s hashers do not
+/// promise across Rust releases.
+struct Fnv1a(u64);
+
+impl Fnv1a {
+    fn new() -> Self {
+        Self(0xcbf2_9ce4_8422_2325)
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 ^= u64::from(b);
+            self.0 = self.0.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+
+    fn finish(&self) -> u64 {
+        self.0
+    }
 }
 
 /// File-system persistence store.
 ///
 /// Stores each entry as a separate file under a subdirectory of the given
-/// base directory. The subdirectory is named
-/// `<client_id>-<server_uri>` (with characters invalid in path names
-/// replaced by underscores), where `server_uri` is the one the client was
-/// created with, so a separate store is maintained for each client. A
-/// client that connects to several servers keeps one store for all of
-/// them; see [`ClientPersistence::open`].
+/// base directory, one per client. The subdirectory is named
+/// `<client_id>-<server_uri>-<hash>`, where `server_uri` is the one the
+/// client was created with. The first two are there to be read, with
+/// characters invalid in path names replaced by underscores and cut short
+/// if long; the hash, of the client ID and URI exactly as given, is what
+/// keeps the stores of different clients apart. A client that connects to
+/// several servers keeps one store for all of them; see
+/// [`ClientPersistence::open`].
 pub struct FilePersistence {
     /// Root directory supplied at construction time.
     base_dir: PathBuf,
@@ -422,12 +478,7 @@ impl FilePersistence {
 
 impl ClientPersistence for FilePersistence {
     fn open(&mut self, client_id: &str, server_uri: &str) -> Result<()> {
-        let dir_name = format!(
-            "{}-{}",
-            sanitize_path_component(client_id),
-            sanitize_path_component(server_uri)
-        );
-        self.dir = self.base_dir.join(dir_name);
+        self.dir = self.base_dir.join(store_dir_name(client_id, server_uri));
         std::fs::create_dir_all(&self.dir)?;
         Ok(())
     }
@@ -586,6 +637,76 @@ mod tests {
         let mut p2 = FilePersistence::new(tmp.path());
         p2.open("cli", "tcp://localhost:1883").expect("reopen");
         assert_eq!(p2.get("persist_me").expect("get"), b"data");
+    }
+
+    /// The hash is FNV-1a, checked against its published test vectors, so
+    /// a store's name cannot drift between builds.
+    #[test]
+    fn test_fnv1a() {
+        let hash = |b: &[u8]| {
+            let mut h = Fnv1a::new();
+            h.write(b);
+            h.finish()
+        };
+        assert_eq!(hash(b""), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(hash(b"a"), 0xaf63_dc4c_8601_ec8c);
+        assert_eq!(hash(b"foobar"), 0x8594_4171_f739_67e8);
+    }
+
+    /// Names are readable, bounded, and different for every pair. Pairs
+    /// that used to share a store — characters made safe the same way, or
+    /// a `-` moved across the join — no longer do.
+    #[test]
+    fn test_store_dir_names() {
+        assert_eq!(
+            store_dir_name("cli", "tcp://localhost:1883"),
+            "cli-tcp___localhost_1883-c02ea4fae6184a68"
+        );
+        for (a, b) in [
+            (("a/b", "tcp://x"), ("a_b", "tcp://x")),
+            (("a", "b-c"), ("a-b", "c")),
+            (("cli", "tcp://h:1"), ("cli", "tcp://h_1")),
+        ] {
+            assert_ne!(
+                store_dir_name(a.0, a.1),
+                store_dir_name(b.0, b.1),
+                "{a:?} {b:?}"
+            );
+        }
+
+        // Long, and non-ASCII, IDs are cut short on a character boundary.
+        for id in ["x".repeat(1000), "é".repeat(300), "\u{1}\n".repeat(10)] {
+            let name = store_dir_name(&id, "tcp://localhost:1883");
+            assert!(name.len() <= STORE_NAME_MAX + 17, "{}", name.len());
+            assert!(!name.chars().any(|c| c.is_control() || c == '/'));
+        }
+        assert_ne!(
+            store_dir_name(&"x".repeat(1000), "u"),
+            store_dir_name(&"x".repeat(1001), "u"),
+            "the cut-off part still counts"
+        );
+    }
+
+    /// Two clients whose names used to collide keep separate stores, and a
+    /// client ID far over the file-name limit still gets one.
+    #[test]
+    fn test_stores_kept_apart() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut a = FilePersistence::new(tmp.path());
+        let mut b = FilePersistence::new(tmp.path());
+        a.open("a", "b-c").unwrap();
+        b.open("a-b", "c").unwrap();
+        a.put("s1", vec![b"from a"]).unwrap();
+        assert!(b.keys().unwrap().is_empty());
+        b.put("s2", vec![b"from b"]).unwrap();
+        b.clear().unwrap();
+        assert_eq!(a.keys().unwrap(), ["s1"]);
+
+        let mut long = FilePersistence::new(tmp.path());
+        long.open(&"x".repeat(1000), "tcp://localhost:1883")
+            .unwrap();
+        long.put("s1", vec![b"data"]).unwrap();
+        assert_eq!(long.get("s1").unwrap(), b"data");
     }
 
     // ---- MemPersistence ----
