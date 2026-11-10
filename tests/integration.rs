@@ -2699,6 +2699,78 @@ fn test_session_that_ends_with_its_connection_is_discarded() {
     }
 }
 
+/// Publishes the in-flight window is holding back when the connection
+/// drops go out on the next connection, after the one that was in flight,
+/// in publish order. They used to fail with `Disconnected`, while
+/// publishes made a moment later, with no connection, were buffered and
+/// delivered.
+#[test]
+fn test_deferred_publishes_survive_a_lost_connection() {
+    use mqtt::paho_mqtt_codec::{ConnAck, Packet, Property, PubAck, ReasonCode};
+
+    // The first connection has room for one publish and never acknowledges
+    // it; it drops on the client's first PINGREQ, a keep-alive interval
+    // later, by when the other publishes are certainly waiting for room.
+    let broker = common::spawn_broker_seq(2, |pkt, conn| match (pkt, conn) {
+        (Packet::Connect(_), 0) => {
+            let mut ack = ConnAck::new(false, ReasonCode::Success);
+            ack.properties.push(Property::ReceiveMaximum(1));
+            vec![Packet::ConnAck(ack)].into()
+        }
+        (Packet::PingReq, 0) => common::Reply::close_after(vec![]),
+        (Packet::Connect(_), _) => {
+            vec![Packet::ConnAck(ConnAck::new(true, ReasonCode::Success))].into()
+        }
+        (Packet::Publish(p), 1) => match p.packet_id {
+            Some(id) => vec![Packet::PubAck(PubAck::new(id))].into(),
+            None => common::Reply::none(),
+        },
+        (Packet::PingReq, _) => vec![Packet::PingResp].into(),
+        _ => common::Reply::none(),
+    });
+
+    let cli = mqtt::CreateOptionsBuilder::new()
+        .server_uri(broker.uri.clone())
+        .send_while_disconnected(true)
+        .create_async_client()
+        .unwrap();
+    let opts = mqtt::ConnectOptionsBuilder::new_v5()
+        .clean_start(false)
+        .properties(durable_props())
+        .keep_alive_interval(Duration::from_secs(1))
+        .automatic_reconnect(Duration::from_millis(50), Duration::from_millis(100))
+        .finalize();
+    cli.connect(opts).wait().expect("connect failed");
+
+    let toks: Vec<_> = (0..3)
+        .map(|i| {
+            cli.publish(mqtt::Message::new(
+                topic!("deferred"),
+                format!("m{i}"),
+                mqtt::QOS_1,
+            ))
+        })
+        .collect();
+    for (i, tok) in toks.into_iter().enumerate() {
+        tok.wait_for(Duration::from_secs(10))
+            .unwrap_or_else(|e| panic!("m{i} failed: {e}"));
+    }
+
+    let sent: Vec<(String, bool)> = broker.received_matching(|p| match p {
+        Packet::Publish(p) => Some((String::from_utf8_lossy(&p.payload).into_owned(), p.dup)),
+        _ => None,
+    });
+    let expected = [("m0", false), ("m0", true), ("m1", false), ("m2", false)];
+    let expected: Vec<(String, bool)> = expected.iter().map(|(m, d)| (m.to_string(), *d)).collect();
+    assert_eq!(
+        sent, expected,
+        "one in flight, re-sent; the others after it"
+    );
+
+    cli.disconnect(None).wait().ok();
+    broker.join();
+}
+
 /// A QoS 1 publish left unacknowledged when the connection drops is re-sent,
 /// with DUP set, on the reconnect that resumes the session — with no
 /// persistence store involved.

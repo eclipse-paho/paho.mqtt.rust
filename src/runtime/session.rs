@@ -2975,6 +2975,51 @@ fn buf_push(buf: &mut VecDeque<Command>, cmd: Command, cfg: &OfflineConfig) {
     // else: buffer full, new cmd is dropped → its Completer resolves with Disconnected
 }
 
+/// Takes back the operations a session's in-flight window was holding when
+/// it ended, which were accepted while connected but never sent.
+///
+/// A publish goes back into the send-while-disconnected buffer, ahead of
+/// anything buffered since — it was handed over first — to go out on the
+/// next connection, as a publish made a moment later would. The buffer's
+/// limit then applies as usual, `delete_oldest` dropping from the front.
+/// Where nothing would be buffered, it fails with
+/// [`Error::Disconnected`], as a publish made while disconnected does; so
+/// does a deferred (un)subscribe, which is never buffered. A deferred
+/// retransmission needs nothing: its message is still in the session state.
+fn requeue_deferred(
+    buf: &mut VecDeque<Command>,
+    deferred: VecDeque<Deferred>,
+    cfg: &OfflineConfig,
+    should_buf: bool,
+) {
+    let mut cmds: Vec<Command> = deferred
+        .into_iter()
+        .filter_map(|d| match d {
+            Deferred::Command(cmd) => Some(cmd),
+            Deferred::Retransmit(_) => None,
+        })
+        .collect();
+    while let Some(cmd) = cmds.pop() {
+        match cmd {
+            cmd @ Command::Publish { .. } if should_buf => buf.push_front(cmd),
+            Command::Publish { tx, .. } => tx.complete(Err(Error::Disconnected)),
+            Command::Subscribe { tx, .. } => tx.complete(Err(Error::Disconnected)),
+            Command::Unsubscribe { tx, .. } => tx.complete(Err(Error::Disconnected)),
+            // Nothing else is ever deferred.
+            _ => {}
+        }
+    }
+    // Over the limit, a dropped command's completer resolves its token
+    // with `Disconnected`, as in `buf_push`.
+    while buf.len() > cfg.max_buffered_msgs {
+        if cfg.delete_oldest {
+            buf.pop_front();
+        } else {
+            buf.pop_back();
+        }
+    }
+}
+
 /// What became of a command that arrived while there was no session.
 enum Offline {
     /// Buffered, or its token was resolved; nothing else to do.
@@ -3562,6 +3607,12 @@ pub(crate) async fn run_event_loop<B: Backend>(
             sinks = session.sinks;
             persist = session.persist;
             buf = session.buf;
+            requeue_deferred(
+                &mut buf,
+                std::mem::take(&mut session.inflight_deferred),
+                &offline_cfg,
+                offline_cfg.buffers(ever_connected),
+            );
             held_connect = session.held_connect;
             deliver_offline::<B>(flushed).await;
 
@@ -5015,6 +5066,67 @@ mod tests {
             ));
             assert_eq!(h.conn.get(), after_loss);
         }
+    }
+
+    /// Publishes the in-flight window held back when a session ended are
+    /// buffered for the next connection, ahead of what was buffered after
+    /// them, and subject to the buffer's limit. They used to be dropped,
+    /// failing with `Disconnected`, while publishes made a moment later
+    /// were buffered and delivered.
+    #[test]
+    fn test_deferred_publishes_are_buffered_when_the_session_ends() {
+        let topic = |c: &Command| match c {
+            Command::Publish { topic, .. } => topic.clone(),
+            _ => unreachable!(),
+        };
+        // Two deferred publishes and a deferred subscribe, with a
+        // retransmission among them, and one publish buffered afterwards.
+        let setup = || {
+            let (p1, c1) = publish_cmd("d1", QoS::QoS1, Bytes::new());
+            let (p2, c2) = publish_cmd("d2", QoS::QoS2, Bytes::new());
+            let (sub, cs) = subscribe_cmd("s");
+            let deferred = VecDeque::from([
+                Deferred::Command(c1),
+                Deferred::Retransmit(7),
+                Deferred::Command(cs),
+                Deferred::Command(c2),
+            ]);
+            let (later, cl) = publish_cmd("later", QoS::QoS1, Bytes::new());
+            (deferred, VecDeque::from([cl]), [p1, p2, later], sub)
+        };
+        let cfg = |max, delete_oldest| OfflineConfig {
+            send_while_disconnected: true,
+            max_buffered_msgs: max,
+            delete_oldest,
+            ..OfflineConfig::default()
+        };
+
+        // Buffered, in the order they were handed over.
+        let (deferred, mut buf, mut toks, mut sub) = setup();
+        requeue_deferred(&mut buf, deferred, &cfg(10, false), true);
+        let order: Vec<String> = buf.iter().map(topic).collect();
+        assert_eq!(order, ["d1", "d2", "later"]);
+        assert!(toks.iter_mut().all(|t| t.try_wait().is_none()));
+        assert!(matches!(sub.try_wait(), Some(Err(Error::Disconnected))));
+
+        // Not buffering: they fail, as a publish made while disconnected.
+        let (deferred, mut buf, mut toks, _) = setup();
+        requeue_deferred(&mut buf, deferred, &cfg(10, false), false);
+        assert_eq!(buf.len(), 1);
+        for t in &mut toks[..2] {
+            assert!(matches!(t.try_wait(), Some(Err(Error::Disconnected))));
+        }
+
+        // Over the limit: the newest goes, or with `delete_oldest` the
+        // oldest.
+        let (deferred, mut buf, mut toks, _) = setup();
+        requeue_deferred(&mut buf, deferred, &cfg(2, false), true);
+        assert_eq!(buf.iter().map(topic).collect::<Vec<_>>(), ["d1", "d2"]);
+        assert!(matches!(toks[2].try_wait(), Some(Err(Error::Disconnected))));
+        let (deferred, mut buf, mut toks, _) = setup();
+        requeue_deferred(&mut buf, deferred, &cfg(2, true), true);
+        assert_eq!(buf.iter().map(topic).collect::<Vec<_>>(), ["d2", "later"]);
+        assert!(matches!(toks[0].try_wait(), Some(Err(Error::Disconnected))));
     }
 
     /// When the event loop goes back to waiting for a `connect()`, an
