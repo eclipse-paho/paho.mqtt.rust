@@ -2043,10 +2043,10 @@ fn parse_host_port_path(rest: &str, default_port: u16) -> Result<(String, u16, S
 /// Recognises:
 /// - `unix://` or `unix:` — Unix-domain socket path
 /// - `mqtt://`, `tcp://` — plain TCP (default port 1883)
-/// - `ws://` — WebSocket over TCP (default port 1883); [`ServerAddr::Ws`] when
+/// - `ws://` — WebSocket over TCP (default port 80, HTTP's); [`ServerAddr::Ws`] when
 ///   the `websocket` feature is enabled, plain TCP otherwise
 /// - `mqtts://`, `ssl://`, `tls://` — TLS TCP (default port 8883)
-/// - `wss://` — WebSocket over TLS (default port 8883); [`ServerAddr::Wss`]
+/// - `wss://` — WebSocket over TLS (default port 443, HTTPS's); [`ServerAddr::Wss`]
 ///   when both `websocket` and `tls` features are enabled, TLS TCP otherwise
 ///
 /// If no explicit port is present the default for the scheme is used. An
@@ -2067,7 +2067,9 @@ fn parse_server_uri(uri: &str) -> Result<ServerAddr> {
     // WebSocket transports (feature-gated).
     #[cfg(any(feature = "websocket", feature = "smol-websocket"))]
     if let Some(rest) = uri.strip_prefix("ws://") {
-        let (host, port, path) = parse_host_port_path(rest, 1883)?;
+        // A WebSocket URI is an HTTP one (RFC 6455 §3), so its default
+        // port is HTTP's, as it was in v1.x.
+        let (host, port, path) = parse_host_port_path(rest, 80)?;
         return Ok(ServerAddr::Ws { host, port, path });
     }
 
@@ -2076,7 +2078,7 @@ fn parse_server_uri(uri: &str) -> Result<ServerAddr> {
         all(feature = "smol-websocket", feature = "smol-tls")
     ))]
     if let Some(rest) = uri.strip_prefix("wss://") {
-        let (host, port, path) = parse_host_port_path(rest, 8883)?;
+        let (host, port, path) = parse_host_port_path(rest, 443)?;
         return Ok(ServerAddr::Wss { host, port, path });
     }
 
@@ -2448,6 +2450,27 @@ mod tests {
             ServerAddr::Ws { ref host, port, ref path }
                 if host == "localhost" && port == 8080 && path == "/mqtt"
         ));
+        // A WebSocket URI without a port takes HTTP's, 80, or HTTPS's, 443,
+        // as in v1.x — not MQTT's.
+        #[cfg(any(feature = "websocket", feature = "smol-websocket"))]
+        assert!(matches!(
+            parse_server_uri("ws://broker/mqtt").unwrap(),
+            ServerAddr::Ws { port: 80, .. }
+        ));
+        #[cfg(any(
+            all(feature = "websocket", any(feature = "tls", feature = "openssl")),
+            all(feature = "smol-websocket", feature = "smol-tls")
+        ))]
+        {
+            assert!(matches!(
+                parse_server_uri("wss://broker/mqtt").unwrap(),
+                ServerAddr::Wss { port: 443, .. }
+            ));
+            assert!(matches!(
+                parse_server_uri("wss://broker:8884/mqtt").unwrap(),
+                ServerAddr::Wss { port: 8884, .. }
+            ));
+        }
         #[cfg(unix)]
         assert!(matches!(
             parse_server_uri("unix:///tmp/mqtt.sock").unwrap(),
