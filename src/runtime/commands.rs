@@ -673,6 +673,12 @@ pub(crate) enum Event {
     /// A TLS error occurred during connection setup (only when the `tls`
     /// feature is enabled and TLS is configured).
     TlsError(crate::TlsError),
+    /// A `disconnect()` has completed, one event for each call. The message
+    /// callback is given `None` for it. It comes from the event loop, after
+    /// every message that connection delivered, so that the callback sees
+    /// the end of the stream after the stream, and is only ever called from
+    /// the dispatcher thread.
+    DisconnectDone,
 }
 
 /////////////////////////////////////////////////////////////////////////////

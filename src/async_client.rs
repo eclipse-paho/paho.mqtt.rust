@@ -689,30 +689,14 @@ impl AsyncClient {
             tx: comp,
         };
 
+        // The message callback gets its `None` from the dispatcher thread,
+        // when the event loop reports the disconnect done
+        // (`Event::DisconnectDone`): after every message the connection
+        // delivered, and never alongside one. It used to be called here, on
+        // the caller's thread, where it raced the dispatcher.
         if self.inner.cmd_tx.send_blocking(cmd).is_err() {
             return Err(Error::Disconnected);
         }
-
-        // Signal the end of the message stream. The callback runs outside
-        // the lock, so it may call back into the client — including removing
-        // itself.
-        let taken = self
-            .inner
-            .callback_context
-            .lock()
-            .unwrap()
-            .on_message_arrived
-            .take();
-        if let Some((mut cb, generation)) = taken {
-            cb(self, None);
-            self.inner
-                .callback_context
-                .lock()
-                .unwrap()
-                .on_message_arrived
-                .restore(cb, generation);
-        }
-
         Ok(tok)
     }
 
@@ -1595,6 +1579,12 @@ impl AsyncClient {
     /// The callback runs outside the lock on its slot, so it may call back
     /// into the client — including registering a different callback, or
     /// removing itself. Either sticks.
+    ///
+    /// It is called with `None` when a connection ends: when it is lost,
+    /// when the server disconnects, and when a [`disconnect`](Self::disconnect)
+    /// completes. Every call comes from the client's dispatcher thread, one
+    /// at a time, so the `None` follows every message that connection
+    /// delivered.
     pub fn set_message_callback<F>(&self, cb: F)
     where
         F: FnMut(&AsyncClient, Option<Message>) + Send + 'static,
@@ -1971,6 +1961,25 @@ impl AsyncClient {
                         .lock()
                         .unwrap()
                         .on_disconnected
+                        .restore(cb, generation);
+                }
+            }
+            // A `disconnect()` has completed: the end of the message stream.
+            Ev::DisconnectDone => {
+                let taken = self
+                    .inner
+                    .callback_context
+                    .lock()
+                    .unwrap()
+                    .on_message_arrived
+                    .take();
+                if let Some((mut cb, generation)) = taken {
+                    cb(self, None);
+                    self.inner
+                        .callback_context
+                        .lock()
+                        .unwrap()
+                        .on_message_arrived
                         .restore(cb, generation);
                 }
             }
@@ -2674,19 +2683,35 @@ mod tests {
     /// `disconnect()` ends the message stream by calling the message callback
     /// with `None`. That call used to happen while holding the callback lock,
     /// so a callback touching any slot deadlocked; it now runs outside it.
+    ///
+    /// It also comes from the dispatcher thread, once the event loop has
+    /// finished the disconnect, rather than from the caller's thread, where
+    /// it raced the dispatcher: a message arriving meanwhile could find the
+    /// slot empty and be dropped, though already acknowledged.
     #[test]
     fn test_message_callback_may_touch_the_client_during_disconnect() {
         let cli = test_client();
         let calls = counter();
+        let caller = std::thread::current().id();
 
         let c = calls.clone();
         cli.set_message_callback(move |cli, msg| {
-            *c.lock().unwrap() += 1;
             assert!(msg.is_none(), "disconnect signals the end of the stream");
+            assert_ne!(std::thread::current().id(), caller, "on the dispatcher");
             cli.remove_message_callback();
+            *c.lock().unwrap() += 1;
         });
 
-        let _tok = cli.disconnect(None);
+        cli.disconnect(None).wait().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while *calls.lock().unwrap() == 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(*calls.lock().unwrap(), 1);
+
+        // It removed itself, so a second disconnect calls nothing.
+        cli.disconnect(None).wait().unwrap();
+        std::thread::sleep(Duration::from_millis(50));
         assert_eq!(*calls.lock().unwrap(), 1);
     }
 

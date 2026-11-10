@@ -1190,6 +1190,11 @@ struct Session<B: Backend> {
     /// Further `disconnect()` calls made while one was in progress, resolved
     /// when it completes.
     held_disconnects: Vec<Completer<()>>,
+    /// How many `disconnect()` calls this session completed. Each gets an
+    /// [`Event::DisconnectDone`], sent by the event loop once the messages
+    /// held back at the end have been handed over, so as not to overtake
+    /// them.
+    disconnects_done: usize,
 }
 
 impl<B: Backend> Session<B> {
@@ -1255,6 +1260,7 @@ impl<B: Backend> Session<B> {
             offline_cfg,
             held_connect: None,
             held_disconnects: Vec::new(),
+            disconnects_done: 0,
         }
     }
 
@@ -2160,6 +2166,7 @@ impl<B: Backend> Session<B> {
         }
         self.conn_state.set(ConnectionState::Disconnected);
         req.tx.complete(Ok(()));
+        self.disconnects_done = 1 + self.held_disconnects.len();
         for tx in self.held_disconnects.drain(..) {
             tx.complete(Ok(()));
         }
@@ -3285,10 +3292,19 @@ async fn report_tls_error(event_tx: &async_channel::Sender<Event>, err: &Error) 
 /// client as [`Disconnected`](ConnectionState::Disconnected), then resolves
 /// the token, so that the state has changed by the time the caller sees it
 /// complete. `tx` is `None` when the API was dropped instead.
-fn finish_disconnect(conn_state: &StateCell, tx: Option<Completer<()>>) {
+///
+/// A `disconnect()` gets its [`Event::DisconnectDone`]; with no session,
+/// there are no messages for it to wait behind. Without one (`tx` is
+/// `None`: the API was dropped) there is no one to tell.
+fn finish_disconnect(
+    conn_state: &StateCell,
+    event_tx: &async_channel::Sender<Event>,
+    tx: Option<Completer<()>>,
+) {
     conn_state.set(ConnectionState::Disconnected);
     if let Some(tx) = tx {
         tx.complete(Ok(()));
+        let _ = event_tx.try_send(Event::DisconnectDone);
     }
 }
 
@@ -3474,7 +3490,7 @@ pub(crate) async fn run_event_loop<B: Backend>(
             let should_buf = offline_cfg.buffers(ever_connected);
             match handle_offline_command(cmd, &mut buf, &offline_cfg, should_buf, &mut sinks) {
                 Offline::Handled => {}
-                Offline::Disconnect(tx) => finish_disconnect(&conn_state, Some(tx)),
+                Offline::Disconnect(tx) => finish_disconnect(&conn_state, &event_tx, Some(tx)),
                 Offline::Connect(job, tx) => break (job, Some(tx)),
             }
         };
@@ -3563,7 +3579,7 @@ pub(crate) async fn run_event_loop<B: Backend>(
                                 last_err = Some(e);
                             }
                             Attempt::Aborted(tx) => {
-                                finish_disconnect(&conn_state, tx);
+                                finish_disconnect(&conn_state, &event_tx, tx);
                                 continue 'outer;
                             }
                         }
@@ -3581,7 +3597,7 @@ pub(crate) async fn run_event_loop<B: Backend>(
                     .await
                 {
                     WaitOutcome::Abort(tx) => {
-                        finish_disconnect(&conn_state, tx);
+                        finish_disconnect(&conn_state, &event_tx, tx);
                         break 'retry;
                     }
                     WaitOutcome::Retry => {
@@ -3633,7 +3649,7 @@ pub(crate) async fn run_event_loop<B: Backend>(
                 stored,
             } = match attempt {
                 Attempt::Aborted(tx) => {
-                    finish_disconnect(&conn_state, tx);
+                    finish_disconnect(&conn_state, &event_tx, tx);
                     break 'retry;
                 }
                 // A TLS failure was reported as it happened, above. A failed
@@ -3743,6 +3759,7 @@ pub(crate) async fn run_event_loop<B: Backend>(
             // Whatever was received and held back is delivered, ahead of the
             // end-of-connection notice below.
             let flushed = session.flush_held();
+            let disconnects_done = session.disconnects_done;
             // A session that ends with its connection takes its state with
             // it (v3.1.1 §3.1.2.4, v5 §3.1.2.11.2): the server has
             // discarded its half, so nothing in flight can be completed and
@@ -3769,6 +3786,10 @@ pub(crate) async fn run_event_loop<B: Backend>(
             );
             held_connect = session.held_connect;
             deliver_offline::<B>(flushed).await;
+            // After the messages held back, so as not to overtake them.
+            for _ in 0..disconnects_done {
+                let _ = event_tx.send(Event::DisconnectDone).await;
+            }
 
             match result {
                 // Clean disconnect: back to waiting for a Connect.

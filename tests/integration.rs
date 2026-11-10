@@ -93,6 +93,79 @@ fn v3_1_client(id: &str) -> mqtt::AsyncClient {
     .unwrap()
 }
 
+/// The `None` that `disconnect()` gives the message callback comes after
+/// every message, exactly once, and none is lost to it. It used to be
+/// called from the caller's thread while the dispatcher was delivering: a
+/// message arriving then found the callback's slot empty and was dropped,
+/// though acknowledged, or the `None` was skipped.
+#[test]
+fn test_disconnect_ends_the_message_callback_in_order() {
+    use mqtt::paho_mqtt_codec::{ConnAck, Packet, Publish, ReasonCode};
+
+    // Messages pipelined behind the CONNACK, still being delivered when the
+    // client disconnects.
+    let broker = common::spawn_broker(|pkt| match pkt {
+        Packet::Connect(_) => {
+            let mut pkts = vec![Packet::ConnAck(ConnAck::new(false, ReasonCode::Success))];
+            pkts.extend((1..=30u16).map(|id| {
+                Packet::Publish(Publish {
+                    dup: false,
+                    qos: mqtt::QoS::QoS1,
+                    retain: false,
+                    topic: "in".into(),
+                    packet_id: Some(id),
+                    payload: id.to_string().into(),
+                    properties: Default::default(),
+                })
+            }));
+            pkts
+        }
+        _ => vec![],
+    });
+
+    let cli = mqtt::AsyncClient::new(broker.uri.clone()).unwrap();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let s = seen.clone();
+    cli.set_message_callback(move |_, msg| {
+        // Slow, so the disconnect lands mid-delivery.
+        std::thread::sleep(Duration::from_millis(2));
+        s.lock()
+            .unwrap()
+            .push(msg.map(|m| m.payload_str().into_owned()));
+    });
+    cli.connect(mqtt::ConnectOptions::new_v5())
+        .wait_for(TIMEOUT)
+        .expect("connect failed");
+    std::thread::sleep(Duration::from_millis(10));
+    cli.disconnect(None).wait_for(TIMEOUT).unwrap();
+
+    let deadline = std::time::Instant::now() + TIMEOUT;
+    while !seen.lock().unwrap().contains(&None) && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    std::thread::sleep(Duration::from_millis(50));
+    let seen = seen.lock().unwrap().clone();
+    // A message is acknowledged only once it has been handed over for
+    // delivery, so each one acknowledged must have reached the callback.
+    let acked = broker
+        .received_matching(|p| matches!(p, Packet::PubAck(_)).then_some(()))
+        .len();
+    broker.join();
+
+    assert_eq!(seen.iter().filter(|m| m.is_none()).count(), 1, "{seen:?}");
+    assert_eq!(seen.last(), Some(&None), "the end comes last: {seen:?}");
+    let msgs: Vec<u16> = seen.iter().flatten().map(|m| m.parse().unwrap()).collect();
+    assert!(
+        msgs.windows(2).all(|w| w[0] < w[1]),
+        "in order, none twice: {msgs:?}"
+    );
+    assert!(
+        msgs.len() >= acked,
+        "{acked} acknowledged, {} delivered: {msgs:?}",
+        msgs.len()
+    );
+}
+
 /// A broker named by an IPv6 literal, `tcp://[::1]:1883`, with and
 /// without a port. The host used to keep its brackets, failing the address
 /// lookup, and without a port the address's own colons were taken for one.
