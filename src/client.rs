@@ -163,6 +163,17 @@ impl Client {
         self.cli.state()
     }
 
+    /// Attempts to publish a message without blocking or queuing.
+    ///
+    /// Returns a `DeliveryToken` immediately if the message was accepted, or
+    /// [`Error::Publish`] — which carries both the
+    /// cause and the message itself, so it can be sent again — if the
+    /// client's command channel is closed or the message needs a protocol
+    /// version the connection is not using.
+    pub fn try_publish(&self, msg: Message) -> Result<DeliveryToken> {
+        self.cli.try_publish(msg)
+    }
+
     /// Publishes a message to an MQTT broker
     pub fn publish(&self, msg: Message) -> Result<PublishResponse> {
         self.cli.publish(msg).wait_for(self.timeout)
@@ -419,17 +430,6 @@ impl Client {
     /// Gets access to the user-defined data stored in the client.
     pub fn user_data(&self) -> Option<&UserData> {
         self.cli.user_data()
-    }
-
-    /// Attempts to publish a message without blocking or queuing.
-    ///
-    /// Returns a `DeliveryToken` immediately if the message was accepted, or
-    /// [`Error::Publish`] — which carries both the
-    /// cause and the message itself, so it can be sent again — if the
-    /// client's command channel is closed or the message needs a protocol
-    /// version the connection is not using.
-    pub fn try_publish(&self, msg: Message) -> Result<DeliveryToken> {
-        self.cli.try_publish(msg)
     }
 
     /// Sets the callback for when the connection is established with the broker.

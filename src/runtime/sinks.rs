@@ -39,11 +39,9 @@
 //! [`start_consuming`]: crate::AsyncClient::start_consuming
 //! [`start_consuming_events`]: crate::AsyncClient::start_consuming_events
 
-use std::{future::Future, pin::Pin};
-
-use async_channel::{Sender, TrySendError};
-
 use crate::{Event, Message, Properties, ReasonCode};
+use async_channel::{Sender, TrySendError};
+use std::{future::Future, pin::Pin};
 
 /// One application channel the runtime delivers to.
 pub(crate) enum Sink {

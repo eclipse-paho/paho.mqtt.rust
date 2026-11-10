@@ -1134,7 +1134,31 @@ impl AsyncClient {
             .unwrap_or_else(SubscribeManyToken::from_err)
     }
 
+    /// Attempts to unsubscribe from a single topic, but returns an error
+    /// immediately if the request can't be started.
+    ///
+    /// That is a failure found before anything goes on the wire: a client
+    /// whose background session has shut down ([`Error::Disconnected`]).
+    ///
+    /// On success the returned token tracks the unsubscribe itself.
+    ///
+    /// # Arguments
+    ///
+    /// * `topic` The topic to unsubscribe. It must match a topic from a
+    ///   previous subscribe.
+    ///
+    pub fn try_unsubscribe<S>(&self, topic: S) -> Result<UnsubscribeToken>
+    where
+        S: Into<String>,
+    {
+        self.try_unsubscribe_with_options(topic, Properties::default())
+    }
+
     /// Unsubscribes from a single topic.
+    ///
+    /// Returns a token to track the progress of the operation. A failure
+    /// found before the request is sent — see
+    /// [`try_unsubscribe`](Self::try_unsubscribe) — fails the token instead.
     ///
     /// # Arguments
     ///
@@ -1145,20 +1169,51 @@ impl AsyncClient {
     where
         S: Into<String>,
     {
+        self.try_unsubscribe(topic)
+            .unwrap_or_else(UnsubscribeToken::from_err)
+    }
+
+    /// Attempts to unsubscribe from a single topic with v5 options, but
+    /// returns an error immediately if the request can't be started.
+    ///
+    /// The failures are those of [`try_unsubscribe`](Self::try_unsubscribe),
+    /// and [`Error::WrongMqttVersion`] for v5 properties on a connection of
+    /// an earlier version.
+    ///
+    /// # Arguments
+    ///
+    /// * `topic` The topic to unsubscribe.
+    /// * `props` MQTT v5 properties for the unsubscribe.
+    ///
+    pub fn try_unsubscribe_with_options<S>(
+        &self,
+        topic: S,
+        props: Properties,
+    ) -> Result<UnsubscribeToken>
+    where
+        S: Into<String>,
+    {
+        self.require_v5_for_props(&props)?;
+
         let (tok, comp) = UnsubscribeToken::new();
         let cmd = Command::Unsubscribe {
             single: true,
             filters: vec![topic.into()],
-            props: Default::default(),
+            props,
             tx: comp,
         };
         if self.inner.cmd_tx.send_blocking(cmd).is_err() {
-            return UnsubscribeToken::from_err(Error::Disconnected);
+            return Err(Error::Disconnected);
         }
-        tok
+        Ok(tok)
     }
 
     /// Unsubscribes from a single topic with v5 options.
+    ///
+    /// Returns a token to track the progress of the operation. A failure
+    /// found before the request is sent — see
+    /// [`try_unsubscribe_with_options`](Self::try_unsubscribe_with_options)
+    /// — fails the token instead.
     ///
     /// # Arguments
     ///
@@ -1169,23 +1224,33 @@ impl AsyncClient {
     where
         S: Into<String>,
     {
-        if let Err(err) = self.require_v5_for_props(&props) {
-            return UnsubscribeToken::from_err(err);
-        }
-        let (tok, comp) = UnsubscribeToken::new();
-        let cmd = Command::Unsubscribe {
-            single: true,
-            filters: vec![topic.into()],
-            props,
-            tx: comp,
-        };
-        if self.inner.cmd_tx.send_blocking(cmd).is_err() {
-            return UnsubscribeToken::from_err(Error::Disconnected);
-        }
-        tok
+        self.try_unsubscribe_with_options(topic, props)
+            .unwrap_or_else(UnsubscribeToken::from_err)
+    }
+
+    /// Attempts to unsubscribe from multiple topics simultaneously, but
+    /// returns an error immediately if the request can't be started.
+    ///
+    /// The failures are those of [`try_unsubscribe`](Self::try_unsubscribe).
+    ///
+    /// # Arguments
+    ///
+    /// * `topics` The topics to unsubscribe. Each must match a topic from a
+    ///   previous subscribe.
+    ///
+    pub fn try_unsubscribe_many<T>(&self, topics: &[T]) -> Result<UnsubscribeManyToken>
+    where
+        T: AsRef<str>,
+    {
+        self.try_unsubscribe_many_with_options(topics, Properties::default())
     }
 
     /// Unsubscribes from multiple topics simultaneously.
+    ///
+    /// Returns a token to track the progress of the operation. A failure
+    /// found before the request is sent — see
+    /// [`try_unsubscribe_many`](Self::try_unsubscribe_many) — fails the
+    /// token instead.
     ///
     /// # Arguments
     ///
@@ -1196,21 +1261,52 @@ impl AsyncClient {
     where
         T: AsRef<str>,
     {
+        self.try_unsubscribe_many(topics)
+            .unwrap_or_else(UnsubscribeManyToken::from_err)
+    }
+
+    /// Attempts to unsubscribe from multiple topics simultaneously with v5
+    /// options, but returns an error immediately if the request can't be
+    /// started.
+    ///
+    /// The failures are those of
+    /// [`try_unsubscribe_with_options`](Self::try_unsubscribe_with_options).
+    ///
+    /// # Arguments
+    ///
+    /// * `topics` The topics to unsubscribe.
+    /// * `props` MQTT v5 properties for the unsubscribe.
+    ///
+    pub fn try_unsubscribe_many_with_options<T>(
+        &self,
+        topics: &[T],
+        props: Properties,
+    ) -> Result<UnsubscribeManyToken>
+    where
+        T: AsRef<str>,
+    {
+        self.require_v5_for_props(&props)?;
+
         let (tok, comp) = UnsubscribeManyToken::new();
         let filters = topics.iter().map(|t| t.as_ref().to_string()).collect();
         let cmd = Command::Unsubscribe {
             single: false,
             filters,
-            props: Default::default(),
+            props,
             tx: comp,
         };
         if self.inner.cmd_tx.send_blocking(cmd).is_err() {
-            return UnsubscribeManyToken::from_err(Error::Disconnected);
+            return Err(Error::Disconnected);
         }
-        tok
+        Ok(tok)
     }
 
     /// Unsubscribes from multiple topics simultaneously with v5 options.
+    ///
+    /// Returns a token to track the progress of the operation. A failure
+    /// found before the request is sent — see
+    /// [`try_unsubscribe_many_with_options`](Self::try_unsubscribe_many_with_options)
+    /// — fails the token instead.
     ///
     /// # Arguments
     ///
@@ -1225,21 +1321,8 @@ impl AsyncClient {
     where
         T: AsRef<str>,
     {
-        if let Err(err) = self.require_v5_for_props(&props) {
-            return UnsubscribeManyToken::from_err(err);
-        }
-        let (tok, comp) = UnsubscribeManyToken::new();
-        let filters = topics.iter().map(|t| t.as_ref().to_string()).collect();
-        let cmd = Command::Unsubscribe {
-            single: false,
-            filters,
-            props,
-            tx: comp,
-        };
-        if self.inner.cmd_tx.send_blocking(cmd).is_err() {
-            return UnsubscribeManyToken::from_err(Error::Disconnected);
-        }
-        tok
+        self.try_unsubscribe_many_with_options(topics, props)
+            .unwrap_or_else(UnsubscribeManyToken::from_err)
     }
 
     // ----- State and identity -----
@@ -2639,6 +2722,57 @@ mod tests {
         let err = cli.subscribe("a", QoS::QoS1).wait().unwrap_err();
         assert!(matches!(err, Error::Disconnected), "{err}");
         let err = cli.subscribe_many(&topics, &qos).wait().unwrap_err();
+        assert!(matches!(err, Error::Disconnected), "{err}");
+    }
+
+    /// v5 properties can't go on a v3 unsubscribe.
+    #[test]
+    fn test_try_unsubscribe_rejects_v5_props_on_v3() {
+        let cli = AsyncClient::new(
+            CreateOptionsBuilder::new()
+                .server_uri("mqtt://localhost:1883")
+                .mqtt_version(MqttVersion::V3_1_1)
+                .finalize(),
+        )
+        .unwrap();
+        let mut props = Properties::new();
+        props.push(crate::Property::UserProperty("k".into(), "v".into()));
+
+        assert!(matches!(
+            cli.try_unsubscribe_with_options("a", props.clone()),
+            Err(Error::WrongMqttVersion)
+        ));
+        assert!(matches!(
+            cli.try_unsubscribe_many_with_options(&["a", "b"], props),
+            Err(Error::WrongMqttVersion)
+        ));
+    }
+
+    /// With the command channel closed no variant can queue its unsubscribe,
+    /// and the token-returning ones report the same failure.
+    #[test]
+    fn test_try_unsubscribe_fails_when_disconnected() {
+        let cli = test_client();
+        assert!(cli.inner.cmd_tx.close());
+        let topics = ["a", "b"];
+
+        assert!(matches!(cli.try_unsubscribe("a"), Err(Error::Disconnected)));
+        assert!(matches!(
+            cli.try_unsubscribe_with_options("a", Properties::new()),
+            Err(Error::Disconnected)
+        ));
+        assert!(matches!(
+            cli.try_unsubscribe_many(&topics),
+            Err(Error::Disconnected)
+        ));
+        assert!(matches!(
+            cli.try_unsubscribe_many_with_options(&topics, Properties::new()),
+            Err(Error::Disconnected)
+        ));
+
+        let err = cli.unsubscribe("a").wait().unwrap_err();
+        assert!(matches!(err, Error::Disconnected), "{err}");
+        let err = cli.unsubscribe_many(&topics).wait().unwrap_err();
         assert!(matches!(err, Error::Disconnected), "{err}");
     }
 
