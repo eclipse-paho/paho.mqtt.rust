@@ -408,6 +408,16 @@ impl AsyncClient {
     /// named after the ID. v1.x switched such a client to no persistence
     /// without saying so.
     ///
+    /// [`Error::InvalidArgument`] for
+    /// [`RuntimeMode::ApplicationRuntime`](crate::RuntimeMode::ApplicationRuntime)
+    /// when there is no runtime to borrow: with the tokio backend, when the
+    /// client is not created from within a Tokio runtime; with the smol
+    /// backend, always.
+    ///
+    /// [`Error::Io`] if the runtime the client needs cannot be started: the
+    /// shared Tokio runtime cannot be built, or no thread can be spawned for
+    /// the shared smol executor.
+    ///
     pub fn new<T>(opts: T) -> Result<AsyncClient>
     where
         T: Into<CreateOptions>,
@@ -434,14 +444,14 @@ impl AsyncClient {
         #[cfg(feature = "tokio")]
         let (rt, rt_ownership) = {
             use crate::runtime::{RuntimeHandle, resolve_runtime};
-            let (rt_handle, ownership) = resolve_runtime(&opts.runtime_mode);
+            let (rt_handle, ownership) = resolve_runtime(&opts.runtime_mode)?;
             (RuntimeHandle::spawn(&rt_handle, offline_cfg), ownership)
         };
 
         #[cfg(feature = "smol")]
         let (rt, rt_ownership) = {
             use crate::runtime::{RuntimeHandle, SmolOwnership, resolve_executor};
-            let executor = resolve_executor(&opts.runtime_mode);
+            let executor = resolve_executor(&opts.runtime_mode)?;
             let rt = RuntimeHandle::spawn(&executor, offline_cfg);
             (rt, SmolOwnership::Shared(executor))
         };
@@ -2333,6 +2343,33 @@ mod tests {
         // And with an ID the file store is fine. Nothing is written until a
         // connect opens it.
         assert!(create("an-id", PersistenceType::FilePath(dir)).is_ok());
+    }
+
+    /// `ApplicationRuntime` with no runtime to borrow is an error from
+    /// `new`, as the rest of its configuration errors are. It used to panic
+    /// in the runtime layer. With tokio, called from within a runtime, it
+    /// borrows that one.
+    #[test]
+    fn test_application_runtime_needs_one() {
+        let opts = || {
+            crate::CreateOptionsBuilder::new()
+                .server_uri("tcp://localhost:1883")
+                .use_application_runtime()
+                .finalize()
+        };
+        assert!(matches!(
+            AsyncClient::new(opts()),
+            Err(Error::InvalidArgument(msg)) if msg.contains("ApplicationRuntime")
+        ));
+
+        #[cfg(feature = "tokio")]
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                AsyncClient::new(opts()).expect("borrows the current runtime");
+            });
     }
 
     #[test]

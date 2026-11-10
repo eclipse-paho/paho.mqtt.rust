@@ -134,30 +134,35 @@ static SHARED_RT: Mutex<Option<Weak<LibRuntime>>> = Mutex::new(None);
 
 /// Returns a `Handle` to the appropriate runtime and the corresponding
 /// ownership record, based on `mode`.
+///
+/// Fails with [`Error::InvalidArgument`](crate::Error) for
+/// `ApplicationRuntime` with no runtime current, and with
+/// [`Error::Io`](crate::Error) if the shared runtime cannot be built.
 pub(crate) fn resolve_runtime(
     mode: &crate::create_options::RuntimeMode,
-) -> (tokio::runtime::Handle, RuntimeOwnership) {
+) -> crate::Result<(tokio::runtime::Handle, RuntimeOwnership)> {
     use crate::create_options::RuntimeMode;
-    match mode {
+    let rt = match mode {
         RuntimeMode::Auto => {
             if let Ok(h) = tokio::runtime::Handle::try_current() {
-                return (h, RuntimeOwnership::Borrowed);
+                return Ok((h, RuntimeOwnership::Borrowed));
             }
-            let rt = get_or_create_shared_runtime(0);
-            let h = rt.handle().clone();
-            (h, RuntimeOwnership::Owned(rt))
+            get_or_create_shared_runtime(0)?
         }
-        RuntimeMode::Shared(n) => {
-            let rt = get_or_create_shared_runtime(*n);
-            let h = rt.handle().clone();
-            (h, RuntimeOwnership::Owned(rt))
-        }
+        RuntimeMode::Shared(n) => get_or_create_shared_runtime(*n)?,
         RuntimeMode::ApplicationRuntime => {
-            let h = tokio::runtime::Handle::try_current()
-                .expect("RuntimeMode::ApplicationRuntime requires a current Tokio runtime");
-            (h, RuntimeOwnership::Borrowed)
+            let h = tokio::runtime::Handle::try_current().map_err(|_| {
+                crate::Error::InvalidArgument(
+                    "RuntimeMode::ApplicationRuntime needs a current Tokio runtime: \
+                     create the client from within one, or use RuntimeMode::Auto"
+                        .into(),
+                )
+            })?;
+            return Ok((h, RuntimeOwnership::Borrowed));
         }
-    }
+    };
+    let h = rt.handle().clone();
+    Ok((h, RuntimeOwnership::Owned(rt)))
 }
 
 /// Returns the process-wide shared runtime, creating it if necessary.
@@ -165,7 +170,7 @@ pub(crate) fn resolve_runtime(
 /// `num_threads` is only honoured on first creation. If the runtime already
 /// exists and the requested thread count differs, a warning is logged and
 /// the existing runtime is returned unchanged.
-fn get_or_create_shared_runtime(num_threads: usize) -> Arc<LibRuntime> {
+fn get_or_create_shared_runtime(num_threads: usize) -> std::io::Result<Arc<LibRuntime>> {
     let mut guard = SHARED_RT.lock().unwrap();
     if let Some(weak) = guard.as_ref()
         && let Some(rt) = weak.upgrade()
@@ -178,11 +183,11 @@ fn get_or_create_shared_runtime(num_threads: usize) -> Arc<LibRuntime> {
                 num_threads, existing
             );
         }
-        return rt;
+        return Ok(rt);
     }
-    let rt = Arc::new(LibRuntime(Some(build_runtime(num_threads))));
+    let rt = Arc::new(LibRuntime(Some(build_runtime(num_threads)?)));
     *guard = Some(Arc::downgrade(&rt));
-    rt
+    Ok(rt)
 }
 
 /// How often, in task polls, a busy worker of the shared runtime checks the
@@ -199,7 +204,7 @@ fn get_or_create_shared_runtime(num_threads: usize) -> Arc<LibRuntime> {
 /// driver, but costs a thread and about 10% more CPU per message.)
 const SHARED_EVENT_INTERVAL: u32 = 2;
 
-fn build_runtime(num_threads: usize) -> tokio::runtime::Runtime {
+fn build_runtime(num_threads: usize) -> std::io::Result<tokio::runtime::Runtime> {
     // Always use multi_thread: spawned tasks need background worker threads
     // to drive them. current_thread only runs tasks when block_on is called,
     // which does not apply to the library-owned shared runtime.
@@ -208,7 +213,6 @@ fn build_runtime(num_threads: usize) -> tokio::runtime::Runtime {
         .event_interval(SHARED_EVENT_INTERVAL)
         .enable_all()
         .build()
-        .expect("build tokio runtime")
 }
 
 impl RuntimeHandle {
@@ -499,7 +503,7 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        let lib = Arc::new(LibRuntime(Some(build_runtime(1))));
+        let lib = Arc::new(LibRuntime(Some(build_runtime(1).unwrap())));
         let task = lib.handle().spawn(std::future::pending::<()>());
         app.block_on(async move {
             drop(lib);
@@ -512,7 +516,7 @@ mod tests {
     /// Outside async code the runtime is dropped as usual.
     #[test]
     fn test_lib_runtime_drops_outside_async_context() {
-        let lib = Arc::new(LibRuntime(Some(build_runtime(1))));
+        let lib = Arc::new(LibRuntime(Some(build_runtime(1).unwrap())));
         let n = lib.handle().block_on(async { 1 + 1 });
         assert_eq!(n, 2);
         drop(lib);

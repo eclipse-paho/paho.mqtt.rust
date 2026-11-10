@@ -151,8 +151,9 @@ pub enum RuntimeMode {
     /// called.
     ///
     /// This behaves like the async-context branch of [`Auto`], but is
-    /// **explicit**: it panics immediately if there is no current runtime
-    /// rather than falling back to creating one.
+    /// **explicit**: client creation fails with
+    /// [`Error::InvalidArgument`](crate::Error) if there is no current
+    /// runtime, rather than falling back to creating one.
     ///
     /// **Use this mode when:**
     /// - You want a hard guarantee that the library never creates its own
@@ -164,7 +165,10 @@ pub enum RuntimeMode {
     /// The application runtime is not affected by client lifetimes: dropping
     /// all clients does not shut down the runtime.
     ///
-    /// **Panics** if called outside a Tokio runtime context.
+    /// [`AsyncClient::new`] fails with
+    /// [`Error::InvalidArgument`](crate::Error) if called outside a Tokio
+    /// runtime context, and always with the smol backend, which has no
+    /// ambient executor to borrow.
     ///
     /// [`Auto`]: RuntimeMode::Auto
     ApplicationRuntime,
@@ -641,8 +645,9 @@ impl CreateOptionsBuilder {
     /// Use the Tokio runtime that is current when [`AsyncClient::new`] is
     /// called.
     ///
-    /// Sets [`RuntimeMode::ApplicationRuntime`]. Panics at client-creation
-    /// time if there is no current Tokio runtime.
+    /// Sets [`RuntimeMode::ApplicationRuntime`]. Creating the client fails
+    /// with [`Error::InvalidArgument`](crate::Error) if there is no current
+    /// Tokio runtime.
     pub fn use_application_runtime(mut self) -> Self {
         self.opts.runtime_mode = RuntimeMode::ApplicationRuntime;
         self

@@ -93,6 +93,9 @@ pub(crate) enum SmolOwnership {
 /// `executor.run(future::pending())` indefinitely.
 static SHARED_EXECUTOR: OnceLock<Arc<smol::Executor<'static>>> = OnceLock::new();
 
+/// How many threads were started to run [`SHARED_EXECUTOR`].
+static SHARED_THREADS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 /// Returns the executor to run this client's event loop on, honouring `mode`.
 ///
 /// smol has no ambient runtime to discover or borrow — an executor is just
@@ -101,47 +104,73 @@ static SHARED_EXECUTOR: OnceLock<Arc<smol::Executor<'static>>> = OnceLock::new()
 /// [`Shared(n)`](crate::RuntimeMode::Shared) both mean the process-wide
 /// executor, with `n` deciding how many threads drive it.
 ///
-/// # Panics
+/// # Errors
 ///
-/// On [`ApplicationRuntime`](crate::RuntimeMode::ApplicationRuntime), which
-/// cannot be honoured here: there is no current executor to attach to. This
-/// mirrors the tokio backend, which panics when that mode is chosen with no
-/// runtime running.
+/// [`Error::InvalidArgument`](crate::Error) for
+/// [`ApplicationRuntime`](crate::RuntimeMode::ApplicationRuntime), which
+/// cannot be honoured here: there is no current executor to attach to, as
+/// the tokio backend reports when that mode is chosen with no runtime
+/// running. [`Error::Io`](crate::Error) if not one thread can be started to
+/// run the executor.
 pub(crate) fn resolve_executor(
     mode: &crate::create_options::RuntimeMode,
-) -> Arc<smol::Executor<'static>> {
+) -> crate::Result<Arc<smol::Executor<'static>>> {
     use crate::create_options::RuntimeMode;
 
     let threads = match mode {
         RuntimeMode::Auto => 1,
         RuntimeMode::Shared(n) => (*n).max(1),
-        RuntimeMode::ApplicationRuntime => panic!(
-            "RuntimeMode::ApplicationRuntime is not supported by the smol backend: \
-             smol has no ambient executor to borrow. Use RuntimeMode::Auto or Shared(n)."
-        ),
+        RuntimeMode::ApplicationRuntime => {
+            return Err(crate::Error::InvalidArgument(
+                "RuntimeMode::ApplicationRuntime is not supported by the smol backend: \
+                 smol has no ambient executor to borrow. Use RuntimeMode::Auto or Shared(n)."
+                    .into(),
+            ));
+        }
     };
 
-    let existing = SHARED_EXECUTOR.get().is_some();
-    let ex = SHARED_EXECUTOR
-        .get_or_init(|| {
-            let ex = Arc::new(smol::Executor::new());
-            for i in 0..threads {
-                let ex = ex.clone();
-                std::thread::Builder::new()
-                    .name(format!("mqtt-smol-{i}"))
-                    .spawn(move || smol::block_on(ex.run(std::future::pending::<()>())))
-                    .expect("spawn mqtt-smol executor thread");
-            }
-            ex
-        })
-        .clone();
-
-    // As with the tokio backend, the thread count is honoured only by
-    // whichever client creates the executor.
-    if existing && matches!(mode, RuntimeMode::Shared(n) if (*n).max(1) != threads) {
-        warn!("Ignoring num_threads: the shared smol executor already exists");
+    if let Some(ex) = SHARED_EXECUTOR.get() {
+        // As with the tokio backend, the thread count is honoured only by
+        // whichever client creates the executor.
+        let existing = SHARED_THREADS.load(std::sync::atomic::Ordering::Relaxed);
+        if matches!(mode, RuntimeMode::Shared(_)) && threads != existing {
+            warn!(
+                "Ignoring num_threads={threads}: the shared smol executor already has {existing}"
+            );
+        }
+        return Ok(ex.clone());
     }
-    ex
+
+    // Creation can fail, which `OnceLock::get_or_init` cannot report, so it
+    // is serialised here instead: two clients created at once must not
+    // each start threads for an executor of their own.
+    static CREATING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _creating = CREATING.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(ex) = SHARED_EXECUTOR.get() {
+        return Ok(ex.clone());
+    }
+
+    let ex = Arc::new(smol::Executor::new());
+    let mut started = 0;
+    for i in 0..threads {
+        let runner = ex.clone();
+        let res = std::thread::Builder::new()
+            .name(format!("mqtt-smol-{i}"))
+            .spawn(move || smol::block_on(runner.run(std::future::pending::<()>())));
+        match res {
+            Ok(_) => started += 1,
+            // With no thread at all nothing would run the event loop.
+            Err(e) if started == 0 => return Err(e.into()),
+            // With some, it runs, if more slowly than asked for.
+            Err(e) => {
+                warn!("Started {started} of {threads} smol executor threads: {e}");
+                break;
+            }
+        }
+    }
+    SHARED_THREADS.store(started, std::sync::atomic::Ordering::Relaxed);
+    let _ = SHARED_EXECUTOR.set(ex.clone());
+    Ok(ex)
 }
 
 impl RuntimeHandle {
