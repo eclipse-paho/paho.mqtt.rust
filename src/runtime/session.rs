@@ -2387,9 +2387,21 @@ impl<B: Backend> Session<B> {
                 // step, so a crash now cannot resurrect the message.
                 if let Some(inflight) = self.state.mark_sent(rec.packet_id) {
                     inflight.phase = PublishPhase::AwaitingPubComp;
+                    self.queue(&Packet::PubRel(PubAck::new(rec.packet_id)))?;
+                    self.persist_last_frame(b's', rec.packet_id);
+                } else {
+                    // Not one of ours. The server still gets its PUBREL, to
+                    // finish its side — in v5 saying the identifier is not
+                    // known (§3.6.2.1) — but nothing is stored: there is no
+                    // message for the entry to stand for, and no PUBCOMP
+                    // would ever arrive to remove it, so the next run of
+                    // the program would re-send it.
+                    let mut rel = PubAck::new(rec.packet_id);
+                    if self.ver.is_v5() {
+                        rel.reason_code = ReasonCode::PacketIdentifierNotFound;
+                    }
+                    self.queue(&Packet::PubRel(rel))?;
                 }
-                self.queue(&Packet::PubRel(PubAck::new(rec.packet_id)))?;
-                self.persist_last_frame(b's', rec.packet_id);
             }
 
             // ---- QoS 2 outbound: PUBCOMP → resolve token ----
@@ -2487,15 +2499,21 @@ impl<B: Backend> Session<B> {
 
             // ---- QoS 2 inbound: PUBREL → send PUBCOMP, deliver message ----
             Packet::PubRel(rel) => {
-                let comp = Packet::PubComp(PubAck::new(rel.packet_id));
                 match self.state.pending_pub2_in.remove(&rel.packet_id) {
                     Some(msg) => {
                         self.persist_remove(b'r', rel.packet_id);
+                        let comp = Packet::PubComp(PubAck::new(rel.packet_id));
                         self.deliver_msg(msg, Some(comp))?;
                     }
-                    // Already delivered, its PUBCOMP lost: just complete.
+                    // Already delivered, its PUBCOMP lost: just complete,
+                    // in v5 saying the identifier is not known — which
+                    // §3.7.2.1 says "is not an error during recovery".
                     None => {
-                        self.queue(&comp)?;
+                        let mut comp = PubAck::new(rel.packet_id);
+                        if self.ver.is_v5() {
+                            comp.reason_code = ReasonCode::PacketIdentifierNotFound;
+                        }
+                        self.queue(&Packet::PubComp(comp))?;
                     }
                 }
             }
@@ -5256,6 +5274,59 @@ mod tests {
             ));
             assert_eq!(h.conn.get(), after_loss);
         }
+    }
+
+    /// A PUBREC or PUBREL for a packet identifier the client does not hold
+    /// is answered — in v5 with Packet Identifier not found (§3.6.2.1,
+    /// §3.7.2.1) — and nothing is stored for it. A stray PUBREC used to
+    /// leave a PUBREL in the store that no PUBCOMP would ever remove, for
+    /// the next run of the program to re-send.
+    #[test]
+    fn test_unknown_packet_ids_are_answered_and_not_stored() {
+        let store = store_with(&[]);
+        let mut h = harness(BytesMut::new(), Duration::ZERO, SessionState::default());
+        h.session.persist = Persist::Inline(store.clone());
+
+        h.session
+            .handle_packet(Packet::PubRec(PubAck::new(77)))
+            .unwrap();
+        h.session
+            .handle_packet(Packet::PubRel(PubAck::new(88)))
+            .unwrap();
+        let sent = sent_packets(&mut h);
+        assert!(
+            matches!(&sent[..], [Packet::PubRel(rel), Packet::PubComp(comp)]
+                if rel.packet_id == 77 && comp.packet_id == 88
+                    && rel.reason_code == ReasonCode::PacketIdentifierNotFound
+                    && comp.reason_code == ReasonCode::PacketIdentifierNotFound),
+            "{sent:?}"
+        );
+        assert!(stored_keys(&store).unwrap().is_empty(), "nothing stored");
+
+        // One of ours: PUBREL with Success, and the store now holds it.
+        let (_tok, c) = publish_cmd("q", QoS::QoS2, Bytes::from_static(b"x"));
+        h.session.handle_command(c).unwrap();
+        let id = *h.session.state.inflight.keys().next().unwrap();
+        h.session
+            .handle_packet(Packet::PubRec(PubAck::new(id)))
+            .unwrap();
+        let sent = sent_packets(&mut h);
+        assert!(
+            matches!(sent.last(), Some(Packet::PubRel(rel))
+                if rel.packet_id == id && rel.reason_code == ReasonCode::Success),
+            "{sent:?}"
+        );
+        assert_eq!(stored_keys(&store).unwrap(), [format!("s{id}")]);
+
+        // v3 has no reason code to give: a plain PUBREL.
+        h.session.ver = MqttVersion::V3_1_1;
+        h.session
+            .handle_packet(Packet::PubRec(PubAck::new(99)))
+            .unwrap();
+        while h.session.write_now().unwrap() {}
+        let wire = std::mem::take(&mut h.wire.wire().bytes);
+        assert_eq!(wire, [0x62, 0x02, 0x00, 99]);
+        assert_eq!(stored_keys(&store).unwrap(), [format!("s{id}")]);
     }
 
     /// An outbound topic alias lasts one connection (§3.3.2.3.4). What is
