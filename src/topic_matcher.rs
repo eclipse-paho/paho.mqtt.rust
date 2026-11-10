@@ -127,8 +127,8 @@ impl<T> Node<T> {
     /// Removes empty child nodes.
     fn prune(&mut self) {
         // Recursively prune children
-        for node in &mut self.children.values_mut() {
-            node.shrink_to_fit();
+        for node in self.children.values_mut() {
+            node.prune();
         }
 
         // Remove empty children and shrink the has hmaps
@@ -273,19 +273,32 @@ impl<T> TopicMatcher<T> {
 
     /// Removes the entry, returning the value for it, if found.
     ///
-    /// This removes the value from the internal node, but leaves the node,
-    /// even if it is empty. To remove empty nodes, see [`prune`](Self::prune)
-    /// or [`shrink_to_fit`](Self::shrink_to_fit).
+    /// Any node left with neither a value nor children is removed with it,
+    /// so the collection holds nothing for filters that are gone, and
+    /// [`is_empty`](Self::is_empty) is true once every entry has been
+    /// removed.
     pub fn remove(&mut self, filter: &str) -> Option<T> {
-        let mut curr = &mut self.root;
+        Self::remove_at(&mut self.root, filter.split('/'))
+    }
 
-        for field in filter.split('/') {
-            curr = curr.children.get_mut(field)?;
+    /// Removes the value for the remaining `fields` below `node`, and
+    /// whatever nodes on the way down that leaves empty.
+    fn remove_at(node: &mut Node<T>, mut fields: Split<'_, char>) -> Option<T> {
+        let Some(field) = fields.next() else {
+            return node.value.take().map(|(_, v)| v);
+        };
+        let child = node.children.get_mut(field)?;
+        let val = Self::remove_at(child, fields);
+        if child.is_empty() {
+            node.children.remove(field);
         }
-        curr.value.take().map(|(_, v)| v)
+        val
     }
 
     /// Removes empty nodes in the collection.
+    ///
+    /// Since [`remove`](Self::remove) removes the nodes it empties, there
+    /// are none to find; this is kept for compatibility.
     pub fn prune(&mut self) {
         self.root.prune()
     }
@@ -388,20 +401,29 @@ impl<'a, T: 'a> IntoIterator for &'a mut TopicMatcher<T> {
 /// 'b - The topic string
 /// ```
 ///
-/// We keep a stack of nodes that still need to be searched. For each node,
-/// there is also an iterator stack of fields for that node to search.
+/// We keep a stack of work still to do: nodes to search with the topic
+/// fields left to match against them, and `#` nodes, whose values match
+/// whatever is left of the topic, waiting to be yielded.
 #[derive(Debug)]
 pub struct MatchIter<'a, 'b, T> {
-    // The nodes still to be processed.
-    // The tuple is (current node, remaining topic fields, is first node)
-    remaining: Vec<(&'a Node<T>, Split<'b, char>, bool)>,
+    remaining: Vec<Pending<'a, 'b, T>>,
+}
+
+/// One item of [`MatchIter`]'s work.
+#[derive(Debug)]
+enum Pending<'a, 'b, T> {
+    /// Search `node` with the remaining topic fields. `first` is set for the
+    /// root, whose field is the first of the topic.
+    Search(&'a Node<T>, Split<'b, char>, bool),
+    /// Yield the value of a `#` node, if it has one.
+    Yield(&'a Node<T>),
 }
 
 impl<'a, 'b, T> MatchIter<'a, 'b, T> {
     fn new(node: &'a Node<T>, topic: &'b str) -> Self {
         let fields = topic.split('/');
         Self {
-            remaining: vec![(node, fields, true)],
+            remaining: vec![Pending::Search(node, fields, true)],
         }
     }
 }
@@ -411,45 +433,50 @@ impl<'a, 'b, T> Iterator for MatchIter<'a, 'b, T> {
     type Item = (&'a str, &'a T);
 
     /// Gets the next value that matches the iterator's topic.
+    ///
+    /// A node can be left without a value — `remove` takes the value but
+    /// keeps the node — so a node is never taken as a match just for being
+    /// there: an empty one is passed over and the search goes on.
     fn next(&mut self) -> Option<Self::Item> {
-        // If no more nodes to search, we're done
-        let (node, mut fields, first) = self.remaining.pop()?;
+        loop {
+            let (node, mut fields, first) = match self.remaining.pop()? {
+                Pending::Yield(node) => match node.value_ref() {
+                    Some(item) => return Some(item),
+                    None => continue,
+                },
+                Pending::Search(node, fields, first) => (node, fields, first),
+            };
 
-        let field = match fields.next() {
-            Some(field) => field,
-            None => {
-                return node
-                    .value
-                    .as_ref()
-                    .map(|(k, v)| (k.as_str(), v))
-                    .or_else(|| {
-                        node.children
-                            .get("#")
-                            .and_then(|child| child.value_ref())
-                            .or_else(|| self.next())
-                    });
-            }
-        };
+            let Some(field) = fields.next() else {
+                // The whole topic is matched at this node: its own value,
+                // and also that of a `#` below it, since `#` matches the
+                // parent level too (`a/#` matches `a`). Both, not either.
+                if let Some(child) = node.children.get("#") {
+                    self.remaining.push(Pending::Yield(child));
+                }
+                match node.value_ref() {
+                    Some(item) => return Some(item),
+                    None => continue,
+                }
+            };
 
-        if let Some(child) = node.children.get(field) {
-            self.remaining.push((child, fields.clone(), false));
-        }
-
-        // Topics starting with '$' don't match wildcards in the first field
-        // https://docs.oasis-open.org/mqtt/mqtt/v5.0/os/mqtt-v5.0-os.html#_Toc3901246
-
-        if !first || !field.starts_with('$') {
-            if let Some(child) = node.children.get("+") {
-                self.remaining.push((child, fields, false))
+            if let Some(child) = node.children.get(field) {
+                self.remaining
+                    .push(Pending::Search(child, fields.clone(), false));
             }
 
-            if let Some(child) = node.children.get("#") {
+            // Topics starting with '$' don't match wildcards in the first field
+            // https://docs.oasis-open.org/mqtt/mqtt/v5.0/os/mqtt-v5.0-os.html#_Toc3901246
+            if !first || !field.starts_with('$') {
+                if let Some(child) = node.children.get("+") {
+                    self.remaining.push(Pending::Search(child, fields, false));
+                }
                 // By protocol definition, a '#' must be a terminating leaf.
-                return child.value_ref();
+                if let Some(child) = node.children.get("#") {
+                    self.remaining.push(Pending::Yield(child));
+                }
             }
         }
-
-        self.next()
     }
 }
 
@@ -623,5 +650,119 @@ mod tests {
 
         let m: Vec<_> = tm.matches("some/bad/topic").map(|(_, v)| *v).collect();
         assert!(m.is_empty());
+    }
+
+    fn matched(tm: &TopicMatcher<i32>, topic: &str) -> Vec<i32> {
+        let mut m: Vec<_> = tm.matches(topic).map(|(_, v)| *v).collect();
+        m.sort();
+        m
+    }
+
+    /// Adds an empty node for `filter`, as `remove` used to leave behind.
+    /// It now prunes them, but the search must not depend on that.
+    fn add_empty_node(tm: &mut TopicMatcher<i32>, filter: &str) {
+        let mut node = &mut tm.root;
+        for field in filter.split('/') {
+            node = node.children.entry(field.into()).or_default();
+        }
+    }
+
+    /// A `#` node without a value is passed over. It used to end the
+    /// search, hiding every match not yet found.
+    #[test]
+    fn test_matches_past_an_emptied_node() {
+        let mut tm = TopicMatcher::new();
+        add_empty_node(&mut tm, "a/#");
+        tm.insert("a/b", 2);
+        tm.insert("a/+", 3);
+        assert_eq!(matched(&tm, "a/b"), [2, 3]);
+        assert_eq!(matched(&tm, "a"), [0; 0]);
+        assert!(tm.has_match("a/b"));
+    }
+
+    /// Removing an entry removes the nodes it leaves empty, so a collection
+    /// whose entries have all been removed is empty. `is_empty` used to stay
+    /// false, the nodes kept, after an insert and a remove.
+    #[test]
+    fn test_remove_prunes_what_it_empties() {
+        let mut tm = TopicMatcher::new();
+        tm.insert("a/b/c", 1);
+        tm.insert("a/b", 2);
+        tm.insert("a/+/#", 3);
+        assert!(!tm.is_empty());
+
+        // Not there: nothing changes.
+        assert_eq!(tm.remove("a/b/c/d"), None);
+        assert_eq!(tm.remove("a/x"), None);
+
+        // A node with a value or children of its own stays.
+        assert_eq!(tm.remove("a/b/c"), Some(1));
+        assert_eq!(tm.get("a/b"), Some(&2));
+        assert!(
+            !tm.root.children["a"].children["b"]
+                .children
+                .contains_key("c")
+        );
+        assert_eq!(matched(&tm, "a/b"), [2, 3]);
+
+        assert_eq!(tm.remove("a/b"), Some(2));
+        assert!(!tm.root.children["a"].children.contains_key("b"));
+        assert_eq!(tm.remove("a/+/#"), Some(3));
+        assert!(tm.is_empty());
+        assert!(tm.root.children.is_empty());
+        assert!(!tm.has_match("a/b"));
+
+        // And it fills again as before.
+        tm.insert("a/b", 4);
+        assert_eq!(matched(&tm, "a/b"), [4]);
+    }
+
+    /// A topic that ends at a node with a value matches both that value and
+    /// a `#` below it, which matches the parent level too. It used to yield
+    /// only the first.
+    #[test]
+    fn test_matches_a_value_and_its_hash_child() {
+        let tm = topic_matcher! {
+            "a/b" => 1,
+            "a/b/#" => 2,
+            "a/+" => 3,
+            "#" => 4
+        };
+        assert_eq!(matched(&tm, "a/b"), [1, 2, 3, 4]);
+        assert_eq!(matched(&tm, "a/b/c"), [2, 4]);
+    }
+
+    /// `matches` agrees with `topic_matches` for every filter and topic in a
+    /// set chosen to exercise the corners: wildcards at each level, `$`
+    /// topics, empty levels, a filter that is a prefix of another, and a
+    /// node left behind by a removed value.
+    #[test]
+    fn test_matches_agrees_with_topic_matches() {
+        let filters = [
+            "#", "+", "+/+", "+/#", "a", "a/#", "a/+", "a/b", "a/b/#", "a/+/c", "a/b/c", "+/b/#",
+            "/", "/#", "a//c", "$SYS/#", "$SYS/+", "+/x",
+        ];
+        let topics = [
+            "a", "a/b", "a/b/c", "a/x/c", "a/b/c/d", "b", "x/b/y", "/", "/a", "a//c", "a/", "$SYS",
+            "$SYS/x", "$SYS/x/y", "", "q/x",
+        ];
+
+        let mut tm = TopicMatcher::new();
+        for (i, f) in filters.iter().enumerate() {
+            tm.insert(*f, i as i32);
+        }
+        // An empty node in among the rest.
+        add_empty_node(&mut tm, "a/b/x/#");
+        add_empty_node(&mut tm, "+/#");
+
+        for topic in topics {
+            let expected: Vec<i32> = filters
+                .iter()
+                .enumerate()
+                .filter(|(_, f)| topic_matches(f, topic))
+                .map(|(i, _)| i as i32)
+                .collect();
+            assert_eq!(matched(&tm, topic), expected, "topic {topic:?}");
+        }
     }
 }
