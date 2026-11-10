@@ -40,8 +40,9 @@
 //! runs.
 
 use std::{
+    panic::{AssertUnwindSafe, catch_unwind},
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, MutexGuard, PoisonError,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     task::{Context, Poll},
@@ -58,6 +59,39 @@ use crate::persistence::ClientPersistence;
 
 /// The store, shared with whatever opened it.
 pub(crate) type Store = Arc<Mutex<Box<dyn ClientPersistence>>>;
+
+/// Locks `store`. A store that panicked while it was locked leaves the lock
+/// poisoned; the store is taken back anyway; [`call`] has reported the
+/// panic, and refusing the store for ever after would lose more than it
+/// saves.
+pub(crate) fn lock(store: &Store) -> MutexGuard<'_, Box<dyn ClientPersistence>> {
+    store.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Calls `f` on `store`. The store is the application's code, and a panic
+/// in it becomes [`Error::Persistence`](crate::Error) rather than taking
+/// the event loop, or the worker thread, down with it.
+pub(crate) fn call<R>(
+    store: &Store,
+    f: impl FnOnce(&mut dyn ClientPersistence) -> crate::Result<R>,
+) -> crate::Result<R> {
+    let mut guard = lock(store);
+    catch_unwind(AssertUnwindSafe(|| f(&mut **guard))).unwrap_or_else(|panic| {
+        Err(crate::Error::Persistence(format!(
+            "the store panicked: {}",
+            panic_message(panic.as_ref())
+        )))
+    })
+}
+
+/// The message a panic was raised with, if it has one.
+fn panic_message(panic: &(dyn std::any::Any + Send)) -> &str {
+    panic
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("(no message)")
+}
 
 /// One piece of work for the store, in the order the session asked for it.
 enum Op {
@@ -116,24 +150,26 @@ pub(crate) struct PersistWorker {
 
 impl PersistWorker {
     /// Starts the worker thread for `store`.
-    pub(crate) fn start(store: Store, timeout: Duration) -> Self {
+    ///
+    /// Fails if the thread cannot be started. Without it nothing would
+    /// ever be stored, and every message held back for the store would
+    /// stall its session; the caller uses the store on the event loop
+    /// instead.
+    pub(crate) fn start(store: Store, timeout: Duration) -> std::io::Result<Self> {
         let (tx, rx) = crossbeam_channel::unbounded();
         let progress = Arc::new(Progress::default());
         let worker = Arc::clone(&progress);
         // Detached: the thread ends when the queue closes, which happens
         // when the event loop drops this handle.
-        let spawned = thread::Builder::new()
+        thread::Builder::new()
             .name("mqtt-persist".into())
-            .spawn(move || run(&rx, &store, &worker));
-        if let Err(e) = &spawned {
-            warn!("Could not start the persistence thread ({e}); the store will not be used");
-        }
-        Self {
+            .spawn(move || run(&rx, &store, &worker))?;
+        Ok(Self {
             tx,
             progress,
             next_seq: 0,
             timeout,
-        }
+        })
     }
 
     /// How long to wait for this store before giving up on the connection.
@@ -213,41 +249,64 @@ fn run(rx: &Receiver<Op>, store: &Store, progress: &Progress) {
             batch.push(op);
         }
 
-        let mut done = 0;
-        let mut puts: Vec<(String, Vec<Bytes>)> = Vec::new();
-        let mut store = match store.lock() {
-            Ok(store) => store,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        for op in batch {
-            match op {
-                Op::Put { seq, key, parts } => {
-                    puts.push((key, parts));
-                    done = seq;
-                }
-                // Ordered against the puts around it.
-                Op::Remove { key } => {
-                    flush(&mut store, &mut puts);
-                    if let Err(e) = store.remove(&key) {
-                        warn!("Could not remove {key} from the persistence store: {e}");
-                    }
-                }
-                Op::Close => {
-                    flush(&mut store, &mut puts);
-                    let _ = store.close();
-                }
-                Op::Barrier { seq } => {
-                    flush(&mut store, &mut puts);
-                    done = seq;
-                }
+        // A store that panics part way through loses the rest of this batch,
+        // but not the thread: the batch counts as done, as a failed put
+        // does (see `flush`), so nothing waits on it for ever.
+        let last = batch
+            .iter()
+            .filter_map(|op| match op {
+                Op::Put { seq, .. } | Op::Barrier { seq } => Some(*seq),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0);
+        let done = match catch_unwind(AssertUnwindSafe(|| run_batch(batch, store))) {
+            Ok(done) => done,
+            Err(panic) => {
+                warn!(
+                    "The persistence store panicked: {}; messages may not have been stored",
+                    panic_message(panic.as_ref())
+                );
+                last
             }
-        }
-        flush(&mut store, &mut puts);
-        drop(store);
+        };
         if done != 0 {
             progress.publish(done);
         }
     }
+}
+
+/// Does one batch, in order. Returns the highest sequence number it
+/// completed.
+fn run_batch(batch: Vec<Op>, store: &Store) -> u64 {
+    let mut done = 0;
+    let mut puts: Vec<(String, Vec<Bytes>)> = Vec::new();
+    let mut store = lock(store);
+    for op in batch {
+        match op {
+            Op::Put { seq, key, parts } => {
+                puts.push((key, parts));
+                done = seq;
+            }
+            // Ordered against the puts around it.
+            Op::Remove { key } => {
+                flush(&mut store, &mut puts);
+                if let Err(e) = store.remove(&key) {
+                    warn!("Could not remove {key} from the persistence store: {e}");
+                }
+            }
+            Op::Close => {
+                flush(&mut store, &mut puts);
+                let _ = store.close();
+            }
+            Op::Barrier { seq } => {
+                flush(&mut store, &mut puts);
+                done = seq;
+            }
+        }
+    }
+    flush(&mut store, &mut puts);
+    done
 }
 
 /// Hands the puts collected so far to the store, in one call.
@@ -407,12 +466,100 @@ mod tests {
         w.done_seq() >= seq
     }
 
+    /// A store that panics on its first `n` puts, then works.
+    struct Panicky {
+        left: u32,
+        stored: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl ClientPersistence for Panicky {
+        fn open(&mut self, _id: &str, _uri: &str) -> crate::Result<()> {
+            Ok(())
+        }
+        fn close(&mut self) -> crate::Result<()> {
+            Ok(())
+        }
+        fn put(&mut self, key: &str, _bufs: Vec<&[u8]>) -> crate::Result<()> {
+            if self.left > 0 {
+                self.left -= 1;
+                panic!("disk on fire");
+            }
+            self.stored.lock().unwrap().push(key.into());
+            Ok(())
+        }
+        fn get(&mut self, _key: &str) -> crate::Result<Vec<u8>> {
+            Ok(Vec::new())
+        }
+        fn remove(&mut self, _key: &str) -> crate::Result<()> {
+            Ok(())
+        }
+        fn keys(&mut self) -> crate::Result<Vec<String>> {
+            Ok(self.stored.lock().unwrap().clone())
+        }
+        fn clear(&mut self) -> crate::Result<()> {
+            Ok(())
+        }
+        fn contains_key(&mut self, _key: &str) -> bool {
+            false
+        }
+    }
+
+    fn panicky(left: u32) -> (Store, Arc<Mutex<Vec<String>>>) {
+        let stored = Arc::new(Mutex::new(Vec::new()));
+        let store = Panicky {
+            left,
+            stored: Arc::clone(&stored),
+        };
+        (Arc::new(Mutex::new(Box::new(store) as Box<_>)), stored)
+    }
+
+    /// A store that panics gives an error, not a panic, and is usable
+    /// afterwards, even with its lock poisoned by a panic elsewhere. A
+    /// panic used to propagate into the event loop, and a poisoned lock to
+    /// make every later `lock().unwrap()` panic.
+    #[test]
+    fn test_call_survives_a_panicking_store() {
+        let (store, stored) = panicky(1);
+        let res = call(&store, |s| s.put("s1", vec![b"x"]));
+        assert!(
+            matches!(&res, Err(crate::Error::Persistence(m)) if m.contains("disk on fire")),
+            "{res:?}"
+        );
+
+        // Poisoned by a thread that panicked holding the lock.
+        let poisoner = Arc::clone(&store);
+        let _ = thread::spawn(move || {
+            let _guard = poisoner.lock().unwrap();
+            panic!("holding the store");
+        })
+        .join();
+        assert!(store.is_poisoned());
+        call(&store, |s| s.put("s2", vec![b"x"])).unwrap();
+        assert_eq!(call(&store, |s| s.keys()).unwrap(), ["s2"]);
+        assert_eq!(*stored.lock().unwrap(), ["s2"]);
+    }
+
+    /// A store that panics on the worker thread loses that batch, which
+    /// still counts as done so nothing waits on it for ever; the thread
+    /// carries on. It used to die, leaving every later message held back
+    /// until the session gave up on the store.
+    #[test]
+    fn test_worker_survives_a_panicking_store() {
+        let (store, stored) = panicky(1);
+        let mut w = PersistWorker::start(store, Duration::from_secs(30)).unwrap();
+        let first = w.put("s1".into(), vec![Bytes::from_static(b"x")]);
+        assert!(wait_done(&w, first), "the panicked batch counts as done");
+        let second = w.put("s2".into(), vec![Bytes::from_static(b"x")]);
+        assert!(wait_done(&w, second), "the worker is still running");
+        assert_eq!(*stored.lock().unwrap(), ["s2"]);
+    }
+
     /// A burst of puts reaches the store as one `put_many`, and the worker
     /// reports the last of them done.
     #[test]
     fn test_consecutive_puts_are_batched() {
         let (store, log) = spy(Duration::from_millis(20));
-        let mut w = PersistWorker::start(store, Duration::from_secs(30));
+        let mut w = PersistWorker::start(store, Duration::from_secs(30)).unwrap();
         // The first put occupies the worker; the rest pile up behind it and
         // go together.
         let mut last = 0;
@@ -439,7 +586,7 @@ mod tests {
     #[test]
     fn test_remove_stays_behind_its_put() {
         let (store, log) = spy(Duration::from_millis(10));
-        let mut w = PersistWorker::start(store, Duration::from_secs(30));
+        let mut w = PersistWorker::start(store, Duration::from_secs(30)).unwrap();
         w.put("s1".into(), vec![Bytes::from_static(b"x")]);
         w.remove("s1".into());
         let seq = w.put("s2".into(), vec![Bytes::from_static(b"y")]);
@@ -457,7 +604,7 @@ mod tests {
     #[test]
     fn test_idle_waits_for_the_queue() {
         let (store, log) = spy(Duration::from_millis(30));
-        let mut w = PersistWorker::start(store, Duration::from_secs(30));
+        let mut w = PersistWorker::start(store, Duration::from_secs(30)).unwrap();
         for i in 0..3u8 {
             w.put(format!("s{i}"), vec![Bytes::from_static(b"x")]);
         }
