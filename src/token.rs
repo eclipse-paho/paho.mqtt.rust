@@ -70,6 +70,12 @@ struct FutureData<T> {
     result: Option<Result<T>>,
     /// Wakers of every task currently waiting on this token or a clone of it.
     wakers: Vec<Waker>,
+    /// The number of threads blocked in [`Token::wait`] or
+    /// [`Token::wait_for`] on this token or a clone of it. The completer
+    /// signals the condition variable only when this is above zero: a
+    /// notify costs a syscall even with nobody waiting, and most tokens
+    /// (QoS 0, pipelined, `.await`-ed) never have a blocked thread.
+    blocked: u32,
 }
 
 impl<T> Default for FutureData<T> {
@@ -77,20 +83,12 @@ impl<T> Default for FutureData<T> {
         Self {
             result: None,
             wakers: Vec::new(),
+            blocked: 0,
         }
     }
 }
 
 impl<T> FutureData<T> {
-    /// Stores `result` and wakes every task waiting. Threads blocked in
-    /// [`Token::wait`] are woken by the caller, through [`Shared::cv`].
-    fn set(&mut self, result: Result<T>) {
-        self.result = Some(result);
-        for w in self.wakers.drain(..) {
-            w.wake();
-        }
-    }
-
     /// Registers `waker` unless an equivalent one is already registered.
     fn register(&mut self, waker: &Waker) {
         if !self.wakers.iter().any(|w| w.will_wake(waker)) {
@@ -120,11 +118,28 @@ impl<T> Shared<T> {
 
     /// Resolves with `result`, unless already resolved, and wakes every
     /// waiter of either kind.
+    ///
+    /// No wakeup can be lost: a blocking waiter counts itself in
+    /// `blocked` and checks `result` under the lock, and the condition
+    /// variable releases the lock and sleeps as one step, while this sets
+    /// `result` and reads `blocked` under the same lock. The tasks are
+    /// woken after unlocking, so one that is polled at once on another
+    /// thread does not contend for the lock, and a waker that polls inline
+    /// cannot deadlock on it.
     fn complete(&self, result: Result<T>) {
-        let mut data = self.data.lock().unwrap();
-        if data.result.is_none() {
-            data.set(result);
+        let (wakers, notify) = {
+            let mut data = self.data.lock().unwrap();
+            if data.result.is_some() {
+                return;
+            }
+            data.result = Some(result);
+            (std::mem::take(&mut data.wakers), data.blocked > 0)
+        };
+        if notify {
             self.cv.notify_all();
+        }
+        for w in wakers {
+            w.wake();
         }
     }
 }
@@ -208,7 +223,7 @@ impl<T: 'static + Send> Token<T> {
     pub(crate) fn from_err(err: Error) -> Self {
         let inner = Shared::new(FutureData {
             result: Some(Err(err)),
-            wakers: Vec::new(),
+            ..FutureData::default()
         });
         Self { inner }
     }
@@ -220,12 +235,14 @@ impl<T: 'static + Send + Clone> Token<T> {
     /// The thread sleeps on a condition variable that the completing side
     /// signals, so no executor or timer is involved.
     pub fn wait(self) -> Result<T> {
-        let data = self.inner.data.lock().unwrap();
-        let data = self
+        let mut data = self.inner.data.lock().unwrap();
+        data.blocked += 1;
+        let mut data = self
             .inner
             .cv
             .wait_while(data, |d| d.result.is_none())
             .unwrap();
+        data.blocked -= 1;
         data.result.clone().unwrap_or(Err(Error::Disconnected))
     }
 
@@ -238,12 +255,14 @@ impl<T: 'static + Send + Clone> Token<T> {
     /// Blocks the caller for at most `dur`, returning `Err(Error::Timeout)`
     /// if the operation does not complete in time.
     pub fn wait_for(self, dur: Duration) -> Result<T> {
-        let data = self.inner.data.lock().unwrap();
-        let (data, _) = self
+        let mut data = self.inner.data.lock().unwrap();
+        data.blocked += 1;
+        let (mut data, _) = self
             .inner
             .cv
             .wait_timeout_while(data, dur, |d| d.result.is_none())
             .unwrap();
+        data.blocked -= 1;
         data.result.clone().unwrap_or(Err(Error::Timeout))
     }
 }
@@ -429,10 +448,63 @@ mod tests {
     #[test]
     fn test_wait_for_times_out() {
         let (tok, _comp) = ConnectToken::new();
+        let probe = tok.clone();
         let start = std::time::Instant::now();
         let res = tok.wait_for(Duration::from_millis(50));
         assert!(matches!(res, Err(Error::Timeout)));
         assert!(start.elapsed() >= Duration::from_millis(50));
+        // The timed-out thread no longer counts as blocked.
+        assert_eq!(probe.inner.data.lock().unwrap().blocked, 0);
+    }
+
+    /// Blocked threads are counted while they sleep, and uncounted once
+    /// woken, so later tokens' completions skip the notify.
+    #[test]
+    fn test_blocked_threads_are_counted() {
+        use std::thread;
+
+        let (tok, comp) = ConnectToken::new();
+        let probe = tok.clone();
+        let a = {
+            let tok = tok.clone();
+            thread::spawn(move || tok.wait())
+        };
+        let b = thread::spawn(move || tok.wait_for(Duration::from_secs(10)));
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while probe.inner.data.lock().unwrap().blocked < 2 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "waiters never blocked"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        comp.complete(Ok(ConnectResponse::default()));
+        assert!(a.join().unwrap().is_ok());
+        assert!(b.join().unwrap().is_ok());
+        assert_eq!(probe.inner.data.lock().unwrap().blocked, 0);
+    }
+
+    /// A waker that polls its token inline, from inside `wake()`, must not
+    /// deadlock: tasks are woken after the lock is released.
+    #[test]
+    fn test_waker_may_poll_inline() {
+        use std::task::Wake;
+
+        struct PollOnWake(Mutex<Option<ConnectToken>>);
+        impl Wake for PollOnWake {
+            fn wake(self: Arc<Self>) {
+                let mut tok = self.0.lock().unwrap().take().unwrap();
+                assert!(tok.try_wait().is_some());
+            }
+        }
+
+        let (mut tok, comp) = ConnectToken::new();
+        let w = Arc::new(PollOnWake(Mutex::new(Some(tok.clone()))));
+        let waker = Waker::from(w.clone());
+        let mut cx = Context::from_waker(&waker);
+        assert!(Pin::new(&mut tok).poll(&mut cx).is_pending());
+        comp.complete(Ok(ConnectResponse::default()));
+        assert!(w.0.lock().unwrap().is_none(), "woken");
     }
 
     /// Completed by another thread after the waiter has gone to sleep: the
