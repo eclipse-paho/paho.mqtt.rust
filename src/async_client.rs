@@ -793,10 +793,40 @@ impl AsyncClient {
     ///
     /// Note that [`publish`](Self::publish) fails its token with the *cause*
     /// alone, having taken the message.
+    ///
+    /// A message carrying a Subscription Identifier is refused with
+    /// [`Error::InvalidArgument`] as the cause: a client may not send one
+    /// (MQTT-3.3.4-6). A message received from a subscription has them, so
+    /// one republished on must have them removed first:
+    ///
+    /// ```no_run
+    /// # use paho_mqtt as mqtt;
+    /// # fn forward(cli: &mqtt::AsyncClient, mut msg: mqtt::Message) {
+    /// msg.props.remove(mqtt::PropertyId::SubscriptionIdentifier);
+    /// cli.publish(msg);
+    /// # }
+    /// ```
     pub fn try_publish(&self, msg: Message) -> Result<DeliveryToken> {
         debug!("Publish: {:?}", msg);
 
         if let Err(cause) = self.require_v5_for_props(&msg.props) {
+            return Err(Error::Publish(Box::new(cause), Box::new(msg)));
+        }
+
+        // A server puts Subscription Identifiers in the PUBLISH packets it
+        // sends; a client must not (MQTT-3.3.4-6), and the codec, which
+        // serves both sides, cannot tell which it is encoding for. A server
+        // that gets one disconnects with a Protocol Error. The likely way
+        // here is a received message published on unchanged.
+        if msg
+            .props
+            .contains(crate::PropertyId::SubscriptionIdentifier)
+        {
+            let cause = Error::InvalidArgument(
+                "a published message cannot carry a Subscription Identifier (MQTT-3.3.4-6); \
+                 remove it from a received message before publishing it on"
+                    .into(),
+            );
             return Err(Error::Publish(Box::new(cause), Box::new(msg)));
         }
 
@@ -3193,6 +3223,44 @@ mod tests {
             Ok(_) => panic!("the message should not have been queued"),
             Err(err) => panic!("expected the message back, got {err}"),
         }
+    }
+
+    /// A client may not publish a Subscription Identifier (MQTT-3.3.4-6),
+    /// as a received message republished as is would carry. It is refused
+    /// with the message handed back, or on `publish`'s token, and goes out
+    /// once the property is removed. It used to be sent, and a server
+    /// answers that with DISCONNECT (Protocol Error).
+    #[test]
+    fn test_publish_refuses_a_subscription_identifier() {
+        let cli = AsyncClient::new(
+            CreateOptionsBuilder::new()
+                .server_uri("mqtt://localhost:1883")
+                .mqtt_version(MqttVersion::V5)
+                .finalize(),
+        )
+        .unwrap();
+
+        let mut msg = marked_message();
+        msg.props.push(crate::Property::SubscriptionIdentifier(7));
+        msg.props.push(crate::Property::MessageExpiryInterval(30));
+
+        match cli.try_publish(msg.clone()) {
+            Err(Error::Publish(cause, back)) => {
+                assert!(
+                    matches!(&*cause, Error::InvalidArgument(m) if m.contains("Subscription Identifier")),
+                    "{cause}"
+                );
+                assert_same(&back, &msg);
+            }
+            Ok(_) => panic!("the message should not have been queued"),
+            Err(err) => panic!("expected the message back, got {err}"),
+        }
+        let err = cli.publish(msg.clone()).wait().unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)), "{err}");
+
+        // Without it, the message is accepted (and waits for a connection).
+        msg.props.remove(crate::PropertyId::SubscriptionIdentifier);
+        assert!(cli.try_publish(msg).is_ok());
     }
 
     /// `publish` has taken the message, so its token reports the cause alone
