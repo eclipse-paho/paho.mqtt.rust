@@ -431,6 +431,12 @@ pub(crate) struct SessionLimits {
     /// properties (0 when we did not offer any). An inbound alias above it
     /// is a protocol error by the server.
     pub topic_alias_max: u16,
+    /// Highest QoS the server accepts on a PUBLISH (CONNACK `MaximumQoS`,
+    /// QoS 2 when absent, as always in v3) [MQTT-3.2.2-11].
+    pub server_max_qos: QoS,
+    /// Whether the server accepts retained messages (CONNACK
+    /// `RetainAvailable`, `true` when absent) [MQTT-3.2.2-14].
+    pub retain_available: bool,
 }
 
 impl SessionLimits {
@@ -443,6 +449,29 @@ impl SessionLimits {
             server_topic_alias_max: u16_prop(&connack.properties, PropertyId::TopicAliasMaximum)
                 .unwrap_or(0),
             topic_alias_max: u16_prop(&params.props, PropertyId::TopicAliasMaximum).unwrap_or(0),
+            server_max_qos: connack
+                .properties
+                .get_byte(PropertyId::MaximumQoS)
+                .and_then(|b| QoS::try_from(b).ok())
+                .unwrap_or(QoS::QoS2),
+            retain_available: connack
+                .properties
+                .get_byte(PropertyId::RetainAvailable)
+                .is_none_or(|b| b != 0),
+        }
+    }
+
+    /// Why the server would refuse a PUBLISH at `qos`, with `retain`, if it
+    /// would: a QoS above its Maximum QoS, or RETAIN when it said it has no
+    /// retained messages. Either earns a DISCONNECT (0x9B, 0x9A), so the
+    /// client must not send it (v5 §3.2.2.3.4, §3.2.2.3.5).
+    pub fn publish_refusal(&self, qos: QoS, retain: bool) -> Option<ReasonCode> {
+        if qos > self.server_max_qos {
+            Some(ReasonCode::QosNotSupported)
+        } else if retain && !self.retain_available {
+            Some(ReasonCode::RetainNotSupported)
+        } else {
+            None
         }
     }
 }
@@ -870,6 +899,39 @@ mod tests {
         let mut e = v5(Some(60), None);
         e.on_disconnect(&CodecProperties::new());
         assert!(!e.ends_with_connection(), "no interval, no change");
+    }
+
+    /// The server's Maximum QoS and Retain Available, from the CONNACK, with
+    /// their defaults when it does not say (and always in v3); and what they
+    /// refuse.
+    #[test]
+    fn test_publish_limits_from_the_connack() {
+        let p = params_with(CodecProperties::new());
+        let limits = |props| SessionLimits::new(&p, &connack_with(props));
+
+        let open = limits(vec![]);
+        assert_eq!(
+            (open.server_max_qos, open.retain_available),
+            (QoS::QoS2, true)
+        );
+        assert_eq!(open.publish_refusal(QoS::QoS2, true), None);
+
+        let tight = limits(vec![Property::MaximumQoS(0), Property::RetainAvailable(0)]);
+        assert_eq!(tight.publish_refusal(QoS::QoS0, false), None);
+        assert_eq!(
+            tight.publish_refusal(QoS::QoS1, false),
+            Some(ReasonCode::QosNotSupported)
+        );
+        assert_eq!(
+            tight.publish_refusal(QoS::QoS0, true),
+            Some(ReasonCode::RetainNotSupported)
+        );
+        let qos1 = limits(vec![Property::MaximumQoS(1)]);
+        assert_eq!(qos1.publish_refusal(QoS::QoS1, true), None);
+        assert_eq!(
+            qos1.publish_refusal(QoS::QoS2, false),
+            Some(ReasonCode::QosNotSupported)
+        );
     }
 
     fn connack_with(props: Vec<Property>) -> ConnAck {

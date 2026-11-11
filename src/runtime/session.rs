@@ -1549,6 +1549,11 @@ impl<B: Backend> Session<B> {
             // The record's own copy is encoded and put back, not cloned. Any
             // later re-send is a duplicate too, so DUP stays set.
             PublishPhase::AwaitingAck(mut pub_pkt) => {
+                // A resumed session may be on a server that takes less than
+                // the one the message was first sent to.
+                if let Some(rc) = self.limits.publish_refusal(pub_pkt.qos, pub_pkt.retain) {
+                    return Err(Error::ReasonCode(rc, Properties::new()));
+                }
                 pub_pkt.dup = true;
                 let packet = Packet::Publish(*pub_pkt);
                 let res = self.out.push(&packet, self.ver, max);
@@ -2682,6 +2687,15 @@ impl<B: Backend> Session<B> {
                 props,
                 tx,
             } => {
+                // A QoS or RETAIN the server said it does not support would
+                // earn a DISCONNECT, so it fails this publish instead. It is
+                // not downgraded: that would quietly change the delivery the
+                // application asked for.
+                if let Some(rc) = self.limits.publish_refusal(qos, retain) {
+                    tx.complete(Err(Error::ReasonCode(rc, Properties::new())));
+                    return Ok(Flow::Continue);
+                }
+
                 // QoS 1/2 publishes are deferred when the in-flight window is
                 // full or no packet identifier is free. QoS 0 is never gated
                 // (no ACK, no packet ID).
@@ -4178,6 +4192,8 @@ mod tests {
             server_max_packet_size: None,
             server_topic_alias_max: 0,
             topic_alias_max: 0,
+            server_max_qos: QoS::QoS2,
+            retain_available: true,
         }
     }
 
@@ -5372,6 +5388,70 @@ mod tests {
             ));
             assert_eq!(h.conn.get(), after_loss);
         }
+    }
+
+    /// A publish the server said it cannot take — above its Maximum QoS, or
+    /// retained when it has no retained messages — fails on its own token
+    /// and does not reach the wire; it used to, and earned a DISCONNECT. On
+    /// a resumed session, a message in flight that the new server cannot
+    /// take fails alone, its store entry with it.
+    #[test]
+    fn test_publishes_beyond_the_servers_limits_fail() {
+        let refused = |rc| move |r: Option<Result<PublishResponse>>| matches!(r, Some(Err(Error::ReasonCode(c, _))) if c == rc);
+        let qos_refused = refused(ReasonCode::QosNotSupported);
+        let retain_refused = refused(ReasonCode::RetainNotSupported);
+
+        let mut h = harness(BytesMut::new(), Duration::ZERO, SessionState::default());
+        h.session.limits.server_max_qos = QoS::QoS1;
+        h.session.limits.retain_available = false;
+        let (mut q2, c) = publish_cmd("q2", QoS::QoS2, Bytes::from_static(b"x"));
+        h.session.handle_command(c).unwrap();
+        let (mut ret, tx) = Token::new();
+        h.session
+            .handle_command(Command::Publish {
+                topic: "r".into(),
+                payload: Bytes::from_static(b"x"),
+                qos: QoS::QoS0,
+                retain: true,
+                props: Properties::new(),
+                tx,
+            })
+            .unwrap();
+        let (mut ok, c) = publish_cmd("q1", QoS::QoS1, Bytes::from_static(b"x"));
+        h.session.handle_command(c).unwrap();
+        assert!(qos_refused(q2.try_wait()));
+        assert!(retain_refused(ret.try_wait()));
+        assert!(ok.try_wait().is_none(), "within the limits: in flight");
+        let sent: Vec<String> = sent_packets(&mut h).iter().map(describe).collect();
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert!(sent[0].starts_with("PUBLISH q1"));
+
+        // Resumed on a server that takes QoS 1 at most.
+        let store = store_with(&[]);
+        let mut first = harness(BytesMut::new(), Duration::ZERO, SessionState::default());
+        first.session.persist = Persist::Inline(store.clone());
+        let (mut two, c) = publish_cmd("two", QoS::QoS2, Bytes::from_static(b"x"));
+        first.session.handle_command(c).unwrap();
+        let (mut one, c) = publish_cmd("one", QoS::QoS1, Bytes::from_static(b"x"));
+        first.session.handle_command(c).unwrap();
+        assert_eq!(stored_keys(&store).unwrap().len(), 2);
+        let state = std::mem::take(&mut first.session.state);
+        drop(first);
+
+        let mut second = harness(BytesMut::new(), Duration::ZERO, state);
+        second.session.persist = Persist::Inline(store.clone());
+        second.session.limits.server_max_qos = QoS::QoS1;
+        second.session.resume(true);
+        assert!(qos_refused(two.try_wait()));
+        assert!(one.try_wait().is_none());
+        assert_eq!(
+            stored_keys(&store).unwrap().len(),
+            1,
+            "its entry went with it"
+        );
+        let resent: Vec<String> = sent_packets(&mut second).iter().map(describe).collect();
+        assert_eq!(resent.len(), 1, "{resent:?}");
+        assert!(resent[0].starts_with("PUBLISH one"));
     }
 
     /// A PUBREC or PUBREL for a packet identifier the client does not hold

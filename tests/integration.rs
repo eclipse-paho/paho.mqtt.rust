@@ -1610,6 +1610,65 @@ fn test_v5_server_keep_alive_overrides() {
     broker.join();
 }
 
+/// A broker that takes only QoS 0 and no retained messages says so in its
+/// CONNACK, and a publish beyond that fails on its token with the reason,
+/// without reaching the broker; the connection stays up for those within.
+/// They used to be sent, and the broker's answer is a DISCONNECT.
+#[test]
+fn test_v5_server_publish_limits_are_honoured() {
+    use mqtt::paho_mqtt_codec::{ConnAck, Packet, Property, ReasonCode};
+
+    let broker = common::spawn_broker(|pkt| match pkt {
+        Packet::Connect(_) => {
+            let mut ack = ConnAck::new(false, ReasonCode::Success);
+            ack.properties.push(Property::MaximumQoS(0));
+            ack.properties.push(Property::RetainAvailable(0));
+            vec![Packet::ConnAck(ack)]
+        }
+        _ => vec![],
+    });
+
+    let cli = mqtt::AsyncClient::new(broker.uri.clone()).unwrap();
+    let rsp = cli
+        .connect(mqtt::ConnectOptions::new_v5())
+        .wait_for(TIMEOUT)
+        .expect("connect failed");
+    assert_eq!(rsp.maximum_qos(), mqtt::QoS::AtMostOnce);
+    assert!(!rsp.retain_available());
+
+    let refused = |res: mqtt::Result<mqtt::PublishResponse>, rc| matches!(res, Err(mqtt::Error::ReasonCode(c, _)) if c == rc);
+    let qos1 = cli.publish(mqtt::Message::new(topic!("limits"), "q1", mqtt::QOS_1));
+    assert!(refused(
+        qos1.wait_for(TIMEOUT),
+        mqtt::ReasonCode::QosNotSupported
+    ));
+    let retained = cli.publish(mqtt::Message::new_retained(
+        topic!("limits"),
+        "r",
+        mqtt::QOS_0,
+    ));
+    assert!(refused(
+        retained.wait_for(TIMEOUT),
+        mqtt::ReasonCode::RetainNotSupported
+    ));
+    cli.publish(mqtt::Message::new(topic!("limits"), "ok", mqtt::QOS_0))
+        .wait_for(TIMEOUT)
+        .expect("a QoS 0 publish goes out");
+    assert!(cli.is_connected());
+
+    assert!(broker.wait_until(TIMEOUT, |pkts| {
+        pkts.iter().any(|p| matches!(p, Packet::Publish(_)))
+    }));
+    let sent: Vec<String> = broker.received_matching(|p| match p {
+        Packet::Publish(p) => Some(String::from_utf8_lossy(&p.payload).into_owned()),
+        _ => None,
+    });
+    assert_eq!(sent, ["ok"], "nothing beyond the limits reached the broker");
+
+    cli.disconnect(None).wait().ok();
+    broker.join();
+}
+
 /// The broker's Receive Maximum caps the in-flight window even when the
 /// client asked for an unlimited one.
 #[test]

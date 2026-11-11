@@ -866,6 +866,13 @@ impl AsyncClient {
     /// A synchronous failure fails the token with the cause — `Disconnected`
     /// or `WrongMqttVersion`. The message is not handed back, this call having
     /// taken it; use [`try_publish`](Self::try_publish) to keep it.
+    ///
+    /// A message the server said in its CONNACK that it cannot take fails
+    /// the token without being sent, with [`Error::ReasonCode`] carrying
+    /// `QosNotSupported` (a QoS above the server's Maximum QoS) or
+    /// `RetainNotSupported` (RETAIN, when Retain Available is 0); see
+    /// [`ConnectResponse::maximum_qos`] and
+    /// [`ConnectResponse::retain_available`]. It is not downgraded.
     pub fn publish(&self, msg: Message) -> DeliveryToken {
         match self.try_publish(msg) {
             // Unwrap the message this call has taken ownership of, so the
