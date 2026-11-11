@@ -1214,6 +1214,10 @@ struct Session<B: Backend> {
     /// Further `disconnect()` calls made while one was in progress, resolved
     /// when it completes.
     held_disconnects: Vec<Completer<()>>,
+    /// Whether the session failed on a packet of its own — a reply it could
+    /// not encode or that the server's Maximum Packet Size would not take —
+    /// rather than on one from the server; see [`queue_reply`](Self::queue_reply).
+    own_fault: bool,
     /// How many `disconnect()` calls this session completed. Each gets an
     /// [`Event::DisconnectDone`], sent by the event loop once the messages
     /// held back at the end have been handed over, so as not to overtake
@@ -1287,6 +1291,7 @@ impl<B: Backend> Session<B> {
             held_connect: None,
             held_disconnects: Vec::new(),
             disconnects_done: 0,
+            own_fault: false,
         }
     }
 
@@ -1396,7 +1401,7 @@ impl<B: Backend> Session<B> {
         match ack {
             Some(ack) if self.pending.is_some() => self.pending_ack = Some(ack),
             Some(ack) => {
-                self.queue(&ack)?;
+                self.queue_reply(&ack)?;
             }
             None => {}
         }
@@ -1738,6 +1743,24 @@ impl<B: Backend> Session<B> {
             .push(packet, self.ver, self.limits.server_max_packet_size)
     }
 
+    /// Queues a packet the protocol requires the client to send in reply
+    /// (PUBACK, PUBREC, PUBREL, PUBCOMP) or to keep the connection (PINGREQ),
+    /// where a failure leaves the session nowhere to go but closed.
+    ///
+    /// Such a failure is the client's, not the server's: the error is the
+    /// codec's, but the packet was ours. So it is noted, and the DISCONNECT
+    /// that ends the session does not take its reason code from it, which
+    /// would tell the server that *it* broke the protocol; see [`serve`].
+    ///
+    /// [`serve`]: Self::serve
+    fn queue_reply(&mut self, packet: &Packet) -> Result<u64> {
+        let res = self.queue(packet);
+        if res.is_err() {
+            self.own_fault = true;
+        }
+        res
+    }
+
     /// Brings the carried session state into line with what the server
     /// remembers, then puts everything outstanding back on the wire.
     ///
@@ -1855,9 +1878,16 @@ impl<B: Backend> Session<B> {
         // A v5 receiver that rejects a packet must say why before closing
         // (§4.13). Best-effort, and bounded: the connection may already be
         // gone, and the original error is what the caller hears either way.
+        // A fault in a packet of our own is not the server's to hear about
+        // as a protocol error: "unspecified", which v5 has for when no other
+        // reason applies, is all that is true to say.
         if let Err(e) = &res
             && self.ver.is_v5()
-            && let Some(rc) = disconnect_reason(e)
+            && let Some(rc) = if self.own_fault {
+                Some(ReasonCode::UnspecifiedError)
+            } else {
+                disconnect_reason(e)
+            }
             && self
                 .queue(&Packet::Disconnect(Disconnect::with_properties(rc, None)))
                 .is_ok()
@@ -2060,7 +2090,7 @@ impl<B: Backend> Session<B> {
                 LoopEvent::Delivered => {
                     self.pending = None;
                     if let Some(ack) = self.pending_ack.take() {
-                        self.queue(&ack)?;
+                        self.queue_reply(&ack)?;
                     }
                     self.release_held()?;
                     self.handle_buffered()?;
@@ -2112,7 +2142,7 @@ impl<B: Backend> Session<B> {
                                 ka.pinged(now);
                             }
                             ka_sleep.reset(period);
-                            self.queue(&Packet::PingReq)?;
+                            self.queue_reply(&Packet::PingReq)?;
                             self.write_now()?;
                         }
                     }
@@ -2487,7 +2517,7 @@ impl<B: Backend> Session<B> {
                 // step, so a crash now cannot resurrect the message.
                 if let Some(inflight) = self.state.mark_sent(rec.packet_id) {
                     inflight.phase = PublishPhase::AwaitingPubComp;
-                    self.queue(&Packet::PubRel(PubAck::new(rec.packet_id)))?;
+                    self.queue_reply(&Packet::PubRel(PubAck::new(rec.packet_id)))?;
                     self.persist_last_frame(b's', rec.packet_id);
                 } else {
                     // Not one of ours. The server still gets its PUBREL, to
@@ -2500,7 +2530,7 @@ impl<B: Backend> Session<B> {
                     if self.ver.is_v5() {
                         rel.reason_code = ReasonCode::PacketIdentifierNotFound;
                     }
-                    self.queue(&Packet::PubRel(rel))?;
+                    self.queue_reply(&Packet::PubRel(rel))?;
                 }
             }
 
@@ -2592,7 +2622,7 @@ impl<B: Backend> Session<B> {
                         let msg = Message::from(pub_pkt);
                         self.state.pending_pub2_in.insert(id, msg);
                         let rec = PubAck::new(id);
-                        self.queue(&Packet::PubRec(rec))?;
+                        self.queue_reply(&Packet::PubRec(rec))?;
                     }
                 }
             }
@@ -2613,7 +2643,7 @@ impl<B: Backend> Session<B> {
                         if self.ver.is_v5() {
                             comp.reason_code = ReasonCode::PacketIdentifierNotFound;
                         }
-                        self.queue(&Packet::PubComp(comp))?;
+                        self.queue_reply(&Packet::PubComp(comp))?;
                     }
                 }
             }
@@ -5472,6 +5502,39 @@ mod tests {
         let resent: Vec<String> = sent_packets(&mut second).iter().map(describe).collect();
         assert_eq!(resent.len(), 1, "{resent:?}");
         assert!(resent[0].starts_with("PUBLISH one"));
+    }
+
+    /// A session that ends because a reply of its own cannot be sent — here
+    /// a PUBACK, against a server whose Maximum Packet Size is too small for
+    /// it — tells the server "unspecified error" in its DISCONNECT, not the
+    /// codec's classification of the failure, which would say the server
+    /// sent a packet too large. The application still hears the real cause.
+    #[test]
+    fn test_own_fault_is_not_blamed_on_the_server() {
+        let mut h = harness(BytesMut::new(), Duration::ZERO, SessionState::default());
+        h.session.limits.server_max_packet_size = Some(3);
+        let mut reader = MockReader::open_with([wire_publish(
+            "in",
+            QoS::QoS1,
+            Some(7),
+            &Bytes::from_static(b"x"),
+        )]);
+        let res = {
+            let serve = pin!(h.session.serve(&mut reader, &h.cmd_rx, true));
+            poll_until(serve, Duration::from_secs(5)).expect("the session ended")
+        };
+        assert!(
+            matches!(
+                res,
+                Err(Error::Protocol(paho_mqtt_codec::Error::PacketTooLarge))
+            ),
+            "{res:?}"
+        );
+        let sent = sent_packets(&mut h);
+        assert!(
+            matches!(&sent[..], [Packet::Disconnect(d)] if d.reason_code == ReasonCode::UnspecifiedError),
+            "{sent:?}"
+        );
     }
 
     /// A DISCONNECT too large for the server goes out without its Reason

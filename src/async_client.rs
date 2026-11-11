@@ -98,6 +98,21 @@ where
     Ok(())
 }
 
+/// Checks the properties the application gave for a packet of type `ty`:
+/// that each is one such a packet may carry (v5 §2.2.2.2), with a valid
+/// value. The codec would refuse to encode the packet otherwise, which the
+/// event loop could only report later, on the token; here the call itself
+/// fails, with [`Error::InvalidArgument`].
+fn check_packet_props(props: &Properties, ty: paho_mqtt_codec::PacketType) -> Result<()> {
+    if props.is_empty() || (props.is_valid() && props.check_context(ty).is_ok()) {
+        return Ok(());
+    }
+    Err(Error::InvalidArgument(format!(
+        "the {} properties hold one that packet cannot carry, or an invalid value",
+        format!("{ty:?}").to_uppercase()
+    )))
+}
+
 fn make_persistence(
     typ: PersistenceType,
     sync: bool,
@@ -970,9 +985,11 @@ impl AsyncClient {
     /// Attempts to subscribe to a single topic with v5 options, but returns
     /// an error immediately if the request can't be started.
     ///
-    /// The failures are those of [`try_subscribe`](Self::try_subscribe), and
+    /// The failures are those of [`try_subscribe`](Self::try_subscribe),
     /// [`Error::WrongMqttVersion`] for v5 subscribe options or properties on
-    /// a connection of an earlier version.
+    /// a connection of an earlier version, and [`Error::InvalidArgument`]
+    /// for a property a SUBSCRIBE cannot carry, or an invalid value (a
+    /// Subscription Identifier of 0, say).
     ///
     /// # Arguments
     ///
@@ -1002,6 +1019,7 @@ impl AsyncClient {
         let props = props.into().unwrap_or_default();
         self.require_v5_for_sub_opts(&opts)?;
         self.require_v5_for_props(&props)?;
+        check_packet_props(&props, paho_mqtt_codec::PacketType::Subscribe)?;
 
         let (tok, comp) = SubscribeToken::new();
         let cmd = Command::Subscribe {
@@ -1181,6 +1199,7 @@ impl AsyncClient {
 
         let props = props.into().unwrap_or_default();
         self.require_v5_for_props(&props)?;
+        check_packet_props(&props, paho_mqtt_codec::PacketType::Subscribe)?;
 
         let filters = topics
             .iter()
@@ -1282,8 +1301,9 @@ impl AsyncClient {
     /// returns an error immediately if the request can't be started.
     ///
     /// The failures are those of [`try_unsubscribe`](Self::try_unsubscribe),
-    /// and [`Error::WrongMqttVersion`] for v5 properties on a connection of
-    /// an earlier version.
+    /// [`Error::WrongMqttVersion`] for v5 properties on a connection of an
+    /// earlier version, and [`Error::InvalidArgument`] for a property an
+    /// UNSUBSCRIBE cannot carry, or an invalid value.
     ///
     /// # Arguments
     ///
@@ -1301,6 +1321,7 @@ impl AsyncClient {
         let topic = topic.into();
         check_filters([&topic])?;
         self.require_v5_for_props(&props)?;
+        check_packet_props(&props, paho_mqtt_codec::PacketType::Unsubscribe)?;
 
         let (tok, comp) = UnsubscribeToken::new();
         let cmd = Command::Unsubscribe {
@@ -1396,6 +1417,7 @@ impl AsyncClient {
     {
         check_filters(topics)?;
         self.require_v5_for_props(&props)?;
+        check_packet_props(&props, paho_mqtt_codec::PacketType::Unsubscribe)?;
 
         let (tok, comp) = UnsubscribeManyToken::new();
         let filters = topics.iter().map(|t| t.as_ref().to_string()).collect();
@@ -1879,19 +1901,7 @@ impl AsyncClient {
     ///   "does not treat it as a valid DISCONNECT" (v5 §3.14.2.2.2).
     fn check_disconnect_props(&self, props: &Properties) -> Result<()> {
         use crate::PropertyId;
-        if props.is_empty() {
-            return Ok(());
-        }
-        if props
-            .check_context(paho_mqtt_codec::PacketType::Disconnect)
-            .is_err()
-            || !props.is_valid()
-        {
-            return Err(Error::InvalidArgument(
-                "the disconnect properties hold one a DISCONNECT cannot carry, or an invalid value"
-                    .into(),
-            ));
-        }
+        check_packet_props(props, paho_mqtt_codec::PacketType::Disconnect)?;
         if props
             .get_u32(PropertyId::SessionExpiryInterval)
             .is_some_and(|n| n != 0)
@@ -3092,6 +3102,65 @@ mod tests {
         for f in ["#", "+", "a/+/b", "a/#", "$share/g/a/#", "/"] {
             assert!(cli.try_subscribe(f, 1).is_ok(), "{f:?}");
         }
+    }
+
+    /// (Un)subscribe properties are checked when the call is made: one the
+    /// packet cannot carry, or an invalid value, is refused at once. They
+    /// used to reach the event loop, failing the token only when the packet
+    /// would not encode.
+    #[test]
+    fn test_try_subscribe_and_unsubscribe_check_properties() {
+        use crate::Property;
+        let cli = AsyncClient::new(
+            CreateOptionsBuilder::new()
+                .server_uri("mqtt://localhost:1883")
+                .mqtt_version(MqttVersion::V5)
+                .finalize(),
+        )
+        .unwrap();
+        let props = |list: Vec<Property>| {
+            let mut p = Properties::new();
+            for prop in list {
+                p.push(prop);
+            }
+            p
+        };
+        let invalid = |res: Result<()>| matches!(res, Err(Error::InvalidArgument(ref m)) if m.contains("properties"));
+        let opts = SubscribeOptions::default();
+
+        // Not allowed in the packet, or not a valid value.
+        let bad_sub = [
+            props(vec![Property::ContentType("x".into())]),
+            props(vec![Property::SubscriptionIdentifier(0)]),
+        ];
+        for p in bad_sub {
+            assert!(invalid(
+                cli.try_subscribe_with_options("a", 1, opts, p.clone())
+                    .map(drop)
+            ));
+            assert!(invalid(
+                cli.try_subscribe_many_with_options(&["a"], &[1], &[], p)
+                    .map(drop)
+            ));
+        }
+        let bad_unsub = props(vec![Property::SubscriptionIdentifier(3)]);
+        assert!(invalid(
+            cli.try_unsubscribe_with_options("a", bad_unsub.clone())
+                .map(drop)
+        ));
+        assert!(invalid(
+            cli.try_unsubscribe_many_with_options(&["a"], bad_unsub)
+                .map(drop)
+        ));
+
+        // What each may carry goes through.
+        let user = || Property::UserProperty("k".into(), "v".into());
+        let sub = props(vec![Property::SubscriptionIdentifier(3), user()]);
+        assert!(cli.try_subscribe_with_options("a", 1, opts, sub).is_ok());
+        assert!(
+            cli.try_unsubscribe_with_options("a", props(vec![user()]))
+                .is_ok()
+        );
     }
 
     /// v5 subscribe options can't go on a v3 connection.
