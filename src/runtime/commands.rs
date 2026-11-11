@@ -200,7 +200,7 @@ impl From<&CreateOptions> for OfflineConfig {
 /// An IPv6 address must be in brackets (RFC 3986 §3.2.2), since its own
 /// colons would otherwise be taken for the port's; the host is returned
 /// without them, which is the form a socket address or a TLS server name
-/// wants. [`host_port`] puts them back to write the two out together.
+/// wants. `host_port` puts them back to write the two out together.
 pub(crate) fn split_host_port(authority: &str, default_port: u16) -> crate::Result<(String, u16)> {
     let bad = |what: &str| Error::InvalidArgument(format!("{what} in address: {authority}"));
     let port = |p: &str| p.parse::<u16>().map_err(|_| bad("invalid port"));

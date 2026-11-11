@@ -93,6 +93,9 @@ fn panic_message(panic: &(dyn std::any::Any + Send)) -> &str {
         .unwrap_or("(no message)")
 }
 
+/// A call to make on the store, from [`PersistWorker::run`].
+type StoreFn = Box<dyn FnOnce(&mut dyn ClientPersistence) + Send>;
+
 /// One piece of work for the store, in the order the session asked for it.
 enum Op {
     /// Store `parts` under `key`. Consecutive puts are passed to the store
@@ -106,9 +109,11 @@ enum Op {
     Remove { key: String },
     /// Close the store, at the end of a connection.
     Close,
-    /// Report progress without doing anything, so that the loop can wait
-    /// for the queue to empty before using the store directly.
-    Barrier { seq: u64 },
+    /// Run a call on the store, in its place in the queue, for the event
+    /// loop's connect-time work (open, read back, clear), which it would
+    /// otherwise have to do on its own thread. The closure sends the result
+    /// back itself; see [`PersistWorker::run`].
+    Run(StoreFn),
 }
 
 /// How far the worker has got, and whether anyone is waiting to hear.
@@ -198,6 +203,29 @@ impl PersistWorker {
         let _ = self.tx.send(Op::Close);
     }
 
+    /// Queues `f` to run on the store, after everything queued before it,
+    /// and returns where its result will arrive. A panic in the store is an
+    /// [`Error::Persistence`](crate::Error), as in [`call`]; a worker that
+    /// has gone drops the sender, which the caller sees as cancelled.
+    pub(crate) fn run<R, F>(&self, f: F) -> futures::channel::oneshot::Receiver<crate::Result<R>>
+    where
+        R: Send + 'static,
+        F: FnOnce(&mut dyn ClientPersistence) -> crate::Result<R> + Send + 'static,
+    {
+        let (tx, rx) = futures::channel::oneshot::channel();
+        let op = Op::Run(Box::new(move |store: &mut dyn ClientPersistence| {
+            let res = catch_unwind(AssertUnwindSafe(|| f(store))).unwrap_or_else(|panic| {
+                Err(crate::Error::Persistence(format!(
+                    "the store panicked: {}",
+                    panic_message(panic.as_ref())
+                )))
+            });
+            let _ = tx.send(res);
+        }));
+        let _ = self.tx.send(op);
+        rx
+    }
+
     /// The highest sequence number stored so far.
     pub(crate) fn done_seq(&self) -> u64 {
         self.progress.done.load(Ordering::SeqCst)
@@ -222,19 +250,6 @@ impl PersistWorker {
             Poll::Pending
         }
     }
-
-    /// Waits until the queue has drained, so that the caller may use the
-    /// store directly — at connect time, to open it, read it back, or
-    /// clear it — without contending with the worker or reading a state it
-    /// is half way through writing.
-    pub(crate) async fn idle(&mut self) {
-        self.next_seq += 1;
-        let seq = self.next_seq;
-        if self.tx.send(Op::Barrier { seq }).is_err() {
-            return;
-        }
-        std::future::poll_fn(|cx| self.poll_done(cx, seq)).await
-    }
 }
 
 /// The worker thread: take everything queued, do it in order, say how far
@@ -255,7 +270,7 @@ fn run(rx: &Receiver<Op>, store: &Store, progress: &Progress) {
         let last = batch
             .iter()
             .filter_map(|op| match op {
-                Op::Put { seq, .. } | Op::Barrier { seq } => Some(*seq),
+                Op::Put { seq, .. } => Some(*seq),
                 _ => None,
             })
             .max()
@@ -299,9 +314,9 @@ fn run_batch(batch: Vec<Op>, store: &Store) -> u64 {
                 flush(&mut store, &mut puts);
                 let _ = store.close();
             }
-            Op::Barrier { seq } => {
+            Op::Run(f) => {
                 flush(&mut store, &mut puts);
-                done = seq;
+                f(&mut **store);
             }
         }
     }
@@ -599,21 +614,24 @@ mod tests {
         assert!(put1 < rm, "remove overtook its put: {joined}");
     }
 
-    /// `idle` returns only once the queue has drained, so the loop can use
-    /// the store directly without racing the worker.
+    /// A call run on the worker waits behind everything queued before it,
+    /// and its result comes back; a panic in it comes back as an error.
     #[test]
-    fn test_idle_waits_for_the_queue() {
+    fn test_run_waits_for_the_queue() {
         let (store, log) = spy(Duration::from_millis(30));
         let mut w = PersistWorker::start(store, Duration::from_secs(30)).unwrap();
         for i in 0..3u8 {
             w.put(format!("s{i}"), vec![Bytes::from_static(b"x")]);
         }
-        futures::executor::block_on(w.idle());
-        assert_eq!(
-            log.lock().unwrap().len(),
-            1,
-            "idle returned before the queue drained"
-        );
+        let seen = Arc::clone(&log);
+        let n = futures::executor::block_on(w.run(move |_| Ok(seen.lock().unwrap().len())))
+            .unwrap()
+            .unwrap();
+        assert!(n >= 1, "ran before the puts ahead of it");
+
+        let res = futures::executor::block_on(w.run(|_| -> crate::Result<()> { panic!("boom") }))
+            .unwrap();
+        assert!(matches!(res, Err(crate::Error::Persistence(m)) if m.contains("boom")));
     }
 
     /// The store in-process is not worth a thread: the client runs it

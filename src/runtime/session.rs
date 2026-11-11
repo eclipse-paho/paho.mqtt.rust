@@ -404,21 +404,17 @@ fn session_resumed(params: &ConnectParams, connack: &ConnAck) -> bool {
 /// one message lost, against a store that may be from an older version of
 /// the program or a different protocol level — but never silently: each
 /// one is logged with its reason, and a summary follows. A store that
-/// cannot even be listed does fail the connection, in [`stored_keys`], since
+/// cannot even be listed does fail the connection, in [`read_store`], since
 /// it would otherwise look exactly like an empty one.
 fn load_persisted(
     state: &mut SessionState,
-    persist: Option<&Arc<Mutex<Box<dyn ClientPersistence>>>>,
-    keys: &[String],
+    entries: Vec<StoredEntry>,
     ver: MqttVersion,
 ) -> Restored {
     let mut restored = Restored::default();
-    let Some(persist) = persist else {
-        return restored;
-    };
-
-    for key in keys {
-        match restore_entry(state, persist, key, ver) {
+    for entry in entries {
+        let key = entry.key.clone();
+        match restore_entry(state, entry, ver) {
             Ok(Restore::Outbound) => restored.outbound += 1,
             Ok(Restore::Inbound) => restored.inbound += 1,
             Err(why) => {
@@ -446,20 +442,43 @@ fn load_persisted(
     restored
 }
 
-/// Lists the entries of a store that is about to be restored.
+/// One entry of a store being restored: its key, and what reading it gave,
+/// or `None` for a key this client does not write, which is not read.
+pub(crate) struct StoredEntry {
+    key: String,
+    data: Option<Result<Vec<u8>>>,
+}
+
+/// Reads back a store that is about to be restored: lists it, and reads
+/// every entry this client wrote. Runs as one call on the store (see
+/// [`store_op`]), so that a blocking store is read on its own thread.
 ///
-/// A failure here ends the connect. Carrying on would treat a store that
+/// A failure to list ends the connect. Carrying on would treat a store that
 /// holds messages as one that holds none, leaving them unsent with nothing
 /// on the token to say so. The messages are still there once the fault is
 /// fixed; an application that would rather connect without them can turn
-/// off [`restore_msgs`](crate::CreateOptions::restore_msgs).
-fn stored_keys(store: &Store) -> Result<Vec<String>> {
-    persist::call(store, |s| s.keys()).map_err(|e| {
+/// off [`restore_msgs`](crate::CreateOptions::restore_msgs). An entry that
+/// cannot be read costs only itself; see [`load_persisted`].
+fn read_store(store: &mut dyn ClientPersistence) -> Result<Vec<StoredEntry>> {
+    let keys = store.keys().map_err(|e| {
         Error::Persistence(format!(
             "could not list the store to restore its messages ({e}); \
              fix the store, or turn off `restore_messages` to connect without them"
         ))
-    })
+    })?;
+    Ok(keys
+        .into_iter()
+        .map(|key| {
+            let data = parse_persist_key(&key).map(|_| store.get(&key));
+            StoredEntry { key, data }
+        })
+        .collect())
+}
+
+/// The keys in `store`, for the tests to see what it holds.
+#[cfg(test)]
+fn stored_keys(store: &Store) -> Result<Vec<String>> {
+    persist::call(store, |s| s.keys())
 }
 
 /// What [`load_persisted`] made of a store.
@@ -488,14 +507,15 @@ enum Restore {
 /// acknowledgement would then never remove.
 fn restore_entry(
     state: &mut SessionState,
-    persist: &Arc<Mutex<Box<dyn ClientPersistence>>>,
-    key: &str,
+    entry: StoredEntry,
     ver: MqttVersion,
 ) -> std::result::Result<Restore, String> {
-    let (kind, key_id) = parse_persist_key(key)
+    let (kind, key_id) = parse_persist_key(&entry.key)
         .ok_or("the key is not one this client writes (`s<id>` or `r<id>`)")?;
 
-    let data = persist::call(persist, |s| s.get(key))
+    let data = entry
+        .data
+        .ok_or("it was not read")?
         .map_err(|e| format!("it could not be read ({e})"))?;
     let mut buf = BytesMut::from(data.as_slice());
     let raw = match RawPacket::decode(&mut buf) {
@@ -951,14 +971,6 @@ impl Persist {
     /// Whether anything is being stored at all.
     fn is_some(&self) -> bool {
         !matches!(self, Self::None)
-    }
-
-    /// Lets the queue drain, so that the caller may use the store directly
-    /// without contending with the worker.
-    async fn idle(&mut self) {
-        if let Self::Worker(w) = self {
-            w.idle().await;
-        }
     }
 
     /// How long a session waits for this store before giving up on the
@@ -3097,8 +3109,8 @@ struct Connected<B: Backend> {
     /// of being dropped here with the connect: whatever is in it is handled
     /// before the session waits on another read.
     read_buf: BytesMut,
-    /// The persistence entries to restore, from [`stored_keys`].
-    stored: Vec<String>,
+    /// The persistence entries to restore, from [`read_store`].
+    stored: Vec<StoredEntry>,
 }
 
 /// Opens persistence and the transport, sends CONNECT, waits for CONNACK.
@@ -3107,7 +3119,15 @@ struct Connected<B: Backend> {
 /// server, so that one that cannot be read fails the connect while the
 /// broker has yet to hear from this client. A clean start has nothing to
 /// restore, so it never depends on the store being readable.
-async fn do_connect<B: Backend>(job: &ConnectJob, restore: bool) -> Result<Connected<B>> {
+///
+/// The store is used through [`store_op`], each call bounded by
+/// `persist_timeout`.
+async fn do_connect<B: Backend>(
+    job: &ConnectJob,
+    persist: &Persist,
+    persist_timeout: Duration,
+    restore: bool,
+) -> Result<Connected<B>> {
     let p = &job.params;
     let (addr, _) = &p.servers[job.server_idx];
 
@@ -3116,10 +3136,11 @@ async fn do_connect<B: Backend>(job: &ConnectJob, restore: bool) -> Result<Conne
     // state carried over from the last connection, which may have been to
     // another of them, was stored there.
     let mut stored = Vec::new();
-    if let Some(store) = &job.persist {
-        persist::call(store, |s| s.open(&p.client_id, &p.persist_uri))?;
+    if persist.is_some() {
+        let (id, uri) = (p.client_id.clone(), p.persist_uri.clone());
+        store_op::<B, _, _>(persist, persist_timeout, move |s| s.open(&id, &uri)).await?;
         if restore && !p.clean_start {
-            stored = stored_keys(store)?;
+            stored = store_op::<B, _, _>(persist, persist_timeout, read_store).await?;
         }
     }
 
@@ -3314,8 +3335,10 @@ enum Attempt<B: Backend> {
 /// A `Disconnect` aborts the attempt. A `Connect` during an attempt fails its
 /// own token — one connect at a time. Everything else is handled as it is
 /// while disconnected.
+#[allow(clippy::too_many_arguments)]
 async fn attempt_connect<B: Backend>(
     job: &ConnectJob,
+    persist: &Persist,
     cmd_rx: &async_channel::Receiver<Command>,
     buf: &mut VecDeque<Command>,
     offline_cfg: &OfflineConfig,
@@ -3329,7 +3352,7 @@ async fn attempt_connect<B: Backend>(
     } else {
         B::Sleep::new(timeout)
     };
-    let mut conn = pin!(do_connect::<B>(job, restore).fuse());
+    let mut conn = pin!(do_connect::<B>(job, persist, offline_cfg.persist_timeout, restore).fuse());
 
     loop {
         let cmd = select! {
@@ -3479,17 +3502,36 @@ fn next_retry_delay(current: Duration, max: Duration) -> Duration {
     next.min(max)
 }
 
-/// Waits for the persistence worker's queue to drain, for up to `timeout`
-/// (zero: for as long as it takes). Returns whether it did.
-async fn persist_idle<B: Backend>(persist: &mut Persist, timeout: Duration) -> bool {
-    if timeout.is_zero() {
-        persist.idle().await;
-        return true;
-    }
-    let mut limit = B::Sleep::new(timeout);
-    select_biased! {
-        _ = persist.idle().fuse() => true,
-        _ = limit => false,
+/// Runs `f` on the store at connect time: on the store's own thread when it
+/// has one, behind whatever is queued there, and for up to `timeout` (zero:
+/// for as long as it takes); otherwise here, a store that does not block
+/// being as quick as a memory write.
+///
+/// So the event loop never calls a blocking store itself, and one that
+/// stops answering fails the connect attempt with [`store_stalled`] rather
+/// than holding the loop: it is awaited inside [`attempt_connect`], which
+/// goes on answering commands, so a `disconnect()` ends the wait at once.
+async fn store_op<B, R, F>(persist: &Persist, timeout: Duration, f: F) -> Result<R>
+where
+    B: Backend,
+    R: Send + 'static,
+    F: FnOnce(&mut dyn ClientPersistence) -> Result<R> + Send + 'static,
+{
+    match persist {
+        Persist::None => Err(Error::Persistence("no persistence store".into())),
+        Persist::Inline(store) => persist::call(store, f),
+        Persist::Worker(w) => {
+            let gone = || Error::Persistence("the persistence thread has stopped".into());
+            let rx = w.run(f);
+            if timeout.is_zero() {
+                return rx.await.unwrap_or_else(|_| Err(gone()));
+            }
+            let mut limit = B::Sleep::new(timeout);
+            select_biased! {
+                res = rx.fuse() => res.unwrap_or_else(|_| Err(gone())),
+                _ = limit => Err(store_stalled(timeout)),
+            }
+        }
     }
 }
 
@@ -3497,7 +3539,7 @@ async fn persist_idle<B: Backend>(persist: &mut Persist, timeout: Duration) -> b
 /// answering.
 fn store_stalled(timeout: Duration) -> Error {
     Error::Persistence(format!(
-        "the store has not responded in {} s; the connection was not attempted",
+        "the store has not responded in {} s; the connection was abandoned",
         timeout.as_secs()
     ))
 }
@@ -3615,63 +3657,55 @@ pub(crate) async fn run_event_loop<B: Backend>(
 
             // ---- One connection attempt (or one pass over the server list) ----
             //
-            // The connect opens the store, reads it back and may clear it,
-            // all directly, so the worker's queue is let drain first; a
-            // store that does not, within its timeout, fails the attempt
-            // without the connect touching it. On a reconnect the wait
-            // comes after the back-off, which is what answers a
-            // `disconnect()`, so a hung store can keep one waiting for no
-            // longer than its timeout (`persist_timeout`; with zero, the
-            // application has said to wait for as long as it takes).
+            // The connect opens the store and may read it back, through the
+            // store's thread when it has one (see `store_op`), so a store
+            // that has stopped answering fails the attempt after its
+            // timeout, and a `disconnect()` meanwhile is answered at once.
             let attempt: Attempt<B> = if !reconnecting {
-                if !persist_idle::<B>(&mut persist, offline_cfg.persist_timeout).await {
-                    Attempt::Failed(store_stalled(offline_cfg.persist_timeout))
-                } else {
-                    let n = job.params.servers.len();
-                    let mut last_err = None;
-                    let mut result = None;
-                    for idx in 0..n {
-                        job.server_idx = idx;
-                        match attempt_connect::<B>(
-                            &job,
-                            &cmd_rx,
-                            &mut buf,
-                            &offline_cfg,
-                            should_buf,
-                            restore,
-                            &mut sinks,
-                        )
-                        .await
-                        {
-                            Attempt::Connected(c) if c.connack.reason_code.is_err() => {
-                                last_err = Some(Error::ReasonCode(
-                                    c.connack.reason_code,
-                                    c.connack.properties,
-                                ));
-                            }
-                            Attempt::Connected(c) => {
-                                result = Some(c);
-                                break;
-                            }
-                            // Reported now: only the last server's error reaches
-                            // the connect token, but each TLS failure is news.
-                            Attempt::Failed(e) => {
-                                report_tls_error(&event_tx, &e).await;
-                                last_err = Some(e);
-                            }
-                            Attempt::Aborted(tx) => {
-                                finish_disconnect(&conn_state, &event_tx, tx);
-                                continue 'outer;
-                            }
+                let n = job.params.servers.len();
+                let mut last_err = None;
+                let mut result = None;
+                for idx in 0..n {
+                    job.server_idx = idx;
+                    match attempt_connect::<B>(
+                        &job,
+                        &persist,
+                        &cmd_rx,
+                        &mut buf,
+                        &offline_cfg,
+                        should_buf,
+                        restore,
+                        &mut sinks,
+                    )
+                    .await
+                    {
+                        Attempt::Connected(c) if c.connack.reason_code.is_err() => {
+                            last_err = Some(Error::ReasonCode(
+                                c.connack.reason_code,
+                                c.connack.properties,
+                            ));
+                        }
+                        Attempt::Connected(c) => {
+                            result = Some(c);
+                            break;
+                        }
+                        // Reported now: only the last server's error reaches
+                        // the connect token, but each TLS failure is news.
+                        Attempt::Failed(e) => {
+                            report_tls_error(&event_tx, &e).await;
+                            last_err = Some(e);
+                        }
+                        Attempt::Aborted(tx) => {
+                            finish_disconnect(&conn_state, &event_tx, tx);
+                            continue 'outer;
                         }
                     }
-                    match result {
-                        Some(c) => Attempt::Connected(c),
-                        None => Attempt::Failed(
-                            last_err
-                                .unwrap_or(Error::InvalidArgument("no servers configured".into())),
-                        ),
-                    }
+                }
+                match result {
+                    Some(c) => Attempt::Connected(c),
+                    None => Attempt::Failed(
+                        last_err.unwrap_or(Error::InvalidArgument("no servers configured".into())),
+                    ),
                 }
             } else {
                 match reconnect_wait::<B>(retry_delay, &cmd_rx, &mut buf, &offline_cfg, &mut sinks)
@@ -3696,29 +3730,26 @@ pub(crate) async fn run_event_loop<B: Backend>(
                         tx_opt = Some(new_tx);
                     }
                 }
-                if !persist_idle::<B>(&mut persist, offline_cfg.persist_timeout).await {
-                    Attempt::Failed(store_stalled(offline_cfg.persist_timeout))
-                } else {
-                    match attempt_connect::<B>(
-                        &job,
-                        &cmd_rx,
-                        &mut buf,
-                        &offline_cfg,
-                        should_buf,
-                        restore,
-                        &mut sinks,
-                    )
-                    .await
-                    {
-                        Attempt::Connected(c) if c.connack.reason_code.is_err() => Attempt::Failed(
-                            Error::ReasonCode(c.connack.reason_code, c.connack.properties),
-                        ),
-                        Attempt::Failed(e) => {
-                            report_tls_error(&event_tx, &e).await;
-                            Attempt::Failed(e)
-                        }
-                        other => other,
+                match attempt_connect::<B>(
+                    &job,
+                    &persist,
+                    &cmd_rx,
+                    &mut buf,
+                    &offline_cfg,
+                    should_buf,
+                    restore,
+                    &mut sinks,
+                )
+                .await
+                {
+                    Attempt::Connected(c) if c.connack.reason_code.is_err() => Attempt::Failed(
+                        Error::ReasonCode(c.connack.reason_code, c.connack.properties),
+                    ),
+                    Attempt::Failed(e) => {
+                        report_tls_error(&event_tx, &e).await;
+                        Attempt::Failed(e)
                     }
+                    other => other,
                 }
             };
 
@@ -3769,14 +3800,16 @@ pub(crate) async fn run_event_loop<B: Backend>(
             // same path a session the server lost takes, with or without a
             // store.
             if job.params.clean_start
-                && let Some(p) = &job.persist
+                && persist.is_some()
+                && let Err(e) =
+                    store_op::<B, _, _>(&persist, offline_cfg.persist_timeout, |s| s.clear()).await
             {
-                let _ = persist::call(p, |s| s.clear());
+                warn!("Could not clear the persistence store for a clean start: {e}");
             }
 
             // Read a store written by an earlier run of the program into the
             // session state. `stored` is empty unless there is one to read.
-            load_persisted(&mut state, job.persist.as_ref(), &stored, job.params.ver);
+            load_persisted(&mut state, stored, job.params.ver);
             state.loaded = true;
 
             // An assigned identifier replaces the empty one we sent, so that
@@ -4715,8 +4748,8 @@ mod tests {
         ]);
 
         let mut state = SessionState::default();
-        let keys = stored_keys(&store).unwrap();
-        let restored = load_persisted(&mut state, Some(&store), &keys, MqttVersion::V5);
+        let entries = persist::call(&store, read_store).unwrap();
+        let restored = load_persisted(&mut state, entries, MqttVersion::V5);
 
         assert_eq!(
             restored,
@@ -4775,13 +4808,15 @@ mod tests {
             Arc::new(Mutex::new(Box::new(Broken { list_fails })))
         };
 
-        let err = stored_keys(&store(true)).unwrap_err();
-        assert!(matches!(&err, Error::Persistence(s) if s.contains("disk on fire")));
+        let err = persist::call(&store(true), read_store).err().unwrap();
+        assert!(
+            matches!(&err, Error::Persistence(s) if s.contains("disk on fire") && s.contains("restore_messages"))
+        );
 
         let mut state = SessionState::default();
         let store = store(false);
-        let keys = stored_keys(&store).unwrap();
-        let restored = load_persisted(&mut state, Some(&store), &keys, MqttVersion::V5);
+        let entries = persist::call(&store, read_store).unwrap();
+        let restored = load_persisted(&mut state, entries, MqttVersion::V5);
         assert_eq!(
             restored,
             Restored {
@@ -6214,36 +6249,48 @@ mod tests {
         assert!(matches!(tok.try_wait(), Some(Ok(_))));
     }
 
-    /// Before connecting, the loop waits for the store's queue to drain,
-    /// but only for the store's timeout: a store that never answers fails
-    /// the attempt instead of wedging the loop, which then could not even
-    /// answer a `disconnect()`.
+    /// Store calls made at connect time run on the store's thread, behind
+    /// what is queued there, and only for the store's timeout: a store that
+    /// never answers fails the attempt instead of wedging the event loop,
+    /// which then could not even answer a `disconnect()`. They used to be
+    /// made on the loop itself.
     #[test]
-    fn test_waiting_for_the_store_is_bounded() {
+    fn test_connect_time_store_calls_are_bounded() {
         use super::super::persist::testing::HeldStore;
 
         let (store, released, _) = HeldStore::held();
         let mut persist = Persist::Worker(PersistWorker::start(store, Duration::ZERO).unwrap());
+        // A put the store will not finish holds up whatever comes after it.
         if let Persist::Worker(w) = &mut persist {
             w.put("s1".into(), vec![Bytes::from_static(b"x")]);
         }
+        let on_worker = || {
+            let caller = std::thread::current().id();
+            move |_: &mut dyn ClientPersistence| Ok(std::thread::current().id() != caller)
+        };
 
         let limit = Duration::from_millis(50);
         let start = Instant::now();
-        let idle = {
-            let wait = pin!(persist_idle::<MockBackend>(&mut persist, limit));
-            poll_until(wait, Duration::from_secs(5))
+        let res = {
+            let op = pin!(store_op::<MockBackend, _, _>(&persist, limit, on_worker()));
+            poll_until(op, Duration::from_secs(5)).expect("gave up on the store")
         };
-        assert_eq!(idle, Some(false), "gave up on the store");
         assert!(start.elapsed() >= limit);
-        assert!(matches!(store_stalled(limit), Error::Persistence(_)));
+        assert!(
+            matches!(&res, Err(Error::Persistence(m)) if m.contains("not responded")),
+            "{res:?}"
+        );
 
         released.store(true, Ordering::SeqCst);
-        let idle = {
-            let wait = pin!(persist_idle::<MockBackend>(&mut persist, limit * 20));
-            poll_until(wait, Duration::from_secs(5))
+        let res = {
+            let op = pin!(store_op::<MockBackend, _, _>(
+                &persist,
+                limit * 20,
+                on_worker()
+            ));
+            poll_until(op, Duration::from_secs(5)).expect("the store caught up")
         };
-        assert_eq!(idle, Some(true), "the store caught up");
+        assert!(res.unwrap(), "ran on the store's thread, not the caller's");
     }
 
     /// A store that stops answering ends the session rather than stopping

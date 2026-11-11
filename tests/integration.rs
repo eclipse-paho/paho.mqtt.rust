@@ -3261,6 +3261,89 @@ fn test_clean_start_clears_persistence() {
     broker.join();
 }
 
+/// A blocking store whose `open()` does not return until `released` is set,
+/// standing in for a disk or network store that has hung.
+struct HangingStore {
+    released: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl mqtt::ClientPersistence for HangingStore {
+    fn open(&mut self, _: &str, _: &str) -> mqtt::Result<()> {
+        while !self.released.load(std::sync::atomic::Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        Ok(())
+    }
+    fn close(&mut self) -> mqtt::Result<()> {
+        Ok(())
+    }
+    fn put(&mut self, _: &str, _: Vec<&[u8]>) -> mqtt::Result<()> {
+        Ok(())
+    }
+    fn get(&mut self, _: &str) -> mqtt::Result<Vec<u8>> {
+        Err(mqtt::Error::Persistence("empty".into()))
+    }
+    fn remove(&mut self, _: &str) -> mqtt::Result<()> {
+        Ok(())
+    }
+    fn keys(&mut self) -> mqtt::Result<Vec<String>> {
+        Ok(Vec::new())
+    }
+    fn clear(&mut self) -> mqtt::Result<()> {
+        Ok(())
+    }
+    fn contains_key(&mut self, _: &str) -> bool {
+        false
+    }
+}
+
+/// A store that hangs when the client opens it, at connect time, fails the
+/// connect after `persist_timeout`, and a `disconnect()` meanwhile is
+/// answered at once. The event loop used to call the store itself there, so
+/// both waited for as long as the store did, which here is for ever.
+#[test]
+fn test_hung_store_at_connect_does_not_wedge_the_client() {
+    let released = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let client = |timeout: Duration| {
+        mqtt::CreateOptionsBuilder::new()
+            .server_uri(HOST)
+            .client_id("hung-store")
+            .user_persistence(HangingStore {
+                released: released.clone(),
+            })
+            .persist_timeout(timeout)
+            .create_async_client()
+            .unwrap()
+    };
+    let opts = || {
+        mqtt::ConnectOptionsBuilder::new_v5()
+            .clean_start(false)
+            .finalize()
+    };
+
+    // Bounded by the store's timeout.
+    let cli = client(Duration::from_millis(200));
+    let start = std::time::Instant::now();
+    let res = cli.connect(opts()).wait_for(TIMEOUT);
+    assert!(
+        matches!(&res, Err(mqtt::Error::Persistence(m)) if m.contains("not responded")),
+        "{res:?}"
+    );
+    assert!(start.elapsed() < Duration::from_secs(3));
+
+    // With no timeout, still interruptible: the disconnect ends the attempt.
+    let cli = client(Duration::ZERO);
+    let tok = cli.connect(opts());
+    std::thread::sleep(Duration::from_millis(100));
+    cli.disconnect(None)
+        .wait_for(Duration::from_secs(2))
+        .expect("disconnect answered while the store hangs");
+    assert!(tok.wait_for(Duration::from_secs(2)).is_err());
+    assert!(!cli.is_connected());
+
+    released.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
 /// A store that cannot be listed or cleared until `broken` is reset.
 #[derive(Clone)]
 struct UnlistableStore {

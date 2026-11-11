@@ -414,9 +414,10 @@ impl AsyncClient {
     /// client is not created from within a Tokio runtime; with the smol
     /// backend, always.
     ///
-    /// [`Error::Io`] if the runtime the client needs cannot be started: the
-    /// shared Tokio runtime cannot be built, or no thread can be spawned for
-    /// the shared smol executor.
+    /// [`Error::Io`] if what the client needs cannot be started: the shared
+    /// Tokio runtime cannot be built, no thread can be spawned for the
+    /// shared smol executor, or the client's own event-dispatch thread
+    /// cannot be spawned.
     ///
     pub fn new<T>(opts: T) -> Result<AsyncClient>
     where
@@ -471,6 +472,9 @@ impl AsyncClient {
             rt_ownership,
         ));
 
+        // A thread that cannot be started is an error from `new`, like the
+        // runtime's (see `resolve_runtime`). Returning drops `inner`, and
+        // with it the command channel, which ends the event loop task.
         let weak = Arc::downgrade(&inner);
         thread::Builder::new()
             .name("mqtt-events".into())
@@ -489,8 +493,7 @@ impl AsyncClient {
                         dispatch.gate.consumed();
                     }
                 }
-            })
-            .expect("spawn mqtt event thread");
+            })?;
 
         Ok(AsyncClient { inner })
     }

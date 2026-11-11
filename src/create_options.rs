@@ -271,11 +271,13 @@ pub struct CreateOptions {
     /// nothing else touches the store, so the next session's work simply
     /// queues behind it.
     ///
-    /// The same limit applies before each connection attempt, which waits
-    /// for the store's queue to drain so that it can open the store and
-    /// read it back. A store still stuck then fails that attempt with
-    /// [`Error::Persistence`](crate::Error), rather than holding up the
-    /// client — and a `disconnect()` — for as long as it stays stuck.
+    /// The same limit applies to each call a connection attempt makes on
+    /// the store — opening it, reading it back, clearing it for a clean
+    /// start — which run on the store's thread behind whatever is queued
+    /// there. A store that does not answer fails the attempt with
+    /// [`Error::Persistence`](crate::Error), and a `disconnect()` made
+    /// meanwhile is answered at once, rather than either waiting for as
+    /// long as the store stays stuck.
     pub persist_timeout: Duration,
     /// The MQTT protocol version to use for connections from this client.
     /// Defaults to v5, which enables a persistence store compatible with
