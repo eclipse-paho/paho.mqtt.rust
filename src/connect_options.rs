@@ -326,7 +326,9 @@ impl ConnectOptions {
     /// A session expiry may also be sent on DISCONNECT (in
     /// [`DisconnectOptions::props`](crate::DisconnectOptions)) to change the
     /// interval agreed at connect time, though it cannot revive a session
-    /// that was established with an expiry of 0.
+    /// that was established with an expiry of 0: `disconnect()` refuses a
+    /// non-zero one then, with [`Error::InvalidArgument`], since the server
+    /// would not take the DISCONNECT for one (§3.14.2.2.2).
     ///
     /// The client keeps its half of the session by the same rules. When a
     /// connection closes with the interval at 0, its in-flight QoS 1/2

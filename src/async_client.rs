@@ -669,11 +669,17 @@ impl AsyncClient {
     ///
     /// That is a failure found before anything goes on the wire: a v5
     /// reason code or v5 properties on a connection of an earlier version
-    /// ([`Error::WrongMqttVersion`]), or a client whose background session
+    /// ([`Error::WrongMqttVersion`]); a property a DISCONNECT cannot carry,
+    /// or a non-zero Session Expiry Interval when the CONNECT asked for 0
+    /// ([`Error::InvalidArgument`]); or a client whose background session
     /// has shut down ([`Error::Disconnected`]). Either way the message
     /// stream is left open.
     ///
-    /// On success the returned token tracks the disconnect itself.
+    /// On success the returned token tracks the disconnect itself. A
+    /// DISCONNECT too large for the server is sent without its Reason String
+    /// and User Properties; one that cannot be sent even then fails the
+    /// token, as the connection then closes without it and the server
+    /// publishes the Will.
     ///
     /// # Arguments
     ///
@@ -692,6 +698,7 @@ impl AsyncClient {
         // be sent.
         self.require_v5_for_props(&opts.props)?;
         self.require_v5_for_disconnect_reason(opts.reason_code)?;
+        self.check_disconnect_props(&opts.props)?;
 
         let (tok, comp) = Token::<()>::new();
 
@@ -1859,6 +1866,53 @@ impl AsyncClient {
         } else {
             Ok(())
         }
+    }
+
+    /// Checks the properties of a DISCONNECT the application asked for,
+    /// which would otherwise fail where it could not be reported (the
+    /// DISCONNECT not sent) or be taken by the server for no DISCONNECT at
+    /// all — in both cases the server publishing the Will:
+    ///
+    /// - only properties a DISCONNECT may carry, with valid values;
+    /// - no non-zero Session Expiry Interval when the CONNECT asked for 0,
+    ///   or for none, which is 0: that is a Protocol Error, and the server
+    ///   "does not treat it as a valid DISCONNECT" (v5 §3.14.2.2.2).
+    fn check_disconnect_props(&self, props: &Properties) -> Result<()> {
+        use crate::PropertyId;
+        if props.is_empty() {
+            return Ok(());
+        }
+        if props
+            .check_context(paho_mqtt_codec::PacketType::Disconnect)
+            .is_err()
+            || !props.is_valid()
+        {
+            return Err(Error::InvalidArgument(
+                "the disconnect properties hold one a DISCONNECT cannot carry, or an invalid value"
+                    .into(),
+            ));
+        }
+        if props
+            .get_u32(PropertyId::SessionExpiryInterval)
+            .is_some_and(|n| n != 0)
+        {
+            let connect = self
+                .inner
+                .conn_opts
+                .read()
+                .unwrap()
+                .props
+                .get_u32(PropertyId::SessionExpiryInterval)
+                .unwrap_or(0);
+            if connect == 0 {
+                return Err(Error::InvalidArgument(
+                    "a DISCONNECT cannot set a Session Expiry Interval when the CONNECT \
+                     asked for 0 (MQTT v5 3.14.2.2.2); set it in the connect options"
+                        .into(),
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Returns `Err(WrongMqttVersion)` if a DISCONNECT reason code other than
@@ -3223,6 +3277,58 @@ mod tests {
             Ok(_) => panic!("the message should not have been queued"),
             Err(err) => panic!("expected the message back, got {err}"),
         }
+    }
+
+    /// DISCONNECT properties are checked before anything is sent: ones a
+    /// DISCONNECT cannot carry, and a Session Expiry Interval raised from a
+    /// CONNECT's 0 (v5 §3.14.2.2.2), which the server would not take for a
+    /// DISCONNECT at all, publishing the Will. Both used to reach it.
+    #[test]
+    fn test_disconnect_options_are_checked() {
+        use crate::{DisconnectOptionsBuilder, Property};
+        let cli = AsyncClient::new(
+            CreateOptionsBuilder::new()
+                .server_uri("mqtt://localhost:1883")
+                .mqtt_version(MqttVersion::V5)
+                .finalize(),
+        )
+        .unwrap();
+        let with = |props: Vec<Property>| {
+            let mut p = Properties::new();
+            for prop in props {
+                p.push(prop);
+            }
+            DisconnectOptionsBuilder::new().properties(p).finalize()
+        };
+        let invalid = |res: Result<Token<()>>| matches!(res, Err(Error::InvalidArgument(_)));
+
+        assert!(invalid(
+            cli.try_disconnect(with(vec![Property::ContentType("x".into())]))
+        ));
+        assert!(invalid(cli.try_disconnect(with(vec![
+            Property::SessionExpiryInterval(60)
+        ]))));
+        // Shortening to 0, and the other properties a DISCONNECT may carry,
+        // are fine.
+        assert!(
+            cli.try_disconnect(with(vec![
+                Property::SessionExpiryInterval(0),
+                Property::ReasonString("bye".into()),
+                Property::UserProperty("k".into(), "v".into()),
+            ]))
+            .is_ok()
+        );
+
+        // With a CONNECT that asked for an interval, a DISCONNECT may change it.
+        let mut props = Properties::new();
+        props.push(Property::SessionExpiryInterval(3600));
+        *cli.inner.conn_opts.write().unwrap() = crate::ConnectOptionsBuilder::new_v5()
+            .properties(props)
+            .finalize();
+        assert!(
+            cli.try_disconnect(with(vec![Property::SessionExpiryInterval(60)]))
+                .is_ok()
+        );
     }
 
     /// A client may not publish a Subscription Identifier (MQTT-3.3.4-6),

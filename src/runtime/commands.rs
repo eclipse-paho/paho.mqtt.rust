@@ -528,13 +528,12 @@ pub(crate) fn negotiated_keep_alive(params: &ConnectParams, connack: &ConnAck) -
 /// Network Connection is closed"* (§3.1.2.11.2). The interval the client
 /// asks for in its CONNECT can be replaced by the server's in the CONNACK
 /// (§3.2.2.3.2), and by the client's own in its DISCONNECT (§3.14.2.2.2).
+/// A DISCONNECT may not raise it from a CONNECT's 0, which `disconnect()`
+/// refuses, so any it carries is taken as it is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct SessionExpiry {
     /// The interval in force, in seconds; `u32::MAX` never expires.
     secs: u32,
-    /// Whether the CONNECT asked for 0, after which a DISCONNECT may not
-    /// ask for more.
-    connect_zero: bool,
 }
 
 impl SessionExpiry {
@@ -542,10 +541,7 @@ impl SessionExpiry {
     pub(crate) fn negotiated(params: &ConnectParams, connack: &ConnAck) -> Self {
         if !params.ver.is_v5() {
             let secs = if params.clean_start { 0 } else { u32::MAX };
-            return Self {
-                secs,
-                connect_zero: secs == 0,
-            };
+            return Self { secs };
         }
         let asked = params
             .props
@@ -555,21 +551,12 @@ impl SessionExpiry {
             .properties
             .get_u32(PropertyId::SessionExpiryInterval)
             .unwrap_or(asked);
-        Self {
-            secs,
-            connect_zero: asked == 0,
-        }
+        Self { secs }
     }
 
     /// Takes in the properties of a DISCONNECT the client has sent.
-    ///
-    /// A non-zero interval after a CONNECT that asked for 0 is a Protocol
-    /// Error, which the server does not treat as a valid DISCONNECT
-    /// (§3.14.2.2.2), so it changes nothing.
     pub(crate) fn on_disconnect(&mut self, props: &CodecProperties) {
-        if let Some(secs) = props.get_u32(PropertyId::SessionExpiryInterval)
-            && (secs == 0 || !self.connect_zero)
-        {
+        if let Some(secs) = props.get_u32(PropertyId::SessionExpiryInterval) {
             self.secs = secs;
         }
     }
@@ -838,8 +825,9 @@ mod tests {
 
     /// v3.x: a clean session ends with its connection, any other is kept.
     /// v5: the CONNECT's interval, 0 by default, replaced by the CONNACK's,
-    /// then by the client's DISCONNECT — except that one may not lengthen
-    /// an interval the CONNECT asked to be 0 (§3.14.2.2.2).
+    /// then by the client's DISCONNECT. (One that would lengthen a CONNECT's
+    /// 0, a Protocol Error, is refused by `disconnect()` before it gets
+    /// here; see `AsyncClient::check_disconnect_props`.)
     #[test]
     fn test_session_expiry() {
         let ack = connack_with(vec![]);
@@ -891,11 +879,8 @@ mod tests {
 
         assert!(disconnect(v5(Some(60), None), 0), "ended by the DISCONNECT");
         assert!(!disconnect(v5(Some(60), None), 30));
-        assert!(disconnect(v5(None, None), 30), "not lengthened from 0");
-        // The CONNECT asked for 0, so this DISCONNECT is a Protocol Error
-        // and changes nothing: the server's 60 stands.
-        assert!(!disconnect(v5(None, Some(60)), 30));
-        assert!(disconnect(v5(None, Some(60)), 0), "shortening is allowed");
+        assert!(disconnect(v5(None, Some(60)), 0), "the server's, shortened");
+        assert!(!disconnect(v5(Some(60), Some(0)), 30), "taken as it is");
         let mut e = v5(Some(60), None);
         e.on_disconnect(&CodecProperties::new());
         assert!(!e.ends_with_connection(), "no interval, no change");

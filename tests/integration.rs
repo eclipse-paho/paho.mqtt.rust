@@ -2868,7 +2868,8 @@ fn test_session_that_ends_with_its_connection_is_discarded() {
         (mqtt::MQTT_VERSION_3_1, false, None, None, false),
         (mqtt::MQTT_VERSION_5, false, None, None, true),
         (mqtt::MQTT_VERSION_5, false, Some(3600), Some(0), true),
-        (mqtt::MQTT_VERSION_5, false, None, Some(3600), true),
+        // (A DISCONNECT may not raise a CONNECT's 0; `disconnect()` refuses
+        // it, which `test_disconnect_options_are_checked` covers.)
         (mqtt::MQTT_VERSION_5, true, Some(3600), None, false),
     ];
 

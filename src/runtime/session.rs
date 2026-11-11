@@ -2229,26 +2229,46 @@ impl<B: Backend> Session<B> {
         if !req.timeout.is_zero() && self.has_pending() {
             self.drain_pending(reader, req.timeout, &mut cmds).await;
         }
-        let disc = Disconnect::with_properties(req.reason_code, req.props);
-        let packet = Packet::Disconnect(disc);
-        if self.queue(&packet).is_ok() {
-            // A Session Expiry Interval in the DISCONNECT replaces the one
-            // agreed at connect time.
-            if let Packet::Disconnect(disc) = &packet {
-                self.expiry.on_disconnect(&disc.properties);
-            }
-            self.drain_outbox(reader, CLOSE_CAP, cmds).await;
+        let mut disc = Disconnect::with_properties(req.reason_code, req.props);
+        let mut queued = self.queue(&Packet::Disconnect(disc.clone()));
+        // Too large for the server: the Reason String and User Properties
+        // are what a sender must leave out rather than exceed the server's
+        // Maximum Packet Size (MQTT-3.14.2-3, -4). The reason code and any
+        // Session Expiry Interval are what matter.
+        if matches!(
+            queued,
+            Err(Error::Protocol(paho_mqtt_codec::Error::PacketTooLarge))
+        ) {
+            disc.properties.remove(PropertyId::ReasonString);
+            disc.properties.remove(PropertyId::UserProperty);
+            queued = self.queue(&Packet::Disconnect(disc.clone()));
         }
+        // A DISCONNECT that cannot be sent is reported on the token: the
+        // connection closes without one, so the server publishes the Will.
+        // It used to report success.
+        let result = match queued {
+            Ok(_) => {
+                // A Session Expiry Interval in the DISCONNECT replaces the
+                // one agreed at connect time.
+                self.expiry.on_disconnect(&disc.properties);
+                self.drain_outbox(reader, CLOSE_CAP, cmds).await;
+                Ok(())
+            }
+            Err(e) => {
+                warn!("Could not send the DISCONNECT ({e}); the connection closes without it");
+                Err(e)
+            }
+        };
         // Before the disconnect is reported done, so that a caller who
         // waited for it sees the tokens already settled; see `run_event_loop`.
         if self.expiry.ends_with_connection() {
             self.discard_unresumable();
         }
         self.conn_state.set(ConnectionState::Disconnected);
-        req.tx.complete(Ok(()));
+        req.tx.complete(result.clone());
         self.disconnects_done = 1 + self.held_disconnects.len();
         for tx in self.held_disconnects.drain(..) {
-            tx.complete(Ok(()));
+            tx.complete(result.clone());
         }
     }
 
@@ -5452,6 +5472,63 @@ mod tests {
         let resent: Vec<String> = sent_packets(&mut second).iter().map(describe).collect();
         assert_eq!(resent.len(), 1, "{resent:?}");
         assert!(resent[0].starts_with("PUBLISH one"));
+    }
+
+    /// A DISCONNECT too large for the server goes out without its Reason
+    /// String and User Properties (MQTT-3.14.2-3, -4), keeping its reason
+    /// code and Session Expiry Interval. One that cannot go out even then
+    /// fails its token: the connection closes without a DISCONNECT, and the
+    /// server publishes the Will. It used to report success.
+    #[test]
+    fn test_disconnect_too_large_for_the_server() {
+        let disconnect = |h: &mut Harness| {
+            let mut props = Properties::new();
+            props.push(paho_mqtt_codec::Property::SessionExpiryInterval(0));
+            props.push(paho_mqtt_codec::Property::ReasonString("x".repeat(100)));
+            props.push(paho_mqtt_codec::Property::UserProperty(
+                "k".into(),
+                "v".repeat(50),
+            ));
+            let (tok, tx) = Token::<()>::new();
+            h.cmd_tx
+                .try_send(Command::Disconnect {
+                    timeout: Duration::ZERO,
+                    reason_code: ReasonCode::DisconnectWithWillMessage,
+                    props,
+                    tx,
+                })
+                .unwrap();
+            let mut reader = MockReader::open_with([]);
+            let run = pin!(h.session.run(&mut reader, &h.cmd_rx));
+            assert!(poll_until(run, Duration::from_secs(5)).is_some(), "ended");
+            tok
+        };
+
+        let mut h = harness(BytesMut::new(), Duration::ZERO, SessionState::default());
+        h.session.limits.server_max_packet_size = Some(20);
+        let mut tok = disconnect(&mut h);
+        assert!(matches!(tok.try_wait(), Some(Ok(()))));
+        let sent = sent_packets(&mut h);
+        let [Packet::Disconnect(d)] = &sent[..] else {
+            panic!("{sent:?}")
+        };
+        assert_eq!(d.reason_code, ReasonCode::DisconnectWithWillMessage);
+        assert_eq!(
+            d.properties.get_u32(PropertyId::SessionExpiryInterval),
+            Some(0)
+        );
+        assert!(!d.properties.contains(PropertyId::ReasonString));
+        assert!(!d.properties.contains(PropertyId::UserProperty));
+
+        // Smaller than even that.
+        let mut h = harness(BytesMut::new(), Duration::ZERO, SessionState::default());
+        h.session.limits.server_max_packet_size = Some(3);
+        let mut tok = disconnect(&mut h);
+        assert!(matches!(
+            tok.try_wait(),
+            Some(Err(Error::Protocol(paho_mqtt_codec::Error::PacketTooLarge)))
+        ));
+        assert!(sent_packets(&mut h).is_empty());
     }
 
     /// A PUBREC or PUBREL for a packet identifier the client does not hold
